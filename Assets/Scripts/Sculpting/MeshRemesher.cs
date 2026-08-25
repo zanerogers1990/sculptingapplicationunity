@@ -1,0 +1,344 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Sculpting
+{
+    /// Voxel-based remesher: samples a signed distance field around the input mesh on a
+    /// uniform grid, then extracts a new, evenly-tessellated surface with Surface Nets.
+    /// Unlike sculpting a fixed-topology mesh, this redistributes polygons evenly over
+    /// whatever shape resulted, instead of leaving stretched/thin triangles behind.
+    /// Resolution controls voxel count along the mesh's largest bounding-box axis - higher
+    /// gives more detail everywhere, at higher cost. Sampling is parallelized across cores,
+    /// but the call itself still blocks the calling thread until it finishes, so very high
+    /// resolutions will still cause a hitch.
+    public static class MeshRemesher
+    {
+        private static readonly int[][] CubeEdges = BuildCubeEdges();
+        private static readonly Vector3Int[] CubeCorners = BuildCubeCorners();
+
+        // Reused across remesh calls instead of allocating fresh each time (List.Clear() keeps
+        // capacity, so repeated remeshes at similar resolutions settle into zero growth).
+        // Safe because Remesh() is always called synchronously to completion from the main
+        // thread only - never concurrently or re-entrantly - so there's no aliasing hazard.
+        private static readonly List<Vector3> _scratchVerts = new List<Vector3>();
+        private static readonly List<int> _scratchTris = new List<int>();
+
+        public static Mesh Remesh(Vector3[] sourceVertices, int[] sourceTriangles, int resolution)
+        {
+            resolution = Mathf.Clamp(resolution, 4, 512);
+
+            Bounds bounds = ComputeBounds(sourceVertices);
+            float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
+            float cellSize = maxExtent / resolution;
+
+            // Pad by 2 cells on every side so the surface always closes inside the grid,
+            // even where sculpting pushed geometry close to the source mesh's bounds.
+            const int pad = 2;
+            Vector3Int dims = new Vector3Int(
+                Mathf.CeilToInt(bounds.size.x / cellSize) + pad * 2,
+                Mathf.CeilToInt(bounds.size.y / cellSize) + pad * 2,
+                Mathf.CeilToInt(bounds.size.z / cellSize) + pad * 2);
+            Vector3 origin = bounds.min - Vector3.one * (pad * cellSize);
+
+            // SignedDistanceField's own binning grid is a triangle-lookup accelerator for the
+            // SOURCE mesh - it has nothing to do with the OUTPUT sampling resolution, so it
+            // must not reuse `cellSize` (that was a correctness-preserving but performance-
+            // pathological shortcut). Sizing it off the output grid meant remeshing a coarse
+            // source mesh (few, large triangles) at a fine target resolution made every large
+            // triangle's bounding box span thousands of tiny bins, each insertion bloating
+            // every bin it touched and degrading every later lookup against it too - this was
+            // the actual reason high resolutions were unusably slow (28s+ at res=128 on a
+            // ~768-triangle source), not the sampling/extraction work itself. Sizing bins off
+            // the source mesh's own triangle density (~1 triangle per bin on average) keeps
+            // insertion and lookup cost roughly constant regardless of target resolution.
+            float triCount = Mathf.Max(1, sourceTriangles.Length / 3);
+            float binCellSize = Mathf.Clamp(maxExtent / Mathf.Pow(triCount, 1f / 3f), maxExtent * 0.001f, maxExtent);
+            var field = new SignedDistanceField(sourceVertices, sourceTriangles, binCellSize);
+
+            int sx = dims.x + 1, sy = dims.y + 1, sz = dims.z + 1;
+            var sdf = new float[sx * sy * sz];
+
+            // Sign: one parity ray per (y,z) column, shared by every sample on it.
+            var inside = new bool[sx * sy * sz];
+            field.ComputeInsideMask(origin, cellSize, sx, sy, sz, inside);
+
+            // Narrow band: BuildSurface only ever interpolates a vertex position using an
+            // ACTIVE cell's own corners (one whose 8 corners aren't all the same inside/
+            // outside sign) - every other sample only needs its correct sign, which `inside[]`
+            // already gives for free. Without this, every one of the res^3 grid samples paid
+            // for an expensive nearest-triangle query even though only the O(res^2) samples
+            // actually near the surface are ever used for anything beyond their sign - that
+            // was the real reason very high resolutions were intractable (found by
+            // benchmarking: res=400 took 187s despite the triangle-binning fix above). This
+            // cell scan itself is O(res^3) too, but cheap (plain bool comparisons, no
+            // triangle queries), so it doesn't reintroduce the cost it's removing.
+            var needsDistance = new bool[sx * sy * sz];
+            System.Threading.Tasks.Parallel.For(0, dims.z, z =>
+            {
+                for (int y = 0; y < dims.y; y++)
+                for (int x = 0; x < dims.x; x++)
+                {
+                    bool first = inside[SampleIndex(x, y, z, sx, sy)];
+                    bool mixed = false;
+                    for (int c = 1; c < 8 && !mixed; c++)
+                    {
+                        Vector3Int co = CubeCorners[c];
+                        if (inside[SampleIndex(x + co.x, y + co.y, z + co.z, sx, sy)] != first) mixed = true;
+                    }
+                    if (!mixed) continue;
+
+                    // Concurrent cells sharing a corner may all write `true` here - always the
+                    // same value, so this is a benign race, not a correctness issue.
+                    for (int c = 0; c < 8; c++)
+                    {
+                        Vector3Int co = CubeCorners[c];
+                        needsDistance[SampleIndex(x + co.x, y + co.y, z + co.z, sx, sy)] = true;
+                    }
+                }
+            });
+
+            // Never read by BuildSurface for anything but a sign check (see above), so its
+            // exact magnitude doesn't matter as long as it reads unambiguously as "far".
+            const float FarSentinel = 1e6f;
+
+            // Magnitude: nearest-triangle distance, independent per sample - parallelize
+            // across z-slices (each slice writes a disjoint block of sdf, so no races).
+            System.Threading.Tasks.Parallel.For(0, sz, z =>
+            {
+                for (int y = 0; y < sy; y++)
+                for (int x = 0; x < sx; x++)
+                {
+                    int idx = SampleIndex(x, y, z, sx, sy);
+                    if (needsDistance[idx])
+                    {
+                        Vector3 p = origin + new Vector3(x * cellSize, y * cellSize, z * cellSize);
+                        float dist = field.NearestUnsignedDistance(p);
+                        sdf[idx] = inside[idx] ? -dist : dist;
+                    }
+                    else
+                    {
+                        sdf[idx] = inside[idx] ? -FarSentinel : FarSentinel;
+                    }
+                }
+            });
+
+            return BuildSurface(sdf, dims, sx, sy, origin, cellSize);
+        }
+
+        private static int SampleIndex(int x, int y, int z, int sx, int sy) => x + sx * (y + sy * z);
+
+        // Reused across BuildSurface calls for the same reason as _scratchVerts/_scratchTris -
+        // avoids a fresh multi-million-element allocation on every remesh. Sized up (never
+        // down) on demand.
+        private static bool[] _scratchCellHasVertex = new bool[0];
+        private static Vector3[] _scratchCellLocalPos = new Vector3[0];
+        private static int[] _scratchCellVertexIndex = new int[0];
+
+        private static Mesh BuildSurface(float[] sdf, Vector3Int dims, int sx, int sy, Vector3 origin, float cellSize)
+        {
+            int nx = dims.x, ny = dims.y, nz = dims.z;
+            int cellCount = nx * ny * nz;
+
+            if (_scratchCellHasVertex.Length < cellCount)
+            {
+                _scratchCellHasVertex = new bool[cellCount];
+                _scratchCellLocalPos = new Vector3[cellCount];
+                _scratchCellVertexIndex = new int[cellCount];
+            }
+            bool[] cellHasVertex = _scratchCellHasVertex;
+            Vector3[] cellLocalPos = _scratchCellLocalPos;
+            int[] cellVertexIndex = _scratchCellVertexIndex;
+
+            // Pass 1 (parallel): work out whether each cell is active and, if so, its local
+            // Surface Nets vertex position. Each cell only reads sdf[] and writes its own
+            // slot, so - unlike the single shared List<Vector3> this used to append straight
+            // into - this part is embarrassingly parallel across cores. This was the last
+            // remaining single-threaded O(resolution^3) pass in the whole remesh pipeline
+            // (found by benchmarking: still 45-86s at 1-2M output triangles even after the
+            // triangle-binning fix and the narrow-band SDF sampling above).
+            System.Threading.Tasks.Parallel.For(0, nz, z =>
+            {
+                Span<float> corner = stackalloc float[8];
+                for (int y = 0; y < ny; y++)
+                for (int x = 0; x < nx; x++)
+                {
+                    int cellIndex = x + nx * (y + ny * z);
+                    int mask = 0;
+                    for (int c = 0; c < 8; c++)
+                    {
+                        Vector3Int co = CubeCorners[c];
+                        float v = sdf[SampleIndex(x + co.x, y + co.y, z + co.z, sx, sy)];
+                        corner[c] = v;
+                        if (v < 0f) mask |= 1 << c;
+                    }
+
+                    if (mask == 0 || mask == 255) { cellHasVertex[cellIndex] = false; continue; } // all-inside or all-outside: no crossing
+
+                    Vector3 sum = Vector3.zero;
+                    int crossings = 0;
+                    for (int e = 0; e < CubeEdges.Length; e++)
+                    {
+                        int a = CubeEdges[e][0], b = CubeEdges[e][1];
+                        float va = corner[a], vb = corner[b];
+                        if ((va < 0f) == (vb < 0f)) continue;
+
+                        float t = va / (va - vb);
+                        sum += Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
+                        crossings++;
+                    }
+
+                    cellLocalPos[cellIndex] = sum / crossings;
+                    cellHasVertex[cellIndex] = true;
+                }
+            });
+
+            // Pass 2 (sequential, but cheap - pure array reads + list appends, no per-cell
+            // math): compacts pass 1's per-cell results into the final vertex list and
+            // cell->index map, walking cells in the same fixed order the old single-threaded
+            // loop used so output vertex ordering/indexing is unchanged.
+            var verts = _scratchVerts;
+            verts.Clear();
+
+            for (int z = 0; z < nz; z++)
+            for (int y = 0; y < ny; y++)
+            for (int x = 0; x < nx; x++)
+            {
+                int cellIndex = x + nx * (y + ny * z);
+                if (!cellHasVertex[cellIndex]) { cellVertexIndex[cellIndex] = -1; continue; }
+
+                Vector3 worldPos = origin + (new Vector3(x, y, z) + cellLocalPos[cellIndex]) * cellSize;
+                cellVertexIndex[cellIndex] = verts.Count;
+                verts.Add(worldPos);
+            }
+
+            var tris = _scratchTris;
+            tris.Clear();
+            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 0);
+            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 1);
+            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 2);
+
+            var mesh = new Mesh
+            {
+                indexFormat = verts.Count > 65000
+                    ? UnityEngine.Rendering.IndexFormat.UInt32
+                    : UnityEngine.Rendering.IndexFormat.UInt16
+            };
+            mesh.SetVertices(verts);
+            mesh.SetTriangles(tris, 0);
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+
+            var uvs = new Vector2[verts.Count];
+            Vector3 center = mesh.bounds.center;
+            for (int i = 0; i < verts.Count; i++)
+            {
+                Vector3 n = (verts[i] - center).normalized;
+                uvs[i] = new Vector2(
+                    0.5f + Mathf.Atan2(n.z, n.x) / (2f * Mathf.PI),
+                    0.5f - Mathf.Asin(Mathf.Clamp(n.y, -1f, 1f)) / Mathf.PI);
+            }
+            mesh.SetUVs(0, uvs);
+            mesh.RecalculateTangents();
+
+            return mesh;
+        }
+
+        // Walks grid-lattice edges along `axis`; wherever the SDF changes sign across one,
+        // the four cells sharing that edge each hold a Surface Nets vertex - stitch them into a quad.
+        //
+        // This loop runs O(resolution^3) times per axis (called once per axis, 3 total), so
+        // it used to allocate six small int[3] arrays (`sample`, `sampleNext`, `c0`..`c3`) on
+        // every single iteration - at high resolutions those billions of tiny heap allocations
+        // (not the arithmetic itself) were the dominant remaining cost after the SDF-sampling
+        // and BuildSurface-cell-loop fixes above stopped moving the needle any further.
+        // SampleAt/CellAt below map (axis-coordinate, u-coordinate, v-coordinate) straight to
+        // a flat index with no allocation at all.
+        private static void EmitQuads(float[] sdf, int[] cellVertexIndex, Vector3Int dims, int sx, int sy, List<int> tris, int axis)
+        {
+            int nx = dims.x, ny = dims.y, nz = dims.z;
+            int u = (axis + 1) % 3;
+            int v = (axis + 2) % 3;
+            int dimAxis = axis == 0 ? nx : axis == 1 ? ny : nz;
+            int dimU = u == 0 ? nx : u == 1 ? ny : nz;
+            int dimV = v == 0 ? nx : v == 1 ? ny : nz;
+
+            int SampleAt(int a, int b, int c)
+            {
+                int x = axis == 0 ? a : u == 0 ? b : c;
+                int y = axis == 1 ? a : u == 1 ? b : c;
+                int z = axis == 2 ? a : u == 2 ? b : c;
+                return SampleIndex(x, y, z, sx, sy);
+            }
+            int CellAt(int a, int b, int c)
+            {
+                int x = axis == 0 ? a : u == 0 ? b : c;
+                int y = axis == 1 ? a : u == 1 ? b : c;
+                int z = axis == 2 ? a : u == 2 ? b : c;
+                return x + nx * (y + ny * z);
+            }
+
+            for (int ea = 0; ea < dimAxis; ea++)
+            for (int bI = 1; bI < dimU; bI++)
+            for (int cI = 1; cI < dimV; cI++)
+            {
+                float va = sdf[SampleAt(ea, bI, cI)];
+                float vb = sdf[SampleAt(ea + 1, bI, cI)];
+                bool signA = va < 0f, signB = vb < 0f;
+                if (signA == signB) continue;
+
+                int i0 = cellVertexIndex[CellAt(ea, bI - 1, cI - 1)];
+                int i1 = cellVertexIndex[CellAt(ea, bI, cI - 1)];
+                int i2 = cellVertexIndex[CellAt(ea, bI, cI)];
+                int i3 = cellVertexIndex[CellAt(ea, bI - 1, cI)];
+
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) continue; // guard degenerate boundary cells
+
+                if (signA)
+                {
+                    tris.Add(i0); tris.Add(i1); tris.Add(i2);
+                    tris.Add(i0); tris.Add(i2); tris.Add(i3);
+                }
+                else
+                {
+                    tris.Add(i0); tris.Add(i2); tris.Add(i1);
+                    tris.Add(i0); tris.Add(i3); tris.Add(i2);
+                }
+            }
+        }
+
+        private static Bounds ComputeBounds(Vector3[] verts)
+        {
+            Vector3 min = verts[0], max = verts[0];
+            for (int i = 1; i < verts.Length; i++)
+            {
+                min = Vector3.Min(min, verts[i]);
+                max = Vector3.Max(max, verts[i]);
+            }
+            var b = new Bounds();
+            b.SetMinMax(min, max);
+            return b;
+        }
+
+        private static int[][] BuildCubeEdges()
+        {
+            var edges = new List<int[]>();
+            for (int i = 0; i < 8; i++)
+                for (int j = i + 1; j < 8; j++)
+                {
+                    int diff = i ^ j;
+                    if (diff != 0 && (diff & (diff - 1)) == 0)
+                        edges.Add(new[] { i, j });
+                }
+            return edges.ToArray();
+        }
+
+        private static Vector3Int[] BuildCubeCorners()
+        {
+            var corners = new Vector3Int[8];
+            for (int i = 0; i < 8; i++)
+                corners[i] = new Vector3Int(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+            return corners;
+        }
+    }
+}
