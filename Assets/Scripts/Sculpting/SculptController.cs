@@ -826,7 +826,45 @@ namespace Sculpting
         // twitchy about the moment-to-moment fluctuation the OFF path's own Clamp01 already
         // shrugs off on its own.
         private const float AccumulatePressureInfluence = 0.5f;
-        private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence);
+
+        // Mitigates (does not fully solve - the real fix is distance-based stroke spacing, a
+        // bigger separate change) the "blob where a stroke decelerates into a stop" artifact:
+        // every brush deposits once per rendered FRAME, not once per unit of distance the cursor
+        // actually travels, so a decelerating stroke packs many overlapping full-strength
+        // deposits into a small area right where it slows down, on top of the fast-moving middle
+        // of the same stroke that only got one deposit per (much larger) step. Scaling
+        // Accumulate's rate down as stroke speed drops toward zero softens that without
+        // eliminating the deliberate ZBrush/Blender-style "hold in place to keep building"
+        // feature outright - AccumulateSpeedFloor keeps a genuine stationary hold still building,
+        // just more gently, rather than stopping dead.
+        private const float AccumulateFullSpeedReference = 1f; // world units/sec treated as "fully moving" - starting value, tune to taste
+        private const float AccumulateSpeedFloor = 0.35f;
+        private const float StrokeSpeedSmoothingSpeed = 15f;
+        private Vector3? _lastStrokeHitPointWorld;
+        private float _strokeSpeed;
+
+        // Called once per brush application (not per Mirror copy - see UpdatePenPressure's own
+        // remarks on why that matters) from each accumulate-capable brush's Handle*Input, right
+        // after that frame's raycast hit is known. Smoothed for the same reason pressure is -
+        // raw per-frame speed is noisy (frame-time jitter, small hand tremor), and feeding that
+        // straight into the accumulate rate would just trade "blob at the stop" for "flicker
+        // mid-stroke".
+        private void UpdateStrokeSpeed(Vector3 worldHitPoint)
+        {
+            float dt = Mathf.Max(Time.deltaTime, 0.0001f);
+            // No prior point on a stroke's first frame - every stroke's first touch is
+            // inherently a stationary point sample, not yet a stroke, so treat it as speed 0
+            // (gentle first dab) rather than assuming full speed.
+            float instant = _lastStrokeHitPointWorld.HasValue
+                ? Vector3.Distance(worldHitPoint, _lastStrokeHitPointWorld.Value) / dt
+                : 0f;
+            _lastStrokeHitPointWorld = worldHitPoint;
+            _strokeSpeed = Mathf.Lerp(_strokeSpeed, instant, Mathf.Clamp01(dt * StrokeSpeedSmoothingSpeed));
+        }
+
+        private float AccumulateSpeedFactor => Mathf.Lerp(AccumulateSpeedFloor, 1f, Mathf.Clamp01(_strokeSpeed / AccumulateFullSpeedReference));
+
+        private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * AccumulateSpeedFactor;
 
         // Same immediate-write-through as BrushStrength above.
         public float BrushRadius
@@ -1131,6 +1169,11 @@ namespace Sculpting
             {
                 sculptableMesh.RebuildSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
                 sculptableMesh.BeginStrokeUndo();
+                // Fresh stroke, fresh speed reading - without this, a new stroke's first frame
+                // would measure "speed" against wherever the cursor last hit the mesh at the END
+                // of a PREVIOUS, unrelated stroke (see UpdateStrokeSpeed's remarks).
+                _lastStrokeHitPointWorld = null;
+                _strokeSpeed = 0f;
             }
 
             switch (currentBrush)
@@ -1209,6 +1252,7 @@ namespace Sculpting
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
+            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             _previewPositive = rightHeld ? !isPositive : isPositive;
@@ -1460,6 +1504,7 @@ namespace Sculpting
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
+            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             _previewPositive = rightHeld ? !isPositive : isPositive;
@@ -1602,6 +1647,7 @@ namespace Sculpting
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
+            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             _previewPositive = rightHeld ? !isPositive : isPositive;
@@ -1728,6 +1774,7 @@ namespace Sculpting
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
+            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             _previewPositive = rightHeld ? !isPositive : isPositive;
