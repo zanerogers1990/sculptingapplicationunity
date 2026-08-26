@@ -1,0 +1,32 @@
+// Scatters position/normal/color for a small set of touched vertex indices directly into a
+// mesh's own GPU vertex buffer, instead of Unity's managed Mesh.vertices/.normals/.colors
+// setters - those always reupload the ENTIRE buffer regardless of how many vertices actually
+// changed, which is the real per-frame ceiling SculptableMesh.ApplyVerticesLocal hits at high
+// polycounts (see GpuVertexScatter.cs, the only caller). CPU stays fully authoritative for
+// everything else (raycasting/undo/mask/mirror) - this kernel is a one-way write into the
+// render-facing buffer, never read back.
+#pragma kernel ScatterVertexAttributes
+
+RWByteAddressBuffer _VertexBuffer;
+StructuredBuffer<uint> _DirtyIndices;
+StructuredBuffer<float3> _DirtyPositions;
+StructuredBuffer<float3> _DirtyNormals;
+StructuredBuffer<float4> _DirtyColors;
+
+uint _Stride;
+uint _PositionOffset;
+uint _NormalOffset;
+uint _ColorOffset;
+uint _DirtyCount;
+
+[numthreads(64, 1, 1)]
+void ScatterVertexAttributes(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    if (idx >= _DirtyCount) return;
+
+    uint baseAddress = _DirtyIndices[idx] * _Stride;
+    _VertexBuffer.Store3(baseAddress + _PositionOffset, asuint(_DirtyPositions[idx]));
+    _VertexBuffer.Store3(baseAddress + _NormalOffset, asuint(_DirtyNormals[idx]));
+    _VertexBuffer.Store4(baseAddress + _ColorOffset, asuint(_DirtyColors[idx]));
+}

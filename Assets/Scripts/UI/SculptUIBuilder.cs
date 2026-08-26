@@ -31,6 +31,9 @@ namespace Sculpting
 
         private Font _font;
         private Text _positiveToggleLabel;
+        private Toggle _positiveToggle;
+        private Text _accumulateToggleLabel;
+        private Toggle _accumulateToggle;
         private Image _moveButtonImage;
         private Image _clayButtonImage;
         private Image _smoothButtonImage;
@@ -97,6 +100,23 @@ namespace Sculpting
                 _lastShownBrush = controller.CurrentBrush;
                 _lastShownMaskMode = controller.IsMaskPaintMode;
                 RefreshBrushButtons();
+
+                // Each brush remembers its own polarity (see SculptController._brushPolarity),
+                // so switching brushes can silently change controller.IsPositive out from under
+                // this toggle - resync its visual state without re-firing onChange (which would
+                // just feed the same value straight back into controller.IsPositive).
+                if (_positiveToggle != null)
+                {
+                    _positiveToggle.SetIsOnWithoutNotify(controller.IsPositive);
+                    _positiveToggleLabel.text = controller.IsPositive ? "Positive (Add)" : "Negative (Subtract)";
+                }
+
+                // Same per-brush memory for Accumulate (see SculptController._brushAccumulate).
+                if (_accumulateToggle != null)
+                {
+                    _accumulateToggle.SetIsOnWithoutNotify(controller.Accumulate);
+                    _accumulateToggleLabel.text = controller.Accumulate ? "Accumulate" : "Accumulate (Off)";
+                }
             }
 
             if (_undoButton != null) _undoButton.interactable = controller.CanUndo;
@@ -168,11 +188,17 @@ namespace Sculpting
             _brushSizeSlider = CreateSlider(panel.transform, SculptController.MinBrushRadius, SculptController.MaxBrushRadius,
                 controller.BrushRadius, v => controller.BrushRadius = v);
 
-            CreateToggle(panel.transform, "Positive (Add)", controller.IsPositive, v =>
+            _positiveToggle = CreateToggle(panel.transform, "Positive (Add)", controller.IsPositive, v =>
             {
                 controller.IsPositive = v;
                 _positiveToggleLabel.text = v ? "Positive (Add)" : "Negative (Subtract)";
             }, out _positiveToggleLabel);
+
+            _accumulateToggle = CreateToggle(panel.transform, "Accumulate", controller.Accumulate, v =>
+            {
+                controller.Accumulate = v;
+                _accumulateToggleLabel.text = v ? "Accumulate" : "Accumulate (Off)";
+            }, out _accumulateToggleLabel);
 
             var brushRow = CreateRow(panel.transform);
             var moveButton = CreateButton(brushRow.transform, "Move", () => SetBrushType(BrushType.Move));

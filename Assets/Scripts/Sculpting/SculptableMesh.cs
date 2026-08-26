@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Sculpting
 {
@@ -81,6 +83,15 @@ namespace Sculpting
         // state a snapshot needs to capture/restore.
         private readonly SculptHistory _history = new SculptHistory();
 
+        // Pushes only the touched vertices' position/normal/color into the mesh's GPU vertex
+        // buffer every ApplyVerticesLocal call, instead of Unity's Mesh.vertices/.normals/
+        // .colors setters (which always reupload the WHOLE array regardless of footprint size -
+        // see GpuVertexScatter's remarks). A plain C# class like _triangleGrid/_spatialGrid, so
+        // it gets the same lazy-rebuild-if-null treatment for the mid-Play-recompile domain-
+        // reload case (see EnsureGpuScatter) - it's never treated as a source of truth, only
+        // ever (re)bound to whatever _mesh currently is.
+        private GpuVertexScatter _gpuScatter;
+
         public Mesh Mesh => _mesh;
         public Vector3[] Vertices => _workingVertices;
         public Vector3[] Normals => _workingNormals;
@@ -115,16 +126,26 @@ namespace Sculpting
             _mesh.MarkDynamic();
             _meshFilter.mesh = _mesh;
 
+            // Read the source mesh's own data BEFORE redefining its vertex layout below -
+            // ConfigureGpuVertexLayout resets the buffer to a smaller, GPU-compute-writable
+            // layout (position/normal/color only, dropping whatever else the source asset had
+            // - e.g. UV0), so anything we still need has to be captured first.
             _originalVertices = _mesh.vertices;
             _workingVertices = (Vector3[])_originalVertices.Clone();
             _workingNormals = _mesh.normals;
             _workingTriangles = _mesh.triangles;
+
+            ConfigureGpuVertexLayout(_mesh, _workingVertices.Length);
+            _mesh.vertices = _workingVertices;
+            _mesh.normals = _workingNormals;
+
             BuildAdjacency();
             RebuildTriangleGrid();
             _cavityColors = new Color[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
+            BindGpuScatter();
 
             if (useMeshCollider)
             {
@@ -133,6 +154,46 @@ namespace Sculpting
                     _meshCollider = gameObject.AddComponent<MeshCollider>();
                 _meshCollider.sharedMesh = _mesh;
             }
+        }
+
+        private void OnDestroy()
+        {
+            _gpuScatter?.Dispose();
+            if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
+            if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
+        }
+
+        // Marks the mesh's vertex buffer as compute-shader-writable (GraphicsBuffer.Target.Raw)
+        // and pins its layout to exactly position/normal/color in one stream, with no UV0/
+        // tangent - matches what SculptPBR.shader's Attributes struct actually reads (no
+        // TEXCOORD0 at all), and mirrors the existing, already-verified-harmless "UV0 doesn't
+        // survive a full mesh rebuild" outcome RestoreSnapshot's full-rebuild path already has.
+        // Resetting the layout clears whatever data was there - callers must reassign vertices/
+        // normals/colors immediately afterward.
+        private static void ConfigureGpuVertexLayout(Mesh mesh, int vertexCount)
+        {
+            mesh.vertexBufferTarget |= GraphicsBuffer.Target.Raw;
+            mesh.SetVertexBufferParams(vertexCount,
+                new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3),
+                new VertexAttributeDescriptor(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3),
+                new VertexAttributeDescriptor(VertexAttribute.Color, VertexAttributeFormat.Float32, 4));
+        }
+
+        // _gpuScatter is a plain C# class (not Unity-serializable), so like _triangleGrid/
+        // _spatialGrid it can come back null after a script recompile during Play mode -
+        // lazily recreate rather than assuming it always survives. Rebinding is cheap and must
+        // happen unconditionally whenever _mesh itself changes identity (Remesh/RestoreSnapshot),
+        // not just on the null/recompile path, since a stale buffer handle from a replaced mesh
+        // is silently wrong, not absent.
+        private void EnsureGpuScatter()
+        {
+            if (_gpuScatter == null) BindGpuScatter();
+        }
+
+        private void BindGpuScatter()
+        {
+            _gpuScatter ??= new GpuVertexScatter();
+            _gpuScatter.BindMesh(_mesh);
         }
 
         // Cell size targets ~8 triangles per cell on average, sized off the CURRENT mesh's own
@@ -262,6 +323,48 @@ namespace Sculpting
                 BuildAdjacency();
         }
 
+        // CSR (compressed sparse row) flattening of _adjacency for the Smooth brush's Burst job
+        // (SculptController.SmoothRelaxJob) - jagged int[][] arrays can't be used inside a Burst-
+        // compiled job at all, so this is a NativeArray-backed copy of the same data: neighbors
+        // of vertex i live in NeighborsFlat[OffsetsFlat[i] .. OffsetsFlat[i+1]). Rebuilt whenever
+        // the managed _adjacency itself is rebuilt (topology change, or a mid-Play-recompile
+        // domain reload nulling it - see EnsureAdjacency/[[project_domain_reload_null_fields]]) -
+        // a plain length check can't distinguish "still valid" from "silently rebuilt with
+        // identical content" after a same-topology domain reload, but that distinction is
+        // harmless here since BuildAdjacency is deterministic - rebuilding from unchanged source
+        // data just reproduces the same content.
+        private NativeArray<int> _nativeAdjacencyOffsets;
+        private NativeArray<int> _nativeAdjacencyNeighbors;
+
+        public NativeArray<int> AdjacencyOffsets { get { EnsureNativeAdjacency(); return _nativeAdjacencyOffsets; } }
+        public NativeArray<int> AdjacencyNeighbors { get { EnsureNativeAdjacency(); return _nativeAdjacencyNeighbors; } }
+
+        private void EnsureNativeAdjacency()
+        {
+            EnsureAdjacency();
+            if (_nativeAdjacencyOffsets.IsCreated && _nativeAdjacencyOffsets.Length == _workingVertices.Length + 1)
+                return;
+
+            if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
+            if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
+
+            int vertCount = _workingVertices.Length;
+            int totalNeighbors = 0;
+            for (int i = 0; i < vertCount; i++) totalNeighbors += _adjacency[i].Length;
+
+            _nativeAdjacencyOffsets = new NativeArray<int>(vertCount + 1, Allocator.Persistent);
+            _nativeAdjacencyNeighbors = new NativeArray<int>(totalNeighbors, Allocator.Persistent);
+
+            int cursor = 0;
+            for (int i = 0; i < vertCount; i++)
+            {
+                _nativeAdjacencyOffsets[i] = cursor;
+                int[] neighbors = _adjacency[i];
+                for (int k = 0; k < neighbors.Length; k++) _nativeAdjacencyNeighbors[cursor++] = neighbors[k];
+            }
+            _nativeAdjacencyOffsets[vertCount] = cursor;
+        }
+
         /// The average position of a vertex's directly-connected neighbors (Laplacian
         /// smoothing target). Returns the vertex's own position, unchanged, if it has no
         /// neighbors (degenerate/isolated vertex).
@@ -278,7 +381,10 @@ namespace Sculpting
 
         /// Pushes the current working vertex buffer into the mesh, recomputes normals/bounds,
         /// and rebuilds the triangle spatial grid so the next raycast follows the sculpted
-        /// surface. Does NOT touch the MeshCollider - see class remarks.
+        /// surface. Does NOT touch the MeshCollider - see class remarks. Full-mesh cost is fine
+        /// here since callers (ResetMesh/Undo/Redo across a topology change/Remesh) already
+        /// touch the whole mesh at once - see ApplyVerticesLocal for the footprint-scoped path
+        /// every ordinary brush stroke uses instead.
         public void ApplyVertices()
         {
             _mesh.vertices = _workingVertices;
@@ -290,10 +396,79 @@ namespace Sculpting
             _mesh.colors = _cavityColors;
         }
 
+        // Reused across RecomputeNormalsLocal calls - same "grow, don't reallocate" pattern as
+        // _dirtyCavityScratch/_dirtyTriangleScratch.
+        private readonly HashSet<int> _dirtyNormalScratch = new HashSet<int>();
+
+        /// Recomputes normals for exactly the affected vertices (dirty vertices plus their
+        /// direct neighbors, mirroring RecomputeCavityLocal's scope) instead of Mesh.
+        /// RecalculateNormals()'s full-mesh scan - a vertex's normal only changes when one of
+        /// its incident triangles changes shape, and two vertices share a triangle iff they're
+        /// adjacent, so this scope is already exactly correct, no wider walk needed. Sums each
+        /// incident triangle's raw (unnormalized) face-normal cross product - its magnitude is
+        /// proportional to the triangle's area, so this naturally area-weights the average,
+        /// matching what RecalculateNormals() itself does - just scoped to the affected set
+        /// instead of the whole mesh. See ApplyVerticesLocal.
+        private void RecomputeNormalsLocal(IReadOnlyCollection<int> dirtyVertices)
+        {
+            EnsureAdjacency();
+            _dirtyNormalScratch.Clear();
+            foreach (int vi in dirtyVertices)
+            {
+                _dirtyNormalScratch.Add(vi);
+                int[] neighbors = _adjacency[vi];
+                for (int i = 0; i < neighbors.Length; i++) _dirtyNormalScratch.Add(neighbors[i]);
+            }
+
+            foreach (int i in _dirtyNormalScratch)
+                RecomputeNormalAt(i);
+        }
+
+        private void RecomputeNormalAt(int i)
+        {
+            int[] incidentTris = _vertexTriangles[i];
+            Vector3 sum = Vector3.zero;
+            for (int t = 0; t < incidentTris.Length; t++)
+            {
+                int baseIndex = incidentTris[t] * 3;
+                Vector3 a = _workingVertices[_workingTriangles[baseIndex]];
+                Vector3 b = _workingVertices[_workingTriangles[baseIndex + 1]];
+                Vector3 c = _workingVertices[_workingTriangles[baseIndex + 2]];
+                sum += Vector3.Cross(b - a, c - a);
+            }
+            // Degenerate (zero-area) triangles can null out the sum for an isolated vertex -
+            // keep the previous normal rather than collapsing it to zero, same "leave it alone"
+            // behavior GetNeighborAverage uses for a neighborless vertex.
+            if (sum.sqrMagnitude > 1e-12f) _workingNormals[i] = sum.normalized;
+        }
+
+        /// Grows the mesh's bounds to include the given vertices' current positions - O(dirty
+        /// count) instead of Mesh.RecalculateBounds()'s O(total vertex count) full scan. Bounds
+        /// only ever need to grow to stay valid for culling; a stroke that moves geometry inward
+        /// leaves bounds slightly loose rather than exactly tight, which is harmless - the same
+        /// approximation any incremental-bounds scheme makes. ApplyVertices() (Remesh/Reset/
+        /// topology-crossing Undo's full-rebuild path) keeps calling the real
+        /// RecalculateBounds() - already-infrequent full-mesh operations that don't need this.
+        private void ExpandBoundsLocal(IReadOnlyCollection<int> dirtyVertices)
+        {
+            if (dirtyVertices.Count == 0) return;
+            Bounds b = _mesh.bounds;
+            foreach (int i in dirtyVertices)
+                b.Encapsulate(_workingVertices[i]);
+            _mesh.bounds = b;
+        }
+
         // Reused across ApplyVerticesLocal calls so a brush stroke doesn't allocate a fresh
         // HashSet every frame - cleared and refilled each call, same "grow, don't reallocate"
         // pattern as the scratch buffers in SculptController.
         private readonly HashSet<int> _dirtyTriangleScratch = new HashSet<int>();
+
+        // Reused across PaintMask calls so a held mask-paint drag doesn't allocate a fresh
+        // HashSet every frame - same pattern as _dirtyTriangleScratch. Holds exactly the
+        // candidates that passed PaintMask's own dist &lt;= radius check, i.e. the vertices
+        // actually touched this call (QueryNear's candidate list is a superset - see its
+        // remarks).
+        private readonly HashSet<int> _paintMaskScratch = new HashSet<int>();
 
         /// Same effect as ApplyVertices(), but the caller guarantees only the vertices in
         /// dirtyVertices moved this frame - lets the triangle grid update just the triangles
@@ -303,10 +478,8 @@ namespace Sculpting
         /// Remesh - see their call sites).
         public void ApplyVerticesLocal(IReadOnlyCollection<int> dirtyVertices)
         {
-            _mesh.vertices = _workingVertices;
-            _mesh.RecalculateNormals();
-            _mesh.RecalculateBounds();
-            _workingNormals = _mesh.normals;
+            RecomputeNormalsLocal(dirtyVertices);
+            ExpandBoundsLocal(dirtyVertices);
 
             if (_triangleGrid != null && dirtyVertices.Count > 0)
             {
@@ -336,7 +509,16 @@ namespace Sculpting
             }
 
             RecomputeCavityLocal(dirtyVertices);
-            _mesh.colors = _cavityColors;
+
+            // Replaces the full _mesh.vertices=/.colors= reassignment (and the .normals=
+            // assignment removed above) with a compute-shader scatter write scoped to just the
+            // affected vertices - see GpuVertexScatter remarks. _dirtyNormalScratch is exactly
+            // that "dirty ∪ neighbors" set (already computed by RecomputeNormalsLocal above,
+            // and identical to what RecomputeCavityLocal just used) - position is redundant-but-
+            // harmless for neighbor-only entries whose position didn't change, only their
+            // normal/cavity color did.
+            EnsureGpuScatter();
+            _gpuScatter.ScatterDirty(_dirtyNormalScratch, _dirtyNormalScratch.Count, _workingVertices, _workingNormals, _cavityColors);
         }
 
         /// Approximates per-vertex concavity/convexity from how far a vertex sits from its
@@ -405,6 +587,7 @@ namespace Sculpting
             float innerRadius = radius * Mathf.Clamp01(hardness);
             float falloffSpan = Mathf.Max(radius - innerRadius, 1e-5f);
 
+            _paintMaskScratch.Clear();
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
@@ -426,8 +609,17 @@ namespace Sculpting
                 Color c = _cavityColors[i];
                 c.g = _mask[i];
                 _cavityColors[i] = c;
+                _paintMaskScratch.Add(i);
             }
-            _mesh.colors = _cavityColors;
+
+            // Held mask-paint drags call this every frame (see SculptController.ApplyMaskPaint),
+            // so at high polycounts this needs the same footprint-scoped GPU write
+            // ApplyVerticesLocal uses instead of a full _mesh.colors= reassignment - see
+            // GpuVertexScatter remarks. Position/normal are unchanged by mask painting; scattering
+            // them anyway alongside the updated color is the same accepted redundant-write pattern
+            // ApplyVerticesLocal already relies on for its neighbor-only entries.
+            EnsureGpuScatter();
+            _gpuScatter.ScatterDirty(_paintMaskScratch, _paintMaskScratch.Count, _workingVertices, _workingNormals, _cavityColors);
         }
 
         /// Flips every vertex's mask value (protected <-> sculptable), ZBrush Ctrl+I/Blender
@@ -452,25 +644,100 @@ namespace Sculpting
             ApplyVertices();
         }
 
-        /// Call before starting a discrete edit (a brush stroke, Remesh, Reset Mesh) so Undo
-        /// can revert it. _workingVertices is cloned here since it's the live array brush
-        /// strokes mutate in place every frame - Mesh.triangles doesn't need cloning too,
-        /// Unity's getter already returns a fresh copy every time it's read.
+        /// Call before Remesh/Reset Mesh (topology-changing edits) so Undo can revert them - a
+        /// full clone is unavoidable here since nothing less can describe a topology change.
+        /// _workingVertices is cloned since it's the live array brush strokes mutate in place -
+        /// Mesh.triangles doesn't need cloning too, Unity's getter already returns a fresh copy.
+        /// Ordinary brush strokes use BeginStrokeUndo/EndStrokeUndo instead - see their remarks.
         public void SnapshotForUndo()
         {
-            _history.PushUndo((Vector3[])_workingVertices.Clone(), _mesh.triangles);
+            _history.PushFullUndo((Vector3[])_workingVertices.Clone(), _mesh.triangles);
+        }
+
+        // Accumulates each touched vertex's PRE-stroke position the first time a held stroke
+        // touches it, committed as one delta undo entry when the stroke ends - see
+        // RecordUndoBeforeIfNeeded/EndStrokeUndo. Replaces the old up-front full-mesh clone on
+        // every stroke START (paid regardless of what the stroke ends up touching, or even if it
+        // misses the mesh entirely) with a cost proportional to what actually moved. Two
+        // parallel lists rather than a Dictionary<int,Vector3> - insertion order doesn't matter
+        // here and this avoids dictionary overhead for what's typically hundreds-to-thousands of
+        // entries per stroke.
+        private readonly List<int> _strokeDeltaIndices = new List<int>();
+        private readonly List<Vector3> _strokeDeltaBefore = new List<Vector3>();
+        // Which indices are already recorded THIS stroke - separate from _dirtyVertexScratch-
+        // style per-frame scratch since this has to persist across every frame of a held stroke,
+        // not just one.
+        private readonly HashSet<int> _strokeRecordedIndices = new HashSet<int>();
+
+        /// Call once on stroke start (mouse-press) to clear the previous stroke's accumulator.
+        public void BeginStrokeUndo()
+        {
+            _strokeDeltaIndices.Clear();
+            _strokeDeltaBefore.Clear();
+            _strokeRecordedIndices.Clear();
+        }
+
+        /// Call from a brush's per-candidate write site, BEFORE overwriting
+        /// _workingVertices[index], so the FIRST touch during this stroke captures the true
+        /// pre-stroke value - a vertex touched across multiple frames of the same held stroke
+        /// only records once (its value from before the very first touch, not the most recent).
+        public void RecordUndoBeforeIfNeeded(int index)
+        {
+            if (_strokeRecordedIndices.Add(index))
+            {
+                _strokeDeltaIndices.Add(index);
+                _strokeDeltaBefore.Add(_workingVertices[index]);
+            }
+        }
+
+        /// Call once when a stroke ends (mouse-up) to commit whatever was recorded as one undo
+        /// entry - a no-op if the stroke touched nothing (e.g. a click that missed the mesh),
+        /// which now costs nothing instead of the old unconditional full-mesh clone up front.
+        /// Idempotent: clears the accumulator after pushing, so calling this more than once
+        /// without an intervening BeginStrokeUndo (e.g. a caller's release-detection firing from
+        /// more than one place) harmlessly no-ops on the second call instead of pushing the same
+        /// delta twice.
+        public void EndStrokeUndo()
+        {
+            if (_strokeDeltaIndices.Count == 0) return;
+            _history.PushDeltaUndo(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
+            _strokeDeltaIndices.Clear();
+            _strokeDeltaBefore.Clear();
+            _strokeRecordedIndices.Clear();
         }
 
         public void Undo()
         {
-            if (_history.Undo((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
+            if (_history.TryUndoDelta(i => _workingVertices[i], out int[] indices, out Vector3[] positions))
+            {
+                RestoreDelta(indices, positions);
+                return;
+            }
+            if (_history.TryUndoFull((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
                 RestoreSnapshot(verts, tris);
         }
 
         public void Redo()
         {
-            if (_history.Redo((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
+            if (_history.TryRedoDelta(i => _workingVertices[i], out int[] indices, out Vector3[] positions))
+            {
+                RestoreDelta(indices, positions);
+                return;
+            }
+            if (_history.TryRedoFull((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
                 RestoreSnapshot(verts, tris);
+        }
+
+        /// Fast-path restore for a delta undo/redo entry - writes the given positions directly
+        /// into _workingVertices at the given indices (no full-array reassignment) and reuses
+        /// the exact same incremental update path (ApplyVerticesLocal) a live brush stroke
+        /// already goes through for normals/bounds/triangle-grid/cavity/GPU upload - no separate
+        /// propagation logic needed.
+        private void RestoreDelta(int[] indices, Vector3[] positions)
+        {
+            for (int k = 0; k < indices.Length; k++)
+                _workingVertices[indices[k]] = positions[k];
+            ApplyVerticesLocal(indices);
         }
 
         // Undoing/redoing a brush stroke never changes topology (only positions), so the
@@ -493,12 +760,13 @@ namespace Sculpting
 
             // Full rebuild, mirroring Remesh()'s tail. Note: unlike Remesh(), this doesn't
             // recompute the spherical UVs MeshRemesher assigns - harmless today since
-            // SculptPBR's vertex shader has no TEXCOORD0 input at all, but flagging it here in
-            // case a future shader starts sampling UV0.
+            // SculptPBR's vertex shader has no TEXCOORD0 input at all (ConfigureGpuVertexLayout
+            // below drops it from the buffer entirely regardless, same as Remesh()'s tail).
             _mesh.Clear();
             _mesh.indexFormat = vertices.Length > 65000
                 ? UnityEngine.Rendering.IndexFormat.UInt32
                 : UnityEngine.Rendering.IndexFormat.UInt16;
+            ConfigureGpuVertexLayout(_mesh, vertices.Length);
             _mesh.vertices = vertices;
             _mesh.triangles = triangles;
             _mesh.RecalculateNormals();
@@ -515,6 +783,7 @@ namespace Sculpting
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
+            BindGpuScatter();
 
             if (_meshCollider != null)
             {
@@ -575,7 +844,11 @@ namespace Sculpting
             if (!selection.IsValid) return;
 
             for (int i = 0; i < selection.Indices.Length; i++)
-                _workingVertices[selection.Indices[i]] += localDelta * selection.Weights[i];
+            {
+                int idx = selection.Indices[i];
+                RecordUndoBeforeIfNeeded(idx);
+                _workingVertices[idx] += localDelta * selection.Weights[i];
+            }
         }
 
         /// Rebuilds the mesh from scratch via voxel remeshing (MeshRemesher), giving even
@@ -585,17 +858,32 @@ namespace Sculpting
         /// shape rather than the pre-sculpt original.
         public void Remesh(int resolution)
         {
-            Mesh remeshed = MeshRemesher.Remesh(_mesh.vertices, _mesh.triangles, resolution);
+            // Must read _workingVertices, not _mesh.vertices - ordinary sculpting now writes
+            // touched vertices straight into the mesh's GPU buffer via GpuVertexScatter
+            // (ApplyVerticesLocal), which Unity's managed Mesh.vertices getter does NOT
+            // reliably reflect (see feedback_unity_gpu_buffer_verification memory). Reading
+            // _mesh.vertices here silently remeshed from the stale pre-sculpt shape instead of
+            // the actual sculpted one. _workingTriangles is topology, unaffected either way,
+            // but reading it avoids the same needless full-array copy _mesh.triangles would do.
+            Mesh remeshed = MeshRemesher.Remesh(_workingVertices, _workingTriangles, resolution);
             remeshed.name = _mesh.name;
             remeshed.MarkDynamic();
 
             _mesh = remeshed;
             _meshFilter.mesh = _mesh;
 
+            // Read before ConfigureGpuVertexLayout resets the buffer - drops the spherical UVs
+            // MeshRemesher assigned, same already-accepted tradeoff as RestoreSnapshot's
+            // full-rebuild path (harmless: SculptPBR's Attributes struct has no TEXCOORD0).
             _originalVertices = _mesh.vertices;
             _workingVertices = (Vector3[])_originalVertices.Clone();
             _workingNormals = _mesh.normals;
             _workingTriangles = _mesh.triangles;
+
+            ConfigureGpuVertexLayout(_mesh, _workingVertices.Length);
+            _mesh.vertices = _workingVertices;
+            _mesh.normals = _workingNormals;
+
             _spatialGrid = null;
             BuildAdjacency();
             RebuildTriangleGrid();
@@ -603,6 +891,7 @@ namespace Sculpting
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
+            BindGpuScatter();
 
             if (_meshCollider != null)
             {

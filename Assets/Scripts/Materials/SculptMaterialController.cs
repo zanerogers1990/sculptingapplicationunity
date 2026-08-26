@@ -11,14 +11,14 @@ namespace Sculpting
         [SerializeField] private Color baseColor = new Color(0.65f, 0.65f, 0.68f);
         [SerializeField, Range(0f, 1f)] private float metallic = 0f;
         [SerializeField, Range(0f, 1f)] private float smoothness = 0.4f;
-        [SerializeField, Range(0f, 2f)] private float normalStrength = 0.3f;
+        [SerializeField, Range(0f, 2f)] private float normalStrength = 0f;
         [SerializeField, Range(1f, 300f)] private float normalNoiseScale = 60f;
         // Blender-style Shade Smooth (false, default) / Shade Flat (true) toggle - see
         // SculptPBR.shader's _FlatShading remarks for how this is done without touching
         // SculptableMesh's shared-vertex data model.
         [SerializeField] private bool flatShading = false;
 
-        [SerializeField] private bool cavityEnabled = true;
+        [SerializeField] private bool cavityEnabled = false;
         [SerializeField] private Color recessColor = new Color(0.12f, 0.10f, 0.09f);
         [SerializeField] private Color peakColor = new Color(1f, 0.96f, 0.86f);
         [SerializeField, Range(0f, 2f)] private float cavityIntensity = 1f;
