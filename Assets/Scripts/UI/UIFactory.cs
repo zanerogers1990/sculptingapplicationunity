@@ -467,5 +467,140 @@ namespace Sculpting
 
             return contentGO.transform;
         }
+
+        /// One button in a modal (see ShowModal).
+        public class ModalChoice
+        {
+            public readonly string Label;
+            public readonly Action OnChosen;
+            public ModalChoice(string label, Action onChosen) { Label = label; OnChosen = onChosen; }
+        }
+
+        /// Blocking overlay (dim backdrop + centred panel) offering a set of choices. Cancel is
+        /// added automatically and always first, so no caller can ship a modal with no way out.
+        /// The modal destroys itself before invoking the chosen action, so an action that opens
+        /// another modal can't be hidden behind this one.
+        ///
+        /// Extracted from SceneGraphUIBuilder's Join confirmation once a second panel needed a
+        /// prompt - a modal is exactly the kind of thing that drifts into two subtly different
+        /// implementations if copied. `buildExtraContent` (optional) inserts controls between
+        /// the message and the button row, which is what Join uses for its remesh toggle/slider.
+        /// Returns the modal's root so a caller tracking it can dismiss it early.
+        public static GameObject ShowModal(Transform parent, string message,
+                                           Action<Transform> buildExtraContent, params ModalChoice[] choices)
+        {
+            var canvasGO = new GameObject("ModalCanvas", typeof(RectTransform));
+            canvasGO.transform.SetParent(parent, false);
+            var canvas = canvasGO.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            // Above every panel canvas (which use the default 0) so the modal is never buried.
+            canvas.sortingOrder = 100;
+            var scaler = canvasGO.AddComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ConstantPixelSize;
+            canvasGO.AddComponent<GraphicRaycaster>();
+
+            // Full-screen image, not just a dim: it also swallows clicks, so the panels behind
+            // can't be operated while a decision is pending.
+            var blockerGO = new GameObject("Blocker", typeof(RectTransform), typeof(Image));
+            blockerGO.transform.SetParent(canvasGO.transform, false);
+            var blockerRect = blockerGO.GetComponent<RectTransform>();
+            blockerRect.anchorMin = Vector2.zero;
+            blockerRect.anchorMax = Vector2.one;
+            blockerRect.sizeDelta = Vector2.zero;
+            blockerGO.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.55f);
+
+            var panelGO = new GameObject("Panel", typeof(RectTransform), typeof(Image));
+            panelGO.transform.SetParent(canvasGO.transform, false);
+            panelGO.GetComponent<Image>().color = PanelColor;
+            var panelRect = panelGO.GetComponent<RectTransform>();
+            panelRect.anchorMin = panelRect.anchorMax = panelRect.pivot = new Vector2(0.5f, 0.5f);
+            panelRect.sizeDelta = new Vector2(320, 0);
+            var layout = panelGO.AddComponent<VerticalLayoutGroup>();
+            layout.padding = new RectOffset(16, 16, 16, 16);
+            layout.spacing = 10;
+            layout.childControlHeight = true;
+            layout.childControlWidth = true;
+            layout.childForceExpandWidth = true;
+            var fitter = panelGO.AddComponent<ContentSizeFitter>();
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            CreateLabel(panelGO.transform, message, 13, FontStyle.Normal);
+            buildExtraContent?.Invoke(panelGO.transform);
+
+            // Choices get a row each rather than sharing one: their labels are full phrases
+            // ("Add to current scene"), which would be unreadably squeezed side by side.
+            // Deactivated before Destroy, deliberately. Destroy is deferred to end of frame, so
+            // between the click and the actual destruction the overlay is still live: it keeps
+            // swallowing input and stays on screen, and an action that opens a second modal
+            // would briefly stack two. SetActive(false) makes dismissal take effect the instant
+            // the button is pressed, with Destroy following to actually free it.
+            void Dismiss()
+            {
+                canvasGO.SetActive(false);
+                UnityEngine.Object.Destroy(canvasGO);
+            }
+
+            CreateButton(CreateRow(panelGO.transform, 30f).transform, "Cancel", Dismiss);
+
+            foreach (ModalChoice choice in choices)
+            {
+                if (choice == null) continue;
+                ModalChoice captured = choice; // avoid the closure capturing the loop variable
+                CreateButton(CreateRow(panelGO.transform, 30f).transform, captured.Label, () =>
+                {
+                    Dismiss();
+                    captured.OnChosen?.Invoke();
+                });
+            }
+
+            return canvasGO;
+        }
+
+        /// Single-line text entry. `onSubmit` fires on Enter and on focus loss (Unity raises
+        /// onEndEdit for both), NOT on every keystroke - a path field that fired per-character
+        /// would try to resolve half-typed paths.
+        ///
+        /// Uses the legacy `InputField` rather than TMP_InputField to match every other control
+        /// in this factory (all built on UnityEngine.UI + the built-in LegacyRuntime font), so
+        /// the project keeps needing no TextMeshPro dependency or font asset.
+        public static InputField CreateInputField(Transform parent, string initialText, Action<string> onSubmit)
+        {
+            var go = new GameObject("InputField", typeof(RectTransform), typeof(Image));
+            go.transform.SetParent(parent, false);
+            go.GetComponent<Image>().color = new Color(0.15f, 0.15f, 0.17f);
+            go.AddComponent<LayoutElement>().preferredHeight = 24;
+
+            var textGO = new GameObject("Text", typeof(RectTransform));
+            textGO.transform.SetParent(go.transform, false);
+            var textRect = textGO.GetComponent<RectTransform>();
+            textRect.anchorMin = Vector2.zero;
+            textRect.anchorMax = Vector2.one;
+            textRect.sizeDelta = Vector2.zero;
+            // Left/right inset so the caret and the first glyph aren't flush against the border.
+            textRect.offsetMin = new Vector2(6, 0);
+            textRect.offsetMax = new Vector2(-6, 0);
+
+            var text = textGO.AddComponent<Text>();
+            text.font = Font;
+            text.fontSize = 11;
+            text.color = Color.white;
+            text.alignment = TextAnchor.MiddleLeft;
+            // InputField requires a non-wrapping, single-line-capable Text; Overflow on both
+            // axes keeps a long path scrolling horizontally instead of being clipped away.
+            text.horizontalOverflow = HorizontalWrapMode.Overflow;
+            text.verticalOverflow = VerticalWrapMode.Overflow;
+            text.supportRichText = false;
+
+            var field = go.AddComponent<InputField>();
+            field.textComponent = text;
+            field.lineType = InputField.LineType.SingleLine;
+            field.text = initialText ?? string.Empty;
+            field.caretColor = Color.white;
+            field.customCaretColor = true;
+            field.selectionColor = new Color(0.25f, 0.55f, 0.95f, 0.6f);
+            if (onSubmit != null) field.onEndEdit.AddListener(v => onSubmit(v));
+
+            return field;
+        }
     }
 }
