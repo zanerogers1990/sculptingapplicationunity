@@ -36,6 +36,22 @@ namespace Sculpting
         public bool MirrorZ { get => mirrorZ; set => mirrorZ = value; }
         public bool ShowPlanes { get => showPlanes; set => showPlanes = value; }
 
+        /// Applies a plane-visibility choice to EVERY object in the scene, not just the
+        /// selected one. Mirroring itself is deliberately per-object (each object reflects
+        /// through its own origin, so two objects can't share one setting), but plane
+        /// VISIBILITY is a display preference about the viewport as a whole - scoping it per
+        /// object meant switching selection and unticking "Show Mirror Planes" hid the plane
+        /// of the newly-selected object while some other object's plane, enabled earlier and
+        /// out of reach of the toggle, stayed on screen. That reads as a toggle that doesn't
+        /// work: the plane is still there after you turned it off. See SculptUIBuilder, which
+        /// calls this rather than writing ShowPlanes on the selection alone.
+        public static void SetShowPlanesForAll(bool show)
+        {
+            foreach (MirrorController controller in
+                     FindObjectsByType<MirrorController>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+                controller.showPlanes = show;
+        }
+
         private void Awake()
         {
             _sculptableMesh = GetComponent<SculptableMesh>();

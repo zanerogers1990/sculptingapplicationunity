@@ -25,7 +25,7 @@ namespace Sculpting
             // screen column risked them meeting in the middle on tall content (see
             // 2026-08-25 UI overlap fix). Centering removes the collision entirely rather
             // than just making it less likely.
-            Transform panel = UIFactory.CreatePanelCanvas(transform, "MaterialCanvas", new Vector2(0.5f, 0f), new Vector2(0, 12), 250f);
+            Transform panel = UIFactory.CreatePanelCanvas("MaterialCanvas", new Vector2(0.5f, 0f), new Vector2(0, 12), 250f);
             UIFactory.CreateLabel(panel, "Material", 20, FontStyle.Bold);
 
             UIFactory.CreateColorPicker(panel, "Base Color", _material.BaseColor, c => _material.BaseColor = c);

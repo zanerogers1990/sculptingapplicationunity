@@ -32,7 +32,7 @@ namespace Sculpting
 
         private void BuildUI()
         {
-            Transform panel = UIFactory.CreatePanelCanvas(transform, "LightingCanvas", new Vector2(1, 1), new Vector2(-12, -12), 250f);
+            Transform panel = UIFactory.CreatePanelCanvas("LightingCanvas", new Vector2(1, 1), new Vector2(-12, -12), 250f);
 
             UIFactory.CreateLabel(panel, "Studio Lighting", 20, FontStyle.Bold);
             UIFactory.CreateToggle(panel, "Enabled", _controller.StudioLightingEnabled, v => _controller.StudioLightingEnabled = v);

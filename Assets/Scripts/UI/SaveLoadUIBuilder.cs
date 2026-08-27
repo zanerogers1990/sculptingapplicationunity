@@ -41,10 +41,21 @@ namespace Sculpting
         // resetting to the app's save folder every time.
         private string _lastDirectory;
 
-        private void Start()
+        // The panel's own Canvas GameObject, watched by Update so the panel can rebuild itself
+        // if anything ever destroys it out from under this component. Root-level parenting (see
+        // UIFactory.CreatePanelCanvas) is the actual fix for the Editor-undo case that took
+        // saving and loading out mid-session; this is the backstop, because of every panel in
+        // the app this is the one whose disappearance can cost real work - there is no other
+        // route to Save Scene.
+        private GameObject _canvasRoot;
+
+        private void Start() => Build();
+
+        private void Build()
         {
             Transform panel = UIFactory.CreatePanelCanvas(
-                transform, "SaveLoadCanvas", new Vector2(0.5f, 1f), new Vector2(0, -12), PanelWidth);
+                "SaveLoadCanvas", new Vector2(0.5f, 1f), new Vector2(0, -12), PanelWidth);
+            _canvasRoot = panel.root.gameObject;
 
             UIFactory.CreateLabel(panel, "Scene", 14, FontStyle.Bold);
 
@@ -64,6 +75,15 @@ namespace Sculpting
 
         private void Update()
         {
+            if (_canvasRoot == null)
+            {
+                // Rebuild rather than log-and-limp: a missing panel is unrecoverable for the
+                // user (no menu bar, no hotkey - the buttons ARE the feature), and rebuilding
+                // costs one frame's worth of UI construction on a path that should never run.
+                Build();
+                return;
+            }
+
             if (_statusClearAt > 0f && Time.unscaledTime >= _statusClearAt) ShowHint();
         }
 
@@ -95,7 +115,7 @@ namespace Sculpting
             if (path == null) return;
 
             string name = Path.GetFileName(path);
-            UIFactory.ShowModal(transform,
+            UIFactory.ShowModal(
                 $"\"{name}\"\n\nReplace everything in the scene, or add its objects to what you have?",
                 null,
                 new UIFactory.ModalChoice("Add to current scene", () =>

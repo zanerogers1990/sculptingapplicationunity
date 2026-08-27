@@ -25,6 +25,15 @@ namespace Sculpting
         private Button _joinButton;
         private GameObject _confirmModalGO;
 
+        // Rename field for the primary selection. Kept out of the per-object rows: at this
+        // panel's width a row already carries a name button, a visibility toggle and a delete
+        // button, and a fourth control per row would leave none of them comfortably clickable.
+        // One field that follows the selection also matches how the Material/Lighting panels
+        // already work - they edit whatever is selected rather than repeating themselves per
+        // object.
+        private InputField _renameField;
+        private Button _cloneButton;
+
         // Defaults to X only - the common bilateral symmetry axis for character parts (left/
         // right limbs either side of a centered torso), matching the user's own "remove an arm
         // to see the torso" framing.
@@ -61,7 +70,7 @@ namespace Sculpting
 
         private void BuildUI()
         {
-            Transform panel = UIFactory.CreatePanelCanvas(transform, "SceneGraphCanvas", new Vector2(0f, 0.5f), new Vector2(12, 0), 220f);
+            Transform panel = UIFactory.CreatePanelCanvas("SceneGraphCanvas", new Vector2(0f, 0.5f), new Vector2(12, 0), 220f);
 
             UIFactory.CreateLabel(panel, "Scene", 18, FontStyle.Bold);
 
@@ -84,6 +93,10 @@ namespace Sculpting
             vlg.childForceExpandHeight = false;
             listGO.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
             _listContent = listGO.transform;
+
+            UIFactory.CreateLabel(panel, "Selected Object", 13, FontStyle.Normal);
+            _renameField = UIFactory.CreateInputField(panel, string.Empty, RenameSelected);
+            _cloneButton = UIFactory.CreateButton(panel, "Clone Selected", CloneSelected);
 
             UIFactory.CreateLabel(panel, "Tool", 13, FontStyle.Normal);
             GameObject toolRow = UIFactory.CreateRow(panel, 26f);
@@ -125,6 +138,54 @@ namespace Sculpting
                 UIFactory.CreateToggle(row.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v));
                 UIFactory.CreateButton(row.transform, "X", () => _selection.DeleteObject(obj));
             }
+
+            RefreshSelectedObjectControls();
+        }
+
+        // ------------------------------------------------------------------ rename and clone
+
+        private void RefreshSelectedObjectControls()
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+
+            if (_renameField != null)
+            {
+                _renameField.interactable = primary != null;
+                // SetTextWithoutNotify, not .text: assigning .text fires onEndEdit on some
+                // uGUI paths, which would feed the name straight back into RenameSelected -
+                // harmless today but exactly the kind of loop the toggles elsewhere in this
+                // codebase already use the without-notify setters to avoid.
+                _renameField.SetTextWithoutNotify(primary != null ? primary.name : string.Empty);
+            }
+            if (_cloneButton != null) _cloneButton.interactable = primary != null;
+        }
+
+        /// Renames the primary selection. Trims, and ignores an empty result rather than
+        /// letting an object end up with a blank row in the list that can't be told apart from
+        /// any other blank one; RefreshList then puts the old name back in the field.
+        private void RenameSelected(string newName)
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            if (primary == null) { RefreshSelectedObjectControls(); return; }
+
+            string trimmed = (newName ?? string.Empty).Trim();
+            if (trimmed.Length == 0 || trimmed == primary.name)
+            {
+                RefreshSelectedObjectControls();
+                return;
+            }
+
+            primary.name = trimmed;
+            _selection.NotifyChanged(); // redraws the list row, which shows the name
+        }
+
+        private void CloneSelected()
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            if (primary == null) return;
+            // Clone selects itself (see MeshCloner), which bumps SelectionVersion and gets the
+            // list rebuilt on the next Update poll.
+            MeshCloner.Clone(primary);
         }
 
         private void OnRowClicked(SculptableMesh obj)
@@ -227,7 +288,7 @@ namespace Sculpting
             // replaces the open prompt rather than stacking another on top of it.
             if (_confirmModalGO != null) Destroy(_confirmModalGO);
 
-            _confirmModalGO = UIFactory.ShowModal(transform, message, buildExtraContent,
+            _confirmModalGO = UIFactory.ShowModal(message, buildExtraContent,
                 new UIFactory.ModalChoice("Confirm", () =>
                 {
                     // ShowModal has already destroyed the overlay by the time this runs; just

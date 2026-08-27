@@ -29,7 +29,7 @@ namespace Sculpting
 
         private void BuildUI()
         {
-            Transform panel = UIFactory.CreatePanelCanvas(transform, "PresentationCanvas", new Vector2(1, 0), new Vector2(-12, 12), 250f);
+            Transform panel = UIFactory.CreatePanelCanvas("PresentationCanvas", new Vector2(1, 0), new Vector2(-12, 12), 250f);
             UIFactory.CreateLabel(panel, "Presentation", 20, FontStyle.Bold);
 
             if (_post != null && _post.HasVolume) BuildPostProcessingSections(panel);

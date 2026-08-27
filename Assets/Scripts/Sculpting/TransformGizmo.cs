@@ -85,6 +85,15 @@ namespace Sculpting
         private Vector3 _dragPlaneNormal;
         private float _dragStartValue; // meaning depends on _dragKind: signed offset along axis (Move/Scale) or angle in degrees (Rotate)
 
+        // Non-null while this drag is deforming vertices around a mask instead of moving the
+        // Transform (see SculptableMesh.BeginMaskedTransform). Captured at mouse-press for the
+        // same reason _dragTarget is: a selection change mid-drag must not redirect it.
+        private SculptableMesh _maskedTarget;
+        // Uniform scale is the one handle with no absolute drag reference (see
+        // DragUniformScale) - masked mode needs a total-since-drag-start factor, not a
+        // per-frame one, so it accumulates here rather than compounding into the Transform.
+        private float _uniformScaleAccum = 1f;
+
         private void Awake()
         {
             _cam = Camera.main;
@@ -167,6 +176,15 @@ namespace Sculpting
             _dragStartPos = liveTarget.position;
             _dragStartRot = liveTarget.rotation;
             _dragStartScale = liveTarget.localScale;
+            _uniformScaleAccum = 1f;
+
+            // With anything masked, this drag deforms the mesh around the frozen region rather
+            // than moving the whole object - the "mask the body, Transpose out an arm" workflow.
+            // Falls straight back to the plain Transform drag when nothing is masked (see
+            // SculptableMesh.BeginMaskedTransform).
+            SculptableMesh candidateTarget = Target;
+            _maskedTarget = candidateTarget != null && candidateTarget.transform == liveTarget &&
+                            candidateTarget.BeginMaskedTransform() ? candidateTarget : null;
 
             if (_dragKind == HandleKind.Move || _dragKind == HandleKind.Scale)
             {
@@ -205,12 +223,32 @@ namespace Sculpting
         private void EndDrag()
         {
             _dragTarget = null;
+            if (_maskedTarget != null)
+            {
+                _maskedTarget.EndMaskedTransform();
+                _maskedTarget = null;
+            }
         }
+
+        // Every handler below has the same shape: work out what the drag means, then either
+        // write it to the Transform (nothing masked) or hand the equivalent LOCAL-space matrix
+        // to the mesh so masked vertices can sit it out (see SculptableMesh.ApplyMaskedTransform).
+        // Local space is the natural frame for the masked path: the gizmo pivots on the object's
+        // own origin, which IS local zero, so "rotate/scale about the pivot" needs no
+        // translate-to-pivot-and-back sandwich.
 
         private void DragMove(Ray ray)
         {
             float current = ProjectRayOntoAxis(ray, _dragStartPos, _dragAxisWorld, _dragPlaneNormal);
-            _dragTarget.position = _dragStartPos + _dragAxisWorld * (current - _dragStartValue);
+            Vector3 worldDelta = _dragAxisWorld * (current - _dragStartValue);
+
+            if (_maskedTarget != null)
+            {
+                _maskedTarget.ApplyMaskedTransform(
+                    Matrix4x4.Translate(_dragTarget.InverseTransformVector(worldDelta)));
+                return;
+            }
+            _dragTarget.position = _dragStartPos + worldDelta;
         }
 
         private void DragRotate(Ray ray)
@@ -218,6 +256,16 @@ namespace Sculpting
             if (!SculptController.RayPlaneIntersect(ray, _dragStartPos, _dragAxisWorld, out Vector3 hit)) return;
             float current = AngleOnPlane(hit, _dragStartPos, _dragAxisWorld);
             float deltaAngle = Mathf.DeltaAngle(_dragStartValue, current);
+
+            if (_maskedTarget != null)
+            {
+                // _dragAxisWorld is this same local axis pushed through the object's rotation
+                // (see TryBeginDrag), so rotating by the local axis is the same rotation
+                // expressed in the frame the vertices actually live in.
+                _maskedTarget.ApplyMaskedTransform(
+                    Matrix4x4.Rotate(Quaternion.AngleAxis(deltaAngle, AxisDirections[_dragAxis])));
+                return;
+            }
             _dragTarget.rotation = Quaternion.AngleAxis(deltaAngle, _dragAxisWorld) * _dragStartRot;
         }
 
@@ -226,6 +274,14 @@ namespace Sculpting
             float current = ProjectRayOntoAxis(ray, _dragStartPos, _dragAxisWorld, _dragPlaneNormal);
             float start = Mathf.Abs(_dragStartValue) < 0.01f ? 0.01f : _dragStartValue;
             float ratio = Mathf.Max(0.05f, current / start);
+
+            if (_maskedTarget != null)
+            {
+                Vector3 axisScale = Vector3.one;
+                axisScale[_dragAxis] = ratio;
+                _maskedTarget.ApplyMaskedTransform(Matrix4x4.Scale(axisScale));
+                return;
+            }
 
             Vector3 scale = _dragStartScale;
             switch (_dragAxis)
@@ -247,6 +303,16 @@ namespace Sculpting
         {
             float dy = mouse.delta.ReadValue().y;
             float factor = Mathf.Max(0.01f, 1f + dy * UniformScaleSensitivity);
+
+            if (_maskedTarget != null)
+            {
+                // ApplyMaskedTransform always re-derives from the pre-drag positions, so it
+                // needs the TOTAL factor since drag start - accumulate the incremental one.
+                _uniformScaleAccum = Mathf.Max(0.01f, _uniformScaleAccum * factor);
+                _maskedTarget.ApplyMaskedTransform(Matrix4x4.Scale(Vector3.one * _uniformScaleAccum));
+                return;
+            }
+
             Vector3 s = _dragTarget.localScale * factor;
             _dragTarget.localScale = new Vector3(
                 Mathf.Max(MinScaleAxis, s.x), Mathf.Max(MinScaleAxis, s.y), Mathf.Max(MinScaleAxis, s.z));

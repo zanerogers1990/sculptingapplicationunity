@@ -100,13 +100,22 @@ namespace Sculpting
         private void Update()
         {
             if (_sceneSun != null) _sceneSun.enabled = !studioLightingEnabled;
-            if (_rig == null) return;
+            // Rebuild-if-null rather than bail-if-null: a script recompile DURING Play reloads
+            // the domain, and Unity's state backup keeps _rig itself (a private field it can
+            // serialize) while dropping every RigLight.light inside it - the field is explicitly
+            // [NonSerialized], and a Light is a scene object reference the backup can't carry
+            // across either way. That left _rig non-null with null lights, so the guard below
+            // passed and the loop dereferenced null on EVERY frame for the rest of the session.
+            // Same lazy-rebuild-if-null discipline SculptableMesh's own plain-class caches use
+            // for exactly this reload hazard.
+            if (_rig == null || _rigRoot == null) BuildRig();
 
             Vector3 pivot = GetPivot();
             for (int i = 0; i < _rig.Length; i++)
             {
                 var slot = (LightSlot)i;
                 RigLight cfg = _rig[i];
+                if (cfg.light == null) cfg.light = CreateLightObject(cfg.label, slot);
                 bool wantActive = studioLightingEnabled && cfg.enabled && IsSlotAvailable(slot);
                 if (cfg.light.gameObject.activeSelf != wantActive) cfg.light.gameObject.SetActive(wantActive);
                 if (!wantActive) continue;

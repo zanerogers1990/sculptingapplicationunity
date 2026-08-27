@@ -24,10 +24,22 @@ namespace Sculpting
         /// auto-sizing vertical panel inside it - the same structural pattern SculptUIBuilder
         /// uses for its own top-left panel, parameterized so callers can pick a different
         /// corner and horizontal-flow direction.
-        public static Transform CreatePanelCanvas(Transform parent, string name, Vector2 anchor, Vector2 offset, float width)
+        ///
+        /// The Canvas is created at the SCENE ROOT, deliberately not parented under the builder
+        /// that asked for it. It's ScreenSpaceOverlay, so parenting never affected layout -
+        /// but it did affect survival. This app runs inside the Unity Editor during
+        /// development, where the Editor's own global Ctrl+Z can fire in Play mode (which is
+        /// already why sculpt undo is bound to a bare Z - see SculptController.
+        /// HandleUndoRedoKeys). An Editor undo that reverts a scene object takes its children
+        /// with it, and a runtime-created child was never registered with the Editor's undo
+        /// system, so Unity destroys it and logs "child GameObject ... was not registered into
+        /// the undo system and became dangling during an undo operation". The panel simply
+        /// vanished for the rest of the session - which is exactly how the Save/Load panel
+        /// disappeared mid-session, taking saving and loading with it. A root object has no
+        /// parent whose reversion can drag it down.
+        public static Transform CreatePanelCanvas(string name, Vector2 anchor, Vector2 offset, float width)
         {
             var canvasGO = new GameObject(name, typeof(RectTransform));
-            canvasGO.transform.SetParent(parent, false);
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             var scaler = canvasGO.AddComponent<CanvasScaler>();
@@ -485,12 +497,12 @@ namespace Sculpting
         /// prompt - a modal is exactly the kind of thing that drifts into two subtly different
         /// implementations if copied. `buildExtraContent` (optional) inserts controls between
         /// the message and the button row, which is what Join uses for its remesh toggle/slider.
-        /// Returns the modal's root so a caller tracking it can dismiss it early.
-        public static GameObject ShowModal(Transform parent, string message,
+        /// Returns the modal's root so a caller tracking it can dismiss it early. Root-level
+        /// like CreatePanelCanvas, and for the same reason - see its remarks.
+        public static GameObject ShowModal(string message,
                                            Action<Transform> buildExtraContent, params ModalChoice[] choices)
         {
             var canvasGO = new GameObject("ModalCanvas", typeof(RectTransform));
-            canvasGO.transform.SetParent(parent, false);
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             // Above every panel canvas (which use the default 0) so the modal is never buried.

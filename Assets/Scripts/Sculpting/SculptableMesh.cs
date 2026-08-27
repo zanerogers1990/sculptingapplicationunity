@@ -429,14 +429,34 @@ namespace Sculpting
         /// here since callers (ResetMesh/Undo/Redo across a topology change/Remesh) already
         /// touch the whole mesh at once - see ApplyVerticesLocal for the footprint-scoped path
         /// every ordinary brush stroke uses instead.
-        public void ApplyVertices()
+        public void ApplyVertices() => ApplyVertices(true);
+
+        /// fullRebuild:false skips the triangle-raycast grid rebuild and the cavity recompute -
+        /// the two O(vertex count) passes in here that a LIVE whole-mesh drag doesn't need on
+        /// every frame (nothing raycasts the mesh while a gizmo handle is being dragged, and a
+        /// cavity tint that re-derived itself every frame of the drag would read as flicker).
+        /// Callers using it must finish with a full ApplyVertices() when the drag ends, or the
+        /// next brush raycast tests against the pre-drag surface - see BeginMaskedTransform/
+        /// EndMaskedTransform, the only user today.
+        public void ApplyVertices(bool fullRebuild)
         {
             _mesh.vertices = _workingVertices;
             _mesh.RecalculateNormals();
             _mesh.RecalculateBounds();
             _workingNormals = _mesh.normals;
-            RebuildTriangleGrid();
-            RecomputeCavity();
+            if (fullRebuild)
+            {
+                // A wholesale vertex reassignment invalidates any index built over the old
+                // positions - QueryNear/SelectGrab rebuild lazily from null (see their remarks),
+                // whereas a kept-but-stale grid is silently wrong.
+                _spatialGrid = null;
+                RebuildTriangleGrid();
+                RecomputeCavity();
+            }
+            // Reassigned even on the cheap path: Mesh.vertices= reuploads from Unity's own
+            // CPU-side mesh data, which does NOT include the colors GpuVertexScatter wrote
+            // straight into the GPU buffer (see GpuVertexScatter/_cavityColors remarks), so
+            // skipping this would revert the mask/cavity tint to whatever Unity last knew.
             _mesh.colors = _cavityColors;
         }
 
@@ -524,6 +544,15 @@ namespace Sculpting
         {
             RecomputeNormalsLocal(dirtyVertices);
             ExpandBoundsLocal(dirtyVertices);
+
+            // Re-bucket the moved vertices in the vertex index so it stays exact for the rest
+            // of this stroke and for whatever queries it next (mask painting in particular,
+            // which reuses whatever index the last sculpt stroke left behind). Without this
+            // the index only ever tolerated one cell of drift, and anything past that dropped
+            // out of every future candidate list - see VertexSpatialGrid's class remarks for
+            // the artifacts that caused.
+            if (_spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length)
+                _spatialGrid.UpdateVertices(dirtyVertices);
 
             if (_triangleGrid != null && dirtyVertices.Count > 0)
             {
@@ -845,6 +874,101 @@ namespace Sculpting
             _mesh.colors = _cavityColors;
         }
 
+        /// True if anything at all is masked - what TransformGizmo checks to decide whether a
+        /// Transpose/Scale drag should move the whole object's Transform (nothing masked, the
+        /// original behaviour) or deform the vertices around the frozen masked region instead
+        /// (see BeginMaskedTransform). Early-outs on the first masked vertex rather than
+        /// scanning the whole array, since it's called on every gizmo mouse-press.
+        public bool HasMask
+        {
+            get
+            {
+                if (_mask == null) return false;
+                for (int i = 0; i < _mask.Length; i++)
+                    if (_mask[i] > 0.001f) return true;
+                return false;
+            }
+        }
+
+        // Pre-drag vertex positions for a masked Transpose/Scale drag. Every frame of the drag
+        // re-derives the whole result from THESE rather than compounding onto last frame's
+        // output - compounding a per-frame delta would let rounding drift accumulate over a
+        // long drag, and (worse) makes dragging back to the start not actually return to the
+        // start. Non-null exactly while such a drag is in progress; see BeginMaskedTransform.
+        private Vector3[] _maskedTransformBase;
+
+        public bool IsMaskedTransformActive => _maskedTransformBase != null;
+
+        /// Starts a mask-aware whole-object transform: instead of moving the Transform (which
+        /// would drag the masked region along with everything else), the drag deforms the
+        /// vertex buffer, holding fully-masked vertices exactly where they are and blending
+        /// smoothly through partially-masked ones. This is what makes "mask the torso, then
+        /// Transpose-drag" pull a limb out of the surface - ZBrush's core Transpose-with-mask
+        /// behaviour - rather than sliding the whole mesh sideways.
+        ///
+        /// Returns false (and starts nothing) when nothing is masked, so the caller can fall
+        /// back to the plain Transform drag - with no mask, deforming every vertex by the same
+        /// matrix and moving the Transform are visually identical, and the Transform is both
+        /// free and undoable by simply dragging back.
+        ///
+        /// Records undo up front for every vertex the drag can touch (mask &lt; 1), reusing the
+        /// ordinary stroke-delta accumulator - at drag start _workingVertices still holds the
+        /// pre-drag values, which is exactly what RecordUndoBeforeIfNeeded captures.
+        public bool BeginMaskedTransform()
+        {
+            if (_workingVertices == null || _mask == null || !HasMask) return false;
+
+            _maskedTransformBase = (Vector3[])_workingVertices.Clone();
+
+            BeginStrokeUndo();
+            for (int i = 0; i < _mask.Length; i++)
+                if (_mask[i] < 0.999f) RecordUndoBeforeIfNeeded(i);
+
+            return true;
+        }
+
+        /// Applies one frame of a masked transform drag. localDelta is the drag's accumulated
+        /// transform expressed in THIS object's local space (the gizmo builds it there - the
+        /// object's own origin is the gizmo pivot, so a rotation/scale about the pivot is just
+        /// a rotation/scale about local zero). Per-vertex weight is 1 - mask, so a fully masked
+        /// vertex is pinned and a half-masked one travels half as far, which is what gives the
+        /// pulled limb a smooth root instead of a torn ring.
+        public void ApplyMaskedTransform(Matrix4x4 localDelta)
+        {
+            if (_maskedTransformBase == null) return;
+
+            for (int i = 0; i < _workingVertices.Length; i++)
+            {
+                Vector3 basePos = _maskedTransformBase[i];
+                float weight = 1f - _mask[i];
+                if (weight <= 0f) { _workingVertices[i] = basePos; continue; }
+
+                Vector3 moved = localDelta.MultiplyPoint3x4(basePos);
+                _workingVertices[i] = weight >= 1f ? moved : Vector3.LerpUnclamped(basePos, moved, weight);
+            }
+
+            // Cheap path - see ApplyVertices(bool). EndMaskedTransform does the full one.
+            ApplyVertices(false);
+        }
+
+        /// Ends a masked transform drag: one full ApplyVertices so the triangle-raycast grid,
+        /// cavity tint and collider catch up with the deformed surface, then commits the undo
+        /// entry BeginMaskedTransform opened.
+        public void EndMaskedTransform()
+        {
+            if (_maskedTransformBase == null) return;
+            _maskedTransformBase = null;
+
+            ApplyVertices();
+            EndStrokeUndo();
+
+            if (_meshCollider != null)
+            {
+                _meshCollider.sharedMesh = null;
+                _meshCollider.sharedMesh = _mesh;
+            }
+        }
+
         public void ResetMesh()
         {
             Array.Copy(_originalVertices, _workingVertices, _originalVertices.Length);
@@ -877,12 +1001,47 @@ namespace Sculpting
         // not just one.
         private readonly HashSet<int> _strokeRecordedIndices = new HashSet<int>();
 
+        // Slot into _strokeDeltaBefore per vertex, or -1 for "not touched this stroke". Turns
+        // the undo accumulator above into an O(1)-readable record of where the surface was when
+        // this stroke began, which is what StrokeStartPosition serves - see its remarks for why
+        // a brush needs that. _strokeRecordedIndices already answers "was it touched", but not
+        // "where was it", and a HashSet lookup plus a linear scan of the parallel lists would be
+        // far too slow for something read once per candidate per dab.
+        private int[] _strokeRecordSlot;
+
+        /// Where a vertex was when the CURRENT stroke started, or its live position if this
+        /// stroke hasn't moved it yet (which is the same thing - an untouched vertex is still
+        /// exactly where the stroke found it). Lets a brush measure against the surface it began
+        /// with rather than the surface its own earlier dabs already deposited; see
+        /// SculptController's Clay area-plane, which would otherwise chase its own output.
+        public Vector3 StrokeStartPosition(int index)
+        {
+            if (_strokeRecordSlot == null || _strokeRecordSlot.Length != _workingVertices.Length)
+                return _workingVertices[index];
+            int slot = _strokeRecordSlot[index];
+            return slot >= 0 ? _strokeDeltaBefore[slot] : _workingVertices[index];
+        }
+
         /// Call once on stroke start (mouse-press) to clear the previous stroke's accumulator.
         public void BeginStrokeUndo()
         {
+            ReleaseStrokeSlots();
             _strokeDeltaIndices.Clear();
             _strokeDeltaBefore.Clear();
             _strokeRecordedIndices.Clear();
+        }
+
+        /// Resets only the slots this stroke actually used, rather than refilling the whole
+        /// per-vertex array with -1 on every stroke - O(touched) instead of O(vertex count),
+        /// which matters because a stroke can be a click that touches nothing at all.
+        private void ReleaseStrokeSlots()
+        {
+            if (_strokeRecordSlot == null) return;
+            for (int k = 0; k < _strokeDeltaIndices.Count; k++)
+            {
+                int vi = _strokeDeltaIndices[k];
+                if (vi >= 0 && vi < _strokeRecordSlot.Length) _strokeRecordSlot[vi] = -1;
+            }
         }
 
         /// Call from a brush's per-candidate write site, BEFORE overwriting
@@ -893,6 +1052,16 @@ namespace Sculpting
         {
             if (_strokeRecordedIndices.Add(index))
             {
+                // Reallocated (and reset) whenever topology changed under us - a Remesh
+                // mid-session leaves the old array sized to the old vertex count, and indexing
+                // it would either throw or, worse, silently return another vertex's slot.
+                if (_strokeRecordSlot == null || _strokeRecordSlot.Length != _workingVertices.Length)
+                {
+                    _strokeRecordSlot = new int[_workingVertices.Length];
+                    for (int i = 0; i < _strokeRecordSlot.Length; i++) _strokeRecordSlot[i] = -1;
+                }
+
+                _strokeRecordSlot[index] = _strokeDeltaIndices.Count;
                 _strokeDeltaIndices.Add(index);
                 _strokeDeltaBefore.Add(_workingVertices[index]);
             }
@@ -909,6 +1078,7 @@ namespace Sculpting
         {
             if (_strokeDeltaIndices.Count == 0) return;
             _history.PushDeltaUndo(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
+            ReleaseStrokeSlots();
             _strokeDeltaIndices.Clear();
             _strokeDeltaBefore.Clear();
             _strokeRecordedIndices.Clear();

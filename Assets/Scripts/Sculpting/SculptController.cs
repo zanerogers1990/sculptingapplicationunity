@@ -175,6 +175,40 @@ namespace Sculpting
         // (Plateau depth used to be a constant here too; it's now the serialized
         // clayHeightFactor field/ClayHeightFactor property above so it's tunable from the UI.)
         private const float ClaySpeed = 4f;
+
+        // The most a SINGLE Clay stroke may displace any one vertex, as a multiple of that
+        // stroke's clay depth (brushRadius * clayHeightFactor). Measured per vertex from where
+        // the stroke found it (SculptableMesh.StrokeStartPosition), along the dab's plane
+        // normal. This is what makes a held or back-and-forth stroke SETTLE instead of
+        // ballooning - the "bubbles at both ends of a back-and-forth stroke" report.
+        //
+        // Why Clay ran away at all: the area plane each dab targets is averaged from the
+        // footprint's CURRENT positions, which include whatever this very stroke just deposited
+        // there, so each pass re-bases its target on its own output and climbs again.
+        // Algebraically, once the footprint converges onto plane + height*w, the new
+        // weighted-mean height is the old one plus height * mean(w) - a fixed rise per pass,
+        // forever. Dragging back and forth parks the cursor at each turnaround, which is where
+        // the passes pile up.
+        //
+        // An earlier attempt at this fixed the FEEDBACK instead of the SYMPTOM: it averaged the
+        // plane from stroke-start positions (the original-coordinates trick Blender's
+        // flatten-family brushes use). That does stop the runaway, but it also changes what Clay
+        // fundamentally does - from "add on top of the surface as it is now" to "reshape toward
+        // an absolute profile". Dabs then FIGHT: as the brush moves on, a vertex's weight drops,
+        // its absolute target drops with it, and the trailing dabs pull back down what the
+        // leading ones just raised. Every dab stamps its own dome over its neighbour's instead
+        // of sweeping one continuous ridge, which is what produced the rippled/corrugated
+        // surface the user reported next - worst at low Tip Softness, where the flat-topped
+        // profile gives each competing stamp a hard rim. The plane is deliberately LIVE again;
+        // only this per-stroke displacement cap holds the buildup down, and because it is a
+        // flat per-vertex limit (NOT scaled by the dab's falloff weight) it is identical for
+        // every dab that reaches it - so it truncates into one clean plateau instead of
+        // re-imposing each dab's profile the way a weight-scaled ceiling did.
+        //
+        // Releasing and stroking again re-bases the cap, so buildup ACROSS strokes - which is
+        // what clay buildup actually means - is untouched.
+        private const float ClayStrokeDepthLimitAccumulate = 3f;
+        private const float ClayStrokeDepthLimit = 1.5f;
         // Fraction of the brush radius given over to Clay's edge taper (see ClayFalloff) - the
         // rest of the footprint sits at full weight. 1 tapers across the whole radius (a round
         // dome); small values keep a near-flat top with a narrow band of falloff right at the
@@ -327,6 +361,12 @@ namespace Sculpting
         private NativeArray<float> _nativeClayWeights;
         private NativeArray<Vector3> _nativeClayWeightedPos;
         private NativeArray<Vector3> _nativeClayWeightedNormal;
+        // Each candidate's position as of THIS stroke's start (see
+        // SculptableMesh.StrokeStartPosition) - the reference ClampStrokeDepth measures Clay's
+        // per-stroke buildup cap against. Gathered in the Clay job path only, alongside
+        // GatherCandidatesNative's shared arrays; the managed path reads StrokeStartPosition
+        // directly.
+        private NativeArray<Vector3> _nativeClayStrokeStart;
         private int _nativeScratchCapacity;
 
         // Clay's alpha stamp (see BrushAlphaLibrary) baked into a NativeArray once per type
@@ -351,6 +391,7 @@ namespace Sculpting
                 _nativeClayWeights = new NativeArray<float>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedPos = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedNormal = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
+                _nativeClayStrokeStart = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
             }
         }
 
@@ -364,6 +405,7 @@ namespace Sculpting
             if (_nativeClayWeights.IsCreated) _nativeClayWeights.Dispose();
             if (_nativeClayWeightedPos.IsCreated) _nativeClayWeightedPos.Dispose();
             if (_nativeClayWeightedNormal.IsCreated) _nativeClayWeightedNormal.Dispose();
+            if (_nativeClayStrokeStart.IsCreated) _nativeClayStrokeStart.Dispose();
         }
 
         private void EnsureAlphaNative()
@@ -659,6 +701,9 @@ namespace Sculpting
         private struct ClayDisplacementJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<Vector3> PositionsIn;
+            // See ClampStrokeDepth - the cap is per-vertex, relative to where this stroke found
+            // each one, so it bounds only what this stroke added.
+            [ReadOnly] public NativeArray<Vector3> StrokeStartIn;
             [ReadOnly] public NativeArray<float> WeightsIn;
             [ReadOnly] public NativeArray<float> AlphaSamples;
             public NativeArray<Vector3> PositionsOut;
@@ -678,6 +723,9 @@ namespace Sculpting
             public int AlphaSize;
             public bool Accumulate;
             public float Rate; // sign * brushStrength * ClaySpeed * dt, only used when Accumulate
+            // Signed per-stroke displacement cap along PlaneNormal - see ClampStrokeDepth.
+            // Deliberately NOT multiplied by this dab's weight; see ClayStrokeDepthLimit.
+            public float MaxAlong;
 
             public void Execute(int index)
             {
@@ -721,10 +769,19 @@ namespace Sculpting
                 Vector3 toTarget = target - pos;
                 float lerp = Mathf.Clamp01(weight * LerpFactorScale);
 
-                if (Accumulate)
-                    PositionsOut[index] = pos + PlaneNormal * (Rate * weight) + toTarget * lerp;
-                else
-                    PositionsOut[index] = pos + toTarget * lerp;
+                Vector3 moved = Accumulate
+                    ? pos + PlaneNormal * (Rate * weight) + toTarget * lerp
+                    : pos + toTarget * lerp;
+
+                // Inlined ClampStrokeDepth - a Burst job can't call the shared static without
+                // dragging Vector3 method-call overhead into the inner loop, and the two must
+                // stay identical or the Burst and managed paths would diverge (see
+                // MinJobVertexCount: which one runs depends only on footprint size).
+                float along = Vector3.Dot(moved - StrokeStartIn[index], PlaneNormal);
+                bool overshot = Height >= 0f ? along > MaxAlong : along < MaxAlong;
+                if (overshot) moved -= PlaneNormal * (along - MaxAlong);
+
+                PositionsOut[index] = moved;
                 AppliedOut[index] = 1;
             }
 
@@ -964,6 +1021,15 @@ namespace Sculpting
 
         private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * AccumulateSpeedFactor * accumulateStrength;
 
+        /// Clay's own accumulate strength, identical to the above minus AccumulateSpeedFactor.
+        /// That factor exists to stop a time-driven brush dumping material wherever the cursor
+        /// slows down; Clay no longer deposits on a clock at all (see ApplyClayStroke), so a
+        /// slow stroke already lays down exactly the same material per unit of travel as a fast
+        /// one. Keeping the factor here would double-count speed and invert the intent - fast
+        /// strokes would deposit MORE per unit distance than careful ones. The other brushes
+        /// are still time-driven and still want it.
+        private float EffectiveClayStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
+
         // Same immediate-write-through as BrushStrength above.
         public float BrushRadius
         {
@@ -1095,7 +1161,28 @@ namespace Sculpting
         // below - a caller (e.g. a Scene Graph UI button) can change the selection and read
         // Mirror in the very same frame, before this component's own Update() has run to
         // re-sync those fields, so this always resolves against the CURRENT Target directly.
-        public MirrorController Mirror => Target != null ? Target.GetComponent<MirrorController>() : null;
+        //
+        // Adds the component if the target hasn't got one instead of returning null. Every
+        // runtime path that creates a sculptable object pairs it with a MirrorController
+        // (PrimitiveSpawner, MeshMirror, MeshCloner, SceneSerializer), but a SculptableMesh
+        // placed by hand in the scene can easily be saved without one - and one was: the scene
+        // shipped a "Sphere" that registered ahead of SculptSphere, became the default primary
+        // selection, and returned null here. That killed SculptUIBuilder.BuildUI partway
+        // through the Mirror toggles (so the bottom of the brush panel - mirror axes, plane
+        // visibility, wireframe, undo/redo, the brush-resize gauge - silently never got built)
+        // and would have thrown out of GetMirrorSigns on the first brush stroke against that
+        // object. Self-healing here fixes every one of those call sites at once, and costs a
+        // GetComponent on a path that already did one.
+        public MirrorController Mirror
+        {
+            get
+            {
+                SculptableMesh target = Target;
+                if (target == null) return null;
+                MirrorController mirror = target.GetComponent<MirrorController>();
+                return mirror != null ? mirror : target.gameObject.AddComponent<MirrorController>();
+            }
+        }
 
         // Detects a selection change once per Update() (see SyncSelectionTarget) rather than
         // re-resolving Target on every one of the ~60 sculptableMesh/mirrorController call
@@ -1411,6 +1498,20 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
+            // Mask painting queries the vertex spatial index (SculptableMesh.PaintMask ->
+            // QueryNear) just like the sculpting brushes do, so it needs the same start-of-
+            // stroke rebuild they get in HandleSculptInput - which it never reached, since
+            // mask mode returns before that block. Left over from whatever the last sculpt
+            // stroke built, the index was sized for THAT stroke's brush radius and bucketed
+            // against pre-stroke positions, so vertices the stroke had since moved dropped out
+            // of the footprint entirely and painted a mask full of holes - invisible until
+            // Invert Mask turned those holes into islands of protected surface, which is the
+            // "weird effects after inverting" this fixes. (ApplyVerticesLocal now also keeps
+            // the index current as geometry moves - see VertexSpatialGrid.UpdateVertices - so
+            // this rebuild is really about matching cell size to the mask brush's own radius.)
+            if (!altHeld && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
+                sculptableMesh.RebuildSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
+
             Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
@@ -1420,11 +1521,15 @@ namespace Sculpting
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
 
+            // Ctrl inverts while held, exactly as it does for every sculpting brush (see
+            // CtrlHeld) - mask mode used to ignore it, so the Blender/ZBrush reflex of
+            // Ctrl-dragging to erase mask silently painted MORE mask instead.
             bool rightHeld = mouse.rightButton.isPressed;
-            _previewPositive = !rightHeld; // green while painting, red while erasing
+            bool erasing = rightHeld || CtrlHeld;
+            _previewPositive = !erasing; // green while painting, red while erasing
 
             if (altHeld) return;
-            if (mouse.leftButton.isPressed) ApplyMaskPaint(hitPoint, true);
+            if (mouse.leftButton.isPressed) ApplyMaskPaint(hitPoint, !erasing);
             else if (rightHeld) ApplyMaskPaint(hitPoint, false);
         }
 
@@ -1471,9 +1576,27 @@ namespace Sculpting
             ApplyClayStroke(hitPoint, hitNormal, sculptingLeft ? (invertHeld ? !isPositive : isPositive) : !isPositive);
         }
 
-        // Sub-divides a held Clay stroke into multiple dabs when the cursor has travelled more
-        // than a fraction of the brush radius since the last frame, instead of applying a
-        // single dab wherever the raycast lands this frame. Every dab already flattens its own
+        // Paces a held Clay stroke by DISTANCE TRAVELLED rather than by elapsed time: a dab of
+        // fixed size and fixed material is laid down every `spacing` of cursor travel, and a
+        // cursor that isn't moving lays down nothing at all.
+        //
+        // It used to split the frame's `Time.deltaTime` across however many sub-dabs the travel
+        // needed, so the material deposited was a function of how long the cursor spent
+        // somewhere rather than how far it moved. That put a full round stamp's worth of clay
+        // wherever the cursor paused - which is precisely the press at the start of a stroke,
+        // every turnaround of a back-and-forth scrub, and the moment before release. The user's
+        // own description: "it builds up more at the beginning and ending of my stroke, you get
+        // a pool of the alpha I'm using... vs Nomad where it softens near the end of the stroke
+        // and has more mass in the centre, like a very long arch."
+        //
+        // Distance pacing produces that arch for free, and it's worth being precise about why:
+        // the deposited height along the path is the convolution of the dab's falloff with the
+        // dab density. Uniform density over the stroke's length integrates to a full-height
+        // plateau in the middle, falling to HALF height at the exact endpoints and tapering over
+        // about one brush radius on either side. That taper IS the soft end Nomad shows; the old
+        // scheme buried it under the extra dabs the pause deposited. It also makes a stroke
+        // look the same whether it was drawn quickly or slowly, and immune to frame-rate jitter -
+        // dt no longer enters Clay's deposit at all. Every dab already flattens its own
         // footprint onto a freshly area-averaged plane (see ApplyClayBrushLocal's remarks) -
         // without spacing, a fast drag (or a frame-rate dip under a heavy stroke) leaves visible
         // gaps between consecutive dabs' plateaus, which read as a washboard of separate raised
@@ -1488,7 +1611,26 @@ namespace Sculpting
         // regardless of how many dabs that frame took - a fast drag shouldn't deposit MORE clay
         // than a slow one just because it needed more dabs to stay gap-free.
         private const float ClayDabSpacingFraction = 0.2f;
-        private const int ClayMaxDabsPerFrame = 8;
+        // Raised from 8 now that a dab is a fixed quantum of material rather than a slice of the
+        // frame's time: the cap is purely a cost ceiling for a frame in which the cursor jumped a
+        // long way, and hitting it now means dropping material (a visible gap) rather than just
+        // spreading the same amount thinner. 24 covers ~4.8 brush radii of travel in one frame,
+        // which no plausible drag exceeds.
+        private const int ClayMaxDabsPerFrame = 24;
+
+        // Travel that a single dab's worth of material corresponds to, expressed as the stroke
+        // speed at which the new distance-driven pacing deposits exactly what the old
+        // time-driven pacing did. Purely a calibration constant so existing Brush Strength /
+        // Clay Depth settings keep feeling the same: at this speed the two schemes agree
+        // exactly, below it the new one deposits less per second (but the same per centimetre),
+        // above it more per second. Matches AccumulateFullSpeedReference, which encodes the same
+        // "this is what a normal stroke speed looks like" judgement.
+        private const float ClayReferenceStrokeSpeed = 1f;
+
+        // Distance travelled since the last dab was placed, carried ACROSS frames. Without it a
+        // slow drag - one that covers less than a dab spacing per frame - would round down to
+        // zero dabs every frame and deposit nothing at all.
+        private float _clayDabCarry;
 
         // The square tip's own axes (see ClayTipShapeT01) - frozen for the WHOLE stroke rather
         // than rebuilt per dab from that dab's own (interpolated) normal. Early testing showed
@@ -1508,29 +1650,48 @@ namespace Sculpting
             Vector3 localNormal = t.InverseTransformDirection(worldNormal).normalized;
             float dt = Time.deltaTime;
 
+            float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
+            // One dab = one fixed quantum of material, NOT a slice of this frame's time.
+            float dabDt = spacing / ClayReferenceStrokeSpeed;
+
             if (_lastClayStrokeLocal.HasValue)
             {
                 Vector3 from = _lastClayStrokeLocal.Value;
                 Vector3 fromNormal = _lastClayStrokeNormalLocal.Value;
                 float dist = Vector3.Distance(from, localPoint);
-                float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
-                int steps = Mathf.Clamp(Mathf.CeilToInt(dist / spacing), 1, ClayMaxDabsPerFrame);
-                float stepDt = dt / steps;
 
-                for (int s = 1; s <= steps; s++)
+                // Place a dab every `spacing` of TRAVEL, continuing from wherever the previous
+                // frame's leftover distance left off. A stationary cursor travels nothing and so
+                // deposits nothing - which is the whole point of this rewrite.
+                _clayDabCarry += dist;
+                int placed = 0;
+                while (_clayDabCarry >= spacing && placed < ClayMaxDabsPerFrame)
                 {
-                    float u = (float)s / steps;
+                    _clayDabCarry -= spacing;
+                    // Where along THIS frame's segment the dab falls. dist can be ~0 while carry
+                    // still crosses the threshold (a dab banked by earlier frames finally firing),
+                    // in which case the dab belongs at the current point.
+                    float u = dist > 1e-9f ? Mathf.Clamp01((dist - _clayDabCarry) / dist) : 1f;
                     Vector3 stepPoint = Vector3.Lerp(from, localPoint, u);
                     Vector3 stepNormal = Vector3.Slerp(fromNormal, localNormal, u).normalized;
-                    ApplyClayBrushAtLocal(stepPoint, stepNormal, positive, stepDt);
+                    ApplyClayBrushAtLocal(stepPoint, stepNormal, positive, dabDt);
+                    placed++;
                 }
+
+                // Hit the per-frame ceiling: drop the unspent travel instead of banking it into
+                // a burst of dabs next frame, which would pile material exactly where the stroke
+                // was already struggling to keep up.
+                if (placed >= ClayMaxDabsPerFrame) _clayDabCarry = 0f;
             }
             else
             {
                 // Fresh stroke - (re)lock the square tip's orientation to this first dab's
-                // normal for the rest of the stroke.
+                // normal for the rest of the stroke, and lay one dab down so a tap still marks
+                // the surface (the distance-driven path above never fires for a click that
+                // doesn't move).
                 BuildTangentBasis(localNormal, out _clayStrokeTangent0, out _clayStrokeBitangent0);
-                ApplyClayBrushAtLocal(localPoint, localNormal, positive, dt);
+                _clayDabCarry = 0f;
+                ApplyClayBrushAtLocal(localPoint, localNormal, positive, dabDt);
             }
 
             _lastClayStrokeLocal = localPoint;
@@ -1595,10 +1756,12 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float effectiveStrength = EffectiveBrushStrength;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
+            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
             float height = brushRadius * clayHeightFactor * sign;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
+            for (int ci = 0; ci < candidates.Count; ci++)
+                _nativeClayStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
 
             var weightJob = new ClayWeightJob
             {
@@ -1640,6 +1803,7 @@ namespace Sculpting
             var dispJob = new ClayDisplacementJob
             {
                 PositionsIn = _nativePositionsIn,
+                StrokeStartIn = _nativeClayStrokeStart,
                 WeightsIn = _nativeClayWeights,
                 AlphaSamples = useAlpha ? _nativeAlphaSamples : _nativeClayWeights, // unread when !UseAlpha; just needs to be a valid array
                 PositionsOut = _nativePositionsOut,
@@ -1659,6 +1823,7 @@ namespace Sculpting
                 AlphaSize = useAlpha ? _nativeAlphaSize : 0,
                 Accumulate = accumulate,
                 Rate = sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt,
+                MaxAlong = height * (accumulate ? ClayStrokeDepthLimitAccumulate : ClayStrokeDepthLimit),
             };
             dispJob.Schedule(candidates.Count, 32).Complete();
 
@@ -1669,7 +1834,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float effectiveStrength = EffectiveBrushStrength;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
+            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
             float height = brushRadius * clayHeightFactor * sign;
 
             if (_clayWeightScratch.Length < candidates.Count) _clayWeightScratch = new float[candidates.Count];
@@ -1755,7 +1920,9 @@ namespace Sculpting
                     Vector3 flattenTarget = planeOrigin + tangentialOffsetAcc + planeNormal * (height * weight);
                     Vector3 flattenDelta = (flattenTarget - verts[i]) * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt);
 
-                    verts[i] += buildDelta + flattenDelta;
+                    verts[i] = ClampStrokeDepth(verts[i] + buildDelta + flattenDelta,
+                        sculptableMesh.StrokeStartPosition(i), planeNormal,
+                        height * ClayStrokeDepthLimitAccumulate, height);
                 }
                 else
                 {
@@ -1775,12 +1942,30 @@ namespace Sculpting
                     // reproduced this empirically while testing this brush (a synthetic
                     // large-dt stroke sent a vertex from radius 0.5 to over 3.0 in 90 frames
                     // before this clamp existed).
-                    verts[i] += toTarget * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt);
+                    verts[i] = ClampStrokeDepth(verts[i] + toTarget * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt),
+                        sculptableMesh.StrokeStartPosition(i), planeNormal,
+                        height * ClayStrokeDepthLimit, height);
                 }
 
                 _dirtyVertexScratch.Add(i);
             }
         }
+
+        /// Caps how far THIS stroke has displaced one vertex, measured from where the stroke
+        /// found it rather than from any absolute height - so it bounds only the growth this
+        /// stroke is itself responsible for, and a stroke crossing a ridge an earlier stroke
+        /// built neither chisels it nor is blocked by it. Only the normal component is capped;
+        /// tangential motion is left alone. Shared by the managed path and (as an inlined copy)
+        /// ClayDisplacementJob - see ClayStrokeDepthLimit for the whole rationale, including why
+        /// maxAlong must NOT be scaled by the dab's falloff weight.
+        private static Vector3 ClampStrokeDepth(Vector3 position, Vector3 strokeStart,
+                                                Vector3 planeNormal, float maxAlong, float height)
+        {
+            float along = Vector3.Dot(position - strokeStart, planeNormal);
+            bool within = height >= 0f ? along <= maxAlong : along >= maxAlong;
+            return within ? position : position - planeNormal * (along - maxAlong);
+        }
+
 
         private static void BuildTangentBasis(Vector3 normal, out Vector3 tangent, out Vector3 bitangent)
         {

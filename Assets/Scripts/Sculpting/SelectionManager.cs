@@ -106,6 +106,12 @@ namespace Sculpting
 
         public bool IsSelected(SculptableMesh obj) => _selectedSet.Contains(obj);
 
+        /// Bumps SelectionVersion for a change this class didn't make itself - today, an object
+        /// being renamed. The scene-graph list draws object names, so it has to rebuild for a
+        /// rename exactly as it does for a spawn or a delete, and SelectionVersion is already
+        /// the one signal it polls.
+        public void NotifyChanged() => SelectionVersion++;
+
         /// Toggles obj's visibility; if hiding the current primary selection, backs the
         /// selection off it onto the next visible object (or none) - sculpting an object you
         /// can't see would be confusing.

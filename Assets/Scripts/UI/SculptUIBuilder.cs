@@ -50,6 +50,19 @@ namespace Sculpting
         private Button _undoButton, _redoButton;
         private BrushType _lastShownBrush = (BrushType)(-1);
 
+        // Mirroring is per-object (each object reflects through its own origin - see
+        // MirrorController), but these toggles are built once and then point at whatever is
+        // selected WHEN THEY ARE CLICKED. Without a resync they kept showing the state of
+        // whichever object happened to be selected at build time, so after switching objects
+        // the ticks were simply lying about the selection - and unticking one then wrote
+        // "off" to an object that was already off while the plane you could actually see
+        // (belonging to the previously-selected object) stayed up. Polled against
+        // SelectionManager.SelectionVersion below, same once-per-frame idiom as the brush
+        // buttons above.
+        private Toggle _mirrorXToggle, _mirrorYToggle, _mirrorZToggle, _showPlanesToggle;
+        private SelectionManager _selection;
+        private int _lastShownSelectionVersion = -1;
+
         private static readonly BrushAlphaType[] AlphaTypes =
         {
             BrushAlphaType.SoftCircle, BrushAlphaType.Noise, BrushAlphaType.Bumps,
@@ -134,6 +147,8 @@ namespace Sculpting
             if (_undoButton != null) _undoButton.interactable = controller.CanUndo;
             if (_redoButton != null) _redoButton.interactable = controller.CanRedo;
 
+            RefreshMirrorToggles();
+
             if (_polyCountLabel != null)
             {
                 int tris = controller.TriangleCount, verts = controller.VertexCount;
@@ -143,6 +158,40 @@ namespace Sculpting
                     _lastShownVertCount = verts;
                     _polyCountLabel.text = "Tris: " + tris.ToString("N0") + " | Verts: " + verts.ToString("N0");
                 }
+            }
+        }
+
+        /// Re-reads the Mirror toggles off the CURRENT selection whenever it changes, so the
+        /// panel describes the object the brushes are actually about to mirror through. Uses
+        /// SetIsOnWithoutNotify for the same reason the polarity/accumulate resyncs above do:
+        /// firing onChange here would just write the value straight back where it came from.
+        private void RefreshMirrorToggles()
+        {
+            if (_mirrorXToggle == null) return;
+            if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
+            if (_selection == null || _selection.SelectionVersion == _lastShownSelectionVersion) return;
+            _lastShownSelectionVersion = _selection.SelectionVersion;
+
+            MirrorController mirror = controller.Mirror;
+            if (mirror == null) return;
+
+            _mirrorXToggle.SetIsOnWithoutNotify(mirror.MirrorX);
+            _mirrorYToggle.SetIsOnWithoutNotify(mirror.MirrorY);
+            _mirrorZToggle.SetIsOnWithoutNotify(mirror.MirrorZ);
+            _showPlanesToggle.SetIsOnWithoutNotify(mirror.ShowPlanes);
+        }
+
+        /// Null-guarded because controller.Mirror resolves through the live selection, which
+        /// can be empty (every object deleted) between the panel being built and a click.
+        private void SetMirrorAxis(int axis, bool on)
+        {
+            MirrorController mirror = controller.Mirror;
+            if (mirror == null) return;
+            switch (axis)
+            {
+                case 0: mirror.MirrorX = on; break;
+                case 1: mirror.MirrorY = on; break;
+                default: mirror.MirrorZ = on; break;
             }
         }
 
@@ -157,7 +206,8 @@ namespace Sculpting
         private void BuildUI()
         {
             var canvasGO = new GameObject("SculptCanvas", typeof(RectTransform));
-            canvasGO.transform.SetParent(transform, false);
+            // Root-level, not parented under this builder - see UIFactory.CreatePanelCanvas
+            // for why a runtime-created child of a scene object doesn't survive an Editor undo.
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             // Constant pixel size keeps the panel a fixed, predictable size in the top-left
@@ -303,15 +353,25 @@ namespace Sculpting
             CreateLabel(pressureFoldout, "Curve (Sensitive <-> Gradual)", 12, FontStyle.Normal);
             CreateSlider(pressureFoldout, 0.5f, 3f, controller.PressureCurve, v => controller.PressureCurve = v);
 
-            CreateLabel(panel.transform, "Mirror (Local Axes)", 14, FontStyle.Normal);
-            CreateToggle(panel.transform, "Mirror X", controller.Mirror.MirrorX,
-                v => controller.Mirror.MirrorX = v, out _, MirrorXColor);
-            CreateToggle(panel.transform, "Mirror Y", controller.Mirror.MirrorY,
-                v => controller.Mirror.MirrorY = v, out _, MirrorYColor);
-            CreateToggle(panel.transform, "Mirror Z", controller.Mirror.MirrorZ,
-                v => controller.Mirror.MirrorZ = v, out _, MirrorZColor);
-            CreateToggle(panel.transform, "Show Mirror Planes", controller.Mirror.ShowPlanes,
-                v => controller.Mirror.ShowPlanes = v, out _);
+            // Read through a local that tolerates null rather than dereferencing
+            // controller.Mirror three times: an exception thrown from anywhere in BuildUI
+            // abandons the REST of the panel silently (everything below this point simply
+            // never exists), which is a far worse failure than a couple of toggles starting
+            // unticked. SculptController.Mirror now self-heals a missing MirrorController, so
+            // this is belt-and-braces for the genuinely empty-scene case.
+            MirrorController mirror = controller.Mirror;
+            CreateLabel(panel.transform, "Mirror (Selected Object)", 14, FontStyle.Normal);
+            _mirrorXToggle = CreateToggle(panel.transform, "Mirror X", mirror != null && mirror.MirrorX,
+                v => SetMirrorAxis(0, v), out _, MirrorXColor);
+            _mirrorYToggle = CreateToggle(panel.transform, "Mirror Y", mirror != null && mirror.MirrorY,
+                v => SetMirrorAxis(1, v), out _, MirrorYColor);
+            _mirrorZToggle = CreateToggle(panel.transform, "Mirror Z", mirror != null && mirror.MirrorZ,
+                v => SetMirrorAxis(2, v), out _, MirrorZColor);
+            // Applied scene-wide, not to the selection alone - see
+            // MirrorController.SetShowPlanesForAll for why a per-object visibility toggle
+            // reads as broken.
+            _showPlanesToggle = CreateToggle(panel.transform, "Show Mirror Planes", mirror == null || mirror.ShowPlanes,
+                MirrorController.SetShowPlanesForAll, out _);
 
             CreateToggle(panel.transform, "Wireframe (Scene View)", controller.ShowWireframeGizmo,
                 v => controller.ShowWireframeGizmo = v, out _);
