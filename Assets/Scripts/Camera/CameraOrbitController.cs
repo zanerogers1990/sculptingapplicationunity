@@ -1,15 +1,17 @@
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 
 namespace Sculpting
 {
     /// Alt+left-drag orbits the camera around a pivot (mirrors the navigation scheme of most
     /// sculpting apps); middle-drag pans; scroll zooms, unless the cursor is over the
-    /// sculptable surface, where SculptController takes the wheel to resize the brush instead.
-    /// Ctrl+Alt+left-drag zooms too (drag-based alternative for stylus/trackpad input). Right
-    /// mouse is not used here - it's reserved by SculptController for inverted sculpting.
-    /// SculptController checks the same Alt/Ctrl state so these combos orbit/zoom instead of
-    /// sculpting.
+    /// sculptable surface (SculptController takes the wheel there to resize the brush instead)
+    /// or over a UI panel (scrolling a panel's own scrollbar shouldn't also zoom the view
+    /// underneath it). Ctrl+Alt+left-drag zooms too (drag-based alternative for stylus/trackpad
+    /// input). Right mouse is not used here - it's reserved by SculptController for inverted
+    /// sculpting. SculptController checks the same Alt/Ctrl state so these combos orbit/zoom
+    /// instead of sculpting.
     public class CameraOrbitController : MonoBehaviour
     {
         public Transform target;
@@ -94,17 +96,18 @@ namespace Sculpting
                 _pitch = Mathf.Clamp(_pitch, -89f, 89f);
             }
 
-            // Suppressed while a UI panel is being middle-dragged (see DraggablePanel) - without
-            // this, starting a panel drag would also pan the camera underneath it every frame.
-            if (mouse.middleButton.isPressed && !DraggablePanel.IsAnyDragging)
+            if (mouse.middleButton.isPressed)
             {
                 _pivot -= transform.right * (delta.x * panSpeed) + transform.up * (delta.y * panSpeed);
             }
 
             // Deferred to SculptController while the cursor is over the sculptable surface -
             // there, the same wheel resizes the active brush instead (see
-            // SculptController.HandleBrushSizeScroll/IsHoveringSculptSurface).
-            if (!SculptController.IsHoveringSculptSurface)
+            // SculptController.HandleBrushSizeScroll/IsHoveringSculptSurface). Also skipped
+            // while the cursor is over a UI panel, so scrolling one of the panel's own
+            // scrollbars (see UIFactory.CreateScrollingPanelCanvas) doesn't also zoom the 3D
+            // view underneath it.
+            if (!SculptController.IsHoveringSculptSurface && !IsPointerOverUI())
             {
                 float scroll = mouse.scroll.ReadValue().y;
                 if (Mathf.Abs(scroll) > 0.01f)
@@ -116,6 +119,9 @@ namespace Sculpting
 
             UpdateTransform();
         }
+
+        private static bool IsPointerOverUI() =>
+            EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
         private void UpdateTransform()
         {

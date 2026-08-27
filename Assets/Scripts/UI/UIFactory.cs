@@ -20,81 +20,38 @@ namespace Sculpting
         private static Font _font;
         public static Font Font => _font != null ? _font : (_font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"));
 
-        /// Builds a standalone Canvas anchored to one corner of the screen with a padded,
-        /// auto-sizing vertical panel inside it - the same structural pattern SculptUIBuilder
-        /// uses for its own top-left panel, parameterized so callers can pick a different
-        /// corner and horizontal-flow direction.
-        ///
-        /// The Canvas is created at the SCENE ROOT, deliberately not parented under the builder
-        /// that asked for it. It's ScreenSpaceOverlay, so parenting never affected layout -
-        /// but it did affect survival. This app runs inside the Unity Editor during
-        /// development, where the Editor's own global Ctrl+Z can fire in Play mode (which is
-        /// already why sculpt undo is bound to a bare Z - see SculptController.
-        /// HandleUndoRedoKeys). An Editor undo that reverts a scene object takes its children
-        /// with it, and a runtime-created child was never registered with the Editor's undo
-        /// system, so Unity destroys it and logs "child GameObject ... was not registered into
-        /// the undo system and became dangling during an undo operation". The panel simply
-        /// vanished for the rest of the session - which is exactly how the Save/Load panel
-        /// disappeared mid-session, taking saving and loading with it. A root object has no
-        /// parent whose reversion can drag it down.
-        public static Transform CreatePanelCanvas(string name, Vector2 anchor, Vector2 offset, float width)
-        {
-            DestroyStaleCanvas(name);
-            var canvasGO = new GameObject(name, typeof(RectTransform));
-            var canvas = canvasGO.AddComponent<Canvas>();
-            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-            var scaler = canvasGO.AddComponent<CanvasScaler>();
-            scaler.uiScaleMode = CanvasScaler.ScaleMode.ConstantPixelSize;
-            scaler.scaleFactor = 1f;
-            canvasGO.AddComponent<GraphicRaycaster>();
-
-            var panelGO = new GameObject("Panel", typeof(RectTransform), typeof(Image));
-            panelGO.transform.SetParent(canvasGO.transform, false);
-            panelGO.GetComponent<Image>().color = PanelColor;
-            panelGO.AddComponent<DraggablePanel>();
-
-            var rect = panelGO.GetComponent<RectTransform>();
-            rect.anchorMin = anchor;
-            rect.anchorMax = anchor;
-            rect.pivot = anchor;
-            rect.anchoredPosition = offset;
-            rect.sizeDelta = new Vector2(width, 0);
-
-            var layout = panelGO.AddComponent<VerticalLayoutGroup>();
-            layout.padding = new RectOffset(12, 12, 12, 12);
-            layout.spacing = 8;
-            layout.childAlignment = TextAnchor.UpperLeft;
-            layout.childControlHeight = true;
-            layout.childControlWidth = true;
-            layout.childForceExpandHeight = false;
-            layout.childForceExpandWidth = true;
-            var fitter = panelGO.AddComponent<ContentSizeFitter>();
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
-
-            return panelGO.transform;
-        }
-
         /// Every panel canvas this factory builds is created at the scene ROOT under a fixed
-        /// name (see CreatePanelCanvas's remarks on why - Editor-undo survival). That means a
-        /// rebuild (SaveLoadUIBuilder/SceneGraphUIBuilder's "Replace scene" flow re-running
-        /// every panel's Start via SendMessage) used to leave the OLD root object behind as an
-        /// orphan, since nothing ever destroyed it before the same-named replacement was
-        /// created - two stacked, overlapping copies of the same panel. Called at the top of
-        /// both panel-canvas factories so every rebuild is idempotent by construction rather
-        /// than relying on each caller to track and destroy its own previous canvas.
+        /// name, deliberately not parented under the builder that asked for it. It's
+        /// ScreenSpaceOverlay, so parenting never affected layout - but it did affect survival.
+        /// This app runs inside the Unity Editor during development, where the Editor's own
+        /// global Ctrl+Z can fire in Play mode (which is already why sculpt undo is bound to a
+        /// bare Z - see SculptController.HandleUndoRedoKeys). An Editor undo that reverts a
+        /// scene object takes its children with it, and a runtime-created child was never
+        /// registered with the Editor's undo system, so Unity destroys it and logs "child
+        /// GameObject ... was not registered into the undo system and became dangling during an
+        /// undo operation". The panel simply vanished for the rest of the session - which is
+        /// exactly how the Save/Load panel once disappeared mid-session, taking saving and
+        /// loading with it. A root object has no parent whose reversion can drag it down.
+        ///
+        /// Root-level naming also means a rebuild (SceneGraphUIBuilder's "Replace scene" flow
+        /// re-running every panel's Start via SendMessage) used to leave the OLD root object
+        /// behind as an orphan, since nothing ever destroyed it before the same-named
+        /// replacement was created - two stacked, overlapping copies of the same panel. Called
+        /// at the top of CreateScrollingPanelCanvas so every rebuild is idempotent by
+        /// construction rather than relying on each caller to track and destroy its own
+        /// previous canvas.
         private static void DestroyStaleCanvas(string name)
         {
             GameObject stale = GameObject.Find(name);
             if (stale != null) UnityEngine.Object.DestroyImmediate(stale);
         }
 
-        /// Same as CreatePanelCanvas, but the panel's content sits behind a scrollbar/viewport
-        /// instead of growing the panel to whatever height its content needs. The panel still
-        /// auto-sizes to its content below maxHeight (so a short panel isn't left with dead
-        /// space) - it only starts scrolling once content would otherwise run past maxHeight.
-        /// Returns the scrolling CONTENT transform, so callers build into it exactly like
-        /// CreatePanelCanvas's return value - the scrolling machinery is invisible to them.
+        /// Builds a standalone Canvas docked to one corner of the screen with a panel inside it
+        /// whose content sits behind a scrollbar/viewport instead of growing without limit. The
+        /// panel still auto-sizes to its content below maxHeight (so a short panel isn't left
+        /// with dead space) - it only starts scrolling once content would otherwise run past
+        /// maxHeight. Returns the scrolling CONTENT transform - callers just build into it like
+        /// any other panel transform, the scrolling machinery is invisible to them.
         public static Transform CreateScrollingPanelCanvas(string name, Vector2 anchor, Vector2 offset, float width, float maxHeight)
         {
             DestroyStaleCanvas(name);
@@ -109,7 +66,6 @@ namespace Sculpting
             var panelGO = new GameObject("Panel", typeof(RectTransform), typeof(Image));
             panelGO.transform.SetParent(canvasGO.transform, false);
             panelGO.GetComponent<Image>().color = PanelColor;
-            panelGO.AddComponent<DraggablePanel>();
 
             var rect = panelGO.GetComponent<RectTransform>();
             rect.anchorMin = anchor;
@@ -121,13 +77,13 @@ namespace Sculpting
             return AddScrollingContent(rect, maxHeight, new RectOffset(12, 12, 12, 12), 8f);
         }
 
-        /// Wraps an already-positioned, already-sized panel RectTransform (background Image +
-        /// DraggablePanel already attached, as every panel in this project has) with a
-        /// Viewport/Content/Scrollbar/ScrollRect, and a ScrollPanelHeightController that keeps
-        /// the panel's own height matched to its content up to maxHeight. Split out from
-        /// CreateScrollingPanelCanvas so SculptUIBuilder - which builds its own panel by hand
-        /// rather than going through CreatePanelCanvas - can add the same scrolling behavior to
-        /// its existing panel instead of rebuilding it through this factory.
+        /// Wraps an already-positioned, already-sized panel RectTransform (background Image
+        /// already attached, as every panel in this project has) with a Viewport/Content/
+        /// Scrollbar/ScrollRect, and a ScrollPanelHeightController that keeps the panel's own
+        /// height matched to its content up to maxHeight. Split out from
+        /// CreateScrollingPanelCanvas so SculptUIBuilder - which builds its own panel by hand -
+        /// can add the same scrolling behavior to its existing panel instead of rebuilding it
+        /// through this factory.
         public static Transform AddScrollingContent(RectTransform panelRect, float maxHeight, RectOffset padding, float spacing)
         {
             GameObject panelGO = panelRect.gameObject;
@@ -148,6 +104,13 @@ namespace Sculpting
             contentRect.anchorMax = new Vector2(1f, 1f);
             contentRect.pivot = new Vector2(0f, 1f);
             contentRect.anchoredPosition = Vector2.zero;
+            // A fresh RectTransform defaults to a 100x100 sizeDelta. With anchors stretched
+            // horizontally (anchorMin.x=0, anchorMax.x=1), that leftover sizeDelta.x ADDS to the
+            // stretch-computed width, making Content 100px wider than the Viewport - wide enough
+            // that a row's last button/toggle (or a long label) fell past the Viewport's
+            // RectMask2D and got clipped. horizontalFit stays Unconstrained (width should track
+            // the viewport, not its own preferred size), so this has to be zeroed explicitly.
+            contentRect.sizeDelta = Vector2.zero;
 
             var vlg = contentGO.AddComponent<VerticalLayoutGroup>();
             vlg.padding = padding;
@@ -657,7 +620,7 @@ namespace Sculpting
         /// implementations if copied. `buildExtraContent` (optional) inserts controls between
         /// the message and the button row, which is what Join uses for its remesh toggle/slider.
         /// Returns the modal's root so a caller tracking it can dismiss it early. Root-level
-        /// like CreatePanelCanvas, and for the same reason - see its remarks.
+        /// like every panel canvas, and for the same reason - see DestroyStaleCanvas's remarks.
         public static GameObject ShowModal(string message,
                                            Action<Transform> buildExtraContent, params ModalChoice[] choices)
         {

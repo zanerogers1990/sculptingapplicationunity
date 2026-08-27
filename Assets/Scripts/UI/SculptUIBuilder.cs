@@ -213,7 +213,7 @@ namespace Sculpting
             if (staleCanvas != null) DestroyImmediate(staleCanvas);
 
             var canvasGO = new GameObject("SculptCanvas", typeof(RectTransform));
-            // Root-level, not parented under this builder - see UIFactory.CreatePanelCanvas
+            // Root-level, not parented under this builder - see UIFactory.DestroyStaleCanvas
             // for why a runtime-created child of a scene object doesn't survive an Editor undo.
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
@@ -227,21 +227,21 @@ namespace Sculpting
             canvasGO.AddComponent<GraphicRaycaster>();
 
             var panelRoot = CreatePanel(canvasGO.transform);
-            panelRoot.AddComponent<DraggablePanel>();
             var panelRect = panelRoot.GetComponent<RectTransform>();
             panelRect.anchorMin = new Vector2(0, 1);
             panelRect.anchorMax = new Vector2(0, 1);
             panelRect.pivot = new Vector2(0, 1);
-            panelRect.anchoredPosition = new Vector2(12, -12);
+            // Docked flush to the top-left corner and fixed there - no longer draggable (see
+            // UIFactory's now-removed DraggablePanel; the two remaining panels sit at opposite
+            // screen edges and stay put, matching a normal sculpting app's toolbars).
+            panelRect.anchoredPosition = Vector2.zero;
             panelRect.sizeDelta = new Vector2(270, 0);
 
             // This panel carries by far the most controls of any panel in the app (every brush
-            // shaping foldout, mirror, export, remesh...), so it's the one that actually runs
-            // off the bottom of the screen on a normal display - hence a scrollbar here "for
-            // now" rather than on every panel. Capped at Screen.height minus a small margin so
-            // the panel never grows taller than the window; UIFactory.AddScrollingContent still
+            // shaping foldout, mirror, export, remesh...). Capped at the full window height so
+            // it never grows past the bottom of the screen; UIFactory.AddScrollingContent still
             // shrinks it back down to fit shorter content, same as the old ContentSizeFitter did.
-            float maxHeight = Mathf.Max(300f, Screen.height - 40f);
+            float maxHeight = Mathf.Max(300f, Screen.height);
             Transform content = UIFactory.AddScrollingContent(panelRect, maxHeight, new RectOffset(12, 12, 12, 12), 10f);
             var panel = content.gameObject;
 

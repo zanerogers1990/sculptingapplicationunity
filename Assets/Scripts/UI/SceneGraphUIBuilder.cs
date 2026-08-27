@@ -7,16 +7,18 @@ using Sculpting.IO;
 
 namespace Sculpting
 {
-    /// Builds the Scene panel: scene-file actions (Import Object / Load Scene / Save Scene),
-    /// add-primitive buttons, a live object list (select/visibility/delete), the Transpose/
-    /// Scale gizmo mode toolbar, one-shot Mirror, and Join - same "build once from code"
-    /// approach as SculptUIBuilder/the other *UIBuilder classes. Anchored left-middle edge, the
-    /// one corner/edge the other panels (documented in MaterialUIBuilder) don't already occupy.
+    /// Builds the right-hand panel: scene-file actions (Import Object / Load Scene / Save
+    /// Scene), add-primitive buttons, a live object list (select/visibility/delete), the
+    /// Transpose/Scale gizmo mode toolbar, one-shot Mirror, Join, and - merged in further down -
+    /// the collapsible Studio Lighting/Material/Presentation sections. Docked flush to the
+    /// top-right corner at full window height, fixed there (no longer draggable), mirroring
+    /// SculptUIBuilder's Sculpting Tools panel on the left.
     ///
-    /// The scene-file actions used to be their own top-center panel (SaveLoadUIBuilder, now
-    /// removed) - merged in here so "everything about the scene as a whole" (what's in it, and
-    /// where it's loaded from/saved to) lives in one place instead of two panels the user had
-    /// to separately find and move.
+    /// Two things used to be separate panels of their own: the scene-file actions (top-center
+    /// SaveLoadUIBuilder) and Studio Lighting/Material/Presentation (top-right
+    /// StudioPanelUIBuilder). Both are merged in here now, so this one scrollable column carries
+    /// everything that isn't sculpting tools, instead of three panels the user had to
+    /// separately find and reposition.
     public class SceneGraphUIBuilder : MonoBehaviour
     {
         // How long a save/load status line stays up before the hint returns. Failures ignore
@@ -115,9 +117,12 @@ namespace Sculpting
 
         private void BuildUI()
         {
-            float maxHeight = Mathf.Max(300f, Screen.height - 40f);
+            // Docked flush to the top-right corner, full window height, fixed there - no
+            // longer draggable (see UIFactory's now-removed DraggablePanel). Sits opposite
+            // SculptUIBuilder's Sculpting Tools panel, which docks the same way on the left.
+            float maxHeight = Mathf.Max(300f, Screen.height);
             Transform panel = UIFactory.CreateScrollingPanelCanvas(
-                "SceneGraphCanvas", new Vector2(0f, 0.5f), new Vector2(12, 0), 220f, maxHeight);
+                "SceneGraphCanvas", new Vector2(1f, 1f), Vector2.zero, 260f, maxHeight);
             _canvasRoot = panel.root.gameObject;
 
             UIFactory.CreateLabel(panel, "Scene", 18, FontStyle.Bold);
@@ -174,6 +179,19 @@ namespace Sculpting
 
             UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
             _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm);
+
+            // Studio Lighting / Material / Presentation used to be three separate always-open
+            // panels (top-right, bottom-center, bottom-right). Merged into this panel as three
+            // collapsible sections - one panel to dock instead of four, and each section starts
+            // collapsed so the panel stays small until the user opens the one they want. These
+            // builders no longer build their own canvas - they just fill whatever content
+            // transform they're handed (see LightingUIBuilder.BuildContent's remarks).
+            var lighting = FindFirstObjectByType<LightingUIBuilder>();
+            var material = FindFirstObjectByType<MaterialUIBuilder>();
+            var presentation = FindFirstObjectByType<PostProcessingUIBuilder>();
+            if (lighting != null) lighting.BuildContent(UIFactory.CreateFoldoutSection(panel, "Studio Lighting", false));
+            if (material != null) material.BuildContent(UIFactory.CreateFoldoutSection(panel, "Material", false));
+            if (presentation != null) presentation.BuildContent(UIFactory.CreateFoldoutSection(panel, "Presentation", false));
         }
 
         private void Spawn(PrimitiveShapeType type) => _spawner?.SpawnPrimitive(type);
@@ -220,11 +238,15 @@ namespace Sculpting
                 {
                     if (SceneSerializer.Load(path, out string error))
                     {
-                        SetStatus("Loaded " + name, OkColor, hold: true);
                         // Only the replacing path needs this: it restores brush/material/
-                        // lighting/camera wholesale, so the Studio panel's controls are showing
-                        // values that no longer apply. Adding objects changes no global setting.
+                        // lighting/camera wholesale, so the Studio Lighting/Material/
+                        // Presentation sections merged into this panel are showing values that
+                        // no longer apply. Adding objects changes no global setting. Rebuild
+                        // FIRST, then set the status - RebuildOtherPanels rebuilds this panel's
+                        // own _statusLabel too (see its remarks), which would otherwise reset
+                        // straight back to the default hint right after this line ran.
                         RebuildOtherPanels();
+                        SetStatus("Loaded " + name, OkColor, hold: true);
                     }
                     else
                     {
@@ -303,32 +325,25 @@ namespace Sculpting
             _statusClearAt = -1f;
         }
 
-        // Destroys and re-runs the Sculpting Tools and Studio panels' Start so their controls
-        // show the loaded scene's values rather than the ones they were built from at startup.
-        // This panel excludes itself: nothing it shows (the object list, tool mode, mirror
-        // toggles) is a stale "value that no longer applies" the way brush/material/lighting
-        // settings are - it already refreshes itself off SelectionManager.SelectionVersion.
+        // Destroys and re-runs the Sculpting Tools panel's Start, plus this panel's own BuildUI,
+        // so every control shows the loaded scene's values rather than the ones it was built
+        // from at startup. This panel can no longer skip rebuilding itself the way the old
+        // separate SaveLoadUIBuilder could: it carries the Studio Lighting/Material/
+        // Presentation sections now (merged in), which DO go stale the same way brush/material/
+        // lighting settings do elsewhere.
         //
-        // Works per HOST GAMEOBJECT, not per builder component, because SculptUIBuilder and
-        // StudioPanelUIBuilder share the single "SculptUI" object - SendMessage hits every
-        // component on the object, so driving this per-component would rebuild that shared host
-        // twice. SendMessage is used at all because Start is private on each builder - the same
-        // "invoke a private MonoBehaviour method without reflection" idiom used elsewhere in
-        // this project.
+        // SculptUIBuilder is driven via SendMessage("Start") rather than a direct call, since
+        // this class holds no reference to it and Start is private - the same "invoke a private
+        // MonoBehaviour method without reflection" idiom used elsewhere in this project.
         private void RebuildOtherPanels()
         {
-            var hosts = new List<GameObject>();
-            void AddHost(MonoBehaviour b)
-            {
-                if (b == null || b.gameObject == gameObject) return;
-                if (!hosts.Contains(b.gameObject)) hosts.Add(b.gameObject);
-            }
+            var sculptBuilder = FindFirstObjectByType<SculptUIBuilder>();
+            if (sculptBuilder != null) sculptBuilder.gameObject.SendMessage("Start", SendMessageOptions.DontRequireReceiver);
 
-            AddHost(FindFirstObjectByType<SculptUIBuilder>());
-            AddHost(FindFirstObjectByType<StudioPanelUIBuilder>());
-
-            foreach (GameObject host in hosts)
-                host.SendMessage("Start", SendMessageOptions.DontRequireReceiver);
+            BuildUI();
+            RefreshList();
+            RefreshJoinButton();
+            RefreshToolButtons();
         }
 
         // -------------------------------------------------------------------------- object list
