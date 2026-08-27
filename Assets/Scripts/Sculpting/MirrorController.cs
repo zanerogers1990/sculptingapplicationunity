@@ -57,7 +57,7 @@ namespace Sculpting
 
         private void UpdatePlane(Transform plane, bool axisActive)
         {
-            bool visible = axisActive && showPlanes;
+            bool visible = axisActive && showPlanes && _sculptableMesh.Visible;
             if (plane.gameObject.activeSelf != visible) plane.gameObject.SetActive(visible);
             if (!visible) return;
 
