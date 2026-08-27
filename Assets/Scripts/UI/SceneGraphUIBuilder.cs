@@ -1,17 +1,33 @@
 using System.Collections.Generic;
+using System.IO;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.UI;
+using Sculpting.IO;
 
 namespace Sculpting
 {
-    /// Builds the Scene Graph panel: add-primitive buttons, a live object list (select/
-    /// visibility/delete), the Transpose/Scale gizmo mode toolbar, one-shot Mirror, and Join -
-    /// same "build once from code" approach as SculptUIBuilder/the other *UIBuilder classes.
-    /// Anchored left-middle edge, the one corner/edge the other panels (documented in
-    /// MaterialUIBuilder) don't already occupy.
+    /// Builds the Scene panel: scene-file actions (Import Object / Load Scene / Save Scene),
+    /// add-primitive buttons, a live object list (select/visibility/delete), the Transpose/
+    /// Scale gizmo mode toolbar, one-shot Mirror, and Join - same "build once from code"
+    /// approach as SculptUIBuilder/the other *UIBuilder classes. Anchored left-middle edge, the
+    /// one corner/edge the other panels (documented in MaterialUIBuilder) don't already occupy.
+    ///
+    /// The scene-file actions used to be their own top-center panel (SaveLoadUIBuilder, now
+    /// removed) - merged in here so "everything about the scene as a whole" (what's in it, and
+    /// where it's loaded from/saved to) lives in one place instead of two panels the user had
+    /// to separately find and move.
     public class SceneGraphUIBuilder : MonoBehaviour
     {
+        // How long a save/load status line stays up before the hint returns. Failures ignore
+        // this and stay until the next action - an error the user blinked past is worse than a
+        // stale line.
+        private const float StatusHoldSeconds = 5f;
+
+        private static readonly Color OkColor = new Color(0.55f, 0.85f, 0.55f);
+        private static readonly Color ErrorColor = new Color(0.95f, 0.45f, 0.4f);
+        private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
+
         private SelectionManager _selection;
         private PrimitiveSpawner _spawner;
         private SculptController _controller;
@@ -39,6 +55,21 @@ namespace Sculpting
         // to see the torso" framing.
         private bool _mirrorX = true, _mirrorY, _mirrorZ;
 
+        // Scene-file (Import/Load/Save) state - see the old SaveLoadUIBuilder this was merged
+        // from for the reasoning behind each piece.
+        private Text _statusLabel;
+        private float _statusClearAt = -1f;
+        private InputField _fallbackField;
+        private string _lastDirectory;
+
+        // The panel's own Canvas GameObject, watched by Update so the panel can rebuild itself
+        // if anything ever destroys it out from under this component. Root-level parenting (see
+        // UIFactory.CreatePanelCanvas) is the actual fix for the Editor-undo case that used to
+        // take the old standalone save/load panel out mid-session; this is the backstop,
+        // because of every panel in the app this is the one whose disappearance can cost real
+        // work - there is no other route to Save Scene.
+        private GameObject _canvasRoot;
+
         // Start(), not Awake() - reads/uses SelectionManager.AllObjects (via RefreshList),
         // which needs every SculptableMesh's OnEnable to have already registered - see
         // SculptUIBuilder's own Start() remarks for the full reasoning.
@@ -56,6 +87,20 @@ namespace Sculpting
 
         private void Update()
         {
+            if (_canvasRoot == null)
+            {
+                // Rebuild rather than log-and-limp: a missing panel is unrecoverable for the
+                // user (no menu bar, no hotkey - the buttons ARE the feature), and rebuilding
+                // costs one frame's worth of UI construction on a path that should never run.
+                BuildUI();
+                RefreshList();
+                RefreshJoinButton();
+                RefreshToolButtons();
+                return;
+            }
+
+            if (_statusClearAt > 0f && Time.unscaledTime >= _statusClearAt) ShowHint();
+
             if (_selection == null) return;
             // Cheap once-per-frame poll, same idiom SculptUIBuilder already uses for brush
             // state - only rebuilds the list when something actually changed (spawn/delete/
@@ -70,9 +115,25 @@ namespace Sculpting
 
         private void BuildUI()
         {
-            Transform panel = UIFactory.CreatePanelCanvas("SceneGraphCanvas", new Vector2(0f, 0.5f), new Vector2(12, 0), 220f);
+            float maxHeight = Mathf.Max(300f, Screen.height - 40f);
+            Transform panel = UIFactory.CreateScrollingPanelCanvas(
+                "SceneGraphCanvas", new Vector2(0f, 0.5f), new Vector2(12, 0), 220f, maxHeight);
+            _canvasRoot = panel.root.gameObject;
 
             UIFactory.CreateLabel(panel, "Scene", 18, FontStyle.Bold);
+
+            UIFactory.CreateButton(panel, "Import Object...", ImportObject);
+            UIFactory.CreateButton(panel, "Load Scene...", LoadScene);
+            UIFactory.CreateButton(panel, "Save Scene...", SaveScene);
+
+            if (!FileDialog.IsSupported)
+            {
+                UIFactory.CreateLabel(panel, "File path", 11, FontStyle.Normal);
+                _fallbackField = UIFactory.CreateInputField(panel, SceneSerializer.DefaultPath, null);
+            }
+
+            _statusLabel = UIFactory.CreateLabel(panel, string.Empty, 11, FontStyle.Normal);
+            ShowHint();
 
             UIFactory.CreateLabel(panel, "Add Primitive", 13, FontStyle.Normal);
             GameObject addRow1 = UIFactory.CreateRow(panel, 26f);
@@ -116,6 +177,159 @@ namespace Sculpting
         }
 
         private void Spawn(PrimitiveShapeType type) => _spawner?.SpawnPrimitive(type);
+
+        // -------------------------------------------------------------- scene file actions
+
+        /// Brings a single model in alongside whatever is already in the scene. Separate from
+        /// Load Scene precisely because it never asks a question: adding a model to what you are
+        /// working on is the only thing it can sensibly mean.
+        private void ImportObject()
+        {
+            string path = PickPath("Import object", "obj");
+            if (path == null) return;
+
+            if (SceneSerializer.ImportAny(path, out int count, out string error))
+                SetStatus($"Imported {Path.GetFileName(path)}", OkColor, hold: true);
+            else
+                SetStatus("Import failed: " + error, ErrorColor, hold: false);
+        }
+
+        /// Opens a saved scene, then asks how to bring it in. The prompt exists because both
+        /// answers are reasonable and one of them is destructive: replacing discards everything
+        /// currently in the scene, and there is no undo for that. Asking after the file is
+        /// chosen (rather than offering two buttons up front) keeps the panel to one obvious
+        /// action and puts the question at the moment it can be answered concretely - the file's
+        /// own name and object count are in the prompt.
+        private void LoadScene()
+        {
+            string path = PickPath("Load scene", "sculpt");
+            if (path == null) return;
+
+            string name = Path.GetFileName(path);
+            UIFactory.ShowModal(
+                $"\"{name}\"\n\nReplace everything in the scene, or add its objects to what you have?",
+                null,
+                new UIFactory.ModalChoice("Add to current scene", () =>
+                {
+                    if (SceneSerializer.ImportAny(path, out int count, out string error))
+                        SetStatus($"Added {count} object{(count == 1 ? "" : "s")} from {name}", OkColor, hold: true);
+                    else
+                        SetStatus("Load failed: " + error, ErrorColor, hold: false);
+                }),
+                new UIFactory.ModalChoice("Replace scene (cannot be undone)", () =>
+                {
+                    if (SceneSerializer.Load(path, out string error))
+                    {
+                        SetStatus("Loaded " + name, OkColor, hold: true);
+                        // Only the replacing path needs this: it restores brush/material/
+                        // lighting/camera wholesale, so the Studio panel's controls are showing
+                        // values that no longer apply. Adding objects changes no global setting.
+                        RebuildOtherPanels();
+                    }
+                    else
+                    {
+                        SetStatus("Load failed: " + error, ErrorColor, hold: false);
+                    }
+                }));
+        }
+
+        private void SaveScene()
+        {
+            string path = PickSavePath();
+            if (path == null) return;
+
+            if (SceneSerializer.Save(path, out string error))
+                SetStatus($"Saved {Path.GetFileName(path)} ({FileSizeMb(path)})", OkColor, hold: true);
+            else
+                SetStatus("Save failed: " + error, ErrorColor, hold: false);
+        }
+
+        // ----------------------------------------------------------------------- path picking
+
+        /// The OS picker where there is one, the fallback field otherwise. Returns null when the
+        /// user cancels, which every caller treats as "do nothing" - deliberately NOT an error,
+        /// since cancelling is a normal thing to do.
+        private string PickPath(string title, params string[] extensions)
+        {
+            if (FileDialog.IsSupported)
+            {
+                string chosen = FileDialog.OpenFile(title, StartDirectory(), extensions);
+                if (!string.IsNullOrEmpty(chosen)) _lastDirectory = FileDialog.DirectoryFor(chosen);
+                return string.IsNullOrEmpty(chosen) ? null : chosen;
+            }
+
+            // Typed paths are used verbatim - no extension is appended, because this same field
+            // has to be able to name a .obj as well as a .sculpt.
+            string typed = _fallbackField != null ? _fallbackField.text?.Trim().Trim('"') : null;
+            if (string.IsNullOrEmpty(typed)) { SetStatus("Type a file path first.", ErrorColor, hold: false); return null; }
+            return typed;
+        }
+
+        private string PickSavePath()
+        {
+            if (FileDialog.IsSupported)
+            {
+                string chosen = FileDialog.SaveFile("Save scene", StartDirectory(), "sculpt-session", "sculpt");
+                if (!string.IsNullOrEmpty(chosen)) _lastDirectory = FileDialog.DirectoryFor(chosen);
+                return string.IsNullOrEmpty(chosen) ? null : chosen;
+            }
+
+            // NormalizePath here (unlike PickPath) because a save target is always a .sculpt, so
+            // a bare name can safely be completed into one.
+            string typed = _fallbackField != null ? _fallbackField.text : null;
+            return SceneSerializer.NormalizePath(typed);
+        }
+
+        private string StartDirectory() =>
+            string.IsNullOrEmpty(_lastDirectory) ? SceneSerializer.DefaultDirectory : _lastDirectory;
+
+        private static string FileSizeMb(string path)
+        {
+            try { return (new FileInfo(path).Length / 1024f / 1024f).ToString("F1") + " MB"; }
+            catch { return "saved"; }
+        }
+
+        private void SetStatus(string message, Color color, bool hold)
+        {
+            _statusLabel.text = message;
+            _statusLabel.color = color;
+            _statusClearAt = hold ? Time.unscaledTime + StatusHoldSeconds : -1f;
+        }
+
+        private void ShowHint()
+        {
+            _statusLabel.text = "Import adds a model (.obj). Load opens a saved scene (.sculpt).";
+            _statusLabel.color = HintColor;
+            _statusClearAt = -1f;
+        }
+
+        // Destroys and re-runs the Sculpting Tools and Studio panels' Start so their controls
+        // show the loaded scene's values rather than the ones they were built from at startup.
+        // This panel excludes itself: nothing it shows (the object list, tool mode, mirror
+        // toggles) is a stale "value that no longer applies" the way brush/material/lighting
+        // settings are - it already refreshes itself off SelectionManager.SelectionVersion.
+        //
+        // Works per HOST GAMEOBJECT, not per builder component, because SculptUIBuilder and
+        // StudioPanelUIBuilder share the single "SculptUI" object - SendMessage hits every
+        // component on the object, so driving this per-component would rebuild that shared host
+        // twice. SendMessage is used at all because Start is private on each builder - the same
+        // "invoke a private MonoBehaviour method without reflection" idiom used elsewhere in
+        // this project.
+        private void RebuildOtherPanels()
+        {
+            var hosts = new List<GameObject>();
+            void AddHost(MonoBehaviour b)
+            {
+                if (b == null || b.gameObject == gameObject) return;
+                if (!hosts.Contains(b.gameObject)) hosts.Add(b.gameObject);
+            }
+
+            AddHost(FindFirstObjectByType<SculptUIBuilder>());
+            AddHost(FindFirstObjectByType<StudioPanelUIBuilder>());
+
+            foreach (GameObject host in hosts)
+                host.SendMessage("Start", SendMessageOptions.DontRequireReceiver);
+        }
 
         // -------------------------------------------------------------------------- object list
 

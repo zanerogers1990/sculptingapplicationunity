@@ -3,11 +3,15 @@ using UnityEngine.UI;
 
 namespace Sculpting
 {
-    /// Builds the top-right "Studio Lighting" panel: a master enable toggle, 3-point/5-point
-    /// mode buttons, a row to pick which light's sliders are currently shown, and
+    /// Builds the "Studio Lighting" section: a master enable toggle, 3-point/5-point mode
+    /// buttons, a row to pick which light's sliders are currently shown, and
     /// intensity/yaw/pitch/distance/color controls for whichever light is selected. Only one
     /// set of sliders is built (rather than one per light) - switching the selected light
     /// re-syncs the same sliders to that light's stored values via SetValueWithoutNotify.
+    ///
+    /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
+    /// with Material and Presentation into one panel with three collapsible headers, and calls
+    /// BuildContent with that section's foldout content transform once the panel is up.
     public class LightingUIBuilder : MonoBehaviour
     {
         private static readonly string[] SlotLabels = { "Key", "Fill", "Rim", "Kick1", "Kick2" };
@@ -20,21 +24,15 @@ namespace Sculpting
         private Slider _intensitySlider, _yawSlider, _pitchSlider, _distanceSlider;
         private UIFactory.ColorPickerHandle _colorPicker;
 
-        // Start (not Awake) - LightingRigController builds its rig array in its own Awake,
-        // and Unity doesn't guarantee Awake order across different GameObjects, so reading
-        // GetConfig() here any earlier than Start could race it.
-        private void Start()
+        // Resolved here rather than Start/Awake: LightingRigController builds its rig array in
+        // its own Awake, and Unity doesn't guarantee Awake order across different GameObjects,
+        // so reading GetConfig() any earlier than this (called from StudioPanelUIBuilder.Start)
+        // could race it.
+        public void BuildContent(Transform panel)
         {
             _controller = FindFirstObjectByType<LightingRigController>();
             if (_controller == null) return;
-            BuildUI();
-        }
 
-        private void BuildUI()
-        {
-            Transform panel = UIFactory.CreatePanelCanvas("LightingCanvas", new Vector2(1, 1), new Vector2(-12, -12), 250f);
-
-            UIFactory.CreateLabel(panel, "Studio Lighting", 20, FontStyle.Bold);
             UIFactory.CreateToggle(panel, "Enabled", _controller.StudioLightingEnabled, v => _controller.StudioLightingEnabled = v);
 
             var modeRow = UIFactory.CreateRow(panel);

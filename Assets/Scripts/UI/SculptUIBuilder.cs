@@ -205,6 +205,13 @@ namespace Sculpting
 
         private void BuildUI()
         {
+            // Destroys any leftover canvas from a previous build (e.g. SceneGraphUIBuilder's
+            // Load Scene "Replace" flow re-running every panel's Start) before making a new
+            // one - see UIFactory.DestroyStaleCanvas for why an un-destroyed previous canvas
+            // would otherwise leave two stacked, overlapping copies of this panel.
+            GameObject staleCanvas = GameObject.Find("SculptCanvas");
+            if (staleCanvas != null) DestroyImmediate(staleCanvas);
+
             var canvasGO = new GameObject("SculptCanvas", typeof(RectTransform));
             // Root-level, not parented under this builder - see UIFactory.CreatePanelCanvas
             // for why a runtime-created child of a scene object doesn't survive an Editor undo.
@@ -219,26 +226,24 @@ namespace Sculpting
             scaler.scaleFactor = 1f;
             canvasGO.AddComponent<GraphicRaycaster>();
 
-            var panel = CreatePanel(canvasGO.transform);
-            panel.AddComponent<DraggablePanel>();
-            var panelRect = panel.GetComponent<RectTransform>();
+            var panelRoot = CreatePanel(canvasGO.transform);
+            panelRoot.AddComponent<DraggablePanel>();
+            var panelRect = panelRoot.GetComponent<RectTransform>();
             panelRect.anchorMin = new Vector2(0, 1);
             panelRect.anchorMax = new Vector2(0, 1);
             panelRect.pivot = new Vector2(0, 1);
             panelRect.anchoredPosition = new Vector2(12, -12);
             panelRect.sizeDelta = new Vector2(270, 0);
 
-            var layout = panel.AddComponent<VerticalLayoutGroup>();
-            layout.padding = new RectOffset(12, 12, 12, 12);
-            layout.spacing = 10;
-            layout.childAlignment = TextAnchor.UpperLeft;
-            layout.childControlHeight = true;
-            layout.childControlWidth = true;
-            layout.childForceExpandHeight = false;
-            layout.childForceExpandWidth = true;
-            var fitter = panel.AddComponent<ContentSizeFitter>();
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            // This panel carries by far the most controls of any panel in the app (every brush
+            // shaping foldout, mirror, export, remesh...), so it's the one that actually runs
+            // off the bottom of the screen on a normal display - hence a scrollbar here "for
+            // now" rather than on every panel. Capped at Screen.height minus a small margin so
+            // the panel never grows taller than the window; UIFactory.AddScrollingContent still
+            // shrinks it back down to fit shorter content, same as the old ContentSizeFitter did.
+            float maxHeight = Mathf.Max(300f, Screen.height - 40f);
+            Transform content = UIFactory.AddScrollingContent(panelRect, maxHeight, new RectOffset(12, 12, 12, 12), 10f);
+            var panel = content.gameObject;
 
             CreateLabel(panel.transform, "Sculpting Tools", 20, FontStyle.Bold);
             _polyCountLabel = CreateLabel(panel.transform, "Tris: - | Verts: -", 12, FontStyle.Normal);

@@ -4,11 +4,15 @@ using UnityEngine.UI;
 
 namespace Sculpting
 {
-    /// Builds the bottom-right "Presentation" panel: collapsible sections for the post-
-    /// processing effects used to show the sculpt off (Bloom, Vignette, Depth of Field,
-    /// Color, Tonemapping) plus the scene background (flat color or two-color gradient).
-    /// Background lives in this panel rather than its own canvas since both are about the
-    /// final presented look rather than the sculpting/lighting workflow itself.
+    /// Builds the "Presentation" section: collapsible sub-sections for the post-processing
+    /// effects used to show the sculpt off (Bloom, Vignette, Depth of Field, Color,
+    /// Tonemapping) plus the scene background (flat color or two-color gradient). Background
+    /// lives in this section rather than its own since both are about the final presented look
+    /// rather than the sculpting/lighting workflow itself.
+    ///
+    /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
+    /// with Studio Lighting and Material into one panel with three collapsible headers, and
+    /// calls BuildContent with that section's foldout content transform once the panel is up.
     public class PostProcessingUIBuilder : MonoBehaviour
     {
         private PostProcessingController _post;
@@ -18,19 +22,14 @@ namespace Sculpting
         private readonly Image[] _bgModeButtons = new Image[2];
         private static readonly TonemappingMode[] TonemapModes = { TonemappingMode.None, TonemappingMode.Neutral, TonemappingMode.ACES };
 
-        // Start (not Awake) - PostProcessingController resolves its Volume overrides in its
-        // own Awake, and Unity doesn't guarantee Awake order across different GameObjects.
-        private void Start()
+        // Resolved here rather than Start/Awake: PostProcessingController resolves its Volume
+        // overrides in its own Awake, and Unity doesn't guarantee Awake order across different
+        // GameObjects, so reading HasVolume any earlier than this (called from
+        // StudioPanelUIBuilder.Start) could race it.
+        public void BuildContent(Transform panel)
         {
             _post = FindFirstObjectByType<PostProcessingController>();
             _background = FindFirstObjectByType<BackgroundController>();
-            BuildUI();
-        }
-
-        private void BuildUI()
-        {
-            Transform panel = UIFactory.CreatePanelCanvas("PresentationCanvas", new Vector2(1, 0), new Vector2(-12, 12), 250f);
-            UIFactory.CreateLabel(panel, "Presentation", 20, FontStyle.Bold);
 
             if (_post != null && _post.HasVolume) BuildPostProcessingSections(panel);
             else UIFactory.CreateLabel(panel, "No Volume found in scene.", 12, FontStyle.Italic);

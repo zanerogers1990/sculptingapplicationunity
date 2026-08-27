@@ -39,6 +39,7 @@ namespace Sculpting
         /// parent whose reversion can drag it down.
         public static Transform CreatePanelCanvas(string name, Vector2 anchor, Vector2 offset, float width)
         {
+            DestroyStaleCanvas(name);
             var canvasGO = new GameObject(name, typeof(RectTransform));
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
@@ -72,6 +73,164 @@ namespace Sculpting
             fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
 
             return panelGO.transform;
+        }
+
+        /// Every panel canvas this factory builds is created at the scene ROOT under a fixed
+        /// name (see CreatePanelCanvas's remarks on why - Editor-undo survival). That means a
+        /// rebuild (SaveLoadUIBuilder/SceneGraphUIBuilder's "Replace scene" flow re-running
+        /// every panel's Start via SendMessage) used to leave the OLD root object behind as an
+        /// orphan, since nothing ever destroyed it before the same-named replacement was
+        /// created - two stacked, overlapping copies of the same panel. Called at the top of
+        /// both panel-canvas factories so every rebuild is idempotent by construction rather
+        /// than relying on each caller to track and destroy its own previous canvas.
+        private static void DestroyStaleCanvas(string name)
+        {
+            GameObject stale = GameObject.Find(name);
+            if (stale != null) UnityEngine.Object.DestroyImmediate(stale);
+        }
+
+        /// Same as CreatePanelCanvas, but the panel's content sits behind a scrollbar/viewport
+        /// instead of growing the panel to whatever height its content needs. The panel still
+        /// auto-sizes to its content below maxHeight (so a short panel isn't left with dead
+        /// space) - it only starts scrolling once content would otherwise run past maxHeight.
+        /// Returns the scrolling CONTENT transform, so callers build into it exactly like
+        /// CreatePanelCanvas's return value - the scrolling machinery is invisible to them.
+        public static Transform CreateScrollingPanelCanvas(string name, Vector2 anchor, Vector2 offset, float width, float maxHeight)
+        {
+            DestroyStaleCanvas(name);
+            var canvasGO = new GameObject(name, typeof(RectTransform));
+            var canvas = canvasGO.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            var scaler = canvasGO.AddComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ConstantPixelSize;
+            scaler.scaleFactor = 1f;
+            canvasGO.AddComponent<GraphicRaycaster>();
+
+            var panelGO = new GameObject("Panel", typeof(RectTransform), typeof(Image));
+            panelGO.transform.SetParent(canvasGO.transform, false);
+            panelGO.GetComponent<Image>().color = PanelColor;
+            panelGO.AddComponent<DraggablePanel>();
+
+            var rect = panelGO.GetComponent<RectTransform>();
+            rect.anchorMin = anchor;
+            rect.anchorMax = anchor;
+            rect.pivot = anchor;
+            rect.anchoredPosition = offset;
+            rect.sizeDelta = new Vector2(width, 0f); // height is driven by ScrollPanelHeightController below
+
+            return AddScrollingContent(rect, maxHeight, new RectOffset(12, 12, 12, 12), 8f);
+        }
+
+        /// Wraps an already-positioned, already-sized panel RectTransform (background Image +
+        /// DraggablePanel already attached, as every panel in this project has) with a
+        /// Viewport/Content/Scrollbar/ScrollRect, and a ScrollPanelHeightController that keeps
+        /// the panel's own height matched to its content up to maxHeight. Split out from
+        /// CreateScrollingPanelCanvas so SculptUIBuilder - which builds its own panel by hand
+        /// rather than going through CreatePanelCanvas - can add the same scrolling behavior to
+        /// its existing panel instead of rebuilding it through this factory.
+        public static Transform AddScrollingContent(RectTransform panelRect, float maxHeight, RectOffset padding, float spacing)
+        {
+            GameObject panelGO = panelRect.gameObject;
+
+            var viewportGO = new GameObject("Viewport", typeof(RectTransform), typeof(RectMask2D));
+            viewportGO.transform.SetParent(panelRect, false);
+            var vpRect = viewportGO.GetComponent<RectTransform>();
+            vpRect.anchorMin = Vector2.zero;
+            vpRect.anchorMax = Vector2.one;
+            vpRect.pivot = new Vector2(0f, 1f);
+            vpRect.offsetMin = Vector2.zero;
+            vpRect.offsetMax = new Vector2(-10f, 0f); // leaves room for the scrollbar strip on the right
+
+            var contentGO = new GameObject("Content", typeof(RectTransform));
+            contentGO.transform.SetParent(viewportGO.transform, false);
+            var contentRect = contentGO.GetComponent<RectTransform>();
+            contentRect.anchorMin = new Vector2(0f, 1f);
+            contentRect.anchorMax = new Vector2(1f, 1f);
+            contentRect.pivot = new Vector2(0f, 1f);
+            contentRect.anchoredPosition = Vector2.zero;
+
+            var vlg = contentGO.AddComponent<VerticalLayoutGroup>();
+            vlg.padding = padding;
+            vlg.spacing = spacing;
+            vlg.childAlignment = TextAnchor.UpperLeft;
+            vlg.childControlHeight = true;
+            vlg.childControlWidth = true;
+            vlg.childForceExpandHeight = false;
+            vlg.childForceExpandWidth = true;
+            var fitter = contentGO.AddComponent<ContentSizeFitter>();
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+
+            var scrollbarGO = new GameObject("Scrollbar", typeof(RectTransform), typeof(Image), typeof(Scrollbar));
+            scrollbarGO.transform.SetParent(panelRect, false);
+            var sbRect = scrollbarGO.GetComponent<RectTransform>();
+            sbRect.anchorMin = new Vector2(1f, 0f);
+            sbRect.anchorMax = new Vector2(1f, 1f);
+            sbRect.pivot = new Vector2(1f, 1f);
+            sbRect.offsetMin = new Vector2(-8f, 2f);
+            sbRect.offsetMax = new Vector2(-2f, -2f);
+            scrollbarGO.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.25f);
+            var scrollbar = scrollbarGO.GetComponent<Scrollbar>();
+            scrollbar.direction = Scrollbar.Direction.BottomToTop;
+
+            var slideAreaGO = new GameObject("Sliding Area", typeof(RectTransform));
+            slideAreaGO.transform.SetParent(scrollbarGO.transform, false);
+            var slideAreaRect = slideAreaGO.GetComponent<RectTransform>();
+            slideAreaRect.anchorMin = Vector2.zero;
+            slideAreaRect.anchorMax = Vector2.one;
+            slideAreaRect.offsetMin = new Vector2(1f, 1f);
+            slideAreaRect.offsetMax = new Vector2(-1f, -1f);
+
+            var handleGO = new GameObject("Handle", typeof(RectTransform), typeof(Image));
+            handleGO.transform.SetParent(slideAreaGO.transform, false);
+            handleGO.GetComponent<Image>().color = new Color(0.45f, 0.45f, 0.5f, 0.9f);
+            var handleRect = handleGO.GetComponent<RectTransform>();
+            handleRect.anchorMin = Vector2.zero;
+            handleRect.anchorMax = Vector2.one;
+            handleRect.sizeDelta = Vector2.zero;
+
+            scrollbar.targetGraphic = handleGO.GetComponent<Image>();
+            scrollbar.handleRect = handleRect;
+
+            var scrollRect = panelGO.AddComponent<ScrollRect>();
+            scrollRect.content = contentRect;
+            scrollRect.viewport = vpRect;
+            scrollRect.horizontal = false;
+            scrollRect.vertical = true;
+            scrollRect.movementType = ScrollRect.MovementType.Clamped;
+            scrollRect.verticalScrollbar = scrollbar;
+            scrollRect.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHideAndExpandViewport;
+            scrollRect.scrollSensitivity = 24f;
+
+            var sizer = panelGO.AddComponent<ScrollPanelHeightController>();
+            sizer.PanelRect = panelRect;
+            sizer.ContentRect = contentRect;
+            sizer.MaxHeight = maxHeight;
+
+            return contentGO.transform;
+        }
+
+        /// Keeps a scrolling panel's outer height matched to its content's natural size, capped
+        /// at MaxHeight - the scrolling equivalent of the plain ContentSizeFitter every other
+        /// panel puts directly on itself, which can't cap. Foldouts opening/closing and lists
+        /// like the scene object list rebuilding change content height continuously after the
+        /// panel is first built, so this re-measures every frame rather than once at
+        /// construction - the same cheap per-frame poll idiom SculptUIBuilder/
+        /// SceneGraphUIBuilder already use for their own refresh checks.
+        private sealed class ScrollPanelHeightController : MonoBehaviour
+        {
+            public RectTransform PanelRect;
+            public RectTransform ContentRect;
+            public float MaxHeight;
+
+            private void LateUpdate()
+            {
+                if (PanelRect == null || ContentRect == null) return;
+                LayoutRebuilder.ForceRebuildLayoutImmediate(ContentRect);
+                float target = Mathf.Min(ContentRect.rect.height, MaxHeight);
+                if (Mathf.Abs(PanelRect.sizeDelta.y - target) > 0.5f)
+                    PanelRect.sizeDelta = new Vector2(PanelRect.sizeDelta.x, target);
+            }
         }
 
         public static Text CreateLabel(Transform parent, string text, int fontSize = 14, FontStyle style = FontStyle.Normal)
