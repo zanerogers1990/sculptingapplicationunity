@@ -23,6 +23,13 @@ namespace Sculpting
 
         private MeshFilter _meshFilter;
         private MeshCollider _meshCollider;
+        private Renderer _renderer;
+        // Visibility toggle for the Scene Graph panel (see SelectionManager.SetVisible) -
+        // toggles Renderer.enabled rather than GameObject.SetActive so the object stays
+        // registered/selectable and its MonoBehaviours keep running while hidden, just
+        // invisible - matches "hide an arm to see the torso" without the object disappearing
+        // from the scene list.
+        private bool _visible = true;
         private Mesh _mesh;
         private Vector3[] _originalVertices;
         private Vector3[] _workingVertices;
@@ -56,7 +63,16 @@ namespace Sculpting
         // Per-vertex concavity/convexity, recomputed after every stroke and written into the
         // mesh's vertex colors (.r) for SculptPBR's cavity coloring - see RecomputeCavity.
         private Color[] _cavityColors;
-        private const float CavitySensitivity = 25f;
+        // Raw (unsmoothed, pre-sensitivity) curvature per vertex, kept as its own array so the
+        // one-ring blur in EncodeCavityAt has unsmoothed neighbour values to average - blurring
+        // in place would feed already-blurred values back in and diffuse far more than intended.
+        private float[] _cavityRaw;
+        // Scales CurvatureAt's dimensionless output into the -1..1 encoded range. Was 25 back
+        // when curvature was a RAW DISTANCE (see CurvatureAt for why that was wrong); a
+        // size-relative input needs a far smaller multiplier. A sphere reads about -0.5 by
+        // construction, so this leaves a plain ball comfortably inside the range and lets
+        // genuine creases saturate.
+        private const float CavitySensitivity = 1.2f;
 
         // Per-vertex mask: 0 = fully sculptable (default), 1 = fully protected. Every brush
         // loop multiplies its falloff weight by (1 - Mask[i]), so a masked area simply doesn't
@@ -64,7 +80,7 @@ namespace Sculpting
         // RestoreSnapshot) - a mask painted before a Remesh has no well-defined mapping onto
         // the remeshed vertex set, so starting fresh is the honest behavior rather than a
         // stale/misaligned carryover. Mirrored into _cavityColors' G channel (see PaintMask/
-        // RecomputeCavityAt) for SculptPBR's mask tint - .r stays cavity, .g is mask, so the two
+        // EncodeCavityAt) for SculptPBR's mask tint - .r stays cavity, .g is mask, so the two
         // overlays are independent.
         private float[] _mask;
 
@@ -95,8 +111,17 @@ namespace Sculpting
         public Mesh Mesh => _mesh;
         public Vector3[] Vertices => _workingVertices;
         public Vector3[] Normals => _workingNormals;
+        public int[] Triangles => _workingTriangles;
         public bool CanUndo => _history.CanUndo;
         public bool CanRedo => _history.CanRedo;
+
+        public bool Visible => _visible;
+
+        public void SetVisible(bool visible)
+        {
+            _visible = visible;
+            if (_renderer != null) _renderer.enabled = visible;
+        }
 
         /// A set of vertices captured by SelectGrab, with smoothstep falloff weights, that
         /// can be dragged as a unit via ApplyGrabDelta. Kept as an immutable value the
@@ -120,6 +145,7 @@ namespace Sculpting
         private void Awake()
         {
             _meshFilter = GetComponent<MeshFilter>();
+            _renderer = GetComponent<Renderer>();
 
             _mesh = Instantiate(_meshFilter.sharedMesh);
             _mesh.name = _meshFilter.sharedMesh.name + " (Sculpt Instance)";
@@ -142,6 +168,7 @@ namespace Sculpting
             BuildAdjacency();
             RebuildTriangleGrid();
             _cavityColors = new Color[_workingVertices.Length];
+            _cavityRaw = new float[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
@@ -156,8 +183,25 @@ namespace Sculpting
             }
         }
 
+        // Registers with the scene's SelectionManager (see its class remarks for why this
+        // deliberately doesn't happen in Awake - a component that needs Register to have
+        // already run should read it from Start(), not Awake, since OnEnable order between
+        // separate GameObjects isn't guaranteed either). Also covers a runtime-spawned object
+        // (PrimitiveSpawner/MeshMirror AddComponent<SculptableMesh>()), whose Awake+OnEnable
+        // fire synchronously the moment the component is added.
+        private void OnEnable()
+        {
+            FindFirstObjectByType<SelectionManager>()?.Register(this);
+        }
+
         private void OnDestroy()
         {
+            // Idempotent alongside SelectionManager.DeleteObject's own explicit Unregister
+            // (List.Remove on an already-removed item is a harmless no-op) - this is the
+            // fallback for any OTHER path that destroys this GameObject directly (e.g.
+            // MeshJoiner destroying a non-survivor), so it can never be left stuck in
+            // AllObjects.
+            FindFirstObjectByType<SelectionManager>()?.Unregister(this);
             _gpuScatter?.Dispose();
             if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
             if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
@@ -531,8 +575,41 @@ namespace Sculpting
         /// whole array on every access.
         private void RecomputeCavity()
         {
+            // Every caller of the full recompute (Awake / Remesh / ReplaceMesh) is exactly the
+            // case where the object's size can have changed, so the scale is refreshed here
+            // rather than at each of those call sites.
+            UpdateCavityLengthScale();
+            EnsureAdjacency();
+            EnsureCavityBuffers();
+            // Two passes, because the encode step blurs across neighbours: every raw value has
+            // to exist before any of them is read.
+            double sum = 0.0; // double, not float - this accumulates millions of terms
             for (int i = 0; i < _workingVertices.Length; i++)
-                RecomputeCavityAt(i);
+            {
+                _cavityRaw[i] = CurvatureAt(i);
+                sum += _cavityRaw[i];
+            }
+            // The DC term EncodeCavityAt subtracts. Computed only on a full recompute, so a
+            // stroke never shifts the whole mesh's tint out from under itself - a brush changes
+            // the average curvature of a whole object negligibly, and a mean that drifted every
+            // frame would make untouched geometry flicker.
+            _cavityMean = _workingVertices.Length > 0 ? (float)(sum / _workingVertices.Length) : 0f;
+
+            for (int i = 0; i < _workingVertices.Length; i++) EncodeCavityAt(i);
+        }
+
+        private float _cavityMean;
+
+        /// Rebuild-if-null, the same treatment _adjacency/_triangleGrid/_gpuScatter get: a
+        /// mid-Play script recompile triggers a domain reload that does not preserve these
+        /// caches, and a stroke immediately afterward would otherwise NullReference. Also covers
+        /// a length mismatch, which would mean the buffers survived a topology change they
+        /// should not have.
+        private void EnsureCavityBuffers()
+        {
+            int n = _workingVertices.Length;
+            if (_cavityRaw == null || _cavityRaw.Length != n) _cavityRaw = new float[n];
+            if (_cavityColors == null || _cavityColors.Length != n) _cavityColors = new Color[n];
         }
 
         // Reused across RecomputeCavityLocal calls - see ApplyVerticesLocal.
@@ -546,6 +623,7 @@ namespace Sculpting
         private void RecomputeCavityLocal(IReadOnlyCollection<int> dirtyVertices)
         {
             EnsureAdjacency();
+            EnsureCavityBuffers();
             _dirtyCavityScratch.Clear();
             foreach (int vi in dirtyVertices)
             {
@@ -554,15 +632,126 @@ namespace Sculpting
                 for (int i = 0; i < neighbors.Length; i++) _dirtyCavityScratch.Add(neighbors[i]);
             }
 
-            foreach (int i in _dirtyCavityScratch)
-                RecomputeCavityAt(i);
+            // Same two-pass split as the full recompute. The encode pass reads raw values one
+            // ring beyond this set, which are left over from before the stroke and so are very
+            // slightly stale - that only softens the blur at the footprint's rim by a fraction
+            // of a vertex, and widening the recompute by another ring every frame would cost
+            // far more than it could possibly be worth.
+            foreach (int i in _dirtyCavityScratch) _cavityRaw[i] = CurvatureAt(i);
+            foreach (int i in _dirtyCavityScratch) EncodeCavityAt(i);
         }
 
-        private void RecomputeCavityAt(int i)
+        /// Discrete mean curvature at a vertex, expressed relative to the object's own size:
+        /// mean over neighbours of dot(direction to neighbour, normal) / |direction|^2, scaled
+        /// by _cavityLengthScale. 0 on a flat surface, positive in a concave valley, negative
+        /// on a convex ridge.
+        ///
+        /// Both divisions matter, and each fixes a different half of the same bug. The original
+        /// version measured dot(neighbourAverage - vertex, normal) - a raw DISTANCE, which for a
+        /// sphere of radius R with edge length e scales as e^2/R, so it collapsed toward zero as
+        /// a mesh got denser. It had been tuned against a ~500-vertex sphere; on a 442k-vertex
+        /// imported model (edges ~100x shorter) the identical shape produced values ~10,000x
+        /// smaller, flattening the whole mesh to a uniform 0.5 and making the cavity controls
+        /// look broken on exactly the dense models they matter most for.
+        ///
+        /// Dividing by |d| once gives dot(unit, normal), which still scales as e/R - measurably
+        /// better but still density-dependent (verified: mean drifted 0.20 -> 0.44 -> 0.48
+        /// across the same sphere at 515 / 10.7k / 91.5k vertices). Dividing by |d|^2 yields
+        /// true curvature ~1/R, which is density-INdependent but now scales with object size;
+        /// multiplying by the object's own extent cancels that too. The result is a pure shape
+        /// measure: the same sphere reads the same at any tessellation and any scale, while a
+        /// crease far sharper than the object is large saturates and pops, which is what cavity
+        /// shading is for.
+        private float CurvatureAt(int i)
         {
-            Vector3 avg = GetNeighborAverage(i);
-            float curvature = Vector3.Dot(avg - _workingVertices[i], _workingNormals[i]);
-            float normalized = Mathf.Clamp(curvature * CavitySensitivity, -1f, 1f);
+            EnsureAdjacency();
+            int[] neighbors = _adjacency[i];
+            if (neighbors.Length == 0) return 0f;
+
+            Vector3 p = _workingVertices[i];
+            Vector3 n = _workingNormals[i];
+
+            // Accumulate first, divide ONCE - not dot(d,n)/|d|^2 per neighbour. Both give the
+            // same answer on a regular mesh, but the per-edge form divides by each individual
+            // edge length, so one unusually short edge produces a huge term. Surface Nets output
+            // is full of those (its one-vertex-per-cell placement puts neighbours at wildly
+            // varying distances), and the per-edge version turned that into visible speckle:
+            // measured stdev 0.19 on a remeshed sphere against 0.007 on the authored one, with
+            // values pinned at both 0 and 1. Averaging the offsets and the squared lengths
+            // separately keeps the same curvature estimate while letting a stray short edge
+            // barely move it.
+            Vector3 offsetSum = Vector3.zero;
+            float sqrLenSum = 0f;
+            int counted = 0;
+            for (int k = 0; k < neighbors.Length; k++)
+            {
+                Vector3 d = _workingVertices[neighbors[k]] - p;
+                float sqrLen = d.sqrMagnitude;
+                // Skip coincident vertices - welded/degenerate geometry does occur, and a NaN
+                // here would propagate into the vertex colours and the rendered mesh.
+                if (sqrLen < 1e-18f) continue;
+                offsetSum += d;
+                sqrLenSum += sqrLen;
+                counted++;
+            }
+            if (counted == 0 || sqrLenSum <= 0f) return 0f;
+
+            // dot(meanOffset, normal) has units of length; dividing by the mean SQUARED edge
+            // length gives 1/length (true curvature); multiplying by the object's extent makes
+            // it dimensionless. No square roots anywhere on this path, which matters because it
+            // runs per touched vertex on every stroke.
+            float meanSqrLen = sqrLenSum / counted;
+            return Vector3.Dot(offsetSum / counted, n) / meanSqrLen * _cavityLengthScale;
+        }
+
+        /// Characteristic size of the object in LOCAL space, used to make CurvatureAt's true
+        /// curvature (units of 1/length) dimensionless. Refreshed on a full recompute only -
+        /// Awake, Remesh and ReplaceMesh - not per stroke: a brush changes the silhouette far
+        /// too little to be worth an O(n) bounds pass every frame, and a cavity tint that
+        /// subtly rescaled itself mid-stroke would read as flicker.
+        private float _cavityLengthScale = 1f;
+
+        private void UpdateCavityLengthScale()
+        {
+            if (_workingVertices == null || _workingVertices.Length == 0) { _cavityLengthScale = 1f; return; }
+
+            Vector3 min = _workingVertices[0], max = _workingVertices[0];
+            for (int i = 1; i < _workingVertices.Length; i++)
+            {
+                min = Vector3.Min(min, _workingVertices[i]);
+                max = Vector3.Max(max, _workingVertices[i]);
+            }
+            Vector3 extents = (max - min) * 0.5f;
+            _cavityLengthScale = Mathf.Max(extents.x, Mathf.Max(extents.y, extents.z));
+            if (_cavityLengthScale < 1e-6f) _cavityLengthScale = 1f;
+        }
+
+        /// Turns raw curvature into the encoded 0..1 vertex-colour value, blurring across the
+        /// vertex's one-ring on the way.
+        ///
+        /// The blur is not cosmetic polish - without it the measure is unusable on remeshed
+        /// geometry. Surface Nets places one vertex per grid cell, so its output is genuinely
+        /// bumpy at the cell scale, and true curvature (which is what CurvatureAt now reports)
+        /// faithfully reports that bumpiness as very high: measured stdev 0.185 with 21% of
+        /// vertices pinned at 0 or 1 on a remeshed sphere, against 0.007 on the same shape as
+        /// authored. That reads as speckle rather than shading. Averaging over the one-ring
+        /// suppresses per-vertex noise while leaving real creases - which span many vertices -
+        /// essentially untouched.
+        private void EncodeCavityAt(int i)
+        {
+            int[] neighbors = _adjacency[i];
+            float sum = _cavityRaw[i];
+            for (int k = 0; k < neighbors.Length; k++) sum += _cavityRaw[neighbors[k]];
+            float smoothed = sum / (neighbors.Length + 1);
+
+            // Subtracting the mesh-wide mean makes this a high-pass of curvature, which is what
+            // "cavity" actually means: tint where the surface departs from its own overall
+            // curvature, not wherever it is curved at all. Without it every convex object is
+            // uniformly peak-tinted - a plain sphere measured a flat 0.199 across its whole
+            // surface, which the shader renders as a solid peak colour rather than the neutral
+            // it should be. Now a smooth ball sits at ~0.5 (neutral), while a crease or ridge,
+            // whose curvature departs sharply from the body it sits on, still swings hard.
+            float normalized = Mathf.Clamp((smoothed - _cavityMean) * CavitySensitivity, -1f, 1f);
             float encoded = 0.5f + normalized * 0.5f;
             // .r = cavity, .g = mask (see _mask remarks) - .b mirrors .r, unused by the shader
             // today but harmless to keep populated in case something else ever samples it.
@@ -630,6 +819,25 @@ namespace Sculpting
             for (int i = 0; i < _mask.Length; i++)
             {
                 _mask[i] = 1f - _mask[i];
+                Color c = _cavityColors[i];
+                c.g = _mask[i];
+                _cavityColors[i] = c;
+            }
+            _mesh.colors = _cavityColors;
+        }
+
+        /// Restores a saved mask (see SceneSerializer). Mirrors InvertMask's body exactly: the
+        /// mask is stored twice - in _mask (what the brushes read) and in _cavityColors[i].g
+        /// (what the shader reads to tint protected areas) - so writing only _mask would restore
+        /// the behaviour with no visual feedback at all. Silently ignores a length mismatch
+        /// rather than throwing: that means the file's geometry and mask disagree, and a mesh
+        /// with no mask is a far better failure than a half-applied one.
+        public void SetMask(float[] mask)
+        {
+            if (mask == null || _mask == null || mask.Length != _mask.Length) return;
+            for (int i = 0; i < _mask.Length; i++)
+            {
+                _mask[i] = Mathf.Clamp01(mask[i]);
                 Color c = _cavityColors[i];
                 c.g = _mask[i];
                 _cavityColors[i] = c;
@@ -780,6 +988,7 @@ namespace Sculpting
             BuildAdjacency();
             RebuildTriangleGrid();
             _cavityColors = new Color[_workingVertices.Length];
+            _cavityRaw = new float[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
@@ -865,16 +1074,23 @@ namespace Sculpting
             // _mesh.vertices here silently remeshed from the stale pre-sculpt shape instead of
             // the actual sculpted one. _workingTriangles is topology, unaffected either way,
             // but reading it avoids the same needless full-array copy _mesh.triangles would do.
-            Mesh remeshed = MeshRemesher.Remesh(_workingVertices, _workingTriangles, resolution);
-            remeshed.name = _mesh.name;
-            remeshed.MarkDynamic();
+            ReplaceMesh(MeshRemesher.Remesh(_workingVertices, _workingTriangles, resolution));
+        }
 
-            _mesh = remeshed;
+        /// Swaps in an entirely new mesh (different topology/vertex count) and rebuilds every
+        /// piece of derived state from it - adjacency, triangle-raycast grid, cavity/mask
+        /// buffers, GPU scatter binding, collider. Extracted from Remesh()'s own tail so
+        /// MeshJoiner can reuse the identical rebuild after Mesh.CombineMeshes without
+        /// duplicating it. Same tradeoff Remesh() already accepted: drops whatever UVs the
+        /// source mesh had (harmless - SculptPBR's Attributes struct has no TEXCOORD0 input).
+        public void ReplaceMesh(Mesh newMesh)
+        {
+            newMesh.name = _mesh.name;
+            newMesh.MarkDynamic();
+
+            _mesh = newMesh;
             _meshFilter.mesh = _mesh;
 
-            // Read before ConfigureGpuVertexLayout resets the buffer - drops the spherical UVs
-            // MeshRemesher assigned, same already-accepted tradeoff as RestoreSnapshot's
-            // full-rebuild path (harmless: SculptPBR's Attributes struct has no TEXCOORD0).
             _originalVertices = _mesh.vertices;
             _workingVertices = (Vector3[])_originalVertices.Clone();
             _workingNormals = _mesh.normals;
@@ -888,6 +1104,7 @@ namespace Sculpting
             BuildAdjacency();
             RebuildTriangleGrid();
             _cavityColors = new Color[_workingVertices.Length];
+            _cavityRaw = new float[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
             RecomputeCavity();
             _mesh.colors = _cavityColors;
