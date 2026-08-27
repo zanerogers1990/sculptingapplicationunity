@@ -626,6 +626,7 @@ GameObject:
   - component: {fileID: 803899617}
   - component: {fileID: 803899616}
   - component: {fileID: 803899615}
+  - component: {fileID: 803899620}
   m_Layer: 0
   m_Name: SceneSystems
   m_TagString: Untagged
@@ -801,6 +802,18 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d3b8b6001def95647bdc92ea1e108031, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.SelectionManager
+--- !u!114 &803899620
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 803899609}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d67fb3586c41fed4097fa32c559f4275, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.MaskExtractController
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

@@ -63,6 +63,15 @@ namespace Sculpting
         private SelectionManager _selection;
         private int _lastShownSelectionVersion = -1;
 
+        // Mask extract (see BuildExtractSection). The controller owns all the state; these are
+        // just the controls whose enabled-ness and text have to follow it.
+        private MaskExtractController _extract;
+        private Button _extractAcceptButton, _extractCancelButton;
+        private Text _extractStatusLabel;
+        private bool _lastShownExtractPreviewing;
+        private int _lastShownExtractTris = -1;
+        private string _lastShownExtractError = "\0"; // sentinel: never equal to a real value, so the first poll always draws
+
         private static readonly BrushAlphaType[] AlphaTypes =
         {
             BrushAlphaType.SoftCircle, BrushAlphaType.Noise, BrushAlphaType.Bumps,
@@ -148,6 +157,7 @@ namespace Sculpting
             if (_redoButton != null) _redoButton.interactable = controller.CanRedo;
 
             RefreshMirrorToggles();
+            RefreshExtractStatus();
 
             if (_polyCountLabel != null)
             {
@@ -303,6 +313,8 @@ namespace Sculpting
             CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v);
             CreateButton(maskFoldout, "Invert Mask", () => controller.InvertMask());
 
+            BuildExtractSection(panel.transform);
+
             // Collapsed by default (see UIFactory.CreateFoldoutSection) - with this section
             // expanded, the top-left panel's height was tall enough to run into the
             // Material panel anchored at the bottom-left corner.
@@ -432,6 +444,105 @@ namespace Sculpting
         {
             for (int i = 0; i < AlphaTypes.Length; i++)
                 _alphaButtonImages[i].color = controller.AlphaType == AlphaTypes[i] ? ActiveColor : InactiveColor;
+        }
+
+        // ------------------------------------------------------------------------- extract
+
+        /// Mask extract (ZBrush-style): pull the masked region off the surface as a solid,
+        /// separate object. Sits directly under Masking because the mask IS its input - the
+        /// workflow is paint a mask, open this, dial it in against the live preview, Accept.
+        ///
+        /// Collapsed by default like every other shaping foldout. Every slider writes straight
+        /// through to MaskExtractController, whose setters rebuild the preview themselves, so
+        /// there's no refresh plumbing here - dragging a slider with no preview open is a plain
+        /// value assignment.
+        private void BuildExtractSection(Transform panel)
+        {
+            _extract = FindFirstObjectByType<MaskExtractController>();
+            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Extract (from Mask)", false);
+
+            if (_extract == null)
+            {
+                CreateLabel(foldout, "No MaskExtractController in scene.", 11, FontStyle.Italic);
+                return;
+            }
+
+            CreateLabel(foldout, "Thickness", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0.002f, 0.5f, _extract.ThicknessFraction, v => _extract.ThicknessFraction = v);
+
+            CreateLabel(foldout, "Offset (sink <-> float)", 12, FontStyle.Normal);
+            CreateSlider(foldout, -0.25f, 0.25f, _extract.OffsetFraction, v => _extract.OffsetFraction = v);
+
+            CreateLabel(foldout, "Edge Falloff (slab <-> feathered)", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0f, 1f, _extract.FalloffAmount, v => _extract.FalloffAmount = v);
+
+            CreateLabel(foldout, "Border Smoothing", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0f, 20f, _extract.BorderSmoothing, v => _extract.BorderSmoothing = Mathf.RoundToInt(v));
+
+            CreateLabel(foldout, "Surface Smoothing", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0f, 20f, _extract.SurfaceSmoothing, v => _extract.SurfaceSmoothing = Mathf.RoundToInt(v));
+
+            CreateLabel(foldout, "Shrinkwrap (inner face to body)", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0f, 1f, _extract.Shrinkwrap, v => _extract.Shrinkwrap = v);
+
+            CreateLabel(foldout, "Mask Threshold", 12, FontStyle.Normal);
+            CreateSlider(foldout, 0.05f, 0.95f, _extract.MaskThreshold, v => _extract.MaskThreshold = v);
+
+            CreateToggle(foldout, "Extract Unmasked Instead", _extract.InvertRegion,
+                v => _extract.InvertRegion = v, out _);
+
+            CreateButton(foldout, "Preview Extract", () => _extract.BeginPreview());
+            var acceptCancelRow = CreateRow(foldout);
+            _extractAcceptButton = CreateButton(acceptCancelRow.transform, "Accept", () => _extract.Accept());
+            _extractCancelButton = CreateButton(acceptCancelRow.transform, "Cancel", () => _extract.Cancel());
+
+            _extractStatusLabel = CreateLabel(foldout, "", 11, FontStyle.Italic);
+            RefreshExtractStatus();
+        }
+
+        /// Keeps the status line and the Accept/Cancel buttons in step with the controller's
+        /// actual state - the preview can close itself without the UI touching it (the source
+        /// gets deleted, the selection moves, a Remesh wipes the mask), so this is polled rather
+        /// than pushed from the buttons. Only rewrites the label when something actually
+        /// changed, same only-on-change idiom the brush buttons above already use.
+        private void RefreshExtractStatus()
+        {
+            if (_extract == null || _extractStatusLabel == null) return;
+
+            bool previewing = _extract.IsPreviewing;
+            string error = _extract.Error;
+            int tris = _extract.PreviewTriangleCount;
+
+            if (previewing == _lastShownExtractPreviewing &&
+                tris == _lastShownExtractTris &&
+                error == _lastShownExtractError)
+                return;
+
+            _lastShownExtractPreviewing = previewing;
+            _lastShownExtractTris = tris;
+            _lastShownExtractError = error;
+
+            // Accept needs actual geometry; Cancel only needs an open session - a session whose
+            // mask was erased has nothing to commit but still very much needs closing. See
+            // MaskExtractController.IsPreviewing.
+            if (_extractAcceptButton != null) _extractAcceptButton.interactable = _extract.HasPreviewGeometry;
+            if (_extractCancelButton != null) _extractCancelButton.interactable = previewing;
+
+            if (!string.IsNullOrEmpty(error))
+            {
+                _extractStatusLabel.text = error;
+                _extractStatusLabel.color = new Color(0.95f, 0.65f, 0.4f);
+            }
+            else if (previewing)
+            {
+                _extractStatusLabel.text = $"Preview: {tris:N0} tris. Accept to keep.";
+                _extractStatusLabel.color = new Color(0.55f, 0.85f, 0.55f);
+            }
+            else
+            {
+                _extractStatusLabel.text = "Mask a region, then Preview. Accept makes it a new object.";
+                _extractStatusLabel.color = new Color(0.65f, 0.65f, 0.7f);
+            }
         }
 
         // Square icon button showing a live preview of a procedurally-generated brush alpha

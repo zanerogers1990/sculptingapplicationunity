@@ -86,6 +86,13 @@ namespace Sculpting
 
         public float[] Mask => _mask;
 
+        /// Bumped by every operation that changes _mask (painting, inverting, restoring, and the
+        /// wholesale reset a topology change forces). Lets a watcher tell "the mask moved" from
+        /// "nothing happened" without diffing an array that can be millions of entries long -
+        /// same cheap-poll idiom SelectionManager.SelectionVersion already serves for the UI.
+        /// Read by MaskExtractController to keep a live extract preview following the brush.
+        public int MaskVersion { get; private set; }
+
         // Accelerates SelectGrab/QueryNear so a brush stroke doesn't scan every vertex in the
         // mesh every frame - see VertexSpatialGrid. Rebuilt by SculptController at the start
         // of each stroke (RebuildSpatialIndex), and invalidated here whenever the vertex
@@ -829,6 +836,7 @@ namespace Sculpting
                 _cavityColors[i] = c;
                 _paintMaskScratch.Add(i);
             }
+            MaskVersion++;
 
             // Held mask-paint drags call this every frame (see SculptController.ApplyMaskPaint),
             // so at high polycounts this needs the same footprint-scoped GPU write
@@ -853,6 +861,7 @@ namespace Sculpting
                 _cavityColors[i] = c;
             }
             _mesh.colors = _cavityColors;
+            MaskVersion++;
         }
 
         /// Restores a saved mask (see SceneSerializer). Mirrors InvertMask's body exactly: the
@@ -872,6 +881,7 @@ namespace Sculpting
                 _cavityColors[i] = c;
             }
             _mesh.colors = _cavityColors;
+            MaskVersion++;
         }
 
         /// True if anything at all is masked - what TransformGizmo checks to decide whether a
@@ -1276,6 +1286,10 @@ namespace Sculpting
             _cavityColors = new Color[_workingVertices.Length];
             _cavityRaw = new float[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
+            // The new topology has no mapping onto the old mask, so it starts blank - which is
+            // itself a mask change any watcher needs to hear about (a live extract preview
+            // built from the pre-remesh mask is describing geometry that no longer exists).
+            MaskVersion++;
             RecomputeCavity();
             _mesh.colors = _cavityColors;
             BindGpuScatter();

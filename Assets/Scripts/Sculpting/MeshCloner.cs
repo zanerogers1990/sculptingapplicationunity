@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace Sculpting
@@ -32,7 +31,7 @@ namespace Sculpting
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            var go = new GameObject(UniqueName(source.name), typeof(MeshFilter), typeof(MeshRenderer));
+            var go = new GameObject(ObjectNaming.Unique(source.name + " Copy"), typeof(MeshFilter), typeof(MeshRenderer));
             go.transform.SetPositionAndRotation(srcT.position, srcT.rotation);
             go.transform.localScale = srcT.localScale;
             go.GetComponent<MeshFilter>().sharedMesh = mesh;
@@ -65,28 +64,6 @@ namespace Sculpting
             selection?.Select(clone, false);
 
             return clone;
-        }
-
-        /// "Head" -> "Head Copy" -> "Head Copy (2)" ... Names are what the Scene Graph list
-        /// shows and the only way to tell two identically-shaped objects apart, so a duplicate
-        /// name would defeat the point of cloning something you intend to keep both of.
-        private static string UniqueName(string baseName)
-        {
-            var taken = new HashSet<string>();
-            SelectionManager selection = Object.FindFirstObjectByType<SelectionManager>();
-            if (selection != null)
-                foreach (SculptableMesh obj in selection.AllObjects)
-                    if (obj != null) taken.Add(obj.name);
-
-            string candidate = baseName + " Copy";
-            if (!taken.Contains(candidate)) return candidate;
-
-            for (int i = 2; i < 1000; i++)
-            {
-                candidate = $"{baseName} Copy ({i})";
-                if (!taken.Contains(candidate)) return candidate;
-            }
-            return baseName + " Copy";
         }
     }
 }
