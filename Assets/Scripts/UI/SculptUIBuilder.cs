@@ -34,6 +34,7 @@ namespace Sculpting
         private Toggle _positiveToggle;
         private Text _accumulateToggleLabel;
         private Toggle _accumulateToggle;
+        private Slider _accumulateStrengthSlider;
         private Image _moveButtonImage;
         private Image _clayButtonImage;
         private Image _smoothButtonImage;
@@ -62,7 +63,13 @@ namespace Sculpting
         private RectTransform _resizeGaugeRect;
         private RectTransform _resizeGaugeFillRect;
 
-        private void Awake()
+        // Start(), not Awake(): BuildUI() reads controller.Mirror.MirrorX, which now resolves
+        // through SelectionManager.PrimarySelection (see SculptController.Mirror) instead of a
+        // GetComponent on this same GameObject. That needs every SculptableMesh's OnEnable
+        // (where it registers itself - see SelectionManager) to have already run, and Unity
+        // only guarantees ALL objects' Awake+OnEnable are complete before ANY object's Start -
+        // building the UI from Awake() risked racing that registration on scene load.
+        private void Start()
         {
             if (controller == null) controller = FindFirstObjectByType<SculptController>();
             _font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
@@ -117,6 +124,11 @@ namespace Sculpting
                     _accumulateToggle.SetIsOnWithoutNotify(controller.Accumulate);
                     _accumulateToggleLabel.text = controller.Accumulate ? "Accumulate" : "Accumulate (Off)";
                 }
+
+                // Same per-brush memory for Accumulate Strength (see
+                // SculptController._accumulateStrengthPerType).
+                if (_accumulateStrengthSlider != null)
+                    _accumulateStrengthSlider.SetValueWithoutNotify(controller.AccumulateStrength);
             }
 
             if (_undoButton != null) _undoButton.interactable = controller.CanUndo;
@@ -200,6 +212,10 @@ namespace Sculpting
                 _accumulateToggleLabel.text = v ? "Accumulate" : "Accumulate (Off)";
             }, out _accumulateToggleLabel);
 
+            CreateLabel(panel.transform, "Accumulate Strength", 14, FontStyle.Normal);
+            _accumulateStrengthSlider = CreateSlider(panel.transform, 0.1f, 3f, controller.AccumulateStrength,
+                v => controller.AccumulateStrength = v);
+
             var brushRow = CreateRow(panel.transform);
             var moveButton = CreateButton(brushRow.transform, "Move", () => SetBrushType(BrushType.Move));
             var clayButton = CreateButton(brushRow.transform, "Clay", () => SetBrushType(BrushType.Clay));
@@ -239,6 +255,14 @@ namespace Sculpting
             CreateLabel(clayFoldout, "Clay Depth", 12, FontStyle.Normal);
             CreateSlider(clayFoldout, 0.1f, 1.5f, controller.ClayHeightFactor, v => controller.ClayHeightFactor = v);
 
+            CreateLabel(clayFoldout, "Tip Shape (Square <-> Round)", 12, FontStyle.Normal);
+            CreateSlider(clayFoldout, 0f, 1f, controller.ClayTipRoundness, v => controller.ClayTipRoundness = v);
+
+            // Low = flat-topped strip with a hard rim; high = soft-shouldered pad. See
+            // SculptController.clayEdgeSoftness.
+            CreateLabel(clayFoldout, "Tip Softness (Flat <-> Domed)", 12, FontStyle.Normal);
+            CreateSlider(clayFoldout, 0.05f, 1f, controller.ClayEdgeSoftness, v => controller.ClayEdgeSoftness = v);
+
             CreateToggle(clayFoldout, "Use Alpha", controller.UseAlpha, v => controller.UseAlpha = v, out _);
 
             var alphaRow = CreateRow(clayFoldout);
@@ -268,6 +292,16 @@ namespace Sculpting
             CreateSlider(creaseFoldout, 0.05f, 1f, controller.CreaseDepthFactor, v => controller.CreaseDepthFactor = v);
             CreateLabel(creaseFoldout, "Dam Standard Lip Height", 12, FontStyle.Normal);
             CreateSlider(creaseFoldout, 0f, 1f, controller.DamLipHeight, v => controller.DamLipHeight = v);
+
+            // Collapsed by default, same reasoning as "Clay Shaping" above. Both controls are
+            // inert without a stylus - CurrentPressure short-circuits to 1 when Pen.current is
+            // null - but the section is always built rather than hidden on no-pen, since a
+            // tablet can be plugged in after the UI is constructed.
+            Transform pressureFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Stylus Pressure", false);
+            CreateLabel(pressureFoldout, "Light-Touch Floor", 12, FontStyle.Normal);
+            CreateSlider(pressureFoldout, 0f, 0.5f, controller.PressureFloor, v => controller.PressureFloor = v);
+            CreateLabel(pressureFoldout, "Curve (Sensitive <-> Gradual)", 12, FontStyle.Normal);
+            CreateSlider(pressureFoldout, 0.5f, 3f, controller.PressureCurve, v => controller.PressureCurve = v);
 
             CreateLabel(panel.transform, "Mirror (Local Axes)", 14, FontStyle.Normal);
             CreateToggle(panel.transform, "Mirror X", controller.Mirror.MirrorX,
@@ -306,7 +340,7 @@ namespace Sculpting
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std  6 Inflate\nM Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag: resize brush\nLMB Sculpt/Mask | RMB Invert/Erase\nAlt+LMB Orbit | MMB Pan\nScroll Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std  6 Inflate\nM Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             _resizeGaugeGO = CreateResizeGauge(canvasGO.transform);

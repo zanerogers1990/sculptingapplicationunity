@@ -40,10 +40,6 @@ namespace Sculpting
 
         private void Awake()
         {
-            var target = FindFirstObjectByType<SculptableMesh>();
-            Renderer targetRenderer = target != null ? target.GetComponent<Renderer>() : null;
-            if (targetRenderer == null) return;
-
             Shader shader = Shader.Find("Custom/SculptPBR");
             if (shader == null)
             {
@@ -52,8 +48,23 @@ namespace Sculpting
             }
 
             _material = new Material(shader) { name = "Sculpt PBR (Runtime)" };
-            targetRenderer.material = _material;
             Push();
+
+            // Every sculptable object shares this one material instance - applies to whatever
+            // exists at scene start; PrimitiveSpawner/MeshMirror call ApplyTo directly for
+            // anything spawned afterward.
+            foreach (SculptableMesh sm in FindObjectsByType<SculptableMesh>(FindObjectsSortMode.None))
+                ApplyTo(sm.GetComponent<Renderer>());
+        }
+
+        /// Applies the shared runtime material to a renderer - called for every existing
+        /// object in Awake() above, and by PrimitiveSpawner/MeshMirror for objects created
+        /// after startup, so newly spawned/mirrored objects render with the same live-editable
+        /// material instead of Unity's default.
+        public void ApplyTo(Renderer renderer)
+        {
+            if (renderer == null || _material == null) return;
+            renderer.material = _material;
         }
 
         private void Push()
