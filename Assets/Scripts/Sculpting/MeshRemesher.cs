@@ -59,7 +59,7 @@ namespace Sculpting
             int sx = dims.x + 1, sy = dims.y + 1, sz = dims.z + 1;
             var sdf = new float[sx * sy * sz];
 
-            // Sign: one parity ray per (y,z) column, shared by every sample on it.
+            // Sign: one winding-number ray per (y,z) column, shared by every sample on it.
             var inside = new bool[sx * sy * sz];
             field.ComputeInsideMask(origin, cellSize, sx, sy, sz, inside);
 
@@ -214,9 +214,11 @@ namespace Sculpting
 
             var tris = _scratchTris;
             tris.Clear();
-            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 0);
-            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 1);
-            EmitQuads(sdf, cellVertexIndex, dims, sx, sy, tris, axis: 2);
+            EmitQuads(sdf, cellVertexIndex, verts, dims, sx, sy, tris, origin, cellSize, axis: 0);
+            EmitQuads(sdf, cellVertexIndex, verts, dims, sx, sy, tris, origin, cellSize, axis: 1);
+            EmitQuads(sdf, cellVertexIndex, verts, dims, sx, sy, tris, origin, cellSize, axis: 2);
+
+            PatchHoles(verts, tris);
 
             var mesh = new Mesh
             {
@@ -252,9 +254,9 @@ namespace Sculpting
         // every single iteration - at high resolutions those billions of tiny heap allocations
         // (not the arithmetic itself) were the dominant remaining cost after the SDF-sampling
         // and BuildSurface-cell-loop fixes above stopped moving the needle any further.
-        // SampleAt/CellAt below map (axis-coordinate, u-coordinate, v-coordinate) straight to
+        // SampleAt/CellXYZ below map (axis-coordinate, u-coordinate, v-coordinate) straight to
         // a flat index with no allocation at all.
-        private static void EmitQuads(float[] sdf, int[] cellVertexIndex, Vector3Int dims, int sx, int sy, List<int> tris, int axis)
+        private static void EmitQuads(float[] sdf, int[] cellVertexIndex, List<Vector3> verts, Vector3Int dims, int sx, int sy, List<int> tris, Vector3 origin, float cellSize, int axis)
         {
             int nx = dims.x, ny = dims.y, nz = dims.z;
             int u = (axis + 1) % 3;
@@ -270,12 +272,12 @@ namespace Sculpting
                 int z = axis == 2 ? a : u == 2 ? b : c;
                 return SampleIndex(x, y, z, sx, sy);
             }
-            int CellAt(int a, int b, int c)
+            Vector3Int CellXYZ(int a, int b, int c)
             {
                 int x = axis == 0 ? a : u == 0 ? b : c;
                 int y = axis == 1 ? a : u == 1 ? b : c;
                 int z = axis == 2 ? a : u == 2 ? b : c;
-                return x + nx * (y + ny * z);
+                return new Vector3Int(x, y, z);
             }
 
             for (int ea = 0; ea < dimAxis; ea++)
@@ -287,12 +289,29 @@ namespace Sculpting
                 bool signA = va < 0f, signB = vb < 0f;
                 if (signA == signB) continue;
 
-                int i0 = cellVertexIndex[CellAt(ea, bI - 1, cI - 1)];
-                int i1 = cellVertexIndex[CellAt(ea, bI, cI - 1)];
-                int i2 = cellVertexIndex[CellAt(ea, bI, cI)];
-                int i3 = cellVertexIndex[CellAt(ea, bI - 1, cI)];
+                // The sign flip just confirmed above means all four of these cells MUST
+                // contain a crossing (this exact edge is one of each cell's 12) and so should
+                // already hold a Surface Nets vertex from BuildSurface's pass 1 - but on rare
+                // sculpted geometry (two close/near-touching features meeting near the same
+                // cell) that independent per-cell mask check can disagree with this direct
+                // edge check by one cell, which used to silently drop the whole quad here and
+                // leave a permanent hole/crack in the output mesh (a genuine missing face -
+                // no amount of later smoothing or clay can weld it back, since there's no
+                // vertex-position fix for a triangle that was never emitted). Falling back to
+                // synthesizing the missing corner's vertex on demand - it's still a genuine
+                // Surface Nets vertex for that cell, just computed lazily instead of during
+                // the up-front parallel pass - keeps every crossing edge closed.
+                Vector3Int p0 = CellXYZ(ea, bI - 1, cI - 1);
+                Vector3Int p1 = CellXYZ(ea, bI, cI - 1);
+                Vector3Int p2 = CellXYZ(ea, bI, cI);
+                Vector3Int p3 = CellXYZ(ea, bI - 1, cI);
 
-                if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) continue; // guard degenerate boundary cells
+                int i0 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p0, nx, ny, sx, sy, origin, cellSize);
+                int i1 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p1, nx, ny, sx, sy, origin, cellSize);
+                int i2 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p2, nx, ny, sx, sy, origin, cellSize);
+                int i3 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p3, nx, ny, sx, sy, origin, cellSize);
+
+                if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) continue; // truly degenerate (out of grid bounds) - not the hole-causing case above
 
                 if (signA)
                 {
@@ -305,6 +324,161 @@ namespace Sculpting
                     tris.Add(i0); tris.Add(i3); tris.Add(i2);
                 }
             }
+        }
+
+        // See EmitQuads' fallback remarks above - lazily computes (and caches in
+        // cellVertexIndex, so a second lookup for the same cell from a different axis/edge is
+        // free) a Surface Nets vertex for a cell, mirroring BuildSurface's pass-1 math exactly.
+        // Returns -1 only if this cell's 8 corners turn out to be genuinely uniform (all-inside
+        // or all-outside) despite the caller having just observed a sign flip on one of this
+        // cell's edges - defensive; a plain skip is safer than fabricating a wrong position for
+        // a case that (per EmitQuads' remarks) shouldn't occur.
+        private static int GetOrCreateCellVertex(float[] sdf, int[] cellVertexIndex, List<Vector3> verts, Vector3Int cell, int nx, int ny, int sx, int sy, Vector3 origin, float cellSize)
+        {
+            int cellIndex = cell.x + nx * (cell.y + ny * cell.z);
+            int existing = cellVertexIndex[cellIndex];
+            if (existing >= 0) return existing;
+
+            Span<float> corner = stackalloc float[8];
+            int mask = 0;
+            for (int c = 0; c < 8; c++)
+            {
+                Vector3Int co = CubeCorners[c];
+                float val = sdf[SampleIndex(cell.x + co.x, cell.y + co.y, cell.z + co.z, sx, sy)];
+                corner[c] = val;
+                if (val < 0f) mask |= 1 << c;
+            }
+            if (mask == 0 || mask == 255) return -1;
+
+            Vector3 sum = Vector3.zero;
+            int crossings = 0;
+            for (int e = 0; e < CubeEdges.Length; e++)
+            {
+                int a = CubeEdges[e][0], b = CubeEdges[e][1];
+                float va = corner[a], vb = corner[b];
+                if ((va < 0f) == (vb < 0f)) continue;
+                float t = va / (va - vb);
+                sum += Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
+                crossings++;
+            }
+
+            Vector3 localPos = sum / crossings;
+            Vector3 worldPos = origin + (new Vector3(cell.x, cell.y, cell.z) + localPos) * cellSize;
+            int newIndex = verts.Count;
+            verts.Add(worldPos);
+            cellVertexIndex[cellIndex] = newIndex;
+            return newIndex;
+        }
+
+        // Packs an ordered pair of vertex indices into one key. Used two ways below: as a
+        // DIRECTED key (a,b distinct from b,a) when counting triangle-edge occurrences isn't
+        // needed, and via UndirectedEdgeKey (always packing the smaller index first) when it is.
+        private static long EdgeKey(int a, int b) => ((long)a << 32) | (uint)b;
+        private static long UndirectedEdgeKey(int a, int b) => a < b ? EdgeKey(a, b) : EdgeKey(b, a);
+
+        /// Finds every boundary edge Surface Nets left open - used by exactly one triangle,
+        /// with no matching triangle on the other side - walks each into a closed loop, and
+        /// caps it with a fan of triangles from a new centroid vertex. This is what makes the
+        /// output watertight the way DynaMesh/Blender's Voxel Remesh guarantee, rather than
+        /// leaving a permanent hole: naive Surface Nets places exactly one vertex per active
+        /// grid cell, so a genuinely concave pinch where two close/near-touching sculpted
+        /// features pass through the SAME cell as two distinct surface sheets can't be
+        /// represented there - EmitQuads already has a fallback for a related edge case
+        /// (GetOrCreateCellVertex), but the underlying one-vertex-per-cell ambiguity itself
+        /// isn't fixable at the per-cell level; patching the resulting hole afterward is. A
+        /// missing face has no vertex-position fix, which is why this couldn't be solved by
+        /// smoothing/sculpting after the fact before this pass existed - see
+        /// [[project_scene_graph_epic]] memory for the original investigation.
+        ///
+        /// No-ops (after one cheap O(triangle count) scan) on the overwhelmingly common
+        /// watertight case - this only does real work on the rare geometry that actually needs
+        /// it, and even then only touches the small boundary loops themselves, not the mesh at
+        /// large.
+        private static void PatchHoles(List<Vector3> verts, List<int> tris)
+        {
+            int triCount = tris.Count / 3;
+            var edgeCount = new Dictionary<long, int>(triCount * 3 / 2);
+            for (int t = 0; t < triCount; t++)
+            {
+                int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+                IncrementEdge(edgeCount, a, b);
+                IncrementEdge(edgeCount, b, c);
+                IncrementEdge(edgeCount, c, a);
+            }
+
+            // boundaryNext[a] = b means the directed edge a->b (as some triangle listed it) has
+            // no partner triangle traversing it b->a - the classic definition of a mesh
+            // boundary edge, and its direction is exactly the "walk the hole's rim consistently
+            // with the surrounding surface's winding" direction.
+            var boundaryNext = new Dictionary<int, int>();
+            for (int t = 0; t < triCount; t++)
+            {
+                int a = tris[t * 3], b = tris[t * 3 + 1], c = tris[t * 3 + 2];
+                RecordIfBoundary(edgeCount, boundaryNext, a, b);
+                RecordIfBoundary(edgeCount, boundaryNext, b, c);
+                RecordIfBoundary(edgeCount, boundaryNext, c, a);
+            }
+
+            if (boundaryNext.Count == 0) return;
+
+            var visited = new HashSet<int>();
+            var loop = new List<int>();
+            foreach (int startVertex in boundaryNext.Keys)
+            {
+                if (visited.Contains(startVertex) || boundaryNext[startVertex] < 0) continue;
+
+                loop.Clear();
+                int current = startVertex;
+                bool closed = false;
+                int guard = boundaryNext.Count + 1;
+                while (guard-- > 0)
+                {
+                    if (!visited.Add(current)) break; // shouldn't happen before closing - bail out safely
+                    loop.Add(current);
+                    if (!boundaryNext.TryGetValue(current, out int next) || next < 0) break;
+                    if (next == startVertex) { closed = true; break; }
+                    current = next;
+                }
+
+                // An unclosed or degenerate walk means a non-manifold branch or a malformed
+                // loop this simple algorithm can't safely fill - leave it as an open edge
+                // rather than fabricate a wrong cap.
+                if (!closed || loop.Count < 3) continue;
+
+                Vector3 centroid = Vector3.zero;
+                for (int i = 0; i < loop.Count; i++) centroid += verts[loop[i]];
+                centroid /= loop.Count;
+                int centroidIndex = verts.Count;
+                verts.Add(centroid);
+
+                for (int i = 0; i < loop.Count; i++)
+                {
+                    int a = loop[i];
+                    int b = loop[(i + 1) % loop.Count];
+                    // Any two triangles sharing a manifold edge always traverse it in opposite
+                    // directions - since the boundary edge itself is a->b, the cap triangle
+                    // filling the gap on the other side must list it b->a to keep the new
+                    // face's normal pointing the same way as the surrounding surface.
+                    tris.Add(b); tris.Add(a); tris.Add(centroidIndex);
+                }
+            }
+        }
+
+        private static void IncrementEdge(Dictionary<long, int> counts, int a, int b)
+        {
+            long key = UndirectedEdgeKey(a, b);
+            counts.TryGetValue(key, out int existing);
+            counts[key] = existing + 1;
+        }
+
+        private static void RecordIfBoundary(Dictionary<long, int> counts, Dictionary<int, int> boundaryNext, int a, int b)
+        {
+            if (counts[UndirectedEdgeKey(a, b)] != 1) return;
+            // More than one boundary edge starting at the same vertex means 3+ surface sheets
+            // meet there (a non-manifold branch) - exactly the kind of case a simple loop-walk
+            // can't represent. Mark it unpatchable (-1) rather than silently picking one branch.
+            if (boundaryNext.ContainsKey(a)) boundaryNext[a] = -1;
+            else boundaryNext[a] = b;
         }
 
         private static Bounds ComputeBounds(Vector3[] verts)

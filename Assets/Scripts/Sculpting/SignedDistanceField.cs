@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using UnityEngine;
@@ -6,7 +7,7 @@ namespace Sculpting
 {
     /// Accelerated signed distance queries against a static triangle soup, used by
     /// MeshRemesher to sample its voxel grid. Distance magnitude comes from the nearest
-    /// triangle; sign comes from a parity ray cast, which (unlike a nearest-face-normal
+    /// triangle; sign comes from a winding-number ray cast, which (unlike a nearest-face-normal
     /// heuristic) stays correct across concave folds and overhangs that sculpting produces.
     internal class SignedDistanceField
     {
@@ -79,7 +80,19 @@ namespace Sculpting
         // allocations while staying safe under concurrent access (a single shared buffer
         // would not be).
         private static readonly ThreadLocal<HashSet<int>> _testedPool = new ThreadLocal<HashSet<int>>(() => new HashSet<int>());
-        private static readonly ThreadLocal<List<float>> _crossingsPool = new ThreadLocal<List<float>>(() => new List<float>());
+        private static readonly ThreadLocal<List<Crossing>> _crossingsPool = new ThreadLocal<List<Crossing>>(() => new List<Crossing>());
+
+        /// One ray/surface crossing along a column's +X ray: where it happened, and whether the
+        /// ray was entering (+1) or leaving (-1) the surface there. Implements IComparable so
+        /// List.Sort() orders by X through the default comparer - no Comparison delegate, since
+        /// this sorts once per (y,z) column and that is a resolution^2-scaling call count.
+        private readonly struct Crossing : IComparable<Crossing>
+        {
+            public readonly float X;
+            public readonly int Winding;
+            public Crossing(float x, int winding) { X = x; Winding = winding; }
+            public int CompareTo(Crossing other) => X.CompareTo(other.X);
+        }
 
         public float NearestUnsignedDistance(Vector3 p)
         {
@@ -119,7 +132,7 @@ namespace Sculpting
         // Fills insideOut (flattened x + sx*(y + sy*z), matching MeshRemesher's sdf layout)
         // with the inside/outside sign for every sample on the grid. Casts one +X ray per
         // (y,z) column instead of one per sample point: the crossings along that column are
-        // shared by every sample on it, so a single sorted sweep gives every sample's parity
+        // shared by every sample on it, so a single sorted sweep gives every sample's winding
         // in one pass instead of a full column walk per sample. Columns are independent, so
         // they run in parallel across cores.
         public void ComputeInsideMask(Vector3 origin, float cellSize, int sx, int sy, int sz, bool[] insideOut)
@@ -163,31 +176,53 @@ namespace Sculpting
                     Vector3 a = vertices[triangles[t * 3]];
                     Vector3 b = vertices[triangles[t * 3 + 1]];
                     Vector3 c = vertices[triangles[t * 3 + 2]];
-                    if (RayIntersectsTriangleX(rayOrigin, a, b, c, out float hitX))
-                        crossings.Add(hitX);
+                    if (RayIntersectsTriangleX(rayOrigin, a, b, c, out float hitX, out int winding))
+                        crossings.Add(new Crossing(hitX, winding));
                 }
             }
 
             crossings.Sort();
 
+            // Accumulates a WINDING NUMBER rather than flipping an even-odd parity bit.
+            // Parity is only correct for a single closed manifold: MeshJoiner concatenates two
+            // (or more) closed shells without welding them (by design - it's Merge Down, not a
+            // boolean), so a ray through the region where those shells OVERLAP crosses four
+            // surfaces and parity reports "outside" there. That carved a hollow out of exactly
+            // the intersection volume - the visible breakage when remeshing joined objects.
+            // Parity computes the shells' XOR; summing signed crossings computes their union.
+            // Same fix also covers a SINGLE mesh sculpted until it self-intersects (a fold
+            // pushed through its own surface), which parity broke identically.
+            //
+            // Tested against `!= 0` rather than `> 0` deliberately: a shell whose winding runs
+            // opposite the rest (a mirrored/negatively-scaled object baked in by Join, say)
+            // still reads as solid instead of vanishing. The tradeoff is that inverted winding
+            // can't be used to express a boolean SUBTRACTION - if boolean ops land later, that
+            // wants its own explicit per-shell sign, not an accident of triangle order here.
             int ci = 0;
-            bool inside = false;
+            int windingNumber = 0;
             for (int x = 0; x < sx; x++)
             {
                 float wx = origin.x + x * cellSize;
-                while (ci < crossings.Count && crossings[ci] < wx)
+                while (ci < crossings.Count && crossings[ci].X < wx)
                 {
-                    inside = !inside;
+                    windingNumber += crossings[ci].Winding;
                     ci++;
                 }
-                insideOut[x + sx * (y + sy * z)] = inside;
+                insideOut[x + sx * (y + sy * z)] = windingNumber != 0;
             }
         }
 
-        // Moller-Trumbore ray-triangle intersection with a fixed +X direction.
-        private static bool RayIntersectsTriangleX(Vector3 origin, Vector3 a, Vector3 b, Vector3 c, out float hitX)
+        // Moller-Trumbore ray-triangle intersection with a fixed +X direction. Also reports
+        // which way the ray passed through the face, for ComputeColumn's winding sum:
+        // det = e1 . (dir x e2) = -dir . (e1 x e2), and (e1 x e2) is exactly the triangle
+        // normal Unity's own RecalculateNormals builds - so it points OUTWARD on a correctly
+        // wound mesh. dir . normal < 0 means the ray is going against the outward normal, i.e.
+        // ENTERING the solid, and that is det > 0. Falling out of the same det the intersection
+        // test already needs means the facing test costs nothing extra.
+        private static bool RayIntersectsTriangleX(Vector3 origin, Vector3 a, Vector3 b, Vector3 c, out float hitX, out int winding)
         {
             hitX = 0f;
+            winding = 0;
             Vector3 dir = new Vector3(1f, 0f, 0f);
             Vector3 e1 = b - a, e2 = c - a;
             Vector3 h = Vector3.Cross(dir, e2);
@@ -206,6 +241,7 @@ namespace Sculpting
             float t = Vector3.Dot(e2, q) * invDet;
             if (t < 0f) return false;
             hitX = origin.x + t;
+            winding = det > 0f ? 1 : -1;
             return true;
         }
 
