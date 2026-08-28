@@ -16,6 +16,15 @@ Shader "Custom/SculptPBR"
         _CavityIntensity("Cavity Intensity", Range(0,2)) = 1.0
         _CavityRange("Cavity Range", Range(0.05,0.6)) = 0.25
 
+        // Matcap ("material capture", as in ZBrush/Blender/Nomad): a photo of a sphere shaded
+        // exactly how the surface should look, indexed by the view-space normal. It replaces
+        // the whole lit result rather than feeding into it - a matcap already has its lighting
+        // baked in, so running it through UniversalFragmentPBR would light it twice.
+        _MatcapEnabled("Matcap Enabled", Float) = 0
+        _MatcapTex("Matcap", 2D) = "white" {}
+        _MatcapIntensity("Matcap Intensity", Range(0,3)) = 1.0
+        _MatcapTintStrength("Matcap Tint By Base Color", Range(0,1)) = 0.0
+
         // Darker grey rather than a saturated color - matches ZBrush/Blender/Mudbox's
         // convention of shading masked areas toward grey/black instead of tinting them a
         // color, so the mask overlay doesn't read as "painted" onto the surface.
@@ -107,7 +116,13 @@ Shader "Custom/SculptPBR"
                 half _CavityRange;
                 half4 _MaskTintColor;
                 half _MaskTintStrength;
+                half _MatcapEnabled;
+                half _MatcapIntensity;
+                half _MatcapTintStrength;
             CBUFFER_END
+
+            TEXTURE2D(_MatcapTex);
+            SAMPLER(sampler_MatcapTex);
 
             // Compact hashed value noise for a small tangent/UV-independent surface
             // micro-bump (see _NormalStrength). The mesh's spherical remesh UVs get badly
@@ -160,6 +175,24 @@ Shader "Custom/SculptPBR"
                 return normalize(n - tangentialGrad * _NormalStrength);
             }
 
+            // Shades `color` by the per-vertex cavity term - vertex color .r: 0 = convex/peak,
+            // 0.5 = flat, 1 = concave/recess, written by SculptableMesh.RecomputeCavity after
+            // every stroke. Pulled out of the fragment body so the matcap path can run the same
+            // ramp over the matcap's color that the PBR path runs over the albedo: cavity is a
+            // property of the geometry, not of which shading model happens to be switched on.
+            half3 ApplyCavity(half3 color, half cavity)
+            {
+                half recessT = smoothstep(0.5, 0.5 + _CavityRange, cavity);
+                // HLSL's smoothstep is documented as undefined when the first argument
+                // is greater than the second, so this ramps the same "low edge" -> "0.5"
+                // range and inverts the result rather than calling smoothstep(0.5, 0.5 -
+                // _CavityRange, ...) directly.
+                half peakT = 1.0 - smoothstep(0.5 - _CavityRange, 0.5, cavity);
+                color = lerp(color, _RecessColor.rgb, saturate(recessT * _CavityIntensity));
+                color = lerp(color, _PeakColor.rgb, saturate(peakT * _CavityIntensity));
+                return color;
+            }
+
             Varyings SculptPBRVertex(Attributes input)
             {
                 Varyings output = (Varyings)0;
@@ -175,6 +208,64 @@ Shader "Custom/SculptPBR"
                 output.normalWS = normalInputs.normalWS;
                 output.color = input.color;
                 return output;
+            }
+
+            // Looks the shading up in the matcap by the normal in VIEW space, which is what
+            // pins the lighting to the camera the way ZBrush/Blender/Nomad do it: orbit the
+            // model and the highlight stays put on screen while the surface turns under it.
+            // Deliberately the plain normal.xy mapping rather than a reflection-vector one -
+            // matcaps are authored as an orthographic photo of a sphere, and that is the
+            // mapping they are drawn to be read back with.
+            //
+            // Takes normalWS AFTER flat-shading and the procedural normal detail have had their
+            // say, so faceting and surface grain read through a matcap exactly as they do under
+            // real lights.
+            half3 MatcapShade(float3 normalWS, half cavity)
+            {
+                float3 normalVS = normalize(mul((float3x3)UNITY_MATRIX_V, normalWS));
+                float2 matcapUV = normalVS.xy * 0.5 + 0.5;
+                half3 color = SAMPLE_TEXTURE2D(_MatcapTex, sampler_MatcapTex, matcapUV).rgb * _MatcapIntensity;
+
+                // Cavity goes ON TOP of the matcap, not underneath it. There is no lighting term
+                // in this path for a tinted albedo to survive into, so shading the albedo the way
+                // the PBR path does would have thrown the cavity away entirely.
+                if (_CavityEnabled > 0.5)
+                    color = ApplyCavity(color, cavity);
+
+                // Off by default: a matcap carries its own colour and multiplying the base colour
+                // through it just fights that. Kept as a dial for the grey-clay case, where a
+                // neutral matcap plus a tint is exactly what's wanted.
+                color *= lerp(half3(1, 1, 1), _BaseColor.rgb, _MatcapTintStrength);
+                return color;
+            }
+
+            half4 PhysicallyShade(Varyings input, float3 normalWS, half3 albedo)
+            {
+                InputData inputData = (InputData)0;
+                inputData.positionWS = input.positionWS;
+                inputData.positionCS = input.positionCS;
+                inputData.normalWS = normalWS;
+                inputData.viewDirectionWS = GetWorldSpaceNormalizeViewDir(input.positionWS);
+                inputData.shadowCoord = TransformWorldToShadowCoord(input.positionWS);
+                inputData.fogCoord = 0;
+                inputData.vertexLighting = half3(0, 0, 0);
+                inputData.bakedGI = SampleSHPixel(half3(0, 0, 0), normalWS);
+                inputData.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(input.positionCS);
+                inputData.shadowMask = half4(1, 1, 1, 1);
+
+                SurfaceData surfaceData;
+                surfaceData.albedo = albedo;
+                surfaceData.specular = half3(0, 0, 0);
+                surfaceData.metallic = _Metallic;
+                surfaceData.smoothness = _Smoothness;
+                surfaceData.normalTS = half3(0, 0, 1);
+                surfaceData.emission = half3(0, 0, 0);
+                surfaceData.occlusion = 1.0;
+                surfaceData.alpha = 1.0;
+                surfaceData.clearCoatMask = 0.0;
+                surfaceData.clearCoatSmoothness = 1.0;
+
+                return UniversalFragmentPBR(inputData, surfaceData);
             }
 
             half4 SculptPBRFragment(Varyings input) : SV_Target
@@ -209,47 +300,18 @@ Shader "Custom/SculptPBR"
                 if (_NormalStrength > 0.0001)
                     normalWS = PerturbNormal(normalWS, positionOS);
 
-                half3 albedo = _BaseColor.rgb;
-                if (_CavityEnabled > 0.5)
+                half4 litColor;
+                if (_MatcapEnabled > 0.5)
                 {
-                    // vertex color .r: 0 = convex/peak, 0.5 = flat, 1 = concave/recess
-                    // (written by SculptableMesh.RecomputeCavity after every stroke)
-                    half cavity = input.color.r;
-                    half recessT = smoothstep(0.5, 0.5 + _CavityRange, cavity);
-                    // HLSL's smoothstep is documented as undefined when the first argument
-                    // is greater than the second, so this ramps the same "low edge" -> "0.5"
-                    // range and inverts the result rather than calling smoothstep(0.5, 0.5 -
-                    // _CavityRange, ...) directly.
-                    half peakT = 1.0 - smoothstep(0.5 - _CavityRange, 0.5, cavity);
-                    albedo = lerp(albedo, _RecessColor.rgb, saturate(recessT * _CavityIntensity));
-                    albedo = lerp(albedo, _PeakColor.rgb, saturate(peakT * _CavityIntensity));
+                    litColor = half4(MatcapShade(normalWS, input.color.r), 1.0);
                 }
-
-                InputData inputData = (InputData)0;
-                inputData.positionWS = input.positionWS;
-                inputData.positionCS = input.positionCS;
-                inputData.normalWS = normalWS;
-                inputData.viewDirectionWS = GetWorldSpaceNormalizeViewDir(input.positionWS);
-                inputData.shadowCoord = TransformWorldToShadowCoord(input.positionWS);
-                inputData.fogCoord = 0;
-                inputData.vertexLighting = half3(0, 0, 0);
-                inputData.bakedGI = SampleSHPixel(half3(0, 0, 0), normalWS);
-                inputData.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(input.positionCS);
-                inputData.shadowMask = half4(1, 1, 1, 1);
-
-                SurfaceData surfaceData;
-                surfaceData.albedo = albedo;
-                surfaceData.specular = half3(0, 0, 0);
-                surfaceData.metallic = _Metallic;
-                surfaceData.smoothness = _Smoothness;
-                surfaceData.normalTS = half3(0, 0, 1);
-                surfaceData.emission = half3(0, 0, 0);
-                surfaceData.occlusion = 1.0;
-                surfaceData.alpha = 1.0;
-                surfaceData.clearCoatMask = 0.0;
-                surfaceData.clearCoatSmoothness = 1.0;
-
-                half4 litColor = UniversalFragmentPBR(inputData, surfaceData);
+                else
+                {
+                    half3 albedo = _BaseColor.rgb;
+                    if (_CavityEnabled > 0.5)
+                        albedo = ApplyCavity(albedo, input.color.r);
+                    litColor = PhysicallyShade(input, normalWS, albedo);
+                }
 
                 // vertex color .g: 0 = unmasked, 1 = fully protected (written by
                 // SculptableMesh.PaintMask/RecomputeCavityAt). Darkens the fully-lit result
@@ -258,7 +320,8 @@ Shader "Custom/SculptPBR"
                 // looking just as bright as before, since specular reflectance on a
                 // non-metallic surface is nearly independent of albedo. Post-lighting darkening
                 // matches how ZBrush/Mudbox actually render a mask overlay: a uniformly darker
-                // grey regardless of what's lighting that patch.
+                // grey regardless of what's lighting that patch - and it lands the same way on
+                // the matcap path, which has no lighting term to darken at all.
                 half mask = input.color.g;
                 litColor.rgb = lerp(litColor.rgb, litColor.rgb * _MaskTintColor.rgb, saturate(mask * _MaskTintStrength));
                 return litColor;

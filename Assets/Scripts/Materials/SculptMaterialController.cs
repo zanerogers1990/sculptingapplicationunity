@@ -24,7 +24,16 @@ namespace Sculpting
         [SerializeField, Range(0f, 2f)] private float cavityIntensity = 1f;
         [SerializeField, Range(0.05f, 0.6f)] private float cavityRange = 0.25f;
 
+        // Matcap shading (see MatcapLibrary for where the images come from). Stored by NAME,
+        // not by texture reference: names are what a .sculpt file can carry between machines,
+        // and the texture itself is loaded on demand.
+        [SerializeField] private bool matcapEnabled = false;
+        [SerializeField] private string matcapName = string.Empty;
+        [SerializeField, Range(0f, 3f)] private float matcapIntensity = 1f;
+        [SerializeField, Range(0f, 1f)] private float matcapTintStrength = 0f;
+
         private Material _material;
+        [System.NonSerialized] private Texture2D _matcapTexture;
 
         public Color BaseColor { get => baseColor; set { baseColor = value; Push(); } }
         public float Metallic { get => metallic; set { metallic = Mathf.Clamp01(value); Push(); } }
@@ -38,6 +47,61 @@ namespace Sculpting
         public float CavityIntensity { get => cavityIntensity; set { cavityIntensity = Mathf.Clamp(value, 0f, 2f); Push(); } }
         public float CavityRange { get => cavityRange; set { cavityRange = Mathf.Clamp(value, 0.05f, 0.6f); Push(); } }
 
+        /// Whether matcap shading replaces the lit PBR result. Turning it on with no matcap
+        /// picked selects the first one in the library rather than showing a flat white sphere -
+        /// the toggle is the user asking to SEE a matcap, and an empty texture slot answers that
+        /// with something that looks broken.
+        public bool MatcapEnabled
+        {
+            get => matcapEnabled;
+            set
+            {
+                matcapEnabled = value;
+                if (matcapEnabled && _matcapTexture == null)
+                {
+                    var entries = MatcapLibrary.Entries;
+                    if (entries.Count > 0) { matcapName = entries[0].Name; ResolveMatcap(); }
+                    // Nothing in the folder at all - refuse rather than render flat white.
+                    else matcapEnabled = false;
+                }
+                Push();
+            }
+        }
+
+        /// File name (no extension) of the selected matcap. Setting it to a name the library
+        /// doesn't have clears the selection instead of failing - that's the "saved scene refers
+        /// to a matcap this machine doesn't have" case, and it should degrade to plain PBR
+        /// shading rather than to a broken-looking surface.
+        public string MatcapName
+        {
+            get => matcapName;
+            set { matcapName = value ?? string.Empty; ResolveMatcap(); Push(); }
+        }
+
+        public float MatcapIntensity { get => matcapIntensity; set { matcapIntensity = Mathf.Clamp(value, 0f, 3f); Push(); } }
+        public float MatcapTintStrength { get => matcapTintStrength; set { matcapTintStrength = Mathf.Clamp01(value); Push(); } }
+
+        /// True when a matcap is both selected and actually loaded - i.e. when the shader is
+        /// really running the matcap path. The UI needs this to tell "matcap off" apart from
+        /// "matcap on but its image went missing".
+        public bool HasMatcap => _matcapTexture != null;
+
+        /// Re-resolves the selected matcap against the library and pushes the result. For after
+        /// a rescan, where the selected image may have appeared, changed, or gone away without
+        /// the selected NAME having changed at all.
+        public void RefreshMatcap()
+        {
+            ResolveMatcap();
+            Push();
+        }
+
+        private void ResolveMatcap()
+        {
+            MatcapLibrary.Entry entry = MatcapLibrary.Find(matcapName);
+            _matcapTexture = entry != null ? MatcapLibrary.GetFull(entry) : null;
+            if (_matcapTexture == null) matcapEnabled = false;
+        }
+
         private void Awake()
         {
             Shader shader = Shader.Find("Custom/SculptPBR");
@@ -48,6 +112,7 @@ namespace Sculpting
             }
 
             _material = new Material(shader) { name = "Sculpt PBR (Runtime)" };
+            ResolveMatcap();
             Push();
 
             // Every sculptable object shares this one material instance - applies to whatever
@@ -81,6 +146,18 @@ namespace Sculpting
             _material.SetColor("_PeakColor", peakColor);
             _material.SetFloat("_CavityIntensity", cavityIntensity);
             _material.SetFloat("_CavityRange", cavityRange);
+
+            // A recompile mid-Play drops _matcapTexture (it's [NonSerialized], and the library's
+            // statics go with it), which would leave the material pointing at a destroyed
+            // texture and the shader reading the "white" default - a blown-out white sculpt.
+            // Re-resolving here rather than only on selection keeps that from surviving a Push.
+            if (matcapEnabled && _matcapTexture == null) ResolveMatcap();
+
+            bool useMatcap = matcapEnabled && _matcapTexture != null;
+            _material.SetFloat("_MatcapEnabled", useMatcap ? 1f : 0f);
+            if (_matcapTexture != null) _material.SetTexture("_MatcapTex", _matcapTexture);
+            _material.SetFloat("_MatcapIntensity", matcapIntensity);
+            _material.SetFloat("_MatcapTintStrength", matcapTintStrength);
         }
     }
 }

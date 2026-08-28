@@ -507,6 +507,10 @@ namespace Sculpting.IO
                 data.material.peakColor = mat.PeakColor;
                 data.material.cavityIntensity = mat.CavityIntensity;
                 data.material.cavityRange = mat.CavityRange;
+                data.material.matcapEnabled = mat.MatcapEnabled;
+                data.material.matcapName = mat.MatcapName;
+                data.material.matcapIntensity = mat.MatcapIntensity;
+                data.material.matcapTintStrength = mat.MatcapTintStrength;
             }
 
             var light = UnityEngine.Object.FindFirstObjectByType<LightingRigController>();
@@ -588,6 +592,16 @@ namespace Sculpting.IO
                 mat.PeakColor = data.material.peakColor;
                 mat.CavityIntensity = data.material.cavityIntensity;
                 mat.CavityRange = data.material.cavityRange;
+                mat.MatcapIntensity = data.material.matcapIntensity;
+                mat.MatcapTintStrength = data.material.matcapTintStrength;
+                // Name before the toggle: MatcapEnabled with nothing selected picks the first
+                // matcap in the library, which would override what the file actually asked for.
+                mat.MatcapName = data.material.matcapName;
+                // ...and only enable if that name actually resolved. MatcapEnabled with nothing
+                // selected falls back to the first matcap in the library, which for a file
+                // naming a matcap this machine doesn't have would silently substitute a
+                // different one - lit shading is the honest answer there.
+                mat.MatcapEnabled = data.material.matcapEnabled && mat.HasMatcap;
             }
 
             var env = data.environment;

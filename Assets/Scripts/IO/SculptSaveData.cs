@@ -68,6 +68,15 @@ namespace Sculpting.IO
             public Color peakColor = Color.white;
             public float cavityIntensity = 1f;
             public float cavityRange = 0.25f;
+
+            // Matcap by file name rather than by path: the image lives in the app's own Matcaps
+            // folder, so a name still resolves on a machine where the app is installed somewhere
+            // else. A name this machine doesn't have falls back to lit shading (see
+            // SculptMaterialController.MatcapName).
+            public bool matcapEnabled;
+            public string matcapName = string.Empty;
+            public float matcapIntensity = 1f;
+            public float matcapTintStrength;
         }
 
         [Serializable]
