@@ -151,7 +151,15 @@ namespace Sculpting
             // primitive) doesn't graze triangle edges/vertices along the whole column.
             float wy = origin.y + y * cellSize + cellSize * 0.0173f;
             float wz = origin.z + z * cellSize + cellSize * 0.0091f;
-            Vector3 rayOrigin = new Vector3(origin.x, wy, wz);
+            // Starts the ray at whichever is further out: the sample grid's own -X edge, or
+            // this mesh's -X bound. They are the same thing when the grid was built around this
+            // mesh (Remesh), but NOT when a caller samples one mesh on another's grid - a
+            // boolean cutter can extend past the target's bounds (MeshBoolean), and a ray that
+            // starts INSIDE the cutter counts none of the crossings behind it, inverting the
+            // whole column's inside/outside. The sample loop below already consumes every
+            // crossing before the first sample's x, so the extra span costs nothing but the
+            // crossings it correctly picks up.
+            Vector3 rayOrigin = new Vector3(Mathf.Min(origin.x, bounds.min.x), wy, wz);
 
             Vector3Int cell = CellOf(rayOrigin);
             var tested = _testedPool.Value;

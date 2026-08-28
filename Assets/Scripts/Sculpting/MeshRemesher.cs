@@ -32,15 +32,44 @@ namespace Sculpting
             float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
             float cellSize = maxExtent / resolution;
 
-            // Pad by 2 cells on every side so the surface always closes inside the grid,
-            // even where sculpting pushed geometry close to the source mesh's bounds.
+            Vector3Int dims = GridDimensions(bounds, cellSize, out Vector3 origin);
+            int sx = dims.x + 1, sy = dims.y + 1, sz = dims.z + 1;
+
+            var sdf = new float[sx * sy * sz];
+            SampleSignedField(sourceVertices, sourceTriangles, origin, cellSize, sx, sy, sz, sdf);
+
+            return BuildSurface(sdf, dims, sx, sy, origin, cellSize);
+        }
+
+        /// Cell dimensions (and, via `origin`, the corner sample the grid starts at) of a
+        /// sample grid covering `bounds` at `cellSize`. Padded by 2 cells on every side so the
+        /// surface always closes inside the grid, even where sculpting pushed geometry right up
+        /// against the source mesh's bounds. Shared with MeshBoolean so a boolean's grid is laid
+        /// out exactly like a remesh's.
+        internal static Vector3Int GridDimensions(Bounds bounds, float cellSize, out Vector3 origin)
+        {
             const int pad = 2;
-            Vector3Int dims = new Vector3Int(
+            origin = bounds.min - Vector3.one * (pad * cellSize);
+            return new Vector3Int(
                 Mathf.CeilToInt(bounds.size.x / cellSize) + pad * 2,
                 Mathf.CeilToInt(bounds.size.y / cellSize) + pad * 2,
                 Mathf.CeilToInt(bounds.size.z / cellSize) + pad * 2);
-            Vector3 origin = bounds.min - Vector3.one * (pad * cellSize);
+        }
 
+        /// Stand-in distance for a sample outside the narrow band (see SampleSignedField).
+        /// Never read for anything but a sign check, so its exact magnitude doesn't matter as
+        /// long as it reads unambiguously as "far". Internal because MeshBoolean combines
+        /// fields carrying it and relies on it being a symmetric, negatable stand-in.
+        internal const float FarSentinel = 1e6f;
+
+        /// Fills `sdf` (layout x + sx*(y + sy*z), negative inside) with the signed distance
+        /// field of one triangle soup, sampled on a grid the CALLER chose. Split out of Remesh
+        /// so MeshBoolean can sample several meshes onto one shared grid and combine them - a
+        /// boolean is exactly this pass run per operand and then min/max'd together, and having
+        /// it in one place keeps the sign/narrow-band subtleties below from being reimplemented
+        /// slightly differently there.
+        internal static void SampleSignedField(Vector3[] verts, int[] tris, Vector3 origin, float cellSize, int sx, int sy, int sz, float[] sdf)
+        {
             // SignedDistanceField's own binning grid is a triangle-lookup accelerator for the
             // SOURCE mesh - it has nothing to do with the OUTPUT sampling resolution, so it
             // must not reuse `cellSize` (that was a correctness-preserving but performance-
@@ -52,12 +81,11 @@ namespace Sculpting
             // ~768-triangle source), not the sampling/extraction work itself. Sizing bins off
             // the source mesh's own triangle density (~1 triangle per bin on average) keeps
             // insertion and lookup cost roughly constant regardless of target resolution.
-            float triCount = Mathf.Max(1, sourceTriangles.Length / 3);
-            float binCellSize = Mathf.Clamp(maxExtent / Mathf.Pow(triCount, 1f / 3f), maxExtent * 0.001f, maxExtent);
-            var field = new SignedDistanceField(sourceVertices, sourceTriangles, binCellSize);
-
-            int sx = dims.x + 1, sy = dims.y + 1, sz = dims.z + 1;
-            var sdf = new float[sx * sy * sz];
+            Bounds sourceBounds = ComputeBounds(verts);
+            float sourceExtent = Mathf.Max(sourceBounds.size.x, sourceBounds.size.y, sourceBounds.size.z, 0.0001f);
+            float triCount = Mathf.Max(1, tris.Length / 3);
+            float binCellSize = Mathf.Clamp(sourceExtent / Mathf.Pow(triCount, 1f / 3f), sourceExtent * 0.001f, sourceExtent);
+            var field = new SignedDistanceField(verts, tris, binCellSize);
 
             // Sign: one winding-number ray per (y,z) column, shared by every sample on it.
             var inside = new bool[sx * sy * sz];
@@ -73,11 +101,18 @@ namespace Sculpting
             // benchmarking: res=400 took 187s despite the triangle-binning fix above). This
             // cell scan itself is O(res^3) too, but cheap (plain bool comparisons, no
             // triangle queries), so it doesn't reintroduce the cost it's removing.
+            //
+            // Combining two such fields (MeshBoolean) keeps this exact rather than approximate:
+            // a sample only holds a sentinel where its own mesh's sign is uniform across every
+            // cell it belongs to, and any cell where that mesh's sign DOES flip is by
+            // definition in its band with all 8 corners carrying real distances. So a sentinel
+            // never ends up on the interpolated side of a crossing, whichever operand dominates.
+            int nx = sx - 1, ny = sy - 1, nz = sz - 1;
             var needsDistance = new bool[sx * sy * sz];
-            System.Threading.Tasks.Parallel.For(0, dims.z, z =>
+            System.Threading.Tasks.Parallel.For(0, nz, z =>
             {
-                for (int y = 0; y < dims.y; y++)
-                for (int x = 0; x < dims.x; x++)
+                for (int y = 0; y < ny; y++)
+                for (int x = 0; x < nx; x++)
                 {
                     bool first = inside[SampleIndex(x, y, z, sx, sy)];
                     bool mixed = false;
@@ -97,10 +132,6 @@ namespace Sculpting
                     }
                 }
             });
-
-            // Never read by BuildSurface for anything but a sign check (see above), so its
-            // exact magnitude doesn't matter as long as it reads unambiguously as "far".
-            const float FarSentinel = 1e6f;
 
             // Magnitude: nearest-triangle distance, independent per sample - parallelize
             // across z-slices (each slice writes a disjoint block of sdf, so no races).
@@ -122,8 +153,6 @@ namespace Sculpting
                     }
                 }
             });
-
-            return BuildSurface(sdf, dims, sx, sy, origin, cellSize);
         }
 
         /// Runs only the second half of the pipeline above - Surface Nets extraction, quad
@@ -498,7 +527,7 @@ namespace Sculpting
             else boundaryNext[a] = b;
         }
 
-        private static Bounds ComputeBounds(Vector3[] verts)
+        internal static Bounds ComputeBounds(Vector3[] verts)
         {
             Vector3 min = verts[0], max = verts[0];
             for (int i = 1; i < verts.Length; i++)

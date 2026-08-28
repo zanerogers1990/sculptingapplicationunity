@@ -42,6 +42,7 @@ namespace Sculpting
 
         private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _zsphereModeImg;
         private Button _joinButton;
+        private Button _subtractButton;
         private GameObject _confirmModalGO;
 
         // ZSphere blockout section - see BuildZSphereSection. Held as fields only for the parts
@@ -108,7 +109,7 @@ namespace Sculpting
             _zsphere = FindFirstObjectByType<ZSphereController>();
             BuildUI();
             RefreshList();
-            RefreshJoinButton();
+            RefreshMultiObjectButtons();
             RefreshToolButtons();
         }
 
@@ -121,7 +122,7 @@ namespace Sculpting
                 // costs one frame's worth of UI construction on a path that should never run.
                 BuildUI();
                 RefreshList();
-                RefreshJoinButton();
+                RefreshMultiObjectButtons();
                 RefreshToolButtons();
                 return;
             }
@@ -138,7 +139,7 @@ namespace Sculpting
             {
                 _lastShownSelectionVersion = _selection.SelectionVersion;
                 RefreshList();
-                RefreshJoinButton();
+                RefreshMultiObjectButtons();
             }
         }
 
@@ -218,6 +219,9 @@ namespace Sculpting
 
             UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
             _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm);
+
+            UIFactory.CreateLabel(panel, "Boolean", 13, FontStyle.Normal);
+            _subtractButton = UIFactory.CreateButton(panel, "Subtract Selected", ShowSubtractConfirm);
 
             // Studio Lighting / Material / Presentation used to be three separate always-open
             // panels (top-right, bottom-center, bottom-right). Merged into this panel as three
@@ -399,7 +403,7 @@ namespace Sculpting
 
             BuildUI();
             RefreshList();
-            RefreshJoinButton();
+            RefreshMultiObjectButtons();
             RefreshToolButtons();
         }
 
@@ -846,9 +850,11 @@ namespace Sculpting
 
         // -------------------------------------------------------------------------------- join
 
-        private void RefreshJoinButton()
+        private void RefreshMultiObjectButtons()
         {
-            if (_joinButton != null) _joinButton.interactable = _selection != null && _selection.SelectedSet.Count >= 2;
+            bool multi = _selection != null && _selection.SelectedSet.Count >= 2;
+            if (_joinButton != null) _joinButton.interactable = multi;
+            if (_subtractButton != null) _subtractButton.interactable = multi;
         }
 
         private void ShowJoinConfirm()
@@ -892,13 +898,59 @@ namespace Sculpting
             MeshJoiner.Join(objects, _controller, remeshAfter);
         }
 
+        // ---------------------------------------------------------------------------- boolean
+
+        /// Subtract, in the same place and shape as Join because it is the same gesture - pick
+        /// the object you are keeping, Ctrl+click the others - and putting it anywhere else
+        /// would mean explaining the selection rule twice.
+        private void ShowSubtractConfirm()
+        {
+            if (_selection == null || _selection.SelectedSet.Count < 2) return;
+
+            SculptableMesh target = _selection.PrimarySelection;
+            string targetName = target != null ? target.name : "the first selected object";
+            int cutters = _selection.SelectedSet.Count - 1;
+
+            // Same defaulting as Join: start from the Remesh Resolution the user already has,
+            // since a boolean rebuilds the target on that same kind of grid. Deliberately NOT
+            // written back to the controller afterwards though - a subtraction often wants a
+            // much higher number than everyday remeshing (fine cutter detail in a big block),
+            // and silently moving the brush panel's slider up there would make the next
+            // ordinary Remesh far more expensive than the user asked for.
+            int resolution = _controller != null ? _controller.RemeshResolution : 24;
+            bool deleteCutters = false;
+
+            ShowConfirm($"Cut {cutters} object{(cutters == 1 ? "" : "s")} out of \"{targetName}\"? " +
+                        "The cutters are hidden, not deleted - re-show them from the list above. " +
+                        "Undo (Z) restores the shape.", extraContent =>
+            {
+                UIFactory.CreateLabel(extraContent, "Voxel Resolution (across the target)", 12, FontStyle.Normal);
+                UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v));
+                UIFactory.CreateToggle(extraContent, "Delete cutters instead of hiding", deleteCutters, v => deleteCutters = v);
+            }, () => DoSubtract(resolution, deleteCutters));
+        }
+
+        private void DoSubtract(int resolution, bool deleteCutters)
+        {
+            if (_selection == null) return;
+            SculptableMesh target = _selection.PrimarySelection;
+            var cutters = new List<SculptableMesh>(_selection.SelectedSet);
+            cutters.Remove(target);
+
+            bool ok = MeshBooleanTool.Apply(target, cutters, BooleanOp.Subtract, resolution,
+                                            hideCutters: true, deleteCutters: deleteCutters, out string message);
+            SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
+            RefreshList();
+        }
+
         // ------------------------------------------------------------------- confirmation modal
 
-        /// Small blocking overlay (dim backdrop + centered panel) for the one destructive
-        /// action in this panel (Join) - no undo exists for it, so this is the mitigation this
-        /// codebase already uses elsewhere for undo-free destructive ops. buildExtraContent
-        /// (optional) can add controls between the message and the Cancel/Confirm row - used by
-        /// Join to expose the Remesh-after-Join toggle/resolution slider before committing.
+        /// Small blocking overlay (dim backdrop + centered panel) for this panel's two
+        /// whole-object actions. Join is destructive with no undo, so the prompt is the
+        /// mitigation this codebase already uses elsewhere for undo-free destructive ops;
+        /// Subtract IS undoable, and prompts because it needs its resolution picked before it
+        /// commits to a slow, mesh-replacing rebuild. buildExtraContent (optional) fills the
+        /// space between the message and the Cancel/Confirm row with exactly those settings.
         private void ShowConfirm(string message, System.Action<Transform> buildExtraContent, System.Action onConfirm)
         {
             // Body moved to UIFactory.ShowModal once the save/load panel needed a prompt of its
