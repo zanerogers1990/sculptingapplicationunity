@@ -42,7 +42,7 @@ namespace Sculpting
 
         private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _zsphereModeImg;
         private Button _joinButton;
-        private Button _subtractButton;
+        private Button _subtractButton, _unionButton, _intersectButton;
         private GameObject _confirmModalGO;
 
         // ZSphere blockout section - see BuildZSphereSection. Held as fields only for the parts
@@ -220,8 +220,13 @@ namespace Sculpting
             UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
             _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm);
 
-            UIFactory.CreateLabel(panel, "Boolean", 13, FontStyle.Normal);
-            _subtractButton = UIFactory.CreateButton(panel, "Subtract Selected", ShowSubtractConfirm);
+            // One row of three rather than a button each: they are the same gesture with the
+            // same prompt, and the panel already spends a lot of vertical space above this.
+            UIFactory.CreateLabel(panel, "Boolean (watertight)", 13, FontStyle.Normal);
+            GameObject booleanRow = UIFactory.CreateRow(panel, 26f);
+            _subtractButton = UIFactory.CreateButton(booleanRow.transform, "Subtract", () => ShowBooleanConfirm(BooleanOp.Subtract));
+            _unionButton = UIFactory.CreateButton(booleanRow.transform, "Union", () => ShowBooleanConfirm(BooleanOp.Union));
+            _intersectButton = UIFactory.CreateButton(booleanRow.transform, "Intersect", () => ShowBooleanConfirm(BooleanOp.Intersect));
 
             // Studio Lighting / Material / Presentation used to be three separate always-open
             // panels (top-right, bottom-center, bottom-right). Merged into this panel as three
@@ -855,6 +860,8 @@ namespace Sculpting
             bool multi = _selection != null && _selection.SelectedSet.Count >= 2;
             if (_joinButton != null) _joinButton.interactable = multi;
             if (_subtractButton != null) _subtractButton.interactable = multi;
+            if (_unionButton != null) _unionButton.interactable = multi;
+            if (_intersectButton != null) _intersectButton.interactable = multi;
         }
 
         private void ShowJoinConfirm()
@@ -900,16 +907,17 @@ namespace Sculpting
 
         // ---------------------------------------------------------------------------- boolean
 
-        /// Subtract, in the same place and shape as Join because it is the same gesture - pick
-        /// the object you are keeping, Ctrl+click the others - and putting it anywhere else
-        /// would mean explaining the selection rule twice.
-        private void ShowSubtractConfirm()
+        /// The boolean ops, in the same place and shape as Join because it is the same gesture -
+        /// pick the object you are keeping, Ctrl+click the others - and putting them anywhere
+        /// else would mean explaining the selection rule twice.
+        private void ShowBooleanConfirm(BooleanOp op)
         {
             if (_selection == null || _selection.SelectedSet.Count < 2) return;
 
             SculptableMesh target = _selection.PrimarySelection;
             string targetName = target != null ? target.name : "the first selected object";
-            int cutters = _selection.SelectedSet.Count - 1;
+            int others = _selection.SelectedSet.Count - 1;
+            string plural = others == 1 ? "" : "s";
 
             // Same defaulting as Join: start from the Remesh Resolution the user already has,
             // since a boolean rebuilds the target on that same kind of grid. Deliberately NOT
@@ -918,27 +926,37 @@ namespace Sculpting
             // and silently moving the brush panel's slider up there would make the next
             // ordinary Remesh far more expensive than the user asked for.
             int resolution = _controller != null ? _controller.RemeshResolution : 24;
-            bool deleteCutters = false;
+            bool deleteOthers = false;
 
-            ShowConfirm($"Cut {cutters} object{(cutters == 1 ? "" : "s")} out of \"{targetName}\"? " +
-                        "The cutters are hidden, not deleted - re-show them from the list above. " +
-                        "Undo (Z) restores the shape.", extraContent =>
+            // Union names Join explicitly: the two sit next to each other and sound alike, but
+            // Join concatenates shells (leaving the walls inside the overlap) while Union welds
+            // them into one surface. Which one someone wants is the whole question, so the
+            // prompt is where to answer it.
+            string question =
+                op == BooleanOp.Subtract ? $"Cut {others} object{plural} out of \"{targetName}\"? " :
+                op == BooleanOp.Union ? $"Weld {others} object{plural} into \"{targetName}\" as one solid? " +
+                                        "Unlike Join, this leaves no geometry inside the overlap. " :
+                                        $"Keep only the volume \"{targetName}\" shares with the other {others} object{plural}? ";
+
+            ShowConfirm(question +
+                        "The other objects are hidden, not deleted - re-show them from the list " +
+                        "above. Undo (Z) restores the shape.", extraContent =>
             {
                 UIFactory.CreateLabel(extraContent, "Voxel Resolution (across the target)", 12, FontStyle.Normal);
                 UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v));
-                UIFactory.CreateToggle(extraContent, "Delete cutters instead of hiding", deleteCutters, v => deleteCutters = v);
-            }, () => DoSubtract(resolution, deleteCutters));
+                UIFactory.CreateToggle(extraContent, "Delete the other objects instead of hiding", deleteOthers, v => deleteOthers = v);
+            }, () => DoBoolean(op, resolution, deleteOthers));
         }
 
-        private void DoSubtract(int resolution, bool deleteCutters)
+        private void DoBoolean(BooleanOp op, int resolution, bool deleteOthers)
         {
             if (_selection == null) return;
             SculptableMesh target = _selection.PrimarySelection;
-            var cutters = new List<SculptableMesh>(_selection.SelectedSet);
-            cutters.Remove(target);
+            var others = new List<SculptableMesh>(_selection.SelectedSet);
+            others.Remove(target);
 
-            bool ok = MeshBooleanTool.Apply(target, cutters, BooleanOp.Subtract, resolution,
-                                            hideCutters: true, deleteCutters: deleteCutters, out string message);
+            bool ok = MeshBooleanTool.Apply(target, others, op, resolution,
+                                            hideOthers: true, deleteOthers: deleteOthers, out string message);
             SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
             RefreshList();
         }
@@ -948,8 +966,8 @@ namespace Sculpting
         /// Small blocking overlay (dim backdrop + centered panel) for this panel's two
         /// whole-object actions. Join is destructive with no undo, so the prompt is the
         /// mitigation this codebase already uses elsewhere for undo-free destructive ops;
-        /// Subtract IS undoable, and prompts because it needs its resolution picked before it
-        /// commits to a slow, mesh-replacing rebuild. buildExtraContent (optional) fills the
+        /// The boolean ops ARE undoable, and prompt because they need a resolution picked before
+        /// committing to a slow, mesh-replacing rebuild. buildExtraContent (optional) fills the
         /// space between the message and the Cancel/Confirm row with exactly those settings.
         private void ShowConfirm(string message, System.Action<Transform> buildExtraContent, System.Action onConfirm)
         {
