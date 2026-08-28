@@ -151,6 +151,15 @@ namespace Sculpting.IO
             // --- past this line the file is known-good; only now touch the live scene ---
 
             var selection = UnityEngine.Object.FindFirstObjectByType<SelectionManager>();
+
+            // Before DestroyExistingObjects, not after: history can be holding objects that are
+            // NOT in SelectionManager's list and so would survive that sweep - an undone ZSphere
+            // convert parks the object it made, deactivated and unregistered, for a possible redo
+            // (see ZSphereController.RecordConvertUndo). Clearing first runs each step's discard
+            // while those objects are still reachable, so the load starts from a genuinely empty
+            // scene instead of leaving orphans behind. Import deliberately does NOT do this -
+            // adding objects invalidates nothing that is already in history.
+            EditHistory.Clear();
             DestroyExistingObjects(selection);
 
             var created = new List<SculptableMesh>(file.Meshes.Count);
@@ -516,6 +525,19 @@ namespace Sculpting.IO
                 data.environment.gradientBias = bg.GradientBias;
             }
 
+            // Existing, not Instance: saving a scene that never touched HDRI should not bring a
+            // controller into being just to write its defaults.
+            var hdri = HdriEnvironmentController.Existing;
+            if (hdri != null)
+            {
+                data.environment.hdriEnabled = hdri.Enabled;
+                data.environment.hdriPath = hdri.Path ?? string.Empty;
+                data.environment.hdriRotation = hdri.Rotation;
+                data.environment.hdriExposure = hdri.Exposure;
+                data.environment.hdriAmbientIntensity = hdri.AmbientIntensity;
+                data.environment.hdriReflectionIntensity = hdri.ReflectionIntensity;
+            }
+
             var post = UnityEngine.Object.FindFirstObjectByType<PostProcessingController>();
             if (post != null && post.HasVolume)
             {
@@ -543,6 +565,7 @@ namespace Sculpting.IO
                 data.camera.pitch = pitch;
                 data.camera.distance = distance;
                 data.camera.pivot = pivot;
+                data.camera.orthographic = cam.Orthographic;
             }
         }
 
@@ -577,6 +600,22 @@ namespace Sculpting.IO
                     light.Mode = (LightingMode)env.lightingMode;
                 }
 
+                // HDRI before the background: the background's Hdri mode is only honoured once
+                // an image is actually loaded, so applying it the other way round would silently
+                // fall back to the gradient.
+                if (env.hdriEnabled || !string.IsNullOrEmpty(env.hdriPath))
+                {
+                    HdriEnvironmentController.Instance.ApplySaved(
+                        env.hdriEnabled, env.hdriPath, env.hdriRotation, env.hdriExposure,
+                        env.hdriAmbientIntensity, env.hdriReflectionIntensity);
+                }
+                else
+                {
+                    // A file saved with no HDRI has to switch off one that is currently running,
+                    // otherwise loading it leaves the previous scene's environment lighting on.
+                    HdriEnvironmentController.Existing?.Clear();
+                }
+
                 var bg = UnityEngine.Object.FindFirstObjectByType<BackgroundController>();
                 if (bg != null)
                 {
@@ -608,8 +647,15 @@ namespace Sculpting.IO
 
             if (data.camera != null && data.camera.valid)
             {
-                UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>()
-                    ?.SetView(data.camera.yaw, data.camera.pitch, data.camera.distance, data.camera.pivot);
+                var orbit = UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>();
+                if (orbit != null)
+                {
+                    // Projection first: SetView derives the orthographic size from the distance
+                    // it is given, so restoring the angles into the wrong projection would frame
+                    // the subject at whatever size the previous projection left behind.
+                    orbit.Orthographic = data.camera.orthographic;
+                    orbit.SetView(data.camera.yaw, data.camera.pitch, data.camera.distance, data.camera.pivot);
+                }
             }
         }
 

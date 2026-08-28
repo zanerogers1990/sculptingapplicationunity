@@ -93,27 +93,24 @@ namespace Sculpting
             return arr;
         }
 
-        // Same per-brush-memory pattern as _brushPolarity/_brushAccumulate, for Brush Strength
-        // and Brush Radius - previously one pair of values shared across every brush, so tuning
-        // Crease's strength while Clay was selected would silently carry over the next time
-        // Clay was picked back up. Every brush starts at the same default (matching the
-        // brushStrength/brushRadius fields' own serialized defaults below) and only diverges
-        // once the user actually changes a value while that brush is selected - kept in sync by
-        // the CurrentBrush/BrushStrength/BrushRadius setters below.
+        // Same per-brush-memory pattern as _brushPolarity/_brushAccumulate, for Brush Strength -
+        // previously one value shared across every brush, so tuning Crease's strength while Clay
+        // was selected would silently carry over the next time Clay was picked back up. Every
+        // brush starts at the same default (matching the brushStrength field's own serialized
+        // default below) and only diverges once the user actually changes it while that brush is
+        // selected - kept in sync by the CurrentBrush/BrushStrength setters below.
+        //
+        // Brush RADIUS deliberately does NOT get this treatment: it is one value shared by every
+        // brush, so a size dialled in on Clay is still the size you get after switching to Move
+        // or Crease. Size is how big the thing you are working on is; strength is how hard a
+        // particular brush should hit, which is a property of the brush. Per-brush radius was
+        // tried first and felt like the tool resizing itself behind your back mid-sculpt.
         private readonly float[] _brushStrengthPerType = CreateDefaultBrushStrength();
-        private readonly float[] _brushRadiusPerType = CreateDefaultBrushRadius();
 
         private static float[] CreateDefaultBrushStrength()
         {
             var arr = new float[Enum.GetValues(typeof(BrushType)).Length];
             for (int i = 0; i < arr.Length; i++) arr[i] = 0.1f; // matches brushStrength field's default below
-            return arr;
-        }
-
-        private static float[] CreateDefaultBrushRadius()
-        {
-            var arr = new float[Enum.GetValues(typeof(BrushType)).Length];
-            for (int i = 0; i < arr.Length; i++) arr[i] = 0.5f; // matches brushRadius field's default below
             return arr;
         }
 
@@ -140,6 +137,16 @@ namespace Sculpting
         [SerializeField, Range(0.05f, 1f)] private float creaseDepthFactor = 0.35f;
         [SerializeField, Range(0f, 1f)] private float damLipHeight = 0.25f;
 
+        [Header("Flatten Brush")]
+        // Where the flatten plane sits relative to the surface it was averaged from, as a
+        // fraction of brushRadius along the plane normal. 0 is a plain flatten (the plane goes
+        // exactly through the footprint's own average height). Positive lifts the plane above
+        // the surface so low ground is filled in while high ground is barely touched - the
+        // ZBrush "Fill"/Nomad "Flatten (fill)" feel; negative sinks it so only the high points
+        // are shaved off - the Scrape/Polish end of the same family. One control rather than
+        // three separate brushes, since Flatten/Fill/Scrape differ ONLY by where this plane sits.
+        [SerializeField, Range(-0.5f, 0.5f)] private float flattenPlaneOffset = 0f;
+
         [Header("Masking")]
         // 0 = smoothstep across the whole radius (soft, gradual edges), 1 = full weight
         // everywhere inside the radius with a hard cutoff (immediate, opaque) - see
@@ -148,6 +155,17 @@ namespace Sculpting
 
         [Header("Remesh Settings")]
         [SerializeField, Range(4, 500)] private int remeshResolution = 24;
+
+        [Header("Symmetry Repair")]
+        // Which plane the correspondence-map tools work across. Deliberately its own setting
+        // rather than being read off MirrorController's three toggles: those are independent and
+        // any combination can be on at once (X+Y mirrors a stroke into four quadrants), whereas
+        // pairing vertices is a question about ONE plane - there is no such thing as a vertex's
+        // counterpart across "X and Y at the same time". Defaults to X, the bilateral axis
+        // essentially every character or creature is symmetric about.
+        [SerializeField, Range(0, 2)] private int symmetryAxis = SymmetryMap.AxisX;
+        [SerializeField, Range(SymmetryOps.MinToleranceScale, SymmetryOps.MaxToleranceScale)]
+        private float symmetryToleranceScale = 1f;
 
         [Header("Debug")]
         [SerializeField] private bool showWireframeGizmo = false;
@@ -237,6 +255,21 @@ namespace Sculpting
         // chosen to match Clay's own default (0.6) for a comparable one-dab feel.
         private const float InflateSpeed = 4f;
         private const float InflateOffCapFactor = 0.6f;
+        // Flatten eases each vertex toward the footprint's own area plane, so - unlike Clay's
+        // live-replanned buildup - it CONVERGES on its own: once the footprint is flat the
+        // remaining distance to the plane is zero and further dwelling does nothing. That is why
+        // it needs no per-stroke depth cap in the flatten direction, and why it ignores the
+        // Accumulate toggle entirely (there is nothing to accumulate), same as Move/Smooth do.
+        private const float FlattenSpeed = 4f;
+        // The inverted (RMB / Ctrl) direction pushes vertices AWAY from the plane instead -
+        // Blender's Ctrl+Flatten "sharpen"/contrast behaviour, which exaggerates whatever relief
+        // is already there. That direction is the one that DIVERGES (every frame's push moves a
+        // vertex further from the plane it is measured against, so the next push is larger), so
+        // it gets a cap on how far one stroke may drive any vertex off its starting height,
+        // as a fraction of brushRadius. Measured from SculptableMesh.StrokeStartPosition and
+        // applied symmetrically - unlike Clay's one-sided ClampStrokeDepth, contrast moves the
+        // two sides of the plane in OPPOSITE directions, so both need bounding.
+        private const float FlattenContrastLimit = 0.5f;
         // Mask paint/erase rate range - reuses brushStrength/brushRadius rather than adding a
         // separate intensity slider, matching the "just a basic one" scope of the original
         // masking feature. maskHardness (see its own field) interpolates between these two:
@@ -272,6 +305,10 @@ namespace Sculpting
         // while resizing (holding S). Tuned so a full-width drag across a ~1080p window
         // covers roughly the whole 0.01-2 range.
         private const float ResizeSensitivity = 0.0025f;
+        // Half ResizeSensitivity, matching that BrushStrength's range (0.01-1) is about half
+        // the width of BrushRadius's (0.01-2) - same "full-width drag covers roughly the whole
+        // range" feel, scaled to the smaller range.
+        private const float StrengthAdjustSensitivity = 0.00125f;
         // Was 0.05 - too coarse once the camera is zoomed in close (CameraOrbitController's
         // minDistance is 0.5) for fine detail work: the smallest available brush still covered
         // a visibly large patch of the zoomed-in surface. 0.01 matches the floor
@@ -320,6 +357,13 @@ namespace Sculpting
         private float _resizeStartMouseX;
         private Vector2 _resizeAnchorScreenPos;
 
+        // Same S-drag-gauge pattern as above (see HandleBrushStrengthKey), but for
+        // per-brush BrushStrength instead of the shared BrushRadius.
+        private bool _isAdjustingStrength;
+        private float _strengthAdjustStartValue;
+        private float _strengthAdjustStartMouseX;
+        private Vector2 _strengthAdjustAnchorScreenPos;
+
         private bool _isShiftSmoothActive;
         private BrushType _preShiftBrush;
 
@@ -328,7 +372,7 @@ namespace Sculpting
         // a mask is typically its own multi-stroke pass, not a quick one-off tweak mid-sculpt.
         private bool _isMaskPaintMode;
 
-        // Reusable scratch buffers for Clay's area-plane weights and Smooth's relaxation
+        // Reusable scratch buffers for Clay's/Flatten's area-plane weights and Smooth's relaxation
         // weights - sized once and grown on demand rather than allocated fresh every frame a
         // stroke is held, matching the allocation-avoidance already applied to MeshRemesher
         // (see VertexSpatialGrid/EmitQuads history).
@@ -356,14 +400,16 @@ namespace Sculpting
         private NativeArray<float> _nativeMaskIn;
         private NativeArray<Vector3> _nativePositionsOut;
         private NativeArray<byte> _nativeAppliedOut;
-        // Clay-only extra scratch (pass-1 weighted reduction inputs to pass-2) - grown alongside
+        // Clay/Flatten extra scratch (pass-1 weighted reduction inputs to pass-2 - both brushes
+        // share ClayWeightJob for that pass) - grown alongside
         // the arrays above for simplicity; the extra memory is trivial at footprint-bounded sizes.
         private NativeArray<float> _nativeClayWeights;
         private NativeArray<Vector3> _nativeClayWeightedPos;
         private NativeArray<Vector3> _nativeClayWeightedNormal;
         // Each candidate's position as of THIS stroke's start (see
         // SculptableMesh.StrokeStartPosition) - the reference ClampStrokeDepth measures Clay's
-        // per-stroke buildup cap against. Gathered in the Clay job path only, alongside
+        // per-stroke buildup cap against (and Flatten's contrast cap - see
+        // FlattenContrastLimit). Gathered in the Clay/Flatten job paths only, alongside
         // GatherCandidatesNative's shared arrays; the managed path reads StrokeStartPosition
         // directly.
         private NativeArray<Vector3> _nativeClayStrokeStart;
@@ -452,12 +498,22 @@ namespace Sculpting
             _nativeFullPositionMirror = new NativeArray<Vector3>(totalVertexCount, Allocator.Persistent);
         }
 
-        private void OnDestroy()
+        private void OnDestroy() => ReleaseNativeResources();
+
+        /// Frees every Allocator.Persistent array this component owns AND resets the capacity
+        /// trackers that gate the Ensure* methods above, so they reallocate instead of handing
+        /// out a disposed array. Called from OnDestroy, and from NativeReloadGuard before an
+        /// editor domain reload - which wipes these fields WITHOUT calling OnDestroy, orphaning
+        /// whatever they pointed at (see that class for the full story).
+        internal void ReleaseNativeResources()
         {
             DisposeNativeVertexScratch();
+            _nativeScratchCapacity = 0;
             if (_nativeAlphaSamples.IsCreated) _nativeAlphaSamples.Dispose();
+            _nativeAlphaCachedType = (BrushAlphaType)(-1);
             if (_nativeVertexToSlot.IsCreated) _nativeVertexToSlot.Dispose();
             if (_nativeFullPositionMirror.IsCreated) _nativeFullPositionMirror.Dispose();
+            _nativeFullMeshCapacity = 0;
             if (_nativeSmoothCandidates.IsCreated) _nativeSmoothCandidates.Dispose();
         }
 
@@ -810,6 +866,50 @@ namespace Sculpting
             }
         }
 
+        // Flatten's pass 2 - direct Burst port of ApplyFlattenBrushLocalManaged's per-candidate
+        // body. Pass 1 is ClayWeightJob, reused as-is with a round tip and full edge softness
+        // (see ApplyFlattenBrushLocalJob): both brushes need exactly the same thing from it -
+        // per-vertex falloff weights plus the weighted position/normal sums the area plane is
+        // reduced from - so a second copy of that job would only be Clay's with two parameters
+        // frozen. AppliedOut mirrors the managed loop's single "weight <= 0 -> continue".
+        [BurstCompile(CompileSynchronously = true)]
+        private struct FlattenDisplacementJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<Vector3> PositionsIn;
+            // Only read in the Contrast direction - see FlattenContrastLimit.
+            [ReadOnly] public NativeArray<Vector3> StrokeStartIn;
+            [ReadOnly] public NativeArray<float> WeightsIn;
+            public NativeArray<Vector3> PositionsOut;
+            public NativeArray<byte> AppliedOut;
+
+            public Vector3 PlaneOrigin; // already includes the flattenPlaneOffset shift
+            public Vector3 PlaneNormal;
+            public float LerpFactorScale; // brushStrength * FlattenSpeed * dt
+            public bool Contrast; // false = flatten toward the plane, true = push away from it
+            public float MaxOffStart; // brushRadius * FlattenContrastLimit, Contrast only
+
+            public void Execute(int index)
+            {
+                float weight = WeightsIn[index];
+                if (weight <= 0f) { AppliedOut[index] = 0; return; }
+
+                Vector3 pos = PositionsIn[index];
+                float along = Vector3.Dot(pos - PlaneOrigin, PlaneNormal);
+                float lerp = Mathf.Clamp01(weight * LerpFactorScale);
+                Vector3 moved = pos + PlaneNormal * ((Contrast ? along : -along) * lerp);
+
+                if (Contrast)
+                {
+                    float fromStart = Vector3.Dot(moved - StrokeStartIn[index], PlaneNormal);
+                    if (fromStart > MaxOffStart) moved -= PlaneNormal * (fromStart - MaxOffStart);
+                    else if (fromStart < -MaxOffStart) moved -= PlaneNormal * (fromStart + MaxOffStart);
+                }
+
+                PositionsOut[index] = moved;
+                AppliedOut[index] = 1;
+            }
+        }
+
         // Precomputes Smooth's per-candidate falloff weight once, shared read-only across every
         // relaxation pass - direct port of ApplySmoothBrushLocalManaged's first loop.
         [BurstCompile(CompileSynchronously = true)]
@@ -1030,18 +1130,16 @@ namespace Sculpting
         /// are still time-driven and still want it.
         private float EffectiveClayStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
 
-        // Same immediate-write-through as BrushStrength above.
+        // One value for every brush, unlike BrushStrength above - see _brushStrengthPerType.
         public float BrushRadius
         {
             get => brushRadius;
-            set
-            {
-                brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
-                _brushRadiusPerType[(int)currentBrush] = brushRadius;
-            }
+            set => brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
         }
         public bool IsResizingBrush => _isResizingBrush;
         public Vector2 ResizeAnchorScreenPosition => _resizeAnchorScreenPos;
+        public bool IsAdjustingStrength => _isAdjustingStrength;
+        public Vector2 StrengthAdjustAnchorScreenPosition => _strengthAdjustAnchorScreenPos;
 
         public bool IsMaskPaintMode
         {
@@ -1068,13 +1166,12 @@ namespace Sculpting
                     _brushAccumulate[(int)currentBrush] = accumulate;
                     _accumulateStrengthPerType[(int)currentBrush] = accumulateStrength;
                     _brushStrengthPerType[(int)currentBrush] = brushStrength;
-                    _brushRadiusPerType[(int)currentBrush] = brushRadius;
                     currentBrush = value;
                     isPositive = _brushPolarity[(int)currentBrush];
                     accumulate = _brushAccumulate[(int)currentBrush];
                     accumulateStrength = _accumulateStrengthPerType[(int)currentBrush];
                     brushStrength = _brushStrengthPerType[(int)currentBrush];
-                    brushRadius = _brushRadiusPerType[(int)currentBrush];
+                    // brushRadius deliberately carries across the switch untouched.
                 }
             }
         }
@@ -1114,6 +1211,7 @@ namespace Sculpting
         public float CreasePinch { get => creasePinch; set => creasePinch = Mathf.Clamp01(value); }
         public float CreaseDepthFactor { get => creaseDepthFactor; set => creaseDepthFactor = Mathf.Clamp(value, 0.05f, 1f); }
         public float DamLipHeight { get => damLipHeight; set => damLipHeight = Mathf.Clamp01(value); }
+        public float FlattenPlaneOffset { get => flattenPlaneOffset; set => flattenPlaneOffset = Mathf.Clamp(value, -0.5f, 0.5f); }
         public float MaskHardness { get => maskHardness; set => maskHardness = Mathf.Clamp01(value); }
         public bool UseAlpha { get => useAlpha; set => useAlpha = value; }
         public BrushAlphaType AlphaType { get => alphaType; set => alphaType = value; }
@@ -1125,6 +1223,13 @@ namespace Sculpting
         public bool UseBurstJobs { get => useBurstJobs; set => useBurstJobs = value; }
         public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, 500); }
 
+        public int SymmetryAxis { get => symmetryAxis; set => symmetryAxis = Mathf.Clamp(value, 0, 2); }
+        public float SymmetryToleranceScale
+        {
+            get => symmetryToleranceScale;
+            set => symmetryToleranceScale = Mathf.Clamp(value, SymmetryOps.MinToleranceScale, SymmetryOps.MaxToleranceScale);
+        }
+
         // GetIndexCount/vertexCount rather than .triangles/.vertices - those copy the whole
         // index/vertex buffer on every access, which would be a real cost read every frame by
         // the UI's poly-count display at multi-million-triangle mesh sizes.
@@ -1133,10 +1238,28 @@ namespace Sculpting
         public int VertexCount => sculptableMesh != null && sculptableMesh.Mesh != null
             ? sculptableMesh.Mesh.vertexCount : 0;
 
-        public bool CanUndo => sculptableMesh != null && sculptableMesh.CanUndo;
-        public bool CanRedo => sculptableMesh != null && sculptableMesh.CanRedo;
-        public void Undo() { if (sculptableMesh == null) return; EndMoveDrag(); sculptableMesh.Undo(); }
-        public void Redo() { if (sculptableMesh == null) return; EndMoveDrag(); sculptableMesh.Redo(); }
+        // Routed through EditHistory rather than straight at the selected object's own stack.
+        // The old form undid whatever the SELECTION had last done, so undoing after clicking a
+        // different object in the scene panel reversed something you did minutes ago on that
+        // object instead of the thing you just did - and it could not reach edits that are not
+        // about one object's vertices at all, like skinning a ZSphere rig into a new mesh. Note
+        // these no longer require a selection: there is plenty worth undoing when nothing is
+        // selected (that ZSphere convert, for one).
+        public bool CanUndo => EditHistory.CanUndo;
+        public bool CanRedo => EditHistory.CanRedo;
+        public void Undo() { EndMoveDrag(); EditHistory.Undo(); }
+        public void Redo() { EndMoveDrag(); EditHistory.Redo(); }
+
+        /// Steps of history held and what they cost, for the UI - see EditHistory.Summary.
+        public static string HistorySummary => EditHistory.Summary();
+
+        /// How many undo steps history keeps. Surfaced here so the UI reaches it the same way it
+        /// reaches every other setting, rather than touching a static class directly.
+        public int UndoSteps
+        {
+            get => EditHistory.MaxSteps;
+            set => EditHistory.MaxSteps = value;
+        }
 
         // Not wired into undo/redo, same deliberate scope call as PaintMask itself (see
         // SculptableMesh.PaintMask remarks) - masking doesn't move geometry.
@@ -1150,6 +1273,17 @@ namespace Sculpting
         private SelectionManager _selection;
         private SelectionManager Selection => _selection != null ? _selection : (_selection = FindFirstObjectByType<SelectionManager>());
         private SculptableMesh Target => Selection != null ? Selection.PrimarySelection : null;
+
+        // Double-click-in-viewport object switching (see HandleObjectPickDoubleClick) - lets
+        // you make a different scene object the sculpt target without hunting for its row in
+        // the Scene Graph panel. Tracked here rather than via EventSystem's PointerClick
+        // clickCount (what SceneGraphUIBuilder's row double-click uses) because the viewport
+        // isn't a uGUI element - there's no PointerClick event to read a clickCount off of, so
+        // this measures the same thing by hand against consecutive wasPressedThisFrame presses.
+        private float _lastLeftClickTime = -1f;
+        private Vector2 _lastLeftClickScreenPos;
+        private const float DoubleClickMaxInterval = 0.35f;
+        private const float DoubleClickMaxPixelDist = 12f;
 
         // Which whole-object tool (see GizmoMode) is currently active - HandleSculptInput
         // early-outs while a non-Sculpt mode is active so gizmo dragging and brush strokes can
@@ -1207,15 +1341,15 @@ namespace Sculpting
                 if (overlayShader != null) _brushPreviewRenderer.material = new Material(overlayShader);
             }
 
-            // The serialized `isPositive`/`accumulate`/`brushStrength`/`brushRadius` predate
-            // per-brush memory and may be stale for whatever brush is currently selected - start
-            // from this brush's own remembered defaults instead (see
-            // _brushPolarity/_brushAccumulate/_brushStrengthPerType/_brushRadiusPerType remarks).
+            // The serialized `isPositive`/`accumulate`/`brushStrength` predate per-brush memory
+            // and may be stale for whatever brush is currently selected - start from this brush's
+            // own remembered defaults instead (see
+            // _brushPolarity/_brushAccumulate/_brushStrengthPerType remarks). `brushRadius` is
+            // shared by every brush, so its serialized value is already the right starting point.
             isPositive = _brushPolarity[(int)currentBrush];
             accumulate = _brushAccumulate[(int)currentBrush];
             accumulateStrength = _accumulateStrengthPerType[(int)currentBrush];
             brushStrength = _brushStrengthPerType[(int)currentBrush];
-            brushRadius = _brushRadiusPerType[(int)currentBrush];
         }
 
         private void Update()
@@ -1223,6 +1357,7 @@ namespace Sculpting
             SyncSelectionTarget();
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
+            HandleBrushStrengthKey();
             HandleUndoRedoKeys();
             UpdatePenPressure();
             HandleSculptInput();
@@ -1290,14 +1425,25 @@ namespace Sculpting
         private void HandleUndoRedoKeys()
         {
             var kb = Keyboard.current;
-            if (kb == null || _isResizingBrush) return;
+            if (kb == null || _isResizingBrush || _isAdjustingStrength) return;
+            if (!kb.zKey.wasPressedThisFrame) return;
 
-            if (kb.zKey.wasPressedThisFrame)
-            {
-                if (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed) Redo();
-                else Undo();
-            }
+            bool redo = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
+
+            // The ZSphere tool keeps its own history for the rig (a scaffold, not a scene object -
+            // see ZSphereController's rig-undo remarks), and takes the key while it is the active
+            // tool and has something left to step through. Asking IT rather than duplicating the
+            // condition here is what guarantees exactly one of the two answers a given press, and
+            // that Z falls back to scene history the moment the rig's own runs out.
+            if (_zsphereForUndo == null) _zsphereForUndo = FindFirstObjectByType<ZSphereController>();
+            if (_zsphereForUndo != null && _zsphereForUndo.HandlesUndoKey(redo)) return;
+
+            if (redo) Redo(); else Undo();
         }
+
+        // Only ever looked up on a frame Z is actually pressed, so the find costs nothing in a
+        // scene that has no ZSphereController at all.
+        private ZSphereController _zsphereForUndo;
 
         private void HandleBrushSwitchKeys()
         {
@@ -1312,12 +1458,21 @@ namespace Sculpting
             // hold-to-smooth doesn't let other brush hotkeys interrupt it either.
             if (_isShiftSmoothActive) return;
 
+            // Also suppressed while the strength gauge (F) is up - CurrentBrush's setter swaps
+            // brushStrength out from under _strengthAdjustStartValue's mid-drag baseline
+            // (BrushRadius has no such per-brush swap, which is why HandleBrushResizeKey's S
+            // doesn't need this same guard), so switching brushes mid-drag would let the next
+            // mouse-move frame stomp the NEWLY-switched-to brush's stored strength with a value
+            // computed from the OLD brush's baseline.
+            if (_isAdjustingStrength) return;
+
             if (kb.digit1Key.wasPressedThisFrame) CurrentBrush = BrushType.Move;
             else if (kb.digit2Key.wasPressedThisFrame) CurrentBrush = BrushType.Clay;
             else if (kb.digit3Key.wasPressedThisFrame) CurrentBrush = BrushType.Smooth;
             else if (kb.digit4Key.wasPressedThisFrame) CurrentBrush = BrushType.Crease;
             else if (kb.digit5Key.wasPressedThisFrame) CurrentBrush = BrushType.DamStandard;
             else if (kb.digit6Key.wasPressedThisFrame) CurrentBrush = BrushType.Inflate;
+            else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
 
             // M used to trigger Remesh directly; moved to R (still reachable via the Remesh
             // button in the Brush panel either way) so M is free for the mask-paint toggle,
@@ -1332,7 +1487,7 @@ namespace Sculpting
         // during the resize gauge for the same reason other input handlers are.
         private void HandleShiftSmoothOverride(Keyboard kb)
         {
-            if (_isResizingBrush) return;
+            if (_isResizingBrush || _isAdjustingStrength) return;
             bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
             if (shiftHeld && !_isShiftSmoothActive)
@@ -1376,6 +1531,38 @@ namespace Sculpting
             BrushRadius = _resizeStartRadius + deltaX * ResizeSensitivity;
         }
 
+        // Holding F enters a strength-adjust mode (instead of sculpting) where horizontal
+        // mouse movement scrubs BrushStrength live - same S-drag gauge UX as
+        // HandleBrushResizeKey above, but for the CURRENT brush's own strength (see
+        // _brushStrengthPerType) rather than the shared BrushRadius. SculptUIBuilder draws the
+        // popup gauge at StrengthAdjustAnchorScreenPosition, and UpdateBrushPreview forces the
+        // brush cursor to NegativeColor/red for the duration so it reads unambiguously as "not
+        // sculpting right now" rather than an ordinary negative-polarity brush dab.
+        private void HandleBrushStrengthKey()
+        {
+            var kb = Keyboard.current;
+            var mouse = Mouse.current;
+            if (kb == null || mouse == null) return;
+
+            if (kb.fKey.wasPressedThisFrame)
+            {
+                EndMoveDrag(); // don't leave a grab mid-drag while the strength gauge is up
+                _isAdjustingStrength = true;
+                _strengthAdjustStartValue = brushStrength;
+                _strengthAdjustStartMouseX = mouse.position.ReadValue().x;
+                _strengthAdjustAnchorScreenPos = mouse.position.ReadValue();
+            }
+            else if (_isAdjustingStrength && !kb.fKey.isPressed)
+            {
+                _isAdjustingStrength = false;
+            }
+
+            if (!_isAdjustingStrength) return;
+
+            float deltaX = mouse.position.ReadValue().x - _strengthAdjustStartMouseX;
+            BrushStrength = _strengthAdjustStartValue + deltaX * StrengthAdjustSensitivity;
+        }
+
         // Shared by every brush handler's invert check below - Ctrl mirrors Blender's
         // hold-to-invert sculpt convention, alongside this app's pre-existing right-mouse-
         // inverts convention (kept for parity with users already used to that scheme).
@@ -1396,13 +1583,69 @@ namespace Sculpting
         private void HandleBrushSizeScroll()
         {
             var mouse = Mouse.current;
-            IsHoveringSculptSurface = mouse != null && _isHovering && !_isOverUI && !_isResizingBrush;
+            IsHoveringSculptSurface = mouse != null && _isHovering && !_isOverUI && !_isResizingBrush && !_isAdjustingStrength;
             if (!IsHoveringSculptSurface) return;
 
             float scroll = mouse.scroll.ReadValue().y;
             if (Mathf.Abs(scroll) < 0.01f) return;
 
             BrushRadius = brushRadius * (1f + Mathf.Sign(scroll) * ScrollResizePercentPerNotch);
+        }
+
+        /// Double-clicking anywhere in the viewport (that isn't UI, and isn't the Alt-orbit
+        /// gesture) selects whichever registered SculptableMesh is under the cursor, making it
+        /// the new sculpt target - the same effect as clicking its row in the Scene Graph
+        /// panel. Deliberately raycasts every registered object rather than just the current
+        /// Target: a click that misses the current target already has no sculpting side effect
+        /// (see the individual brush handlers below, which just return on a miss), so this only
+        /// ever adds behavior on an otherwise-inert click. Double-clicking the ALREADY-primary
+        /// object still leaves two ordinary brush dabs at the click point from ProcessInput's
+        /// own handling of those two presses - accepted as a minor quirk rather than adding the
+        /// extra latency of holding every click for a double-click window before sculpting.
+        private void HandleObjectPickDoubleClick(Mouse mouse, bool overUI, bool altHeld)
+        {
+            if (overUI || altHeld || !mouse.leftButton.wasPressedThisFrame) return;
+
+            Vector2 pos = mouse.position.ReadValue();
+            bool isDoubleClick = Time.unscaledTime - _lastLeftClickTime <= DoubleClickMaxInterval &&
+                                  Vector2.Distance(pos, _lastLeftClickScreenPos) <= DoubleClickMaxPixelDist;
+
+            if (isDoubleClick)
+            {
+                PickObjectUnderCursor(pos);
+                _lastLeftClickTime = -1f; // consume - a third quick click starts a fresh pair, not another pick
+            }
+            else
+            {
+                _lastLeftClickTime = Time.unscaledTime;
+                _lastLeftClickScreenPos = pos;
+            }
+        }
+
+        private void PickObjectUnderCursor(Vector2 screenPos)
+        {
+            if (Selection == null || cam == null) return;
+
+            Ray ray = cam.ScreenPointToRay(screenPos);
+            SculptableMesh closest = null;
+            float closestDist = float.MaxValue;
+            foreach (SculptableMesh obj in Selection.AllObjects)
+            {
+                if (obj == null || !obj.Visible) continue;
+                if (obj.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out _))
+                {
+                    float dist = Vector3.Distance(ray.origin, hitPoint);
+                    if (dist < closestDist) { closestDist = dist; closest = obj; }
+                }
+            }
+
+            // Only flash on an actual switch - double-clicking the object that's already
+            // primary shouldn't flash, since nothing about the sculpt target changed.
+            if (closest != null && closest != Selection.PrimarySelection)
+            {
+                Selection.Select(closest, false);
+                SelectionFlashEffect.Play(closest.gameObject);
+            }
         }
 
         private void HandleSculptInput()
@@ -1421,7 +1664,8 @@ namespace Sculpting
             // While the resize gauge is up, mouse movement scrubs brush size, not sculpting.
             // Force _isOverUI false too so UpdateBrushPreview follows the mouse ray (the
             // deliberate resize-gauge UX) rather than freezing at a stale over-UI position.
-            if (_isResizingBrush)
+            // Same reasoning applies to the strength gauge (F) below.
+            if (_isResizingBrush || _isAdjustingStrength)
             {
                 _isHovering = false;
                 _isOverUI = false;
@@ -1432,6 +1676,8 @@ namespace Sculpting
                           UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject();
             _isOverUI = overUI;
             bool altHeld = Keyboard.current != null && Keyboard.current.leftAltKey.isPressed;
+
+            HandleObjectPickDoubleClick(mouse, overUI, altHeld);
 
             // Mask painting is its own input mode, not one of the sculpting brushes - doesn't
             // move vertices, so it skips the undo snapshot/spatial-grid-rebuild-on-press below
@@ -1480,6 +1726,9 @@ namespace Sculpting
                 case BrushType.Inflate:
                     HandleInflateInput(mouse, overUI, altHeld);
                     break;
+                case BrushType.Flatten:
+                    HandleFlattenInput(mouse, overUI, altHeld);
+                    break;
                 default:
                     HandleClayInput(mouse, overUI, altHeld);
                     break;
@@ -1510,7 +1759,15 @@ namespace Sculpting
             // the index current as geometry moves - see VertexSpatialGrid.UpdateVertices - so
             // this rebuild is really about matching cell size to the mask brush's own radius.)
             if (!altHeld && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
+            {
                 sculptableMesh.RebuildSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
+                // Opens the mask stroke's undo accumulator. Mask mode returns from
+                // HandleSculptInput before its BeginStrokeUndo block, so this is the only place
+                // that can do it; the matching commit needs no new call site, since
+                // HandleStrokeEndCommit already fires EndStrokeUndo on every mouse release
+                // regardless of which mode is active.
+                sculptableMesh.BeginMaskStroke();
+            }
 
             Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
@@ -1647,7 +1904,9 @@ namespace Sculpting
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            Vector3 localNormal = t.InverseTransformDirection(worldNormal).normalized;
+            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
             float dt = Time.deltaTime;
 
             float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
@@ -2006,7 +2265,9 @@ namespace Sculpting
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            Vector3 localNormal = t.InverseTransformDirection(worldNormal).normalized;
+            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
             _dirtyVertexScratch.Clear();
             foreach (Vector3 sign in Mirror.GetMirrorSigns())
@@ -2150,7 +2411,9 @@ namespace Sculpting
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            Vector3 localNormal = t.InverseTransformDirection(worldNormal).normalized;
+            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
             // Stroke-travel direction in the tangent plane, used to bias a raised lip onto the
             // leading edge and leave a groove on the trailing edge - the asymmetry that
@@ -2278,7 +2541,9 @@ namespace Sculpting
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            Vector3 localNormal = t.InverseTransformDirection(worldNormal).normalized;
+            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
             _dirtyVertexScratch.Clear();
             foreach (Vector3 sign in Mirror.GetMirrorSigns())
@@ -2368,6 +2633,234 @@ namespace Sculpting
                 {
                     Vector3 toTarget = target - verts[i];
                     verts[i] += toTarget * Mathf.Clamp01(weight * effectiveStrength * InflateSpeed * dt); // see Clamp01 note on Clay
+                }
+
+                _dirtyVertexScratch.Add(i);
+            }
+        }
+
+        private void HandleFlattenInput(Mouse mouse, bool overUI, bool altHeld)
+        {
+            _isHovering = false;
+            if (overUI) return;
+
+            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+
+            _isHovering = hasHit;
+            if (!_isHovering) return;
+
+            _hoverPoint = hitPoint;
+            _hoverNormal = hitNormal;
+            UpdateStrokeSpeed(hitPoint);
+
+            bool rightHeld = mouse.rightButton.isPressed;
+            bool invertHeld = rightHeld || CtrlHeld;
+            _previewPositive = invertHeld ? !isPositive : isPositive;
+
+            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
+                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+
+            if (mouse.leftButton.isPressed && !altHeld)
+                ApplyFlattenBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
+            else if (rightHeld)
+                ApplyFlattenBrush(hitPoint, hitNormal, !isPositive);
+        }
+
+        private void ApplyFlattenBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive)
+        {
+            Transform t = sculptableMesh.transform;
+            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
+            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+
+            _dirtyVertexScratch.Clear();
+            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            {
+                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
+                ApplyFlattenBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
+            }
+
+            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+        }
+
+        // Projects every vertex in the footprint onto one shared plane - the classic
+        // ZBrush/Nomad/Blender Flatten. The plane is the footprint's own AREA plane: a
+        // falloff-weighted average over the whole footprint rather than the single raycast hit's
+        // own triangle, for exactly the reasons spelled out on ApplyClayBrushLocal (one
+        // triangle's normal jitters as the stroke crosses triangles, and stacks into a
+        // stair-stepped surface). flattenPlaneOffset then slides that plane along its own normal
+        // to get the Fill/Scrape variants out of the same code.
+        //
+        // The origin is averaged from where this stroke FOUND each vertex
+        // (SculptableMesh.StrokeStartPosition), not from where they are now - the "original
+        // coordinates" trick Blender's flatten-family brushes use, and the one point where
+        // Flatten must differ from Clay. Clay deliberately re-plans against the live surface
+        // because it adds material on top of whatever is already there; Flatten's plane is
+        // instead the absolute profile the stroke is driving toward, and averaging it live makes
+        // it chase its own output: at a non-zero offset the plane is re-derived each frame from
+        // vertices the previous frame just moved to it, then offset AGAIN, so holding the brush
+        // still drills or balloons without limit instead of settling. Measured before the fix,
+        // a held Fill dab at offset +0.3 on a radius-0.5 sphere pushed the surface out to 0.89
+        // (it should stop at ~0.6); the anchored plane converges and stops. The plane NORMAL is
+        // still averaged from live normals, which is stable on its own - flattening turns them
+        // toward the plane normal, so that average converges rather than running away.
+        //
+        // Unlike Clay, which offsets each vertex's target ALONG the normal by height*weight and
+        // therefore builds material, Flatten's target is the plane itself for every vertex - the
+        // falloff only controls how fast each one gets there. That difference is the whole brush:
+        // a held Clay dab keeps rising, a held Flatten dab converges onto the plane and stops.
+        // The weight still matters at the footprint edge, where it leaves a soft blend into the
+        // untouched surface instead of a disc-shaped step.
+        //
+        // Inverted (RMB / Ctrl, or the Positive toggle off) pushes vertices AWAY from the plane
+        // instead - Blender's Ctrl+Flatten contrast/sharpen - which is the divergent direction
+        // and so is the only one that needs a cap (see FlattenContrastLimit).
+        private void ApplyFlattenBrushLocal(Vector3 localPoint, Vector3 localNormal, bool positive)
+        {
+            Vector3[] verts = sculptableMesh.Vertices;
+            Vector3[] normals = sculptableMesh.Normals;
+            List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
+            if (candidates.Count == 0) return;
+
+            if (useBurstJobs && candidates.Count >= MinJobVertexCount)
+                ApplyFlattenBrushLocalJob(localPoint, localNormal, positive, candidates, verts, normals);
+            else
+                ApplyFlattenBrushLocalManaged(localPoint, localNormal, positive, candidates, verts, normals);
+        }
+
+        private void ApplyFlattenBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        {
+            float dt = Time.deltaTime;
+
+            GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
+            for (int ci = 0; ci < candidates.Count; ci++)
+                _nativeClayStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+
+            // Clay's pass-1 job, reused with the round tip (TipRoundness 1) and a full-radius
+            // taper (EdgeSoftness 1) - which reduces ClayTipShapeT01/ClayFalloff to exactly the
+            // plain smoothstep-over-the-radius weight ApplyFlattenBrushLocalManaged computes, and
+            // makes Tangent0/Bitangent0 dead parameters (ClayTipShapeT01 returns before reading
+            // them at roundness 1), hence Vector3.zero rather than a basis nothing consumes. Only
+            // WeightsOut is consumed here (see the reduction below), so the job's two weighted-sum
+            // outputs are written into the shared scratch and ignored.
+            var weightJob = new ClayWeightJob
+            {
+                PositionsIn = _nativePositionsIn,
+                NormalsIn = _nativeNormalsIn,
+                MaskIn = _nativeMaskIn,
+                WeightsOut = _nativeClayWeights,
+                WeightedPosOut = _nativeClayWeightedPos,
+                WeightedNormalOut = _nativeClayWeightedNormal,
+                LocalPoint = localPoint,
+                BrushRadius = brushRadius,
+                Tangent0 = Vector3.zero,
+                Bitangent0 = Vector3.zero,
+                TipRoundness = 1f,
+                EdgeSoftness = 1f,
+            };
+            weightJob.Schedule(candidates.Count, 32).Complete();
+
+            // Sequential reduction across the footprint, on the main thread for the same reason
+            // Clay's is (see ClayWeightJob). Weights come from the job; the weighted sums are
+            // recomputed here from _nativeClayStrokeStart rather than read out of the job's
+            // WeightedPosOut, because Flatten's plane is anchored to where the stroke FOUND the
+            // surface, not to where its own earlier frames have already pushed it - see
+            // ApplyFlattenBrushLocal. Two multiplies per candidate in a loop that already runs,
+            // against a second copy of ClayWeightJob differing only in which array it reduces.
+            Vector3 planeOriginSum = Vector3.zero, planeNormalSum = Vector3.zero;
+            float planeWeightSum = 0f;
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                float w = _nativeClayWeights[ci];
+                planeOriginSum += _nativeClayStrokeStart[ci] * w;
+                planeNormalSum += _nativeNormalsIn[ci] * w;
+                planeWeightSum += w;
+            }
+            if (planeWeightSum <= 1e-6f) return;
+
+            Vector3 planeNormal = planeNormalSum.sqrMagnitude > 1e-8f ? planeNormalSum.normalized : localNormal;
+            Vector3 planeOrigin = planeOriginSum / planeWeightSum + planeNormal * (brushRadius * flattenPlaneOffset);
+
+            var dispJob = new FlattenDisplacementJob
+            {
+                PositionsIn = _nativePositionsIn,
+                StrokeStartIn = _nativeClayStrokeStart,
+                WeightsIn = _nativeClayWeights,
+                PositionsOut = _nativePositionsOut,
+                AppliedOut = _nativeAppliedOut,
+                PlaneOrigin = planeOrigin,
+                PlaneNormal = planeNormal,
+                LerpFactorScale = EffectiveBrushStrength * FlattenSpeed * dt,
+                Contrast = !positive,
+                MaxOffStart = brushRadius * FlattenContrastLimit,
+            };
+            dispJob.Schedule(candidates.Count, 32).Complete();
+
+            ScatterJobResults(candidates, verts);
+        }
+
+        private void ApplyFlattenBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        {
+            float dt = Time.deltaTime;
+            float lerpFactorScale = EffectiveBrushStrength * FlattenSpeed * dt;
+            float maxOffStart = brushRadius * FlattenContrastLimit;
+
+            if (_clayWeightScratch.Length < candidates.Count) _clayWeightScratch = new float[candidates.Count];
+            float[] weights = _clayWeightScratch;
+
+            Vector3 planeOriginSum = Vector3.zero;
+            Vector3 planeNormalSum = Vector3.zero;
+            float planeWeightSum = 0f;
+
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                int i = candidates[ci];
+                float dist = Vector3.Distance(verts[i], localPoint);
+                if (dist > brushRadius) { weights[ci] = 0f; continue; }
+
+                float t01 = 1f - dist / brushRadius;
+                float w = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]); // smoothstep, masked-out
+                weights[ci] = w;
+
+                // StrokeStartPosition, not verts[i] - see ApplyFlattenBrushLocal on why the
+                // plane is anchored to the surface this stroke began with.
+                planeOriginSum += sculptableMesh.StrokeStartPosition(i) * w;
+                planeNormalSum += normals[i] * w;
+                planeWeightSum += w;
+            }
+
+            if (planeWeightSum <= 1e-6f) return;
+
+            Vector3 planeNormal = planeNormalSum.sqrMagnitude > 1e-8f
+                ? planeNormalSum.normalized : localNormal;
+            // The plane the footprint gets projected onto, slid along its own normal by the
+            // Plane Offset control - see flattenPlaneOffset for what the two directions mean.
+            Vector3 planeOrigin = planeOriginSum / planeWeightSum + planeNormal * (brushRadius * flattenPlaneOffset);
+
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                float weight = weights[ci];
+                if (weight <= 0f) continue;
+                int i = candidates[ci];
+
+                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+
+                // Signed height above the plane. Flatten cancels it; contrast doubles down on it.
+                float along = Vector3.Dot(verts[i] - planeOrigin, planeNormal);
+                // Clamp01 for the same reason Clay's does - this is a lerp fraction toward the
+                // plane, and a frame hitch with a large dt would otherwise overshoot past it.
+                float lerp = Mathf.Clamp01(weight * lerpFactorScale);
+                verts[i] += planeNormal * ((positive ? -along : along) * lerp);
+
+                if (!positive)
+                {
+                    // Contrast only - see FlattenContrastLimit for why this direction alone
+                    // needs bounding, and why the bound is symmetric.
+                    float fromStart = Vector3.Dot(verts[i] - sculptableMesh.StrokeStartPosition(i), planeNormal);
+                    if (fromStart > maxOffStart) verts[i] -= planeNormal * (fromStart - maxOffStart);
+                    else if (fromStart < -maxOffStart) verts[i] -= planeNormal * (fromStart + maxOffStart);
                 }
 
                 _dirtyVertexScratch.Add(i);
@@ -2671,6 +3164,66 @@ namespace Sculpting
             sculptableMesh.Remesh(remeshResolution);
         }
 
+        /// Live symmetry report for the selected object - pairs found, centreline size, and how
+        /// many vertices have no counterpart. See SymmetryOps.Status for why it is recomputed
+        /// rather than cached.
+        public string SymmetryStatus() => SymmetryOps.Status(sculptableMesh, symmetryAxis, symmetryToleranceScale);
+
+        /// Copies one side of the selected object onto the other through the vertex
+        /// correspondence map. Returns a short result string for the UI, since "nothing visibly
+        /// happened" and "the map could not pair anything" look identical in the viewport.
+        public string MakeSymmetric(bool sourceIsPositive)
+        {
+            if (sculptableMesh == null) return "No object selected";
+            EndMoveDrag();
+
+            int changed = SymmetryOps.MakeSymmetric(sculptableMesh, symmetryAxis, symmetryToleranceScale,
+                                                    sourceIsPositive, out int pairs, out int unmatched);
+
+            string axis = SymmetryOps.AxisName(symmetryAxis);
+            string from = sourceIsPositive ? "+" + axis : "-" + axis;
+            string to = sourceIsPositive ? "-" + axis : "+" + axis;
+
+            // Nothing was modified in this case - mirroring through a partial correspondence
+            // tears the surface instead of repairing it (see SymmetryOps.MaxUnmatchedFraction).
+            // The message names the alternative, because "too asymmetric to mirror" with no way
+            // forward is what makes a refusal read as the tool being broken.
+            if (changed == SymmetryOps.TooAsymmetric)
+                return $"Too asymmetric to mirror: {unmatched} vertices have no counterpart " +
+                       $"across {axis} ({pairs} pairs do). Mirroring would tear those apart. " +
+                       "Use Mirror to build a matching half, or Symmetry Cleanup first.";
+
+            if (changed < 0) return "No geometry to mirror";
+            if (pairs == 0) return $"Nothing paired across {axis} - raise Match Tolerance";
+            if (changed == 0) return $"Already symmetric across {axis} - {pairs} pairs match";
+
+            // The unmatched count rides along on success too: it is the part of the model this
+            // operation could not touch, and leaving it out is what let a partial mirror look
+            // like a complete one.
+            string leftover = unmatched > 0 ? $", {unmatched} unmatched" : string.Empty;
+            return $"Mirrored {from} onto {to}: {changed} of {pairs} pairs{leftover}";
+        }
+
+        /// Snaps the centreline onto the mirror plane and welds the duplicate vertices that
+        /// leaves - the repair for a model joined from two mirrored halves, whose seam is two
+        /// coincident shells rather than one shared edge loop.
+        public string SymmetryCleanup()
+        {
+            if (sculptableMesh == null) return "No object selected";
+            EndMoveDrag();
+
+            if (!SymmetryOps.Cleanup(sculptableMesh, symmetryAxis, symmetryToleranceScale,
+                                     out int snapped, out int welded))
+                return "No geometry to clean up";
+
+            string axis = SymmetryOps.AxisName(symmetryAxis);
+            if (snapped == 0 && welded == 0) return $"Already clean across {axis} - nothing to do";
+            if (welded == 0) return $"Snapped {snapped} vertices onto {axis} - no duplicates found";
+            return snapped == 0
+                ? $"Welded {welded} duplicate vertices"
+                : $"Snapped {snapped} onto {axis}, welded {welded} duplicate vertices";
+        }
+
         // Fixed destination rather than a save-file dialog - EditorUtility.SaveFilePanel only
         // exists in the Editor and would silently vanish once this ships as a standalone
         // build, whereas Environment.GetFolderPath is plain .NET and resolves the real
@@ -2695,6 +3248,14 @@ namespace Sculpting
         {
             if (brushPreview == null || cam == null) return;
             if (sculptableMesh == null) { brushPreview.SetActive(false); return; }
+
+            // Another tool owns the cursor - Transpose/Scale drag the transform, ZSpheres place
+            // and grow rig spheres, and each shows its own affordance. Leaving the brush cursor up
+            // meant it sat frozen wherever it last was: HandleSculptInput returns early in these
+            // modes without clearing _isOverUI, so a stale `true` from clicking the tool button in
+            // the side panel sent this straight down the "freeze at the last good position" branch
+            // and parked a green ball off to one side for as long as the tool was active.
+            if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt) { brushPreview.SetActive(false); return; }
 
             Vector3 previewPos;
             bool positive;
@@ -2733,7 +3294,11 @@ namespace Sculpting
 
             if (_brushPreviewRenderer != null)
             {
-                Color c = positive ? PositiveColor : NegativeColor;
+                // Forced red while the strength gauge (F) is up, overriding whatever polarity
+                // would otherwise be shown - a distinct, unambiguous "you're adjusting
+                // strength, not sculpting" cue, reusing NegativeColor rather than inventing a
+                // third cursor color.
+                Color c = _isAdjustingStrength ? NegativeColor : (positive ? PositiveColor : NegativeColor);
                 c.a = 0.35f;
                 _brushPreviewRenderer.material.color = c;
             }
@@ -2815,7 +3380,10 @@ namespace Sculpting
             // trusted - a file written by an older build (or hand-edited) can legitimately have
             // fewer entries than today's BrushType has members.
             public float[] perBrushStrength;
-            public float[] perBrushRadius;
+            // No perBrushRadius counterpart: radius is one value shared by every brush (see
+            // _brushStrengthPerType), saved as `brushRadius` above. A file written before that
+            // change still carries the old per-brush array; JsonUtility drops the unknown field
+            // and `brushRadius` restores the size that was actually in hand when it was saved.
             public bool[] perBrushPolarity;
             public bool[] perBrushAccumulate;
             public float[] perBrushAccumulateStrength;
@@ -2823,12 +3391,11 @@ namespace Sculpting
 
         public Settings CaptureSettings()
         {
-            // Flush the live values into the per-brush arrays first. BrushStrength/BrushRadius
-            // write through on every set, but currentBrush's own slot is the one that can be
-            // mid-edit, and Capture must not save a stale entry for the brush in hand.
+            // Flush the live values into the per-brush arrays first. BrushStrength writes
+            // through on every set, but currentBrush's own slot is the one that can be mid-edit,
+            // and Capture must not save a stale entry for the brush in hand.
             int cur = (int)currentBrush;
             _brushStrengthPerType[cur] = brushStrength;
-            _brushRadiusPerType[cur] = brushRadius;
             _brushPolarity[cur] = isPositive;
             _brushAccumulate[cur] = accumulate;
             _accumulateStrengthPerType[cur] = accumulateStrength;
@@ -2867,7 +3434,6 @@ namespace Sculpting
                 maskPaintMode = IsMaskPaintMode,
 
                 perBrushStrength = (float[])_brushStrengthPerType.Clone(),
-                perBrushRadius = (float[])_brushRadiusPerType.Clone(),
                 perBrushPolarity = (bool[])_brushPolarity.Clone(),
                 perBrushAccumulate = (bool[])_brushAccumulate.Clone(),
                 perBrushAccumulateStrength = (float[])_accumulateStrengthPerType.Clone(),
@@ -2883,7 +3449,6 @@ namespace Sculpting
             if (s == null) return;
 
             CopyPerBrush(s.perBrushStrength, _brushStrengthPerType);
-            CopyPerBrush(s.perBrushRadius, _brushRadiusPerType);
             CopyPerBrush(s.perBrushPolarity, _brushPolarity);
             CopyPerBrush(s.perBrushAccumulate, _brushAccumulate);
             CopyPerBrush(s.perBrushAccumulateStrength, _accumulateStrengthPerType);
@@ -2910,9 +3475,10 @@ namespace Sculpting
             UseBurstJobs = s.useBurstJobs;
             ShowWireframeGizmo = s.showWireframeGizmo;
 
-            // CurrentBrush's setter swaps in that brush's remembered strength/radius/polarity
-            // from the arrays just restored above, so it has to come AFTER them - and the live
-            // values are assigned after IT, since the swap would otherwise overwrite them.
+            // CurrentBrush's setter swaps in that brush's remembered strength/polarity from
+            // the arrays just restored above, so it has to come AFTER them - and the live values
+            // are assigned after IT, since the swap would otherwise overwrite them. BrushRadius
+            // is unaffected by the swap either way, being shared across brushes.
             CurrentBrush = (BrushType)Mathf.Clamp(s.currentBrush, 0, System.Enum.GetValues(typeof(BrushType)).Length - 1);
             BrushStrength = s.brushStrength;
             BrushRadius = s.brushRadius;

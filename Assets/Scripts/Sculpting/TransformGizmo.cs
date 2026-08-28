@@ -105,7 +105,13 @@ namespace Sculpting
         {
             if (_cam == null) _cam = Camera.main;
             SculptableMesh target = Target;
-            bool active = Mode != GizmoMode.Sculpt && target != null && _cam != null;
+            // Tested against this gizmo's OWN two modes rather than `!= Sculpt`: GizmoMode also
+            // carries modes belonging to other tools (ZSphere), and a blanket "anything but
+            // Sculpt" test showed this gizmo's handles on top of those tools - the Scale trio,
+            // specifically, since the transpose/scale split below reads any non-Transpose mode as
+            // Scale.
+            bool active = (Mode == GizmoMode.Transpose || Mode == GizmoMode.Scale) &&
+                          target != null && _cam != null;
 
             if (_root.activeSelf != active) _root.SetActive(active);
             if (!active) { EndDrag(); return; }
@@ -222,12 +228,63 @@ namespace Sculpting
 
         private void EndDrag()
         {
+            Transform dragged = _dragTarget;
             _dragTarget = null;
+
             if (_maskedTarget != null)
             {
+                // The masked path deformed vertices, and EndMaskedTransform commits the
+                // vertex-delta undo entry BeginMaskedTransform opened - nothing to record here.
                 _maskedTarget.EndMaskedTransform();
                 _maskedTarget = null;
+                return;
             }
+
+            if (dragged != null) RecordTransformUndo(dragged);
+        }
+
+        /// Commits one whole-object Transpose/Scale drag as a single undo step, so it takes its
+        /// turn in scene-wide order alongside brush strokes (see EditHistory).
+        ///
+        /// This used to record nothing at all, on the reasoning that a Transform drag is free to
+        /// reverse by dragging back. That holds only while you can still see where it started -
+        /// after a rotate you did not mean, or several drags later, there is no way back by hand,
+        /// and undo would silently step past the drag to the stroke before it. The masked path
+        /// was always undoable, which made the gap easy to miss.
+        ///
+        /// A whole TRS triple is captured regardless of which handle was dragged. It is 40 bytes
+        /// either way, and recording all three means a step cannot be subtly wrong about what a
+        /// drag touched (uniform scale, for one, is a scale drag that also clamps per-axis).
+        private void RecordTransformUndo(Transform dragged)
+        {
+            Vector3 fromPos = _dragStartPos, toPos = dragged.position;
+            Quaternion fromRot = _dragStartRot, toRot = dragged.rotation;
+            Vector3 fromScale = _dragStartScale, toScale = dragged.localScale;
+
+            // A click that picked a handle without moving it is not an edit - recording it would
+            // spend an undo press doing nothing visible, which reads exactly like undo is broken.
+            if (fromPos == toPos && fromRot == toRot && fromScale == toScale) return;
+
+            EditHistory.RecordSceneAction(
+                _dragKind == HandleKind.Rotate ? "Rotate" : _dragKind == HandleKind.Move ? "Move" : "Scale",
+                () => ApplyTransform(dragged, fromPos, fromRot, fromScale),
+                () => ApplyTransform(dragged, toPos, toRot, toScale),
+                null, // holds nothing but the Transform reference itself - nothing to release
+                TransformStepBytes);
+        }
+
+        // Two Vector3s and a Quaternion - the whole payload a transform step retains.
+        private const long TransformStepBytes = 40;
+
+        private static void ApplyTransform(Transform t, Vector3 position, Quaternion rotation, Vector3 scale)
+        {
+            // Unity's overloaded == reports a destroyed object as null: the object this step
+            // describes can be deleted from the Scene Graph panel after the fact, and a step
+            // that quietly does nothing is exactly what EditHistory.TakeStep already expects of
+            // a stale entry.
+            if (t == null) return;
+            t.SetPositionAndRotation(position, rotation);
+            t.localScale = scale;
         }
 
         // Every handler below has the same shape: work out what the drag means, then either

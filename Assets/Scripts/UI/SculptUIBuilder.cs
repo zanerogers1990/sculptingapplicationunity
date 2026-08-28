@@ -27,6 +27,11 @@ namespace Sculpting
         private static readonly Color MirrorYColor = new Color(0.35f, 1f, 0.35f);
         private static readonly Color MirrorZColor = new Color(0.3f, 0.55f, 1f);
 
+        // Symmetry Repair status line: the same green/grey pairing the extract status already
+        // uses for "an action reported success" versus "here is what this section does".
+        private static readonly Color SymmetryOkColor = new Color(0.55f, 0.85f, 0.55f);
+        private static readonly Color SymmetryHintColor = new Color(0.65f, 0.65f, 0.7f);
+
         private const float ResizeGaugeWidth = 160f;
 
         private Font _font;
@@ -41,9 +46,16 @@ namespace Sculpting
         private Image _creaseButtonImage;
         private Image _damButtonImage;
         private Image _inflateButtonImage;
+        private Image _flattenButtonImage;
         private Image _maskButtonImage;
         private bool _lastShownMaskMode;
         private Slider _brushSizeSlider;
+        // Was previously created but never captured, so this slider went stale the moment a
+        // hotkey (or the F-drag gauge below) changed controller.BrushStrength out from under
+        // it - each brush remembers its own strength (SculptController._brushStrengthPerType),
+        // so switching brushes silently changed the ACTUAL value while the panel kept showing
+        // whatever the last brush had. Now resynced every frame alongside _brushSizeSlider.
+        private Slider _brushStrengthSlider;
         private Text _polyCountLabel;
         private Text _exportStatusLabel;
         private int _lastShownTriCount = -1, _lastShownVertCount = -1;
@@ -65,8 +77,23 @@ namespace Sculpting
 
         // Mask extract (see BuildExtractSection). The controller owns all the state; these are
         // just the controls whose enabled-ness and text have to follow it.
+        // History depth control and its live cost readout - see BuildUI's undo row.
+        private Text _historyLabel;
+        private float _nextHistoryRefresh;
+
         private MaskExtractController _extract;
         private Button _extractAcceptButton, _extractCancelButton;
+
+        // Symmetry repair (see BuildSymmetrySection). The status line is deliberately NOT polled
+        // every frame like the extract one above: producing it means building a whole vertex
+        // correspondence map (SymmetryOps.Status), which is O(vertex count) and would cost a
+        // full pass over a multi-million-vertex sculpt on every single frame just to redraw a
+        // line of text. It is written on demand instead - when Check Symmetry is pressed, and
+        // after each repair, which are exactly the moments the number can have changed.
+        private Image[] _symmetryAxisImages = new Image[3];
+        private Text _symmetryStatusLabel;
+        private Text _symPosToNegLabel, _symNegToPosLabel;
+        private int _lastShownSymmetryAxis = -1;
         private Text _extractStatusLabel;
         private bool _lastShownExtractPreviewing;
         private int _lastShownExtractTris = -1;
@@ -84,6 +111,12 @@ namespace Sculpting
         private GameObject _resizeGaugeGO;
         private RectTransform _resizeGaugeRect;
         private RectTransform _resizeGaugeFillRect;
+
+        // Same popup-gauge pattern, shown while SculptController.IsAdjustingStrength is true
+        // (holding F), positioned at the screen point the F-drag started (see Update()).
+        private GameObject _strengthGaugeGO;
+        private RectTransform _strengthGaugeRect;
+        private RectTransform _strengthGaugeFillRect;
 
         // Start(), not Awake(): BuildUI() reads controller.Mirror.MirrorX, which now resolves
         // through SelectionManager.PrimarySelection (see SculptController.Mirror) instead of a
@@ -118,6 +151,21 @@ namespace Sculpting
             }
 
             if (_brushSizeSlider != null) _brushSizeSlider.SetValueWithoutNotify(controller.BrushRadius);
+
+            // Same as the resize gauge above, but for BrushStrength while holding F.
+            bool showStrength = controller.IsAdjustingStrength;
+            if (_strengthGaugeGO != null)
+            {
+                if (_strengthGaugeGO.activeSelf != showStrength) _strengthGaugeGO.SetActive(showStrength);
+                if (showStrength)
+                {
+                    _strengthGaugeRect.position = controller.StrengthAdjustAnchorScreenPosition + new Vector2(0f, 50f);
+                    float st01 = Mathf.InverseLerp(0.01f, 1f, controller.BrushStrength);
+                    _strengthGaugeFillRect.sizeDelta = new Vector2(ResizeGaugeWidth * st01, _strengthGaugeFillRect.sizeDelta.y);
+                }
+            }
+
+            if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
             // Brush switches can now come from the keyboard outside of SetBrushType (hotkeys
             // 1-5, and holding Shift to temporarily switch to Smooth), so the highlighted
@@ -155,8 +203,10 @@ namespace Sculpting
 
             if (_undoButton != null) _undoButton.interactable = controller.CanUndo;
             if (_redoButton != null) _redoButton.interactable = controller.CanRedo;
+            RefreshHistoryLabel();
 
             RefreshMirrorToggles();
+            RefreshSymmetryAxis();
             RefreshExtractStatus();
 
             if (_polyCountLabel != null)
@@ -259,7 +309,7 @@ namespace Sculpting
             _polyCountLabel = CreateLabel(panel.transform, "Tris: - | Verts: -", 12, FontStyle.Normal);
 
             CreateLabel(panel.transform, "Brush Strength", 14, FontStyle.Normal);
-            CreateSlider(panel.transform, 0.01f, 1f, controller.BrushStrength, v => controller.BrushStrength = v);
+            _brushStrengthSlider = CreateSlider(panel.transform, 0.01f, 1f, controller.BrushStrength, v => controller.BrushStrength = v);
 
             CreateLabel(panel.transform, "Brush Size", 14, FontStyle.Normal);
             _brushSizeSlider = CreateSlider(panel.transform, SculptController.MinBrushRadius, SculptController.MaxBrushRadius,
@@ -304,7 +354,9 @@ namespace Sculpting
             // squeeze into an existing row.
             var brushRow3 = CreateRow(panel.transform);
             var inflateButton = CreateButton(brushRow3.transform, "Inflate", () => SetBrushType(BrushType.Inflate));
+            var flattenButton = CreateButton(brushRow3.transform, "Flatten", () => SetBrushType(BrushType.Flatten));
             _inflateButtonImage = inflateButton.GetComponent<Image>();
+            _flattenButtonImage = flattenButton.GetComponent<Image>();
             RefreshBrushButtons();
 
             // Collapsed by default, same reasoning as the other shaping foldouts below.
@@ -360,6 +412,15 @@ namespace Sculpting
             CreateLabel(creaseFoldout, "Dam Standard Lip Height", 12, FontStyle.Normal);
             CreateSlider(creaseFoldout, 0f, 1f, controller.DamLipHeight, v => controller.DamLipHeight = v);
 
+            // Collapsed by default, same reasoning as "Clay Shaping" above. One slider, because
+            // Plane Offset is the only thing that distinguishes Flatten from its Fill/Scrape
+            // siblings - everything else it needs (size, strength, polarity) is already in the
+            // shared controls at the top of the panel. See SculptController.flattenPlaneOffset.
+            Transform flattenFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Flatten Shaping", false);
+            CreateLabel(flattenFoldout, "Plane Offset (Scrape <-> Fill)", 12, FontStyle.Normal);
+            CreateSlider(flattenFoldout, -0.5f, 0.5f, controller.FlattenPlaneOffset,
+                v => controller.FlattenPlaneOffset = v);
+
             // Collapsed by default, same reasoning as "Clay Shaping" above. Both controls are
             // inert without a stylus - CurrentPressure short-circuits to 1 when Pen.current is
             // null - but the section is always built rather than hidden on no-pen, since a
@@ -390,6 +451,8 @@ namespace Sculpting
             _showPlanesToggle = CreateToggle(panel.transform, "Show Mirror Planes", mirror == null || mirror.ShowPlanes,
                 MirrorController.SetShowPlanesForAll, out _);
 
+            BuildSymmetrySection(panel.transform);
+
             CreateToggle(panel.transform, "Wireframe (Scene View)", controller.ShowWireframeGizmo,
                 v => controller.ShowWireframeGizmo = v, out _);
             CreateToggle(panel.transform, "Log Ray Hits", controller.LogRayHits,
@@ -398,6 +461,21 @@ namespace Sculpting
             var undoRedoRow = CreateRow(panel.transform);
             _undoButton = CreateButton(undoRedoRow.transform, "Undo (Z)", () => controller.Undo());
             _redoButton = CreateButton(undoRedoRow.transform, "Redo (Shift+Z)", () => controller.Redo());
+
+            // Undo depth is a setting rather than a constant because its cost is entirely
+            // workload-dependent: brush strokes store only the vertices they touched, so hundreds
+            // fit in a few MB, while a single high-resolution Remesh stores the whole mesh twice
+            // over. The readout under the slider is the other half of that - EditHistory also
+            // enforces a hard memory ceiling regardless of this number, and without seeing the
+            // megabytes there is no way to tell which of the two limits you are actually against.
+            CreateLabel(panel.transform, "Undo Steps", 14, FontStyle.Normal);
+            CreateSlider(panel.transform, EditHistory.MinSteps, EditHistory.HardMaxSteps,
+                controller.UndoSteps, v => controller.UndoSteps = Mathf.RoundToInt(v));
+            // Populated here rather than left for the first Update: RefreshHistoryLabel is
+            // throttled, and the panel gets rebuilt from scratch on a scene load, so an empty
+            // initial string would leave the readout blank for up to half a second every time.
+            _historyLabel = CreateLabel(panel.transform, SculptController.HistorySummary, 11, FontStyle.Italic);
+            _nextHistoryRefresh = 0f;
 
             CreateButton(panel.transform, "Reset Mesh", () => controller.ResetMesh());
 
@@ -417,10 +495,22 @@ namespace Sculpting
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std  6 Inflate\nM Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (cursor turns red)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             _resizeGaugeGO = CreateResizeGauge(canvasGO.transform);
+            _strengthGaugeGO = CreateStrengthGauge(canvasGO.transform);
+        }
+
+        // Throttled rather than refreshed every frame: EditHistory.TotalBytes walks every step
+        // in both stacks, and this is a status line nobody is watching frame by frame.
+        private const float HistoryRefreshInterval = 0.5f;
+
+        private void RefreshHistoryLabel()
+        {
+            if (_historyLabel == null || Time.unscaledTime < _nextHistoryRefresh) return;
+            _nextHistoryRefresh = Time.unscaledTime + HistoryRefreshInterval;
+            _historyLabel.text = SculptController.HistorySummary;
         }
 
         private void SetBrushType(BrushType type)
@@ -437,6 +527,7 @@ namespace Sculpting
             _creaseButtonImage.color = controller.CurrentBrush == BrushType.Crease ? ActiveColor : InactiveColor;
             _damButtonImage.color = controller.CurrentBrush == BrushType.DamStandard ? ActiveColor : InactiveColor;
             _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? ActiveColor : InactiveColor;
+            _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? ActiveColor : InactiveColor;
             _maskButtonImage.color = controller.IsMaskPaintMode ? MaskActiveColor : InactiveColor;
         }
 
@@ -456,6 +547,87 @@ namespace Sculpting
         /// through to MaskExtractController, whose setters rebuild the preview themselves, so
         /// there's no refresh plumbing here - dragging a slider with no preview open is a plain
         /// value assignment.
+        /// The correspondence-map repair tools. Separate from the Mirror toggles just above even
+        /// though both are "symmetry", because they answer different questions: those toggles ask
+        /// "reflect my strokes as I sculpt" and can have any combination of axes on at once,
+        /// while these ask "are the two halves of this model actually the same, and make them so"
+        /// - which is only meaningful about ONE plane at a time. See SculptController's
+        /// symmetryAxis remarks.
+        private void BuildSymmetrySection(Transform panel)
+        {
+            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Symmetry Repair", false);
+
+            CreateLabel(foldout, "Symmetry Plane", 12, FontStyle.Normal);
+            var axisRow = CreateRow(foldout);
+            for (int i = 0; i < 3; i++)
+            {
+                int axis = i; // captured per iteration, not shared across the three callbacks
+                Button b = CreateButton(axisRow.transform, SymmetryOps.AxisName(axis),
+                    () => controller.SymmetryAxis = axis);
+                _symmetryAxisImages[i] = b.GetComponent<Image>();
+            }
+
+            // Match tolerance is exposed because the right value is a property of the MESH, not
+            // of the app: an exactly-mirrored model pairs at any tolerance, while two halves that
+            // have each been remeshed independently only pair once the window is wide enough to
+            // span the difference in where the two tessellations put their vertices. Too wide is
+            // self-limiting rather than destructive (see SymmetryOps.MaxToleranceScale), so this
+            // is safe to let the user push.
+            CreateLabel(foldout, "Match Tolerance (tight <-> loose)", 12, FontStyle.Normal);
+            CreateSlider(foldout, SymmetryOps.MinToleranceScale, SymmetryOps.MaxToleranceScale,
+                controller.SymmetryToleranceScale, v => controller.SymmetryToleranceScale = v);
+
+            CreateButton(foldout, "Check Symmetry", () => SetSymmetryStatus(controller.SymmetryStatus(), Color.white));
+
+            var mirrorRow = CreateRow(foldout);
+            Button posToNeg = CreateButton(mirrorRow.transform, "+X to -X",
+                () => SetSymmetryStatus(controller.MakeSymmetric(true), SymmetryOkColor));
+            Button negToPos = CreateButton(mirrorRow.transform, "-X to +X",
+                () => SetSymmetryStatus(controller.MakeSymmetric(false), SymmetryOkColor));
+            _symPosToNegLabel = posToNeg.GetComponentInChildren<Text>();
+            _symNegToPosLabel = negToPos.GetComponentInChildren<Text>();
+
+            CreateButton(foldout, "Symmetry Cleanup (Snap + Weld)",
+                () => SetSymmetryStatus(controller.SymmetryCleanup(), SymmetryOkColor));
+
+            _symmetryStatusLabel = CreateLabel(foldout,
+                "Check Symmetry reports how many vertices pair across the plane.", 11, FontStyle.Italic);
+            _symmetryStatusLabel.color = SymmetryHintColor;
+
+            RefreshSymmetryAxis();
+        }
+
+        private void SetSymmetryStatus(string message, Color color)
+        {
+            if (_symmetryStatusLabel == null) return;
+            _symmetryStatusLabel.text = message;
+            _symmetryStatusLabel.color = color;
+        }
+
+        /// Keeps the axis buttons' highlight and the two mirror-direction labels in step with the
+        /// chosen plane. Guarded on change rather than rewritten every frame, the same idiom
+        /// RefreshBrushButtons uses - and unlike the extract status line this is cheap either
+        /// way, it just has no reason to run when nothing moved.
+        private void RefreshSymmetryAxis()
+        {
+            int axis = controller.SymmetryAxis;
+            if (axis == _lastShownSymmetryAxis) return;
+            _lastShownSymmetryAxis = axis;
+
+            for (int i = 0; i < 3; i++)
+            {
+                if (_symmetryAxisImages[i] == null) continue;
+                // Tinted with the axis's own gizmo colour rather than the generic ActiveColor, so
+                // the selected plane matches the coloured quad MirrorController draws for it.
+                _symmetryAxisImages[i].color = i != axis ? InactiveColor
+                    : (i == 0 ? MirrorXColor : i == 1 ? MirrorYColor : MirrorZColor);
+            }
+
+            string name = SymmetryOps.AxisName(axis);
+            if (_symPosToNegLabel != null) _symPosToNegLabel.text = $"+{name} to -{name}";
+            if (_symNegToPosLabel != null) _symNegToPosLabel.text = $"-{name} to +{name}";
+        }
+
         private void BuildExtractSection(Transform panel)
         {
             _extract = FindFirstObjectByType<MaskExtractController>();
@@ -776,6 +948,41 @@ namespace Sculpting
             fillGO.GetComponent<Image>().color = new Color(0.2f, 1f, 0.4f);
 
             _resizeGaugeRect = rect;
+            go.SetActive(false);
+            return go;
+        }
+
+        // Same track+fill gauge as CreateResizeGauge, but red-tinted to match the brush
+        // cursor's forced-red NegativeColor while adjusting strength (see
+        // SculptController.UpdateBrushPreview) - a consistent "this is the strength gesture,
+        // not the size one" cue between the 3D cursor and this HUD bar.
+        private GameObject CreateStrengthGauge(Transform canvasParent)
+        {
+            var go = new GameObject("BrushStrengthGauge", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            var rect = go.GetComponent<RectTransform>();
+            rect.sizeDelta = new Vector2(ResizeGaugeWidth, 12);
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.anchorMin = rect.anchorMax = new Vector2(0f, 0f);
+
+            var trackGO = new GameObject("Track", typeof(RectTransform), typeof(Image));
+            trackGO.transform.SetParent(go.transform, false);
+            var trackRect = trackGO.GetComponent<RectTransform>();
+            trackRect.anchorMin = Vector2.zero;
+            trackRect.anchorMax = Vector2.one;
+            trackRect.sizeDelta = Vector2.zero;
+            trackGO.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.6f);
+
+            var fillGO = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+            fillGO.transform.SetParent(go.transform, false);
+            _strengthGaugeFillRect = fillGO.GetComponent<RectTransform>();
+            _strengthGaugeFillRect.anchorMin = new Vector2(0f, 0f);
+            _strengthGaugeFillRect.anchorMax = new Vector2(0f, 1f);
+            _strengthGaugeFillRect.pivot = new Vector2(0f, 0.5f);
+            _strengthGaugeFillRect.anchoredPosition = Vector2.zero;
+            fillGO.GetComponent<Image>().color = new Color(1f, 0.3f, 0.3f);
+
+            _strengthGaugeRect = rect;
             go.SetActive(false);
             return go;
         }

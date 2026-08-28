@@ -7,6 +7,7 @@ namespace Sculpting
         Smooth,
         Crease,
         DamStandard,
-        Inflate
+        Inflate,
+        Flatten
     }
 }

@@ -81,6 +81,20 @@ namespace Sculpting.IO
             public Color backgroundColorB = Color.grey;
             public float gradientBias = 1f;
 
+            // HDRI environment. The image itself is referenced by absolute path rather than
+            // embedded: an HDRI is tens of megabytes and would dwarf the sculpt it is lighting,
+            // and the same file is normally shared across every scene the user opens. A save
+            // made on another machine therefore loads with its lighting settings intact and a
+            // "not found" note where the image should be, rather than failing.
+            public bool hdriEnabled;
+            public string hdriPath = string.Empty;
+            public float hdriRotation;
+            // Defaulted to 1 rather than 0 so a file written before HDRI support existed loads
+            // with sane values instead of a black environment the moment it is switched on.
+            public float hdriExposure = 1f;
+            public float hdriAmbientIntensity = 1f;
+            public float hdriReflectionIntensity = 1f;
+
             // Post-processing. `postAvailable` records whether the saving scene actually had a
             // Volume - loading a file saved without one must not stamp zeros over a scene that
             // does have one (see PostProcessingController.HasVolume).
@@ -101,6 +115,9 @@ namespace Sculpting.IO
             public bool valid;
             public float yaw, pitch, distance;
             public Vector3 pivot;
+            // Added after the first files were written, so it defaults to false and older saves
+            // load as perspective - which is what they were saved from.
+            public bool orthographic;
         }
     }
 }

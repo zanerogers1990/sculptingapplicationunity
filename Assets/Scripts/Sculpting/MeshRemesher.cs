@@ -126,6 +126,23 @@ namespace Sculpting
             return BuildSurface(sdf, dims, sx, sy, origin, cellSize);
         }
 
+        /// Runs only the second half of the pipeline above - Surface Nets extraction, quad
+        /// stitching and hole patching - over a signed distance grid the caller filled in
+        /// itself, instead of one sampled from an existing mesh.
+        ///
+        /// Exists for ZSphereSkinner, which has an ANALYTIC field (a smooth union of tapered
+        /// capsules) rather than a triangle soup, so everything Remesh does above this line -
+        /// SignedDistanceField's triangle bins, the winding-number inside mask, the narrow-band
+        /// pass - is not just unnecessary but inapplicable. Everything below it is exactly what
+        /// that skinner needs and would otherwise be a second, subtly-different copy of: the
+        /// even tessellation, the mostly-quad output, and PatchHoles' watertightness guarantee.
+        ///
+        /// `sdf` is laid out x + sx*(y + sy*z) with sx/sy/sz one MORE than the cell dims (corner
+        /// samples, not cell centres) - the same layout Remesh builds above. Negative is inside.
+        /// Main thread only, like Remesh, since both share this class's static scratch buffers.
+        internal static Mesh BuildFromSdf(float[] sdf, Vector3Int dims, Vector3 origin, float cellSize)
+            => BuildSurface(sdf, dims, dims.x + 1, dims.y + 1, origin, cellSize);
+
         private static int SampleIndex(int x, int y, int z, int sx, int sy) => x + sx * (y + sy * z);
 
         // Reused across BuildSurface calls for the same reason as _scratchVerts/_scratchTris -

@@ -119,8 +119,13 @@ namespace Sculpting
         public Vector3[] Vertices => _workingVertices;
         public Vector3[] Normals => _workingNormals;
         public int[] Triangles => _workingTriangles;
-        public bool CanUndo => _history.CanUndo;
-        public bool CanRedo => _history.CanRedo;
+        // Undo/redo ORDER lives in EditHistory, not here - a per-object stack cannot say
+        // whether the last thing the user did was on THIS object (see EditHistory's remarks).
+        // These are the hooks it drives this object's own payload stack through.
+        public long HistoryBytes => _history.ApproxBytes;
+        public void ClearHistory() => _history.Clear();
+        public bool DropOldestUndoEntry() => _history.DropOldestUndo();
+        public bool DropNewestRedoEntry() => _history.DropNewestRedo();
 
         public bool Visible => _visible;
 
@@ -209,7 +214,19 @@ namespace Sculpting
             // MeshJoiner destroying a non-survivor), so it can never be left stuck in
             // AllObjects.
             FindFirstObjectByType<SelectionManager>()?.Unregister(this);
+            ReleaseNativeResources();
+        }
+
+        /// Frees every native/GPU allocation this component owns and leaves the managed side in
+        /// the same "not built yet" state a fresh instance has, so EnsureGpuScatter and
+        /// EnsureNativeAdjacency simply rebuild on next use. Called from OnDestroy, and from
+        /// NativeReloadGuard before an editor domain reload - which wipes these fields WITHOUT
+        /// calling OnDestroy, orphaning whatever they pointed at (see that class for the full
+        /// story).
+        internal void ReleaseNativeResources()
+        {
             _gpuScatter?.Dispose();
+            _gpuScatter = null;
             if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
             if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
         }
@@ -302,9 +319,21 @@ namespace Sculpting
 
             Transform t = transform;
             Vector3 localOrigin = t.InverseTransformPoint(worldRay.origin);
-            Vector3 localDir = t.InverseTransformDirection(worldRay.direction).normalized;
-            float scale = AverageScale();
-            float localMaxDistance = maxDistance / Mathf.Max(0.0001f, scale);
+            // InverseTransformVector, NOT InverseTransformDirection: Direction applies only the
+            // inverse ROTATION and deliberately ignores scale, so on a non-uniformly scaled
+            // object it hands back a local direction that no longer points where the cursor
+            // does. The origin (InverseTransformPoint) is un-scaled correctly, so the two
+            // disagree and the ray sweeps off the surface - the whole object goes unresponsive
+            // to brushing, and wherever the skewed ray does still clip geometry the hover
+            // indicator lands somewhere other than the cursor, jumping around as the camera
+            // orbits. Uniform scale hides the bug entirely (a uniform scale only changes the
+            // direction's length, which the normalize below removes anyway).
+            Vector3 localDir = t.InverseTransformVector(worldRay.direction).normalized;
+            // Divided by the SMALLEST scale component rather than the average: a local step of
+            // length 1 covers at least minScale of world distance, so this is the longest the
+            // local ray could need to be to cover maxDistance in world space. The average could
+            // under-estimate it on a stretched object and clip the ray short.
+            float localMaxDistance = maxDistance / Mathf.Max(0.0001f, MinScale());
 
             if (!_triangleGrid.Raycast(localOrigin, localDir, localMaxDistance, _workingVertices, _workingTriangles,
                     out float hitT, out Vector3 localNormal))
@@ -312,14 +341,27 @@ namespace Sculpting
 
             Vector3 localPoint = localOrigin + localDir * hitT;
             worldPoint = t.TransformPoint(localPoint);
-            worldNormal = t.TransformDirection(localNormal).normalized;
+            worldNormal = LocalToWorldNormal(localNormal);
             return true;
         }
 
-        private float AverageScale()
+        /// Normals do not transform like directions when scale is involved - they need the
+        /// inverse transpose, or a stretched surface reports a normal that is no longer
+        /// perpendicular to it (which the normal-driven brushes then push along). Transform's
+        /// own TransformDirection/InverseTransformDirection are rotation-only and so are wrong
+        /// for this on any non-uniformly scaled object - see RaycastMesh.
+        public Vector3 LocalToWorldNormal(Vector3 localNormal) =>
+            transform.worldToLocalMatrix.transpose.MultiplyVector(localNormal).normalized;
+
+        /// Inverse of LocalToWorldNormal - what the brushes use to bring a world-space hit
+        /// normal back into the local space they deform vertices in.
+        public Vector3 WorldToLocalNormal(Vector3 worldNormal) =>
+            transform.localToWorldMatrix.transpose.MultiplyVector(worldNormal).normalized;
+
+        private float MinScale()
         {
             Vector3 s = transform.lossyScale;
-            return (s.x + s.y + s.z) / 3f;
+            return Mathf.Min(Mathf.Abs(s.x), Mathf.Min(Mathf.Abs(s.y), Mathf.Abs(s.z)));
         }
 
         /// Rebuilds the per-vertex direct-edge neighbor lists from the current mesh's
@@ -829,6 +871,7 @@ namespace Sculpting
                     float t01 = 1f - (dist - innerRadius) / falloffSpan;
                     weight = t01 * t01 * (3f - 2f * t01); // smoothstep
                 }
+                RecordMaskBeforeIfNeeded(i);
                 _mask[i] = Mathf.Clamp01(_mask[i] + amount * weight);
 
                 Color c = _cavityColors[i];
@@ -853,18 +896,20 @@ namespace Sculpting
         /// called per-frame like PaintMask.
         public void InvertMask()
         {
-            for (int i = 0; i < _mask.Length; i++)
-            {
-                _mask[i] = 1f - _mask[i];
-                Color c = _cavityColors[i];
-                c.g = _mask[i];
-                _cavityColors[i] = c;
-            }
-            _mesh.colors = _cavityColors;
-            MaskVersion++;
+            // Payload-free undo entry: inverting is its own inverse, so there is nothing to
+            // store. Worth the special case rather than reusing a mask delta - that would be a
+            // whole-mesh array (8MB at a million vertices) for a button people press repeatedly
+            // while dialling a selection in.
+            _history.PushMaskInvert();
+            EditHistory.RecordMeshEdit(this);
+            InvertMaskWithoutUndo();
         }
 
-        /// Restores a saved mask (see SceneSerializer). Mirrors InvertMask's body exactly: the
+        /// Restores a saved mask (see SceneSerializer). Deliberately pushes no undo entry,
+        /// unlike InvertMask: its only caller is scene loading, which wipes history wholesale
+        /// (EditHistory.Clear) because every object an entry could name was just destroyed.
+        ///
+        /// Mirrors InvertMask's body exactly: the
         /// mask is stored twice - in _mask (what the brushes read) and in _cavityColors[i].g
         /// (what the shader reads to tint protected areas) - so writing only _mask would restore
         /// the behaviour with no visual feedback at all. Silently ignores a length mismatch
@@ -994,6 +1039,7 @@ namespace Sculpting
         public void SnapshotForUndo()
         {
             _history.PushFullUndo((Vector3[])_workingVertices.Clone(), _mesh.triangles);
+            EditHistory.RecordMeshEdit(this);
         }
 
         // Accumulates each touched vertex's PRE-stroke position the first time a held stroke
@@ -1032,6 +1078,14 @@ namespace Sculpting
             return slot >= 0 ? _strokeDeltaBefore[slot] : _workingVertices[index];
         }
 
+        // The mask equivalent of the three lists above, filled by RecordMaskBeforeIfNeeded and
+        // committed by the same EndStrokeUndo. No slot array to go with it: nothing needs to read
+        // "what was the mask here when this stroke started" mid-stroke the way Clay's area-plane
+        // needs StrokeStartPosition for geometry.
+        private readonly List<int> _maskStrokeIndices = new List<int>();
+        private readonly List<float> _maskStrokeBefore = new List<float>();
+        private readonly HashSet<int> _maskRecordedIndices = new HashSet<int>();
+
         /// Call once on stroke start (mouse-press) to clear the previous stroke's accumulator.
         public void BeginStrokeUndo()
         {
@@ -1039,6 +1093,28 @@ namespace Sculpting
             _strokeDeltaIndices.Clear();
             _strokeDeltaBefore.Clear();
             _strokeRecordedIndices.Clear();
+        }
+
+        /// The mask-paint equivalent, called on mouse-press in mask mode. Separate from
+        /// BeginStrokeUndo because mask painting takes its own path through SculptController and
+        /// never reaches that one - the two modes are mutually exclusive, so exactly one
+        /// accumulator is ever live at a time.
+        public void BeginMaskStroke()
+        {
+            _maskStrokeIndices.Clear();
+            _maskStrokeBefore.Clear();
+            _maskRecordedIndices.Clear();
+        }
+
+        /// Call from PaintMask BEFORE overwriting _mask[index], so the FIRST touch during this
+        /// stroke captures the true pre-stroke value - mask paint ramps a vertex over many frames
+        /// of a held drag, and recording every frame would make one undo press step back a single
+        /// frame's worth of paint instead of the whole stroke.
+        private void RecordMaskBeforeIfNeeded(int index)
+        {
+            if (!_maskRecordedIndices.Add(index)) return;
+            _maskStrokeIndices.Add(index);
+            _maskStrokeBefore.Add(_mask[index]);
         }
 
         /// Resets only the slots this stroke actually used, rather than refilling the whole
@@ -1086,34 +1162,74 @@ namespace Sculpting
         /// delta twice.
         public void EndStrokeUndo()
         {
-            if (_strokeDeltaIndices.Count == 0) return;
-            _history.PushDeltaUndo(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
-            ReleaseStrokeSlots();
-            _strokeDeltaIndices.Clear();
-            _strokeDeltaBefore.Clear();
-            _strokeRecordedIndices.Clear();
+            // Commits whichever accumulator actually ran. In practice never both - sculpting and
+            // mask painting are separate input modes - but handling them independently means the
+            // one call site SculptController already has (HandleStrokeEndCommit, which fires on
+            // every mouse release regardless of mode) covers both without knowing which is live.
+            if (_strokeDeltaIndices.Count > 0)
+            {
+                _history.PushVertexDelta(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
+                EditHistory.RecordMeshEdit(this);
+                ReleaseStrokeSlots();
+                _strokeDeltaIndices.Clear();
+                _strokeDeltaBefore.Clear();
+                _strokeRecordedIndices.Clear();
+            }
+
+            if (_maskStrokeIndices.Count > 0)
+            {
+                _history.PushMaskDelta(_maskStrokeIndices.ToArray(), _maskStrokeBefore.ToArray());
+                EditHistory.RecordMeshEdit(this);
+                _maskStrokeIndices.Clear();
+                _maskStrokeBefore.Clear();
+                _maskRecordedIndices.Clear();
+            }
         }
 
-        public void Undo()
+        /// Steps this object's own history back one entry. Called by EditHistory, which owns the
+        /// decision of WHICH object to step - never call it directly, or undo stops following the
+        /// order the edits actually happened in. Returns false when this object has nothing left
+        /// to undo, which tells EditHistory to skip this step and try the one before it.
+        public bool ApplyUndoStep()
         {
-            if (_history.TryUndoDelta(i => _workingVertices[i], out int[] indices, out Vector3[] positions))
-            {
-                RestoreDelta(indices, positions);
-                return;
-            }
-            if (_history.TryUndoFull((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
-                RestoreSnapshot(verts, tris);
+            if (!_history.TryUndo(ReadVertex, ReadMask, CaptureFull, out SculptHistory.Restore restore)) return false;
+            ApplyRestore(restore);
+            return true;
         }
 
-        public void Redo()
+        public bool ApplyRedoStep()
         {
-            if (_history.TryRedoDelta(i => _workingVertices[i], out int[] indices, out Vector3[] positions))
+            if (!_history.TryRedo(ReadVertex, ReadMask, CaptureFull, out SculptHistory.Restore restore)) return false;
+            ApplyRestore(restore);
+            return true;
+        }
+
+        private Vector3 ReadVertex(int index) => _workingVertices[index];
+        private float ReadMask(int index) => _mask[index];
+
+        private void CaptureFull(out Vector3[] vertices, out int[] triangles)
+        {
+            vertices = (Vector3[])_workingVertices.Clone();
+            triangles = _mesh.triangles;
+        }
+
+        private void ApplyRestore(SculptHistory.Restore restore)
+        {
+            switch (restore.Kind)
             {
-                RestoreDelta(indices, positions);
-                return;
+                case SculptHistory.EntryKind.Full:
+                    RestoreSnapshot(restore.FullVertices, restore.FullTriangles);
+                    break;
+                case SculptHistory.EntryKind.VertexDelta:
+                    RestoreDelta(restore.Indices, restore.Positions);
+                    break;
+                case SculptHistory.EntryKind.MaskDelta:
+                    RestoreMaskDelta(restore.Indices, restore.MaskValues);
+                    break;
+                case SculptHistory.EntryKind.MaskInvert:
+                    InvertMaskWithoutUndo();
+                    break;
             }
-            if (_history.TryRedoFull((Vector3[])_workingVertices.Clone(), _mesh.triangles, out Vector3[] verts, out int[] tris))
-                RestoreSnapshot(verts, tris);
         }
 
         /// Fast-path restore for a delta undo/redo entry - writes the given positions directly
@@ -1126,6 +1242,53 @@ namespace Sculpting
             for (int k = 0; k < indices.Length; k++)
                 _workingVertices[indices[k]] = positions[k];
             ApplyVerticesLocal(indices);
+        }
+
+        /// Mask counterpart of RestoreDelta. Writes both places the mask is stored - _mask, which
+        /// the brushes read, and _cavityColors[i].g, which the shader reads - then scatters just
+        /// those vertices to the GPU, the same footprint-scoped upload PaintMask itself uses.
+        ///
+        /// Bounds-checked per index rather than trusting the entry: a Remesh between painting the
+        /// mask and undoing it resizes _mask (see RestoreSnapshot), and while the full snapshot
+        /// for that Remesh is a NEWER entry and so is always undone first, restoring stale indices
+        /// into a shorter array would be an exception rather than a visible mistake, so it is
+        /// worth the cheap guard.
+        private void RestoreMaskDelta(int[] indices, float[] values)
+        {
+            if (_mask == null) return;
+
+            _paintMaskScratch.Clear();
+            for (int k = 0; k < indices.Length; k++)
+            {
+                int i = indices[k];
+                if (i < 0 || i >= _mask.Length) continue;
+                _mask[i] = Mathf.Clamp01(values[k]);
+                Color c = _cavityColors[i];
+                c.g = _mask[i];
+                _cavityColors[i] = c;
+                _paintMaskScratch.Add(i);
+            }
+            MaskVersion++;
+
+            EnsureGpuScatter();
+            _gpuScatter.ScatterDirty(_paintMaskScratch, _paintMaskScratch.Count, _workingVertices, _workingNormals, _cavityColors);
+        }
+
+        /// The body of InvertMask without the history push - what undoing (or redoing) a
+        /// MaskInvert entry runs. Going back through InvertMask itself would push a fresh entry
+        /// from inside an undo, which is how an undo stack ends up unable to reach past the last
+        /// thing you undid.
+        private void InvertMaskWithoutUndo()
+        {
+            for (int i = 0; i < _mask.Length; i++)
+            {
+                _mask[i] = 1f - _mask[i];
+                Color c = _cavityColors[i];
+                c.g = _mask[i];
+                _cavityColors[i] = c;
+            }
+            _mesh.colors = _cavityColors;
+            MaskVersion++;
         }
 
         // Undoing/redoing a brush stroke never changes topology (only positions), so the
@@ -1170,6 +1333,11 @@ namespace Sculpting
             _cavityColors = new Color[_workingVertices.Length];
             _cavityRaw = new float[_workingVertices.Length];
             _mask = new float[_workingVertices.Length];
+            // The new topology has no mapping onto the old mask, so it starts blank - which is
+            // itself a mask change any watcher needs to hear about (a live extract preview built
+            // from the pre-undo mask is describing geometry that no longer exists). Matches what
+            // ReplaceMesh already does for the same reason.
+            MaskVersion++;
             RecomputeCavity();
             _mesh.colors = _cavityColors;
             BindGpuScatter();

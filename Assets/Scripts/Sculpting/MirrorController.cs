@@ -84,12 +84,46 @@ namespace Sculpting
         private float PlaneSize()
         {
             Mesh mesh = _sculptableMesh.Mesh;
-            if (mesh == null) return 2f;
 
-            Vector3 e = mesh.bounds.extents;
-            float maxExtent = Mathf.Max(e.x, Mathf.Max(e.y, e.z));
-            return Mathf.Max(0.01f, maxExtent) * 2f * PlanePadding;
+            float meshExtent = 0f;
+            if (mesh != null)
+            {
+                Vector3 e = mesh.bounds.extents;
+                meshExtent = Mathf.Max(e.x, Mathf.Max(e.y, e.z));
+            }
+
+            // A ZSphere rig mirroring about THIS object's origin is sharing this exact plane (the
+            // rig suppresses its own quad when this one is up - see ZSphereController.
+            // UpdateSymmetryPlane), and a blockout is routinely grown well past the sphere it was
+            // started from. Sizing to the mesh alone left the plane as a small card floating
+            // inside a much larger rig, which is no more use than not drawing it.
+            float rigExtent = 0f;
+            ZSphereController zsphere = ZSphere;
+            if (zsphere != null)
+            {
+                float world = zsphere.WorldExtentForPlaneAt(transform.position);
+                if (world > 0f)
+                {
+                    // The rig measures in world units while this quad is a child of a transform
+                    // that may be scaled, and localScale is read in THAT transform's units.
+                    Vector3 s = transform.lossyScale;
+                    float scale = Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+                    rigExtent = world / Mathf.Max(scale, 1e-6f);
+                }
+            }
+
+            float extent = Mathf.Max(meshExtent, rigExtent);
+            if (extent <= 0f) return 2f;
+            return Mathf.Max(0.01f, extent) * 2f * PlanePadding;
         }
+
+        // Resolved lazily and cached, the same idiom SculptController uses for its own scene
+        // lookups - PlaneSize runs per visible plane per frame, and FindFirstObjectByType on that
+        // path would be a scene scan for a reference that never changes. Re-resolves while null so
+        // a rig controller that appears later is still picked up.
+        private ZSphereController _zsphere;
+        private ZSphereController ZSphere =>
+            _zsphere != null ? _zsphere : (_zsphere = FindFirstObjectByType<ZSphereController>());
 
         private Transform CreatePlane(string name, Color color, Quaternion localRotation)
         {

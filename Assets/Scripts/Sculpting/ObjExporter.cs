@@ -38,7 +38,11 @@ namespace Sculpting
 
             for (int i = 0; i < normals.Length; i++)
             {
-                Vector3 n = t.TransformDirection(normals[i]).normalized;
+                // Not t.TransformDirection: that is rotation-only, so on a non-uniformly
+                // scaled object it exports normals that are no longer perpendicular to the
+                // exported (baked, and therefore stretched) faces - see
+                // SculptableMesh.LocalToWorldNormal for the inverse-transpose this needs.
+                Vector3 n = sculptableMesh.LocalToWorldNormal(normals[i]);
                 AppendVector(sb, "vn", -n.x, n.y, n.z);
             }
 
