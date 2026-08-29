@@ -1371,7 +1371,11 @@ namespace Sculpting
         /// smoothstep falloff, so the same region keeps moving together for the rest of a
         /// drag - even once later deltas are queried against a point far outside this
         /// radius. Returns an invalid (empty) selection if nothing was in range.
-        public GrabSelection SelectGrab(Vector3 localPoint, float radius)
+        /// frontFacingOnly/cameraLocalPos gate the grab the same way every other brush's
+        /// footprint is gated (see SculptController.FrontFacingWeight) - a vertex whose own
+        /// normal faces away from the camera never enters the selection at all, so a Move drag
+        /// on one side of a thin fold can't also drag the far side along with it.
+        public GrabSelection SelectGrab(Vector3 localPoint, float radius, bool frontFacingOnly, Vector3 cameraLocalPos)
         {
             var indices = new System.Collections.Generic.List<int>();
             var weights = new System.Collections.Generic.List<float>();
@@ -1386,6 +1390,7 @@ namespace Sculpting
                 float t01 = 1f - dist / radius;
                 float smooth = t01 * t01 * (3f - 2f * t01) * (1f - _mask[i]); // smoothstep, masked-out
                 if (smooth <= 0f) continue;
+                if (frontFacingOnly && Vector3.Dot(_workingNormals[i], cameraLocalPos - _workingVertices[i]) <= 0f) continue;
                 indices.Add(i);
                 weights.Add(smooth);
             }

@@ -40,6 +40,8 @@ namespace Sculpting
         private Text _accumulateToggleLabel;
         private Toggle _accumulateToggle;
         private Slider _accumulateStrengthSlider;
+        private Text _frontFacingOnlyToggleLabel;
+        private Toggle _frontFacingOnlyToggle;
         private Image _moveButtonImage;
         private Image _clayButtonImage;
         private Image _smoothButtonImage;
@@ -118,6 +120,28 @@ namespace Sculpting
         private RectTransform _strengthGaugeRect;
         private RectTransform _strengthGaugeFillRect;
 
+        // ZBrush/Blender-style 2D ring cursor (see SculptController.ShowBrushCursor and
+        // friends) - a halo (dark, slightly larger, for contrast against any background), a
+        // tinted ring at the actual brush diameter, and a small fixed-size center dot for
+        // precision. Replaces the old world-space BrushPreview sphere entirely; the OS cursor
+        // (Cursor.visible) is toggled opposite this by SculptController itself, not here.
+        private GameObject _cursorRingGO;
+        private RectTransform _cursorRingRect;
+        private Image _cursorHaloImage, _cursorRingImage, _cursorDotImage;
+        private RectTransform _cursorHaloRect, _cursorRingVisualRect;
+        private const float CursorHaloExtraPx = 3f;
+        private const float CursorDotSizePx = 4f;
+
+        // "Undo"/"Redo" toast (see SculptController.ShowUndoToast and friends) - a short-lived
+        // text popup, independent of the brush cursor above, anchored bottom-center of the
+        // whole screen (clear of both docked side panels regardless of window width) rather
+        // than trying to reproduce any one exact spot in the viewport.
+        private GameObject _undoToastGO;
+        private RectTransform _undoToastRect;
+        private Text _undoToastLabel;
+        private const float UndoToastBaseY = 60f;
+        private const float UndoToastRiseDistancePx = 24f;
+
         // Start(), not Awake(): BuildUI() reads controller.Mirror.MirrorX, which now resolves
         // through SelectionManager.PrimarySelection (see SculptController.Mirror) instead of a
         // GetComponent on this same GameObject. That needs every SculptableMesh's OnEnable
@@ -167,6 +191,51 @@ namespace Sculpting
 
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
+            // 2D ring cursor - position/size/tint follow the controller every frame it's shown
+            // (see SculptController.UpdateBrushCursor, which also owns Cursor.visible).
+            if (_cursorRingGO != null)
+            {
+                bool showCursor = controller.ShowBrushCursor;
+                if (_cursorRingGO.activeSelf != showCursor) _cursorRingGO.SetActive(showCursor);
+                if (showCursor)
+                {
+                    _cursorRingRect.position = controller.BrushCursorScreenPosition;
+                    float diameter = controller.BrushCursorScreenDiameter;
+                    _cursorRingVisualRect.sizeDelta = new Vector2(diameter, diameter);
+                    _cursorHaloRect.sizeDelta = new Vector2(diameter, diameter) + Vector2.one * (CursorHaloExtraPx * 2f);
+
+                    // Smooth swaps in a dashed ring (still stretched to the live diameter above)
+                    // instead of a different color alone - see SculptController.BrushCursorDashed.
+                    _cursorRingImage.sprite = controller.BrushCursorDashed ? GetDashedRingSprite() : GetRingSprite();
+
+                    // Stroke-end pulse (see SculptController.BrushCursorFadeAlpha) multiplies
+                    // every layer's OWN base alpha rather than being baked into
+                    // BrushCursorColor - that color's alpha is always 1, so the halo (fixed
+                    // 0.55) and the tinted ring/dot (1) fade together in proportion instead of
+                    // the halo swallowing the multiplier at a different rate.
+                    float fade = controller.BrushCursorFadeAlpha;
+                    Color c = controller.BrushCursorColor;
+                    c.a *= fade;
+                    _cursorRingImage.color = c;
+                    _cursorDotImage.color = c;
+                    _cursorHaloImage.color = new Color(0f, 0f, 0f, 0.55f * fade);
+                }
+            }
+
+            // "Undo"/"Redo" toast - see SculptController.ShowUndoToast and friends.
+            if (_undoToastGO != null)
+            {
+                bool showToast = controller.ShowUndoToast;
+                if (_undoToastGO.activeSelf != showToast) _undoToastGO.SetActive(showToast);
+                if (showToast)
+                {
+                    _undoToastLabel.text = controller.UndoToastText;
+                    _undoToastLabel.color = new Color(1f, 1f, 1f, controller.UndoToastAlpha);
+                    float lift = controller.UndoToastProgress01 * UndoToastRiseDistancePx;
+                    _undoToastRect.anchoredPosition = new Vector2(0f, UndoToastBaseY + lift);
+                }
+            }
+
             // Brush switches can now come from the keyboard outside of SetBrushType (hotkeys
             // 1-5, and holding Shift to temporarily switch to Smooth), so the highlighted
             // button needs a per-frame sync rather than only refreshing on a UI click - cheap
@@ -199,6 +268,15 @@ namespace Sculpting
                 // SculptController._accumulateStrengthPerType).
                 if (_accumulateStrengthSlider != null)
                     _accumulateStrengthSlider.SetValueWithoutNotify(controller.AccumulateStrength);
+
+                // Same per-brush memory for Front Facing Only (see
+                // SculptController._brushFrontFacingOnly) - e.g. turning it on for Clay must not
+                // leave it on the next time Move is picked up.
+                if (_frontFacingOnlyToggle != null)
+                {
+                    _frontFacingOnlyToggle.SetIsOnWithoutNotify(controller.FrontFacingOnly);
+                    _frontFacingOnlyToggleLabel.text = controller.FrontFacingOnly ? "Front Facing Only" : "Front Facing Only (Off)";
+                }
             }
 
             if (_undoButton != null) _undoButton.interactable = controller.CanUndo;
@@ -331,6 +409,12 @@ namespace Sculpting
             _accumulateStrengthSlider = CreateSlider(panel.transform, 0.1f, 3f, controller.AccumulateStrength,
                 v => controller.AccumulateStrength = v);
 
+            _frontFacingOnlyToggle = CreateToggle(panel.transform, "Front Facing Only", controller.FrontFacingOnly, v =>
+            {
+                controller.FrontFacingOnly = v;
+                _frontFacingOnlyToggleLabel.text = v ? "Front Facing Only" : "Front Facing Only (Off)";
+            }, out _frontFacingOnlyToggleLabel);
+
             var brushRow = CreateRow(panel.transform);
             var moveButton = CreateButton(brushRow.transform, "Move", () => SetBrushType(BrushType.Move));
             var clayButton = CreateButton(brushRow.transform, "Clay", () => SetBrushType(BrushType.Clay));
@@ -364,6 +448,16 @@ namespace Sculpting
             CreateLabel(maskFoldout, "Hardness (Soft <-> Hard)", 12, FontStyle.Normal);
             CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v);
             CreateButton(maskFoldout, "Invert Mask", () => controller.InvertMask());
+
+            // One shared setting for every brush (not per-brush like Accumulate), so no resync
+            // is needed elsewhere in this file - nothing but this panel ever changes it, same as
+            // MaskHardness above.
+            Transform lazyMouseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Lazy Mouse", false);
+            CreateToggle(lazyMouseFoldout, "Lazy Mouse", controller.LazyMouseEnabled, v => controller.LazyMouseEnabled = v, out _);
+            CreateLabel(lazyMouseFoldout, "Radius (px)", 12, FontStyle.Normal);
+            CreateSlider(lazyMouseFoldout, 1f, 150f, controller.LazyMouseRadius, v => controller.LazyMouseRadius = v);
+            CreateLabel(lazyMouseFoldout, "Smoothing (Springy <-> Taut)", 12, FontStyle.Normal);
+            CreateSlider(lazyMouseFoldout, 0.05f, 1f, controller.LazyMouseStrength, v => controller.LazyMouseStrength = v);
 
             BuildExtractSection(panel.transform);
 
@@ -500,6 +594,12 @@ namespace Sculpting
 
             _resizeGaugeGO = CreateResizeGauge(canvasGO.transform);
             _strengthGaugeGO = CreateStrengthGauge(canvasGO.transform);
+
+            // Built last so it sits on top of every other child in this canvas's sibling order
+            // (Unity UI draws later siblings over earlier ones) - the brush cursor should never
+            // be occluded by a panel, even for the one frame before _isOverUI would hide it.
+            _cursorRingGO = CreateBrushCursor(canvasGO.transform);
+            _undoToastGO = CreateUndoToast(canvasGO.transform);
         }
 
         // Throttled rather than refreshed every frame: EditHistory.TotalBytes walks every step
@@ -983,6 +1083,188 @@ namespace Sculpting
             fillGO.GetComponent<Image>().color = new Color(1f, 0.3f, 0.3f);
 
             _strengthGaugeRect = rect;
+            go.SetActive(false);
+            return go;
+        }
+
+        // Halo (dark, slightly larger) + tinted ring at the live brush diameter + a small
+        // fixed-size center dot - all centered on one positioning parent so Update() only has
+        // to move/resize that one RectTransform's children, not juggle three independent
+        // positions. raycastTarget is off on all three: this sits on top of everything in
+        // sibling order (see BuildUI), and a hit-testable cursor would make itself count as
+        // "over UI" the instant it appeared under the mouse, fighting the very check
+        // (SculptController._isOverUI) that decides whether to show it at all.
+        private GameObject CreateBrushCursor(Transform canvasParent)
+        {
+            var go = new GameObject("BrushCursorRing", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            _cursorRingRect = go.GetComponent<RectTransform>();
+            _cursorRingRect.anchorMin = _cursorRingRect.anchorMax = new Vector2(0f, 0f);
+            _cursorRingRect.pivot = new Vector2(0.5f, 0.5f);
+            _cursorRingRect.sizeDelta = Vector2.zero;
+
+            var haloGO = new GameObject("Halo", typeof(RectTransform), typeof(Image));
+            haloGO.transform.SetParent(go.transform, false);
+            _cursorHaloRect = haloGO.GetComponent<RectTransform>();
+            _cursorHaloRect.anchorMin = _cursorHaloRect.anchorMax = new Vector2(0.5f, 0.5f);
+            _cursorHaloImage = haloGO.GetComponent<Image>();
+            _cursorHaloImage.sprite = GetRingSprite();
+            _cursorHaloImage.color = new Color(0f, 0f, 0f, 0.55f);
+            _cursorHaloImage.raycastTarget = false;
+
+            var ringGO = new GameObject("Ring", typeof(RectTransform), typeof(Image));
+            ringGO.transform.SetParent(go.transform, false);
+            _cursorRingVisualRect = ringGO.GetComponent<RectTransform>();
+            _cursorRingVisualRect.anchorMin = _cursorRingVisualRect.anchorMax = new Vector2(0.5f, 0.5f);
+            _cursorRingImage = ringGO.GetComponent<Image>();
+            _cursorRingImage.sprite = GetRingSprite();
+            _cursorRingImage.raycastTarget = false;
+
+            var dotGO = new GameObject("Dot", typeof(RectTransform), typeof(Image));
+            dotGO.transform.SetParent(go.transform, false);
+            var dotRect = dotGO.GetComponent<RectTransform>();
+            dotRect.anchorMin = dotRect.anchorMax = new Vector2(0.5f, 0.5f);
+            dotRect.sizeDelta = new Vector2(CursorDotSizePx, CursorDotSizePx);
+            _cursorDotImage = dotGO.GetComponent<Image>();
+            _cursorDotImage.sprite = GetDotSprite();
+            _cursorDotImage.raycastTarget = false;
+
+            go.SetActive(false);
+            return go;
+        }
+
+        private static Sprite _ringSprite;
+        private static Sprite _dotSprite;
+
+        // Procedural ring texture: an antialiased circular band near the edge of a 128x128
+        // square, alpha elsewhere zero. Generated once and cached - Image.type Simple stretches
+        // it to whatever sizeDelta Update() sets, so one texture serves every brush radius.
+        private static Sprite GetRingSprite()
+        {
+            if (_ringSprite != null) return _ringSprite;
+            const int size = 128;
+            const float thickness = 6f;
+            float outerR = size * 0.5f - thickness * 0.5f - 1f;
+            Vector2 center = new Vector2(size * 0.5f, size * 0.5f);
+
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
+            var pixels = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float d = Vector2.Distance(new Vector2(x + 0.5f, y + 0.5f), center);
+                    float distFromRing = Mathf.Abs(d - outerR);
+                    float alpha = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(thickness * 0.5f - 1f, thickness * 0.5f + 1f, distFromRing));
+                    pixels[y * size + x] = new Color(1f, 1f, 1f, alpha);
+                }
+            }
+            tex.SetPixels32(pixels);
+            tex.Apply();
+
+            _ringSprite = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f));
+            return _ringSprite;
+        }
+
+        private static Sprite _dashedRingSprite;
+
+        // Same ring band as GetRingSprite, further cut into evenly-spaced segments by angle -
+        // Smooth's cursor style (see SculptController.BrushCursorDashed). A hard on/off cut
+        // (no antialiasing across the segment edges) rather than smoothing them too: at the
+        // cursor's typical on-screen size the crisp edge reads as a dash, not a rendering seam.
+        private static Sprite GetDashedRingSprite()
+        {
+            if (_dashedRingSprite != null) return _dashedRingSprite;
+            const int size = 128;
+            const float thickness = 6f;
+            const int dashCount = 14;
+            const float dashOnFraction = 0.6f;
+            float outerR = size * 0.5f - thickness * 0.5f - 1f;
+            Vector2 center = new Vector2(size * 0.5f, size * 0.5f);
+
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
+            var pixels = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    Vector2 p = new Vector2(x + 0.5f, y + 0.5f) - center;
+                    float distFromRing = Mathf.Abs(p.magnitude - outerR);
+                    float ringAlpha = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(thickness * 0.5f - 1f, thickness * 0.5f + 1f, distFromRing));
+
+                    float angle01 = Mathf.Repeat(Mathf.Atan2(p.y, p.x) / (Mathf.PI * 2f), 1f);
+                    float dashPhase = Mathf.Repeat(angle01 * dashCount, 1f);
+                    float dashAlpha = dashPhase < dashOnFraction ? 1f : 0f;
+
+                    pixels[y * size + x] = new Color(1f, 1f, 1f, ringAlpha * dashAlpha);
+                }
+            }
+            tex.SetPixels32(pixels);
+            tex.Apply();
+
+            _dashedRingSprite = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f));
+            return _dashedRingSprite;
+        }
+
+        // Small filled-circle texture for the center dot, same antialiasing approach as the
+        // ring above.
+        private static Sprite GetDotSprite()
+        {
+            if (_dotSprite != null) return _dotSprite;
+            const int size = 32;
+            float radius = size * 0.5f - 1f;
+            Vector2 center = new Vector2(size * 0.5f, size * 0.5f);
+
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Bilinear;
+            var pixels = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float d = Vector2.Distance(new Vector2(x + 0.5f, y + 0.5f), center);
+                    float alpha = 1f - Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(radius - 1f, radius + 1f, d));
+                    pixels[y * size + x] = new Color(1f, 1f, 1f, alpha);
+                }
+            }
+            tex.SetPixels32(pixels);
+            tex.Apply();
+
+            _dotSprite = Sprite.Create(tex, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f));
+            return _dotSprite;
+        }
+
+        // Bottom-center of the whole screen (not the brush cursor's canvas position) - clear of
+        // both docked side panels regardless of window width, and readable without competing
+        // with the ring cursor up near the mouse. raycastTarget off, same reasoning as the ring
+        // cursor's own children: this sits on top in sibling order and must never itself count
+        // as "over UI".
+        private GameObject CreateUndoToast(Transform canvasParent)
+        {
+            var go = new GameObject("UndoToastLabel", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = new Vector2(0.5f, 0f);
+            rect.anchorMax = new Vector2(0.5f, 0f);
+            rect.pivot = new Vector2(0.5f, 0f);
+            rect.anchoredPosition = new Vector2(0f, UndoToastBaseY);
+            rect.sizeDelta = new Vector2(320f, 40f);
+
+            var text = go.AddComponent<Text>();
+            text.font = _font;
+            text.fontSize = 22;
+            text.fontStyle = FontStyle.Bold;
+            text.alignment = TextAnchor.MiddleCenter;
+            text.color = Color.white;
+            text.raycastTarget = false;
+
+            _undoToastRect = rect;
+            _undoToastLabel = text;
             go.SetActive(false);
             return go;
         }

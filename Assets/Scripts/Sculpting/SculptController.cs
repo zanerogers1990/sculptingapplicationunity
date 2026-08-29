@@ -34,7 +34,6 @@ namespace Sculpting
         // ~60 existing call sites across this file didn't need touching one by one.
         [SerializeField] private SculptableMesh sculptableMesh;
         [SerializeField] private MirrorController mirrorController;
-        public GameObject brushPreview;
 
         [Header("Brush Settings")]
         [SerializeField, Range(0.01f, 1f)] private float brushStrength = 0.1f;
@@ -47,6 +46,13 @@ namespace Sculpting
         // without touching brushStrength itself (which also drives the non-accumulate plateau
         // path). Only meaningful while Accumulate is on for the current brush.
         [SerializeField, Range(0.1f, 3f)] private float accumulateStrength = 1f;
+        // Rejects every backfacing vertex from this brush's footprint (own mesh normal facing
+        // away from the camera) before any falloff/mask weighting - lets a stroke reach into a
+        // tight fold or across a thin fin (an ear, a finger gap) without also dragging the far
+        // side along with it. Per-brush like Accumulate (see _brushFrontFacingOnly), off by
+        // default everywhere: it's a precision aid for tricky geometry, not something that
+        // should silently thin out an ordinary broad stroke.
+        [SerializeField] private bool frontFacingOnly = false;
 
         // Remembers each brush's own polarity across switches this session (ZBrush/Blender-
         // style per-tool state), instead of one flag shared by every brush regardless of which
@@ -93,6 +99,12 @@ namespace Sculpting
             return arr;
         }
 
+        // Same per-brush-memory pattern as _brushAccumulate, for Front Facing Only - every brush
+        // starts OFF (see frontFacingOnly's own remarks) and only diverges once the user turns it
+        // on while that particular brush is selected, so e.g. enabling it for Clay doesn't also
+        // silently turn it on the next time Move is picked up.
+        private readonly bool[] _brushFrontFacingOnly = new bool[Enum.GetValues(typeof(BrushType)).Length];
+
         // Same per-brush-memory pattern as _brushPolarity/_brushAccumulate, for Brush Strength -
         // previously one value shared across every brush, so tuning Crease's strength while Clay
         // was selected would silently carry over the next time Clay was picked back up. Every
@@ -113,6 +125,28 @@ namespace Sculpting
             for (int i = 0; i < arr.Length; i++) arr[i] = 0.1f; // matches brushStrength field's default below
             return arr;
         }
+
+        [Header("Lazy Mouse")]
+        // ZBrush/Nomad-style stroke stabilizer. While painting, the brush doesn't chase the
+        // raw cursor 1:1 - it trails behind on an imaginary taut "rope" of lazyMouseRadius
+        // screen pixels, only moving once the cursor has pulled that rope taut, and then only
+        // directly toward the cursor (see GetStrokeScreenPosition). Small hand tremor/mouse
+        // jitter stays within the rope's radius and never reaches the brush at all, which is
+        // what makes long strokes come out smooth/straight instead of wobbly - at the cost of
+        // a small lag behind fast cursor motion. Off by default (matches ZBrush's own default)
+        // since it changes stroke feel enough that it shouldn't surprise a user who hasn't
+        // asked for it.
+        [SerializeField] private bool lazyMouseEnabled = false;
+        [SerializeField, Range(1f, 150f)] private float lazyMouseRadius = 25f;
+        // Fraction of the rope's excess length (dist - radius) closed per frame once taut. 1 =
+        // classic ZBrush feel (the rope stays exactly taut every frame); lower values add extra
+        // spring-like lag on top of the radius itself, for an even smoother/syrupier trail.
+        [SerializeField, Range(0.05f, 1f)] private float lazyMouseStrength = 1f;
+
+        // Where the rope's near end currently sits, in screen pixels - only meaningful while
+        // _lazyMouseActive is true (see GetStrokeScreenPosition).
+        private Vector2 _lazyMouseScreenPos;
+        private bool _lazyMouseActive;
 
         [Header("Clay Brush")]
         // Peak plateau depth as a fraction of brushRadius. Default halved (was 0.6) at the same
@@ -319,18 +353,58 @@ namespace Sculpting
 
         private static readonly Color PositiveColor = new Color(0.2f, 1f, 0.4f);
         private static readonly Color NegativeColor = new Color(1f, 0.3f, 0.3f);
+        // Smooth has no add/subtract polarity (see _previewPositive's "always neutral" comment
+        // in each brush handler) - blue instead of green/red reads as its own third state
+        // rather than looking like an ordinary positive dab, matching the dashed ring
+        // (BrushCursorDashed) SculptUIBuilder swaps in for the same reason.
+        private static readonly Color SmoothColor = new Color(0.3f, 0.65f, 1f);
 
         private bool _isHovering;
         private Vector3 _hoverPoint;
         private Vector3 _hoverNormal;
         private bool _previewPositive;
-        private Renderer _brushPreviewRenderer;
         private bool _isOverUI;
-        // Last position the preview was legitimately shown at (on the mesh, or floating along
-        // a viewport mouse ray) - reused whenever the mouse is over a UI panel (e.g. dragging
-        // the brush radius slider) so the preview stays put near the model instead of jumping
-        // to wherever the panel happens to be on screen.
-        private Vector3 _lastGoodPreviewPos;
+
+        // 2D screen-space brush cursor (replaces the old world-space BrushPreview sphere) - a
+        // ZBrush/Blender-style ring that tracks the mouse directly rather than a 3D object
+        // positioned via raycast hit point, so it reads correctly even when hovering empty
+        // space beside the model. SculptUIBuilder polls these every frame to position/size/tint
+        // its ring Image, same delegation pattern as IsResizingBrush/ResizeAnchorScreenPosition
+        // below. The OS cursor is hidden directly here (see UpdateBrushCursor) whenever this
+        // ring is shown, and restored whenever it isn't - over a UI panel, over no sculptable
+        // target, or while another tool (Transpose/Scale/ZSphere) owns the viewport.
+        private bool _showBrushCursor;
+        private Vector2 _brushCursorScreenPos;
+        private float _brushCursorScreenDiameter;
+        private Color _brushCursorColor;
+        private bool _brushCursorDashed;
+        private const float MinCursorScreenDiameterPx = 14f;
+
+        // Brief "stroke committed" pulse: blinks the cursor out and eases it back in over
+        // StrokeEndFadeDuration starting the instant a stroke ends (see HandleStrokeEndCommit),
+        // so releasing the mouse gives an unmistakable beat of feedback distinct from just
+        // continuing to hover in the same spot. Counts DOWN from StrokeEndFadeDuration to 0;
+        // BrushCursorFadeAlpha (read by SculptUIBuilder) turns that into a 0->1 ramp.
+        private float _strokeEndFadeTimer;
+        private const float StrokeEndFadeDuration = 0.1f;
+
+        // "Undo"/"Redo" toast (see Undo/Redo/TriggerUndoRedoFeedback) - a short-lived text
+        // popup independent of the brush cursor above, since it needs to be readable even when
+        // nothing is selected (undoing a ZSphere convert, say - see the remarks on Undo/Redo
+        // below) and shouldn't disappear the instant the mouse moves off the model.
+        private string _undoToastText;
+        private float _undoToastTimer;
+        private const float UndoToastDuration = 0.8f;
+        private const float UndoToastFadeDuration = 0.3f;
+
+        // Very brief, neutral (not brush-polarity-colored) flash across the sculpted surface on
+        // Undo/Redo - see TriggerUndoRedoFeedback. Deliberately much shorter than
+        // SelectionFlashEffect's own default (0.35s, blue) used for the double-click object-pick
+        // confirmation: that one is announcing "you just changed WHAT you're working on" and
+        // wants to be noticed, this one is just a wordless "yes, the surface actually changed"
+        // beat alongside the toast text doing the actual explaining.
+        private const float UndoFlashDuration = 0.1f;
+        private static readonly Color UndoFlashColor = new Color(1f, 1f, 1f, 0.5f);
 
         // Previous stroke sample in the mesh's local space, used only by Dam Standard to
         // derive a stroke-travel direction for its leading-edge lip; null between strokes
@@ -577,6 +651,8 @@ namespace Sculpting
             public Vector3 LocalNormal;
             public float CapAmount; // brushRadius * InflateOffCapFactor * sign, only used when !Accumulate
             public float LerpFactorScale; // brushStrength * InflateSpeed * dt, only used when !Accumulate
+            public bool FrontFacingOnly;
+            public Vector3 CameraLocalPos;
 
             public void Execute(int index)
             {
@@ -585,7 +661,8 @@ namespace Sculpting
                 if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
 
                 float t01 = 1f - dist / BrushRadius;
-                float weight = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index]);
+                float weight = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index])
+                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
                 if (weight <= 0f) { AppliedOut[index] = 0; return; }
 
                 if (Accumulate)
@@ -613,6 +690,9 @@ namespace Sculpting
         private struct CreaseJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<Vector3> PositionsIn;
+            // Was gathered-but-unread before Front Facing Only existed (GatherCandidatesNative
+            // always populates all three arrays regardless of brush) - now actually read below.
+            [ReadOnly] public NativeArray<Vector3> NormalsIn;
             [ReadOnly] public NativeArray<float> MaskIn;
             public NativeArray<Vector3> PositionsOut;
             public NativeArray<byte> AppliedOut;
@@ -629,6 +709,8 @@ namespace Sculpting
             public float DepthRate; // sign * creaseDepthFactor * brushStrength * CreaseSpeed * dt
             public float LipRate; // 0 for plain Crease
             public float PinchRateScale; // creasePinch * brushStrength * CreaseSpeed * dt
+            public bool FrontFacingOnly;
+            public Vector3 CameraLocalPos;
 
             public void Execute(int index)
             {
@@ -638,7 +720,8 @@ namespace Sculpting
                 if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
 
                 float t01 = 1f - dist / BrushRadius;
-                float weight = t01 * t01 * t01 * (1f - MaskIn[index]); // sharper falloff than Clay's smoothstep
+                float weight = t01 * t01 * t01 * (1f - MaskIn[index]) // sharper falloff than Clay's smoothstep
+                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
 
                 float alongNormal = Vector3.Dot(toVert, LocalNormal);
                 Vector3 tangentialOffset = toVert - LocalNormal * alongNormal;
@@ -664,6 +747,20 @@ namespace Sculpting
                 }
                 AppliedOut[index] = 1;
             }
+        }
+
+        // Shared by every brush's weight computation, multiplied in alongside the mask term
+        // right next to it (MaskIn / sculptableMesh.Mask) - see frontFacingOnly's remarks for
+        // what this is for. A vertex counts as front-facing when its OWN mesh normal points at
+        // least partly back toward the camera; compared per-vertex against the camera's actual
+        // local-space position rather than one shared view direction, so the test stays correct
+        // up close, where a sculpt's own scale can be comparable to the camera's distance from
+        // it. Plain float/Vector3 math (like ClayFalloff below), so Burst inlines it into a
+        // job's Execute exactly the same way.
+        private static float FrontFacingWeight(bool frontFacingOnly, Vector3 normalLocal, Vector3 posLocal, Vector3 cameraLocalPos)
+        {
+            if (!frontFacingOnly) return 1f;
+            return Vector3.Dot(normalLocal, cameraLocalPos - posLocal) > 0f ? 1f : 0f;
         }
 
         // Clay's own radial falloff (see clayEdgeSoftness remarks) - full weight through the
@@ -727,6 +824,8 @@ namespace Sculpting
             public Vector3 Bitangent0;
             public float TipRoundness;
             public float EdgeSoftness;
+            public bool FrontFacingOnly;
+            public Vector3 CameraLocalPos;
 
             public void Execute(int index)
             {
@@ -741,7 +840,8 @@ namespace Sculpting
                     return;
                 }
 
-                float w = ClayFalloff(t01, EdgeSoftness) * (1f - MaskIn[index]);
+                float w = ClayFalloff(t01, EdgeSoftness) * (1f - MaskIn[index])
+                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
                 WeightsOut[index] = w;
                 WeightedPosOut[index] = pos * w;
                 WeightedNormalOut[index] = NormalsIn[index] * w;
@@ -916,17 +1016,24 @@ namespace Sculpting
         private struct SmoothWeightJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<Vector3> PositionsIn;
+            // Was gathered-but-unread before Front Facing Only existed (GatherCandidatesNative
+            // always populates all three arrays regardless of brush) - now actually read below.
+            [ReadOnly] public NativeArray<Vector3> NormalsIn;
             [ReadOnly] public NativeArray<float> MaskIn;
             public NativeArray<float> WeightsOut;
             public Vector3 LocalPoint;
             public float BrushRadius;
+            public bool FrontFacingOnly;
+            public Vector3 CameraLocalPos;
 
             public void Execute(int index)
             {
-                float dist = Vector3.Distance(PositionsIn[index], LocalPoint);
+                Vector3 pos = PositionsIn[index];
+                float dist = Vector3.Distance(pos, LocalPoint);
                 if (dist > BrushRadius) { WeightsOut[index] = 0f; return; }
                 float t01 = 1f - dist / BrushRadius;
-                WeightsOut[index] = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index]); // smoothstep, masked-out
+                WeightsOut[index] = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index]) // smoothstep, masked-out
+                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
             }
         }
 
@@ -1141,6 +1248,30 @@ namespace Sculpting
         public bool IsAdjustingStrength => _isAdjustingStrength;
         public Vector2 StrengthAdjustAnchorScreenPosition => _strengthAdjustAnchorScreenPos;
 
+        // Polled by SculptUIBuilder every frame to draw the 2D ring cursor (see
+        // UpdateBrushCursor) - same read-only delegation as the resize/strength gauges above.
+        public bool ShowBrushCursor => _showBrushCursor;
+        public Vector2 BrushCursorScreenPosition => _brushCursorScreenPos;
+        public float BrushCursorScreenDiameter => _brushCursorScreenDiameter;
+        public Color BrushCursorColor => _brushCursorColor;
+        public bool BrushCursorDashed => _brushCursorDashed;
+
+        // 0 right on stroke-release, easing back to 1 over StrokeEndFadeDuration - see
+        // _strokeEndFadeTimer. SculptUIBuilder multiplies every cursor layer's own alpha by this.
+        public float BrushCursorFadeAlpha => _strokeEndFadeTimer <= 0f
+            ? 1f
+            : Mathf.Clamp01(1f - _strokeEndFadeTimer / StrokeEndFadeDuration);
+
+        // "Undo"/"Redo" toast - see TriggerUndoRedoFeedback/_undoToastTimer.
+        public bool ShowUndoToast => _undoToastTimer > 0f;
+        public string UndoToastText => _undoToastText;
+        public float UndoToastAlpha => _undoToastTimer <= 0f
+            ? 0f
+            : (_undoToastTimer >= UndoToastFadeDuration ? 1f : _undoToastTimer / UndoToastFadeDuration);
+        // 0 the instant it appears, 1 the instant it's gone - drives a gentle upward drift
+        // (SculptUIBuilder) so it reads as "popping up", not just fading in place.
+        public float UndoToastProgress01 => 1f - Mathf.Clamp01(_undoToastTimer / UndoToastDuration);
+
         public bool IsMaskPaintMode
         {
             get => _isMaskPaintMode;
@@ -1166,11 +1297,13 @@ namespace Sculpting
                     _brushAccumulate[(int)currentBrush] = accumulate;
                     _accumulateStrengthPerType[(int)currentBrush] = accumulateStrength;
                     _brushStrengthPerType[(int)currentBrush] = brushStrength;
+                    _brushFrontFacingOnly[(int)currentBrush] = frontFacingOnly;
                     currentBrush = value;
                     isPositive = _brushPolarity[(int)currentBrush];
                     accumulate = _brushAccumulate[(int)currentBrush];
                     accumulateStrength = _accumulateStrengthPerType[(int)currentBrush];
                     brushStrength = _brushStrengthPerType[(int)currentBrush];
+                    frontFacingOnly = _brushFrontFacingOnly[(int)currentBrush];
                     // brushRadius deliberately carries across the switch untouched.
                 }
             }
@@ -1202,6 +1335,15 @@ namespace Sculpting
                 _accumulateStrengthPerType[(int)currentBrush] = accumulateStrength;
             }
         }
+        public bool FrontFacingOnly
+        {
+            get => frontFacingOnly;
+            set
+            {
+                frontFacingOnly = value;
+                _brushFrontFacingOnly[(int)currentBrush] = value;
+            }
+        }
         public float ClayHeightFactor { get => clayHeightFactor; set => clayHeightFactor = Mathf.Clamp(value, 0.1f, 1.5f); }
         public float ClayTipRoundness { get => clayTipRoundness; set => clayTipRoundness = Mathf.Clamp01(value); }
         // Clamped away from 0 rather than to it - ClayFalloff divides by this.
@@ -1222,6 +1364,12 @@ namespace Sculpting
         public bool LogRayHits { get => logRayHits; set => logRayHits = value; }
         public bool UseBurstJobs { get => useBurstJobs; set => useBurstJobs = value; }
         public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, 500); }
+
+        // One value shared by every brush (unlike BrushStrength) - lazy mouse is an input-
+        // smoothing behavior, not a property of any particular brush's effect.
+        public bool LazyMouseEnabled { get => lazyMouseEnabled; set => lazyMouseEnabled = value; }
+        public float LazyMouseRadius { get => lazyMouseRadius; set => lazyMouseRadius = Mathf.Clamp(value, 1f, 150f); }
+        public float LazyMouseStrength { get => lazyMouseStrength; set => lazyMouseStrength = Mathf.Clamp(value, 0.05f, 1f); }
 
         public int SymmetryAxis { get => symmetryAxis; set => symmetryAxis = Mathf.Clamp(value, 0, 2); }
         public float SymmetryToleranceScale
@@ -1247,8 +1395,33 @@ namespace Sculpting
         // selected (that ZSphere convert, for one).
         public bool CanUndo => EditHistory.CanUndo;
         public bool CanRedo => EditHistory.CanRedo;
-        public void Undo() { EndMoveDrag(); EditHistory.Undo(); }
-        public void Redo() { EndMoveDrag(); EditHistory.Redo(); }
+
+        public void Undo()
+        {
+            EndMoveDrag();
+            if (!EditHistory.CanUndo) return; // nothing actually happened - no flash/toast for a no-op keypress
+            EditHistory.Undo();
+            TriggerUndoRedoFeedback("Undo");
+        }
+
+        public void Redo()
+        {
+            EndMoveDrag();
+            if (!EditHistory.CanRedo) return;
+            EditHistory.Redo();
+            TriggerUndoRedoFeedback("Redo");
+        }
+
+        // Very brief white flash across the sculpted surface (skipped if nothing is selected -
+        // undoing a ZSphere convert, say, has no single mesh to flash) plus the toast text,
+        // which shows regardless of selection since it's confirming the action happened at all,
+        // not that a particular mesh changed.
+        private void TriggerUndoRedoFeedback(string label)
+        {
+            if (sculptableMesh != null) SelectionFlashEffect.Play(sculptableMesh.gameObject, UndoFlashDuration, UndoFlashColor);
+            _undoToastText = label;
+            _undoToastTimer = UndoToastDuration;
+        }
 
         /// Steps of history held and what they cost, for the UI - see EditHistory.Summary.
         public static string HistorySummary => EditHistory.Summary();
@@ -1327,19 +1500,6 @@ namespace Sculpting
         private void Awake()
         {
             if (cam == null) cam = Camera.main;
-            if (brushPreview == null) brushPreview = GameObject.Find("BrushPreview");
-            if (brushPreview != null) _brushPreviewRenderer = brushPreview.GetComponent<Renderer>();
-
-            // Overrides whatever material is authored on the BrushPreview GameObject with a
-            // runtime one that always draws on top of the depth buffer (see
-            // BrushPreviewOverlay.shader) - a normal depth-tested material gets swallowed by
-            // the sculpted mesh whenever the preview's position lands even slightly behind its
-            // surface, which happens easily during the S-drag resize gesture.
-            if (_brushPreviewRenderer != null)
-            {
-                Shader overlayShader = Shader.Find("Custom/BrushPreviewOverlay");
-                if (overlayShader != null) _brushPreviewRenderer.material = new Material(overlayShader);
-            }
 
             // The serialized `isPositive`/`accumulate`/`brushStrength` predate per-brush memory
             // and may be stale for whatever brush is currently selected - start from this brush's
@@ -1354,6 +1514,13 @@ namespace Sculpting
 
         private void Update()
         {
+            // Decayed FIRST, before anything below can (re)trigger either timer this frame -
+            // otherwise a fresh trigger this same frame would immediately lose one frame's worth
+            // of decay before anyone ever reads the full un-decayed value (e.g. the stroke-end
+            // fade would never actually reach its intended "blinks fully out" starting point).
+            if (_undoToastTimer > 0f) _undoToastTimer = Mathf.Max(0f, _undoToastTimer - Time.deltaTime);
+            if (_strokeEndFadeTimer > 0f) _strokeEndFadeTimer = Mathf.Max(0f, _strokeEndFadeTimer - Time.deltaTime);
+
             SyncSelectionTarget();
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
@@ -1363,7 +1530,17 @@ namespace Sculpting
             HandleSculptInput();
             HandleBrushSizeScroll();
             HandleStrokeEndCommit();
-            UpdateBrushPreview();
+            UpdateBrushCursor();
+        }
+
+        // Cursor.visible is a global OS setting, not per-component - if this component (or the
+        // whole app) goes away while the ring cursor had it hidden, the real pointer must come
+        // back or the user is left with no visible cursor at all outside this app's control.
+        private void OnDisable() => Cursor.visible = true;
+
+        private void OnApplicationFocus(bool hasFocus)
+        {
+            if (!hasFocus) Cursor.visible = true;
         }
 
         /// Re-points sculptableMesh/mirrorController at the SelectionManager's current
@@ -1389,8 +1566,6 @@ namespace Sculpting
             _lastClayStrokeNormalLocal = null;
             _lastStrokeHitPointWorld = null;
             _strokeSpeed = 0f;
-
-            if (sculptableMesh != null) _lastGoodPreviewPos = sculptableMesh.transform.position;
         }
 
         // Commits whatever BeginStrokeUndo/RecordUndoBeforeIfNeeded accumulated during a stroke
@@ -1413,7 +1588,10 @@ namespace Sculpting
             Mouse mouse = Mouse.current;
             if (mouse == null || sculptableMesh == null) return;
             if (mouse.leftButton.wasReleasedThisFrame || mouse.rightButton.wasReleasedThisFrame)
+            {
                 sculptableMesh.EndStrokeUndo();
+                _strokeEndFadeTimer = StrokeEndFadeDuration;
+            }
         }
 
         // Bare Z (not Ctrl+Z) is deliberate: this app runs inside the Unity Editor during
@@ -1535,7 +1713,7 @@ namespace Sculpting
         // mouse movement scrubs BrushStrength live - same S-drag gauge UX as
         // HandleBrushResizeKey above, but for the CURRENT brush's own strength (see
         // _brushStrengthPerType) rather than the shared BrushRadius. SculptUIBuilder draws the
-        // popup gauge at StrengthAdjustAnchorScreenPosition, and UpdateBrushPreview forces the
+        // popup gauge at StrengthAdjustAnchorScreenPosition, and UpdateBrushCursor forces the
         // brush cursor to NegativeColor/red for the duration so it reads unambiguously as "not
         // sculpting right now" rather than an ordinary negative-polarity brush dab.
         private void HandleBrushStrengthKey()
@@ -1662,8 +1840,8 @@ namespace Sculpting
             }
 
             // While the resize gauge is up, mouse movement scrubs brush size, not sculpting.
-            // Force _isOverUI false too so UpdateBrushPreview follows the mouse ray (the
-            // deliberate resize-gauge UX) rather than freezing at a stale over-UI position.
+            // Force _isOverUI false too so UpdateBrushCursor keeps showing the ring at the
+            // mouse ray (the deliberate resize-gauge UX) rather than hiding it as "over UI".
             // Same reasoning applies to the strength gauge (F) below.
             if (_isResizingBrush || _isAdjustingStrength)
             {
@@ -1736,6 +1914,41 @@ namespace Sculpting
 
         }
 
+        // Returns the screen position a paint/sculpt stroke should raycast from this frame -
+        // the raw cursor, or (while Lazy Mouse is on and a stroke is actively being drawn) a
+        // point trailing behind it on a taut "rope" of lazyMouseRadius pixels (see that field's
+        // remarks). Used by every brush's input handler and by mask painting; deliberately NOT
+        // used by Move's grab-drag (documented as intentionally 1:1 with the cursor) or by the
+        // resize/strength drag gauges (S/F - those want raw, instant tracking).
+        //
+        // Bypasses straight to the raw position whenever no paint button is held, so ordinary
+        // hovering (and the brush-size preview it drives) is never laggy - only an actual
+        // stroke engages the rope. The rope resets to the raw position on the first frame of
+        // every new stroke, so a fresh click always starts exactly under the cursor rather than
+        // inheriting wherever a previous, unrelated stroke left it.
+        private Vector2 GetStrokeScreenPosition(Mouse mouse)
+        {
+            Vector2 raw = mouse.position.ReadValue();
+            if (!lazyMouseEnabled) { _lazyMouseActive = false; return raw; }
+
+            bool pressed = mouse.leftButton.isPressed || mouse.rightButton.isPressed;
+            if (!pressed) { _lazyMouseActive = false; return raw; }
+
+            if (!_lazyMouseActive)
+            {
+                _lazyMouseActive = true;
+                _lazyMouseScreenPos = raw;
+                return _lazyMouseScreenPos;
+            }
+
+            Vector2 delta = raw - _lazyMouseScreenPos;
+            float dist = delta.magnitude;
+            if (dist > lazyMouseRadius)
+                _lazyMouseScreenPos += delta.normalized * ((dist - lazyMouseRadius) * lazyMouseStrength);
+
+            return _lazyMouseScreenPos;
+        }
+
         // Left mouse paints mask (protects the area from every brush - see
         // SculptableMesh.Mask/PaintMask), right mouse erases it, same LMB-apply/RMB-invert
         // convention as the sculpting brushes. Deliberately NOT part of undo history - masking
@@ -1769,7 +1982,7 @@ namespace Sculpting
                 sculptableMesh.BeginMaskStroke();
             }
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -1806,7 +2019,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2036,6 +2249,8 @@ namespace Sculpting
                 Bitangent0 = bitangent0,
                 TipRoundness = clayTipRoundness,
                 EdgeSoftness = clayEdgeSoftness,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
@@ -2102,6 +2317,7 @@ namespace Sculpting
             Vector3 planeOriginSum = Vector3.zero;
             Vector3 planeNormalSum = Vector3.zero;
             float planeWeightSum = 0f;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2110,7 +2326,8 @@ namespace Sculpting
                 float t01 = ClayTipShapeT01(toVert, brushRadius, tangent0, bitangent0, clayTipRoundness);
                 if (t01 <= 0f) { weights[ci] = 0f; continue; }
 
-                float w = ClayFalloff(t01, clayEdgeSoftness) * (1f - sculptableMesh.Mask[i]); // flat plateau, edge-only taper - see clayEdgeSoftness
+                float w = ClayFalloff(t01, clayEdgeSoftness) * (1f - sculptableMesh.Mask[i]) // flat plateau, edge-only taper - see clayEdgeSoftness
+                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
                 weights[ci] = w;
 
                 planeOriginSum += verts[i] * w;
@@ -2238,7 +2455,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2305,12 +2522,11 @@ namespace Sculpting
             float effectiveStrength = EffectiveBrushStrength;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
 
-            // CreaseJob has no NormalsIn field (unused by this brush) - still gathered via the
-            // shared helper since it always populates all three arrays; harmless, just unread.
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
             var job = new CreaseJob
             {
                 PositionsIn = _nativePositionsIn,
+                NormalsIn = _nativeNormalsIn,
                 MaskIn = _nativeMaskIn,
                 PositionsOut = _nativePositionsOut,
                 AppliedOut = _nativeAppliedOut,
@@ -2326,6 +2542,8 @@ namespace Sculpting
                 DepthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * dt,
                 LipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * dt,
                 PinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * dt,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
             job.Schedule(candidates.Count, 32).Complete();
 
@@ -2339,6 +2557,7 @@ namespace Sculpting
             float effectiveStrength = EffectiveBrushStrength;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             float depth = brushRadius * creaseDepthFactor * sign;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2348,7 +2567,8 @@ namespace Sculpting
                 if (dist > brushRadius) continue;
 
                 float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i]); // sharper falloff than Clay's smoothstep - a narrower peak
+                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i]) // sharper falloff than Clay's smoothstep - a narrower peak
+                    * FrontFacingWeight(frontFacingOnly, sculptableMesh.Normals[i], verts[i], cameraLocalPos);
 
                 float alongNormal = Vector3.Dot(toVert, localNormal);
                 Vector3 tangentialOffset = toVert - localNormal * alongNormal;
@@ -2384,7 +2604,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) { _lastDamHoverLocal = null; return; }
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2467,6 +2687,7 @@ namespace Sculpting
             float depth = brushRadius * creaseDepthFactor * sign;
             float lip = brushRadius * damLipHeight * sign;
             bool hasDir = dirLocal.sqrMagnitude > 1e-6f;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2476,7 +2697,8 @@ namespace Sculpting
                 if (dist > brushRadius) continue;
 
                 float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i]);
+                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i])
+                    * FrontFacingWeight(frontFacingOnly, sculptableMesh.Normals[i], verts[i], cameraLocalPos);
 
                 float alongNormal = Vector3.Dot(toVert, localNormal);
                 Vector3 tangentialOffset = toVert - localNormal * alongNormal;
@@ -2514,7 +2736,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2599,6 +2821,8 @@ namespace Sculpting
                 LocalNormal = localNormal,
                 CapAmount = brushRadius * InflateOffCapFactor * sign,
                 LerpFactorScale = effectiveStrength * InflateSpeed * dt,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
             job.Schedule(candidates.Count, 32).Complete();
 
@@ -2612,6 +2836,7 @@ namespace Sculpting
             float effectiveStrength = EffectiveBrushStrength;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             Vector3 target = localPoint + localNormal * (brushRadius * InflateOffCapFactor * sign);
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2620,7 +2845,8 @@ namespace Sculpting
                 if (dist > brushRadius) continue;
 
                 float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]); // smoothstep, masked-out
+                float weight = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
+                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
                 if (weight <= 0f) continue;
 
                 sculptableMesh.RecordUndoBeforeIfNeeded(i);
@@ -2644,7 +2870,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2759,6 +2985,8 @@ namespace Sculpting
                 Bitangent0 = Vector3.zero,
                 TipRoundness = 1f,
                 EdgeSoftness = 1f,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
@@ -2813,6 +3041,7 @@ namespace Sculpting
             Vector3 planeOriginSum = Vector3.zero;
             Vector3 planeNormalSum = Vector3.zero;
             float planeWeightSum = 0f;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2821,7 +3050,8 @@ namespace Sculpting
                 if (dist > brushRadius) { weights[ci] = 0f; continue; }
 
                 float t01 = 1f - dist / brushRadius;
-                float w = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]); // smoothstep, masked-out
+                float w = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
+                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
                 weights[ci] = w;
 
                 // StrokeStartPosition, not verts[i] - see ApplyFlattenBrushLocal on why the
@@ -2872,7 +3102,7 @@ namespace Sculpting
             _isHovering = false;
             if (overUI) return;
 
-            Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
+            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
@@ -2924,7 +3154,7 @@ namespace Sculpting
             EnsureSmoothFullMeshScratch(totalVerts);
             NativeArray<Vector3>.Copy(verts, _nativeFullPositionMirror, totalVerts); // full-mesh mirror, refreshed once per call - see field remarks
 
-            GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask); // normals unused by these jobs
+            GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
 
             if (!_nativeSmoothCandidates.IsCreated || _nativeSmoothCandidates.Length < candidates.Count)
             {
@@ -2941,10 +3171,13 @@ namespace Sculpting
             var weightJob = new SmoothWeightJob
             {
                 PositionsIn = _nativePositionsIn,
+                NormalsIn = _nativeNormalsIn,
                 MaskIn = _nativeMaskIn,
                 WeightsOut = _nativeClayWeights,
                 LocalPoint = localPoint,
                 BrushRadius = brushRadius,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
@@ -3014,6 +3247,8 @@ namespace Sculpting
             if (_smoothWeightScratch.Length < candidates.Count) _smoothWeightScratch = new float[candidates.Count];
             float[] weights = _smoothWeightScratch;
             bool anyInRange = false;
+            Vector3[] normals = sculptableMesh.Normals;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -3022,7 +3257,8 @@ namespace Sculpting
                 if (dist > brushRadius) { weights[ci] = 0f; continue; }
 
                 float t01 = 1f - dist / brushRadius;
-                weights[ci] = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]); // smoothstep, masked-out
+                weights[ci] = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
+                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
                 anyInRange = true;
             }
             if (!anyInRange) return;
@@ -3109,10 +3345,11 @@ namespace Sculpting
             if (!_isHovering || !mouse.leftButton.wasPressedThisFrame) return;
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
             var selections = new List<(SculptableMesh.GrabSelection, Vector3)>();
             foreach (Vector3 sign in Mirror.GetMirrorSigns())
             {
-                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius);
+                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, cameraLocalPos);
                 if (selection.IsValid) selections.Add((selection, sign));
             }
             if (selections.Count == 0) return;
@@ -3240,68 +3477,88 @@ namespace Sculpting
             return path;
         }
 
-        // Kept visible at all times (not just while hovering the mesh) so its size always
-        // gives a visual read on the current brush radius - most useful while resizing (S)
-        // off to the side of the model. Snaps to the sculpted surface when actually hovering
-        // it; otherwise floats along the camera ray at the model's rough depth.
-        private void UpdateBrushPreview()
+        // Drives the 2D screen-space ring cursor (see ShowBrushCursor/BrushCursorScreenPosition/
+        // BrushCursorScreenDiameter/BrushCursorColor - SculptUIBuilder polls these to actually
+        // draw it) and owns Cursor.visible alongside it: the OS pointer is hidden whenever the
+        // ring is shown, and restored the instant it isn't, so a UI panel or another tool always
+        // gets the ordinary pointer back. Sized/tinted every frame the same way the old
+        // world-space BrushPreview sphere was - snapped to the sculpted surface while hovering
+        // it, floating along the camera ray at the model's rough depth otherwise - just measured
+        // in screen pixels instead of world units.
+        private void UpdateBrushCursor()
         {
-            if (brushPreview == null || cam == null) return;
-            if (sculptableMesh == null) { brushPreview.SetActive(false); return; }
+            bool show = false;
+            Color color = PositiveColor;
 
-            // Another tool owns the cursor - Transpose/Scale drag the transform, ZSpheres place
-            // and grow rig spheres, and each shows its own affordance. Leaving the brush cursor up
-            // meant it sat frozen wherever it last was: HandleSculptInput returns early in these
-            // modes without clearing _isOverUI, so a stale `true` from clicking the tool button in
-            // the side panel sent this straight down the "freeze at the last good position" branch
-            // and parked a green ball off to one side for as long as the tool was active.
-            if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt) { brushPreview.SetActive(false); return; }
+            // Same "another tool owns the cursor" carve-out the old preview had - Transpose/
+            // Scale drag the transform, ZSpheres place and grow rig spheres, and each shows its
+            // own affordance instead.
+            bool sculptToolActive = sculptableMesh != null && cam != null && (Gizmo == null || Gizmo.Mode == GizmoMode.Sculpt);
 
-            Vector3 previewPos;
-            bool positive;
-
-            if (_isHovering)
-            {
-                previewPos = _hoverPoint + _hoverNormal * 0.01f;
-                positive = _previewPositive;
-                _lastGoodPreviewPos = previewPos;
-            }
-            else if (_isOverUI)
-            {
-                // Mouse is over a panel (e.g. dragging the brush radius slider), not the
-                // viewport - a fresh ray from there would send the preview flying off toward
-                // the panel. Freeze at the last on-model/viewport position instead so its size
-                // still reads clearly against the sculpt while the slider is being scrubbed.
-                previewPos = _lastGoodPreviewPos;
-                positive = true;
-            }
-            else
+            if (sculptToolActive && !_isOverUI)
             {
                 Mouse mouse = Mouse.current;
-                if (mouse == null) { brushPreview.SetActive(false); return; }
+                if (mouse != null)
+                {
+                    Vector2 screenPos = mouse.position.ReadValue();
+                    Vector3 worldPoint;
+                    bool positive;
 
-                float fallbackDistance = Mathf.Max(1f, Vector3.Distance(cam.transform.position, sculptableMesh.transform.position));
-                Ray ray = cam.ScreenPointToRay(mouse.position.ReadValue());
-                previewPos = ray.GetPoint(fallbackDistance);
-                positive = true; // neutral tint when just showing size, not actively sculpting
-                _lastGoodPreviewPos = previewPos;
+                    if (_isHovering)
+                    {
+                        worldPoint = _hoverPoint + _hoverNormal * 0.01f;
+                        positive = _previewPositive;
+                    }
+                    else
+                    {
+                        float fallbackDistance = Mathf.Max(1f, Vector3.Distance(cam.transform.position, sculptableMesh.transform.position));
+                        Ray ray = cam.ScreenPointToRay(screenPos);
+                        worldPoint = ray.GetPoint(fallbackDistance);
+                        positive = true; // neutral tint when just showing size, not actively sculpting
+                    }
+
+                    float diameterPx = ProjectDiameterToScreenPixels(worldPoint, brushRadius * AverageScale());
+                    if (diameterPx > 0f)
+                    {
+                        show = true;
+                        _brushCursorScreenPos = screenPos;
+                        // Floored so a tiny brush viewed from far away still reads as a visible
+                        // ring rather than shrinking past legibility - the projected size is
+                        // otherwise unbounded in both directions.
+                        _brushCursorScreenDiameter = Mathf.Max(diameterPx, MinCursorScreenDiameterPx);
+
+                        // Smooth gets its own blue/dashed look (see SmoothColor/
+                        // BrushCursorDashed) since it has no add/subtract polarity at all -
+                        // showing it as an ordinary "positive" green dab would suggest it adds
+                        // material the way Clay/Inflate/etc. do. The strength gauge (F) still
+                        // overrides everything, including Smooth's own styling, with a forced
+                        // solid red - a distinct, unambiguous "you're adjusting strength, not
+                        // sculpting" cue that takes priority over which brush is even selected.
+                        bool isSmooth = currentBrush == BrushType.Smooth;
+                        color = _isAdjustingStrength ? NegativeColor
+                            : isSmooth ? SmoothColor
+                            : positive ? PositiveColor : NegativeColor;
+                        _brushCursorDashed = isSmooth && !_isAdjustingStrength;
+                    }
+                }
             }
 
-            brushPreview.SetActive(true);
-            float diameter = brushRadius * 2f * AverageScale();
-            brushPreview.transform.position = previewPos;
-            brushPreview.transform.localScale = Vector3.one * diameter;
+            _showBrushCursor = show;
+            if (show) _brushCursorColor = color;
+            Cursor.visible = !show;
+        }
 
-            if (_brushPreviewRenderer != null)
-            {
-                // Forced red while the strength gauge (F) is up, overriding whatever polarity
-                // would otherwise be shown - a distinct, unambiguous "you're adjusting
-                // strength, not sculpting" cue, reusing NegativeColor rather than inventing a
-                // third cursor color.
-                Color c = _isAdjustingStrength ? NegativeColor : (positive ? PositiveColor : NegativeColor);
-                c.a = 0.35f;
-                _brushPreviewRenderer.material.color = c;
-            }
+        // Measures how many screen pixels `worldRadius` covers at `worldCenter` by projecting
+        // both the center and a point one radius away (along the camera's own right vector,
+        // always perpendicular to view direction) and comparing their screen positions - works
+        // unmodified for perspective and orthographic cameras alike, unlike computing it from
+        // FOV/distance by hand.
+        private float ProjectDiameterToScreenPixels(Vector3 worldCenter, float worldRadius)
+        {
+            Vector3 centerScreen = cam.WorldToScreenPoint(worldCenter);
+            if (centerScreen.z <= 0f) return 0f; // behind the camera
+            Vector3 edgeScreen = cam.WorldToScreenPoint(worldCenter + cam.transform.right * worldRadius);
+            return Vector2.Distance(centerScreen, edgeScreen) * 2f;
         }
 
         private float AverageScale()
@@ -3351,6 +3608,7 @@ namespace Sculpting
             public bool isPositive;
             public bool accumulate;
             public float accumulateStrength;
+            public bool frontFacingOnly;
 
             public float clayHeightFactor;
             public float clayTipRoundness;
@@ -3387,6 +3645,7 @@ namespace Sculpting
             public bool[] perBrushPolarity;
             public bool[] perBrushAccumulate;
             public float[] perBrushAccumulateStrength;
+            public bool[] perBrushFrontFacingOnly;
         }
 
         public Settings CaptureSettings()
@@ -3399,6 +3658,7 @@ namespace Sculpting
             _brushPolarity[cur] = isPositive;
             _brushAccumulate[cur] = accumulate;
             _accumulateStrengthPerType[cur] = accumulateStrength;
+            _brushFrontFacingOnly[cur] = frontFacingOnly;
 
             return new Settings
             {
@@ -3408,6 +3668,7 @@ namespace Sculpting
                 isPositive = isPositive,
                 accumulate = accumulate,
                 accumulateStrength = accumulateStrength,
+                frontFacingOnly = frontFacingOnly,
 
                 clayHeightFactor = clayHeightFactor,
                 clayTipRoundness = clayTipRoundness,
@@ -3437,6 +3698,7 @@ namespace Sculpting
                 perBrushPolarity = (bool[])_brushPolarity.Clone(),
                 perBrushAccumulate = (bool[])_brushAccumulate.Clone(),
                 perBrushAccumulateStrength = (float[])_accumulateStrengthPerType.Clone(),
+                perBrushFrontFacingOnly = (bool[])_brushFrontFacingOnly.Clone(),
             };
         }
 
@@ -3452,6 +3714,7 @@ namespace Sculpting
             CopyPerBrush(s.perBrushPolarity, _brushPolarity);
             CopyPerBrush(s.perBrushAccumulate, _brushAccumulate);
             CopyPerBrush(s.perBrushAccumulateStrength, _accumulateStrengthPerType);
+            CopyPerBrush(s.perBrushFrontFacingOnly, _brushFrontFacingOnly);
 
             ClayHeightFactor = s.clayHeightFactor;
             ClayTipRoundness = s.clayTipRoundness;
@@ -3485,6 +3748,7 @@ namespace Sculpting
             IsPositive = s.isPositive;
             Accumulate = s.accumulate;
             AccumulateStrength = s.accumulateStrength;
+            FrontFacingOnly = s.frontFacingOnly;
 
             IsMaskPaintMode = s.maskPaintMode;
 
