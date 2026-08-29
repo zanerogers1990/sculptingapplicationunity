@@ -11,18 +11,18 @@ namespace Sculpting
     /// heuristic) stays correct across concave folds and overhangs that sculpting produces.
     internal class SignedDistanceField
     {
-        private readonly Vector3[] vertices;
-        private readonly int[] triangles;
-        private readonly Bounds bounds;
-        private readonly float cellSize;
-        private readonly Vector3Int binDims;
-        private readonly List<int>[] bins;
+        private readonly Vector3[] _vertices;
+        private readonly int[] _triangles;
+        private readonly Bounds _bounds;
+        private readonly float _cellSize;
+        private readonly Vector3Int _binDims;
+        private readonly List<int>[] _bins;
 
         public SignedDistanceField(Vector3[] verts, int[] tris, float cellSize)
         {
-            vertices = verts;
-            triangles = tris;
-            this.cellSize = Mathf.Max(cellSize, 0.0001f);
+            _vertices = verts;
+            _triangles = tris;
+            _cellSize = Mathf.Max(cellSize, 0.0001f);
 
             int triCount = tris.Length / 3;
 
@@ -32,17 +32,17 @@ namespace Sculpting
                 min = Vector3.Min(min, verts[i]);
                 max = Vector3.Max(max, verts[i]);
             }
-            min -= Vector3.one * this.cellSize;
-            max += Vector3.one * this.cellSize;
-            bounds = new Bounds();
-            bounds.SetMinMax(min, max);
+            min -= Vector3.one * _cellSize;
+            max += Vector3.one * _cellSize;
+            _bounds = new Bounds();
+            _bounds.SetMinMax(min, max);
 
-            binDims = new Vector3Int(
-                Mathf.Max(1, Mathf.CeilToInt(bounds.size.x / this.cellSize)),
-                Mathf.Max(1, Mathf.CeilToInt(bounds.size.y / this.cellSize)),
-                Mathf.Max(1, Mathf.CeilToInt(bounds.size.z / this.cellSize)));
+            _binDims = new Vector3Int(
+                Mathf.Max(1, Mathf.CeilToInt(_bounds.size.x / _cellSize)),
+                Mathf.Max(1, Mathf.CeilToInt(_bounds.size.y / _cellSize)),
+                Mathf.Max(1, Mathf.CeilToInt(_bounds.size.z / _cellSize)));
 
-            bins = new List<int>[binDims.x * binDims.y * binDims.z];
+            _bins = new List<int>[_binDims.x * _binDims.y * _binDims.z];
 
             for (int t = 0; t < triCount; t++)
             {
@@ -57,22 +57,22 @@ namespace Sculpting
                 for (int x = bmin.x; x <= bmax.x; x++)
                 {
                     int idx = BinIndex(x, y, z);
-                    if (bins[idx] == null) bins[idx] = new List<int>();
-                    bins[idx].Add(t);
+                    if (_bins[idx] == null) _bins[idx] = new List<int>();
+                    _bins[idx].Add(t);
                 }
             }
         }
 
         private Vector3Int CellOf(Vector3 p)
         {
-            Vector3 local = p - bounds.min;
-            int x = Mathf.Clamp(Mathf.FloorToInt(local.x / cellSize), 0, binDims.x - 1);
-            int y = Mathf.Clamp(Mathf.FloorToInt(local.y / cellSize), 0, binDims.y - 1);
-            int z = Mathf.Clamp(Mathf.FloorToInt(local.z / cellSize), 0, binDims.z - 1);
+            Vector3 local = p - _bounds.min;
+            int x = Mathf.Clamp(Mathf.FloorToInt(local.x / _cellSize), 0, _binDims.x - 1);
+            int y = Mathf.Clamp(Mathf.FloorToInt(local.y / _cellSize), 0, _binDims.y - 1);
+            int z = Mathf.Clamp(Mathf.FloorToInt(local.z / _cellSize), 0, _binDims.z - 1);
             return new Vector3Int(x, y, z);
         }
 
-        private int BinIndex(int x, int y, int z) => x + binDims.x * (y + binDims.y * z);
+        private int BinIndex(int x, int y, int z) => x + _binDims.x * (y + _binDims.y * z);
 
         // ComputeColumn runs once per (y,z) column, concurrently across Parallel.For
         // iterations in ComputeInsideMask - a resolution^2-scaling number of calls per remesh.
@@ -97,16 +97,16 @@ namespace Sculpting
         public float NearestUnsignedDistance(Vector3 p)
         {
             Vector3Int center = CellOf(p);
-            int maxRadius = Mathf.Max(binDims.x, binDims.y, binDims.z);
+            int maxRadius = Mathf.Max(_binDims.x, _binDims.y, _binDims.z);
 
             float bestSqrDist = float.MaxValue;
             int foundAtRadius = -1;
 
             for (int radius = 0; radius <= maxRadius; radius++)
             {
-                ForEachCellInShell(center, radius, binDims, (x, y, z) =>
+                ForEachCellInShell(center, radius, _binDims, (x, y, z) =>
                 {
-                    var list = bins[BinIndex(x, y, z)];
+                    var list = _bins[BinIndex(x, y, z)];
                     if (list == null) return;
 
                     // Reject the whole bin when even its NEAREST point is farther than a
@@ -120,9 +120,9 @@ namespace Sculpting
                     for (int k = 0; k < list.Count; k++)
                     {
                         int t = list[k];
-                        Vector3 a = vertices[triangles[t * 3]];
-                        Vector3 b = vertices[triangles[t * 3 + 1]];
-                        Vector3 c = vertices[triangles[t * 3 + 2]];
+                        Vector3 a = _vertices[_triangles[t * 3]];
+                        Vector3 b = _vertices[_triangles[t * 3 + 1]];
+                        Vector3 c = _vertices[_triangles[t * 3 + 2]];
                         Vector3 closest = ClosestPointOnTriangle(p, a, b, c);
                         float sqr = (closest - p).sqrMagnitude;
                         if (sqr < bestSqrDist) bestSqrDist = sqr;
@@ -143,9 +143,9 @@ namespace Sculpting
         /// face is nearer, or zero between them.
         private float SqrDistanceToBin(Vector3 p, int x, int y, int z)
         {
-            float minX = bounds.min.x + x * cellSize, maxX = minX + cellSize;
-            float minY = bounds.min.y + y * cellSize, maxY = minY + cellSize;
-            float minZ = bounds.min.z + z * cellSize, maxZ = minZ + cellSize;
+            float minX = _bounds.min.x + x * _cellSize, maxX = minX + _cellSize;
+            float minY = _bounds.min.y + y * _cellSize, maxY = minY + _cellSize;
+            float minZ = _bounds.min.z + z * _cellSize, maxZ = minZ + _cellSize;
 
             float dx = p.x < minX ? minX - p.x : (p.x > maxX ? p.x - maxX : 0f);
             float dy = p.y < minY ? minY - p.y : (p.y > maxY ? p.y - maxY : 0f);
@@ -183,7 +183,7 @@ namespace Sculpting
             // whole column's inside/outside. The sample loop below already consumes every
             // crossing before the first sample's x, so the extra span costs nothing but the
             // crossings it correctly picks up.
-            Vector3 rayOrigin = new Vector3(Mathf.Min(origin.x, bounds.min.x), wy, wz);
+            Vector3 rayOrigin = new Vector3(Mathf.Min(origin.x, _bounds.min.x), wy, wz);
 
             Vector3Int cell = CellOf(rayOrigin);
             var tested = _testedPool.Value;
@@ -191,23 +191,23 @@ namespace Sculpting
             var crossings = _crossingsPool.Value;
             crossings.Clear();
 
-            for (int bx = 0; bx < binDims.x; bx++)
+            for (int bx = 0; bx < _binDims.x; bx++)
             for (int dz = -1; dz <= 1; dz++)
             for (int dy = -1; dy <= 1; dy++)
             {
                 int by = cell.y + dy, bz = cell.z + dz;
-                if (by < 0 || by >= binDims.y || bz < 0 || bz >= binDims.z) continue;
+                if (by < 0 || by >= _binDims.y || bz < 0 || bz >= _binDims.z) continue;
 
-                var list = bins[BinIndex(bx, by, bz)];
+                var list = _bins[BinIndex(bx, by, bz)];
                 if (list == null) continue;
                 for (int k = 0; k < list.Count; k++)
                 {
                     int t = list[k];
                     if (!tested.Add(t)) continue;
 
-                    Vector3 a = vertices[triangles[t * 3]];
-                    Vector3 b = vertices[triangles[t * 3 + 1]];
-                    Vector3 c = vertices[triangles[t * 3 + 2]];
+                    Vector3 a = _vertices[_triangles[t * 3]];
+                    Vector3 b = _vertices[_triangles[t * 3 + 1]];
+                    Vector3 c = _vertices[_triangles[t * 3 + 2]];
                     if (RayIntersectsTriangleX(rayOrigin, a, b, c, out float hitX, out int winding))
                         crossings.Add(new Crossing(hitX, winding));
                 }

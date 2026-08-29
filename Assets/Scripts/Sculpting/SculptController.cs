@@ -384,7 +384,7 @@ namespace Sculpting
         // ZBrush/Blender-style ring that tracks the mouse directly rather than a 3D object
         // positioned via raycast hit point, so it reads correctly even when hovering empty
         // space beside the model. SculptUIBuilder polls these every frame to position/size/tint
-        // its ring Image, same delegation pattern as IsResizingBrush/IsAdjustingStrength below.
+        // its ring Image, same delegation pattern as IsAdjustingStrength below.
         // The OS cursor is hidden directly here (see UpdateBrushCursor) whenever this
         // ring is shown, and restored whenever it isn't - over a UI panel, over no sculptable
         // target, or while another tool (Transpose/Scale/ZSphere) owns the viewport.
@@ -1331,12 +1331,11 @@ namespace Sculpting
             get => brushRadius;
             set => brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
         }
-        public bool IsResizingBrush => _isResizingBrush;
         public bool IsAdjustingStrength => _isAdjustingStrength;
 
         // Polled by SculptUIBuilder every frame to draw the 2D ring cursor (see
-        // UpdateBrushCursor) - same read-only delegation pattern as IsResizingBrush/
-        // IsAdjustingStrength above.
+        // UpdateBrushCursor) - same read-only delegation pattern as IsAdjustingStrength
+        // above.
         public bool ShowBrushCursor => _showBrushCursor;
         public Vector2 BrushCursorScreenPosition => _brushCursorScreenPos;
         public float BrushCursorScreenDiameter => _brushCursorScreenDiameter;
@@ -2060,6 +2059,17 @@ namespace Sculpting
         // doesn't move geometry, and folding it into SculptHistory's vertex/triangle snapshot
         // format would be a larger change than this "just a basic one" ask called for; flagged
         // here rather than silently left out.
+        // The one diagnostic every brush handler emits, on the press frame only. Was six
+        // byte-identical copies inline; kept as a method rather than folded into the
+        // handlers so the `logRayHits` gate and the message stay in one place.
+        private void LogRayHit(Mouse mouse, Ray ray, Vector3 hitPoint, Vector3 hitNormal)
+        {
+            if (!logRayHits) return;
+            if (!mouse.leftButton.wasPressedThisFrame && !mouse.rightButton.wasPressedThisFrame) return;
+            Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, "
+                      + $"distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+        }
+
         private void HandleMaskPaintInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
@@ -2138,8 +2148,7 @@ namespace Sculpting
             bool invertHeld = rightHeld || CtrlHeld;
             _previewPositive = invertHeld ? !isPositive : isPositive;
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             // Alt+Left-drag is reserved for orbiting the camera (see CameraOrbitController),
             // so don't also sculpt while Alt is held. Right-drag, or holding Ctrl while
@@ -2575,8 +2584,7 @@ namespace Sculpting
             bool invertHeld = rightHeld || CtrlHeld;
             _previewPositive = invertHeld ? !isPositive : isPositive;
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             if (mouse.leftButton.isPressed && !altHeld)
                 ApplyCreaseBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
@@ -2724,8 +2732,7 @@ namespace Sculpting
             bool invertHeld = rightHeld || CtrlHeld;
             _previewPositive = invertHeld ? !isPositive : isPositive;
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             bool sculpting = (mouse.leftButton.isPressed && !altHeld) || rightHeld;
             if (!sculpting) { _lastDamHoverLocal = null; return; }
@@ -2856,8 +2863,7 @@ namespace Sculpting
             bool invertHeld = rightHeld || CtrlHeld;
             _previewPositive = invertHeld ? !isPositive : isPositive;
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             if (mouse.leftButton.isPressed && !altHeld)
                 ApplyInflateBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
@@ -2990,8 +2996,7 @@ namespace Sculpting
             bool invertHeld = rightHeld || CtrlHeld;
             _previewPositive = invertHeld ? !isPositive : isPositive;
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             if (mouse.leftButton.isPressed && !altHeld)
                 ApplyFlattenBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
@@ -3218,8 +3223,7 @@ namespace Sculpting
             _hoverNormal = hitNormal;
             _previewPositive = true; // Smooth has no add/subtract direction - always neutral/green
 
-            if (logRayHits && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
-                Debug.Log($"[Sculpt] Ray hit at {hitPoint}, normal {hitNormal}, distance {Vector3.Distance(ray.origin, hitPoint):F2}");
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             // Same Alt-reserved-for-orbit rule as Clay; either mouse button smooths since
             // there's no positive/negative to invert.

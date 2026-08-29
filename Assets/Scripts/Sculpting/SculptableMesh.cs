@@ -975,8 +975,6 @@ namespace Sculpting
         // start. Non-null exactly while such a drag is in progress; see BeginMaskedTransform.
         private Vector3[] _maskedTransformBase;
 
-        public bool IsMaskedTransformActive => _maskedTransformBase != null;
-
         /// Starts a mask-aware whole-object transform: instead of moving the Transform (which
         /// would drag the masked region along with everything else), the drag deforms the
         /// vertex buffer, holding fully-masked vertices exactly where they are and blending

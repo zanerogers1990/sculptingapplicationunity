@@ -999,20 +999,6 @@ namespace Sculpting
             return created;
         }
 
-        /// How many spheres are off the mirror plane with no counterpart - what MirrorRig would
-        /// act on. Lets the UI say whether pressing it will do anything before it is pressed.
-        public int UnmirroredCount()
-        {
-            int count = 0;
-            for (int i = 0; i < _rig.Count; i++)
-            {
-                ZSphereRig.Node node = _rig.Get(i);
-                if (node == null || IsCentral(node)) continue;
-                if (_rig.TwinOf(i) == ZSphereRig.NoNode) count++;
-            }
-            return count;
-        }
-
         private void SetPositionSymmetric(int index, Vector3 position)
         {
             ZSphereRig.Node node = _rig.Get(index);

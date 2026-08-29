@@ -63,7 +63,6 @@ namespace Sculpting
 
         public int PartnerOf(int index) => _partner[index];
         public bool IsOnPlane(int index) => _onPlane[index];
-        public bool IsMatched(int index) => _onPlane[index] || _partner[index] != NoPartner;
 
         private SymmetryMap() { }
 

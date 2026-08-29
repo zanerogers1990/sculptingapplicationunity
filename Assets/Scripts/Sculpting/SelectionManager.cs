@@ -90,13 +90,6 @@ namespace Sculpting
             SelectionVersion++;
         }
 
-        public void Deselect(SculptableMesh obj)
-        {
-            _selectedSet.Remove(obj);
-            if (_primary == obj) _primary = _selectedSet.Count > 0 ? _selectedSet[_selectedSet.Count - 1] : null;
-            SelectionVersion++;
-        }
-
         public void ClearSelection()
         {
             _selectedSet.Clear();

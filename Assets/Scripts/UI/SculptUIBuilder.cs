@@ -13,13 +13,12 @@ namespace Sculpting
     {
         public SculptController controller;
 
-        private static readonly Color ActiveColor = new Color(0.25f, 0.55f, 0.95f);
-        private static readonly Color InactiveColor = new Color(0.2f, 0.2f, 0.22f);
-        // Distinct from ActiveColor since mask-paint mode is orthogonal to brush selection
+        // ActiveColor/InactiveColor/PanelColor live on UIFactory, which already publishes
+        // them - this file used to redeclare all three with identical values.
+        // Distinct from UIFactory.ActiveColor above since mask-paint mode is orthogonal to brush selection
         // (which brush is "current" still matters for when you exit mask mode) - a different
         // color keeps the two kinds of highlight from reading as the same kind of state.
         private static readonly Color MaskActiveColor = new Color(0.95f, 0.65f, 0.15f);
-        private static readonly Color PanelColor = new Color(0.08f, 0.08f, 0.1f, 0.88f);
 
         // Matches Unity's axis-handle/gizmo convention (X red, Y green, Z blue), and
         // MirrorController's own plane colors.
@@ -189,50 +188,47 @@ namespace Sculpting
 
             // 2D ring cursor - position/size/tint follow the controller every frame it's shown
             // (see SculptController.UpdateBrushCursor, which also owns Cursor.visible).
-            if (_cursorRingGO != null)
+            bool showCursor = controller.ShowBrushCursor;
+            if (_cursorRingGO.activeSelf != showCursor) _cursorRingGO.SetActive(showCursor);
+            if (showCursor)
             {
-                bool showCursor = controller.ShowBrushCursor;
-                if (_cursorRingGO.activeSelf != showCursor) _cursorRingGO.SetActive(showCursor);
-                if (showCursor)
+                _cursorRingRect.position = controller.BrushCursorScreenPosition;
+                float diameter = controller.BrushCursorScreenDiameter;
+                _cursorRingVisualRect.sizeDelta = new Vector2(diameter, diameter);
+                _cursorHaloRect.sizeDelta = new Vector2(diameter, diameter) + Vector2.one * (CursorHaloExtraPx * 2f);
+
+                // Smooth swaps in a dashed ring (still stretched to the live diameter above)
+                // instead of a different color alone - see SculptController.BrushCursorDashed.
+                _cursorRingImage.sprite = controller.BrushCursorDashed ? GetDashedRingSprite() : GetRingSprite();
+
+                // Stroke-end pulse (see SculptController.BrushCursorFadeAlpha) multiplies
+                // every layer's OWN base alpha rather than being baked into
+                // BrushCursorColor - that color's alpha is always 1, so the halo (fixed
+                // 0.55) and the tinted ring/dot (1) fade together in proportion instead of
+                // the halo swallowing the multiplier at a different rate.
+                float fade = controller.BrushCursorFadeAlpha;
+                Color c = controller.BrushCursorColor;
+                c.a *= fade;
+                _cursorRingImage.color = c;
+                _cursorDotImage.color = c;
+                _cursorHaloImage.color = new Color(0f, 0f, 0f, 0.55f * fade);
+
+                // Inner strength circle - only while holding F (see
+                // SculptController.IsAdjustingStrength). 0 strength reads as a tiny dot
+                // (floored at CursorDotSizePx so it never fully vanishes), scaling up
+                // linearly until max strength exactly fills the outer ring - re-deriving
+                // the diameter from the live outer `diameter` above (rather than caching a
+                // pixel size) is what keeps it correct across brush-size changes too.
+                bool showStrength = controller.IsAdjustingStrength;
+                _cursorStrengthImage.enabled = showStrength;
+                if (showStrength)
                 {
-                    _cursorRingRect.position = controller.BrushCursorScreenPosition;
-                    float diameter = controller.BrushCursorScreenDiameter;
-                    _cursorRingVisualRect.sizeDelta = new Vector2(diameter, diameter);
-                    _cursorHaloRect.sizeDelta = new Vector2(diameter, diameter) + Vector2.one * (CursorHaloExtraPx * 2f);
-
-                    // Smooth swaps in a dashed ring (still stretched to the live diameter above)
-                    // instead of a different color alone - see SculptController.BrushCursorDashed.
-                    _cursorRingImage.sprite = controller.BrushCursorDashed ? GetDashedRingSprite() : GetRingSprite();
-
-                    // Stroke-end pulse (see SculptController.BrushCursorFadeAlpha) multiplies
-                    // every layer's OWN base alpha rather than being baked into
-                    // BrushCursorColor - that color's alpha is always 1, so the halo (fixed
-                    // 0.55) and the tinted ring/dot (1) fade together in proportion instead of
-                    // the halo swallowing the multiplier at a different rate.
-                    float fade = controller.BrushCursorFadeAlpha;
-                    Color c = controller.BrushCursorColor;
-                    c.a *= fade;
-                    _cursorRingImage.color = c;
-                    _cursorDotImage.color = c;
-                    _cursorHaloImage.color = new Color(0f, 0f, 0f, 0.55f * fade);
-
-                    // Inner strength circle - only while holding F (see
-                    // SculptController.IsAdjustingStrength). 0 strength reads as a tiny dot
-                    // (floored at CursorDotSizePx so it never fully vanishes), scaling up
-                    // linearly until max strength exactly fills the outer ring - re-deriving
-                    // the diameter from the live outer `diameter` above (rather than caching a
-                    // pixel size) is what keeps it correct across brush-size changes too.
-                    bool showStrength = controller.IsAdjustingStrength;
-                    _cursorStrengthImage.enabled = showStrength;
-                    if (showStrength)
-                    {
-                        float st01 = Mathf.InverseLerp(0.01f, 1f, controller.BrushStrength);
-                        float strengthDiameter = Mathf.Max(CursorDotSizePx, diameter * st01);
-                        _cursorStrengthRect.sizeDelta = new Vector2(strengthDiameter, strengthDiameter);
-                        Color sc = StrengthCircleColor;
-                        sc.a = StrengthCircleBaseAlpha * fade;
-                        _cursorStrengthImage.color = sc;
-                    }
+                    float st01 = Mathf.InverseLerp(0.01f, 1f, controller.BrushStrength);
+                    float strengthDiameter = Mathf.Max(CursorDotSizePx, diameter * st01);
+                    _cursorStrengthRect.sizeDelta = new Vector2(strengthDiameter, strengthDiameter);
+                    Color sc = StrengthCircleColor;
+                    sc.a = StrengthCircleBaseAlpha * fade;
+                    _cursorStrengthImage.color = sc;
                 }
             }
 
@@ -675,20 +671,20 @@ namespace Sculpting
 
         private void RefreshBrushButtons()
         {
-            _moveButtonImage.color = controller.CurrentBrush == BrushType.Move ? ActiveColor : InactiveColor;
-            _clayButtonImage.color = controller.CurrentBrush == BrushType.Clay ? ActiveColor : InactiveColor;
-            _smoothButtonImage.color = controller.CurrentBrush == BrushType.Smooth ? ActiveColor : InactiveColor;
-            _creaseButtonImage.color = controller.CurrentBrush == BrushType.Crease ? ActiveColor : InactiveColor;
-            _damButtonImage.color = controller.CurrentBrush == BrushType.DamStandard ? ActiveColor : InactiveColor;
-            _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? ActiveColor : InactiveColor;
-            _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? ActiveColor : InactiveColor;
-            _maskButtonImage.color = controller.IsMaskPaintMode ? MaskActiveColor : InactiveColor;
+            _moveButtonImage.color = controller.CurrentBrush == BrushType.Move ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _clayButtonImage.color = controller.CurrentBrush == BrushType.Clay ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _smoothButtonImage.color = controller.CurrentBrush == BrushType.Smooth ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _creaseButtonImage.color = controller.CurrentBrush == BrushType.Crease ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _damButtonImage.color = controller.CurrentBrush == BrushType.DamStandard ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _maskButtonImage.color = controller.IsMaskPaintMode ? MaskActiveColor : UIFactory.InactiveColor;
         }
 
         private void RefreshAlphaButtons()
         {
             for (int i = 0; i < AlphaTypes.Length; i++)
-                _alphaButtonImages[i].color = controller.AlphaType == AlphaTypes[i] ? ActiveColor : InactiveColor;
+                _alphaButtonImages[i].color = controller.AlphaType == AlphaTypes[i] ? UIFactory.ActiveColor : UIFactory.InactiveColor;
         }
 
         // ------------------------------------------------------------------------- extract
@@ -788,9 +784,9 @@ namespace Sculpting
             for (int i = 0; i < 3; i++)
             {
                 if (_symmetryAxisImages[i] == null) continue;
-                // Tinted with the axis's own gizmo colour rather than the generic ActiveColor, so
+                // Tinted with the axis's own gizmo colour rather than the generic UIFactory.ActiveColor, so
                 // the selected plane matches the coloured quad MirrorController draws for it.
-                _symmetryAxisImages[i].color = i != axis ? InactiveColor
+                _symmetryAxisImages[i].color = i != axis ? UIFactory.InactiveColor
                     : (i == 0 ? MirrorXColor : i == 1 ? MirrorYColor : MirrorZColor);
             }
 
@@ -897,7 +893,7 @@ namespace Sculpting
             var go = new GameObject("AlphaButton_" + type, typeof(RectTransform), typeof(Image));
             go.transform.SetParent(parent, false);
             var img = go.GetComponent<Image>();
-            img.color = InactiveColor;
+            img.color = UIFactory.InactiveColor;
             go.AddComponent<LayoutElement>().preferredHeight = 34;
             var btn = go.AddComponent<Button>();
             btn.targetGraphic = img;
@@ -921,7 +917,7 @@ namespace Sculpting
         {
             var go = new GameObject("Panel", typeof(RectTransform), typeof(Image));
             go.transform.SetParent(parent, false);
-            go.GetComponent<Image>().color = PanelColor;
+            go.GetComponent<Image>().color = UIFactory.PanelColor;
             return go;
         }
 
@@ -1020,7 +1016,7 @@ namespace Sculpting
             var go = new GameObject("Button_" + label, typeof(RectTransform), typeof(Image));
             go.transform.SetParent(parent, false);
             var img = go.GetComponent<Image>();
-            img.color = InactiveColor;
+            img.color = UIFactory.InactiveColor;
             go.AddComponent<LayoutElement>().preferredHeight = 32;
             var btn = go.AddComponent<Button>();
             btn.targetGraphic = img;

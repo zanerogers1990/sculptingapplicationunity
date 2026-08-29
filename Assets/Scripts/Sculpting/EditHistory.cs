@@ -67,8 +67,6 @@ namespace Sculpting
 
         public static bool CanUndo => _undo.Count > 0;
         public static bool CanRedo => _redo.Count > 0;
-        public static int UndoDepth => _undo.Count;
-        public static int RedoDepth => _redo.Count;
 
         // -------------------------------------------------------------------------- recording
 

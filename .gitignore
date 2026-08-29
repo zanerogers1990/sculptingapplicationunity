@@ -71,3 +71,7 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+
+# Scene backups pulled out of Assets/ during the cleanup pass - kept on disk, not
+# part of the Unity project any more.
+/_RecoveryBackups/

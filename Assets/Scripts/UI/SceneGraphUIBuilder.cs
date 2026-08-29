@@ -58,6 +58,26 @@ namespace Sculpting
         private float _zsphereStickyUntil;
         private int _lastShownZSphereVersion = -1;
         private int _lastShownZSphereNode = -1;
+        // Last inputs the labels below were actually built from. Without these,
+        // RefreshZSphereSection ran in full on EVERY frame: three interpolated strings plus
+        // a whole-rig walk (EffectiveResolution -> ZSphereSkinner.PreviewResolution, which
+        // calls ComputeBounds and MeanRadius), all to redraw text that changes a handful of
+        // times in a session. Rig.Version covers everything derived from the geometry,
+        // EffectiveResolution included.
+        //
+        // AttachTargetName is still read every frame, because UnityEngine.Object.name is
+        // the only signal that the attach target changed and it marshals a fresh string on
+        // each get. That one small allocation is what buys skipping all of the above, and
+        // adding a version counter purely to dodge it was not worth the extra state.
+        private bool _zsphereLabelsValid;
+        private string _lastZSphereUndoLabel;
+        private int _lastZSphereUndoDepth = -1;
+        private string _lastZSphereAttachName;
+        private bool _lastZSphereSnap;
+        private bool _lastZSphereArmed;
+        private int _lastZSphereTriCount = -1;
+        private string _lastZSphereError;
+        private bool _lastZSphereStickyShowing;
         // Follow live state that no other control reflects: what Undo would reverse, and which
         // object the rig is attached to.
         private Text _zsphereUndoLabel;
@@ -269,7 +289,11 @@ namespace Sculpting
         /// working on is the only thing it can sensibly mean.
         private void ImportObject()
         {
-            string path = PickPath("Import object", "obj");
+            // SceneSerializer.ImportableExtensions, not a hard-coded "obj": ImportAny already
+            // dispatches a .sculpt file to the whole-session importer, and the constant exists
+            // to say so. Hard-coding the narrower list here meant the picker HID .sculpt files
+            // from a button that has always been able to open them.
+            string path = PickPath("Import object", SceneSerializer.ImportableExtensions);
             if (path == null) return;
 
             if (SceneSerializer.ImportAny(path, out int count, out string error))
@@ -585,6 +609,10 @@ namespace Sculpting
         /// again for hours.
         private void BuildZSphereSection(Transform panel)
         {
+            // The labels below are about to be recreated empty, so the cached signature
+            // RefreshZSphereSection skips on no longer describes what is on screen.
+            _zsphereLabelsValid = false;
+
             Transform foldout = UIFactory.CreateFoldoutSection(panel, "ZSpheres (Blockout)", false);
 
             if (_zsphere == null)
@@ -749,27 +777,65 @@ namespace Sculpting
         {
             if (_zsphere == null || _zsphereStatusLabel == null) return;
 
+            // A sticky message expires on a clock, so whether one is showing has to be
+            // re-evaluated every frame - it is part of the signature below precisely so the
+            // frame it lapses is the frame the normal status line comes back.
+            bool stickyShowing = _zsphereSticky != null && Time.unscaledTime < _zsphereStickyUntil;
+
+            string undoLabel = _zsphere.NextRigUndoLabel;
+            int undoDepth = _zsphere.RigUndoDepth;
+            string attachName = _zsphere.AttachTargetName;
+            bool snap = _zsphere.SnapToSurface;
+            bool gizmoArmed = _gizmo != null && _gizmo.Mode == GizmoMode.ZSphere;
+            int triCount = _zsphere.PreviewTriangleCount;
+            string zsError = _zsphere.Error;
+            int node = _zsphere.SelectedNode;
+            int rigVersion = _zsphere.Rig.Version;
+
+            if (_zsphereLabelsValid
+                && undoDepth == _lastZSphereUndoDepth
+                && undoLabel == _lastZSphereUndoLabel
+                && attachName == _lastZSphereAttachName
+                && snap == _lastZSphereSnap
+                && gizmoArmed == _lastZSphereArmed
+                && triCount == _lastZSphereTriCount
+                && zsError == _lastZSphereError
+                && stickyShowing == _lastZSphereStickyShowing
+                && node == _lastShownZSphereNode
+                && rigVersion == _lastShownZSphereVersion)
+                return;
+
+            // Recorded here rather than at the end: the body below has its own early return
+            // on the sticky path, and this pass is about to render THESE inputs either way.
+            _zsphereLabelsValid = true;
+            _lastZSphereUndoLabel = undoLabel;
+            _lastZSphereUndoDepth = undoDepth;
+            _lastZSphereAttachName = attachName;
+            _lastZSphereSnap = snap;
+            _lastZSphereArmed = gizmoArmed;
+            _lastZSphereTriCount = triCount;
+            _lastZSphereError = zsError;
+            _lastZSphereStickyShowing = stickyShowing;
+
             // Above the sticky-message early-out below: these two labels are not the status line,
             // and freezing them for the four seconds a one-off message is up would leave the
             // attach label contradicting the very message that just replaced it.
             if (_zsphereUndoLabel != null)
             {
-                string next = _zsphere.NextRigUndoLabel;
-                _zsphereUndoLabel.text = next == null
+                _zsphereUndoLabel.text = undoLabel == null
                     ? "Rig history empty."
-                    : $"Undo (Z): {next} - {_zsphere.RigUndoDepth} step(s) held.";
+                    : $"Undo (Z): {undoLabel} - {undoDepth} step(s) held.";
                 _zsphereUndoLabel.color = HintColor;
             }
 
             if (_zsphereAttachLabel != null)
             {
-                string attached = _zsphere.AttachTargetName;
-                _zsphereAttachLabel.text = attached == null
+                _zsphereAttachLabel.text = attachName == null
                     ? "Not attached - spheres land on the view plane."
-                    : _zsphere.SnapToSurface
-                        ? $"Attached to {attached} - clicks land on its surface."
-                        : $"Attached to {attached} - surface snap is off.";
-                _zsphereAttachLabel.color = attached == null ? HintColor : OkColor;
+                    : snap
+                        ? $"Attached to {attachName} - clicks land on its surface."
+                        : $"Attached to {attachName} - surface snap is off.";
+                _zsphereAttachLabel.color = attachName == null ? HintColor : OkColor;
             }
 
             if (_zsphereSticky != null)
@@ -783,11 +849,10 @@ namespace Sculpting
                 _zsphereSticky = null;
             }
 
-            if (_zsphere.SelectedNode != _lastShownZSphereNode ||
-                _zsphere.Rig.Version != _lastShownZSphereVersion)
+            if (node != _lastShownZSphereNode || rigVersion != _lastShownZSphereVersion)
             {
-                _lastShownZSphereNode = _zsphere.SelectedNode;
-                _lastShownZSphereVersion = _zsphere.Rig.Version;
+                _lastShownZSphereNode = node;
+                _lastShownZSphereVersion = rigVersion;
 
                 // SetValueWithoutNotify, not `value`: writing the slider normally would fire its
                 // onChange straight back into SelectedRadius, so simply SELECTING a sphere would
@@ -796,10 +861,11 @@ namespace Sculpting
                     _zsphereRadiusSlider.SetValueWithoutNotify(_zsphere.SelectedRadius);
             }
 
-            bool armed = _gizmo != null && _gizmo.Mode == GizmoMode.ZSphere;
+            // SphereCount needs no entry of its own in the signature above: every ZSphereRig
+            // mutation that moves AliveCount bumps Version in the same breath.
             int spheres = _zsphere.SphereCount;
 
-            if (!armed)
+            if (!gizmoArmed)
             {
                 _zsphereStatusLabel.text = spheres > 0
                     ? $"Rig hidden ({spheres} spheres). Pick ZSpheres in Tool to edit it."
@@ -811,16 +877,16 @@ namespace Sculpting
                 _zsphereStatusLabel.text = "Click in the viewport to place the first sphere.";
                 _zsphereStatusLabel.color = HintColor;
             }
-            else if (_zsphere.PreviewTriangleCount > 0)
+            else if (triCount > 0)
             {
                 _zsphereStatusLabel.text =
-                    $"{spheres} spheres | skin {_zsphere.PreviewTriangleCount:N0} tris @ res {_zsphere.EffectiveResolution}";
+                    $"{spheres} spheres | skin {triCount:N0} tris @ res {_zsphere.EffectiveResolution}";
                 _zsphereStatusLabel.color = OkColor;
             }
             else
             {
-                _zsphereStatusLabel.text = _zsphere.Error ?? $"{spheres} spheres. Update Skin to preview.";
-                _zsphereStatusLabel.color = _zsphere.Error != null ? ErrorColor : HintColor;
+                _zsphereStatusLabel.text = zsError ?? $"{spheres} spheres. Update Skin to preview.";
+                _zsphereStatusLabel.color = zsError != null ? ErrorColor : HintColor;
             }
         }
 

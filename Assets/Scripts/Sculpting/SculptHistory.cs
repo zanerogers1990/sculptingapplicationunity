@@ -113,7 +113,6 @@ namespace Sculpting
 
         public bool CanUndo => _undoStack.Count > 0;
         public bool CanRedo => _redoStack.Count > 0;
-        public int UndoCount => _undoStack.Count;
 
         /// Everything this object's history is holding onto, undo and redo stacks together.
         /// EditHistory sums this across objects to enforce the global memory budget - see
