@@ -4,7 +4,7 @@ namespace Sculpting
 {
     /// Assigns a runtime instance of the Custom/SculptPBR shader to the sculpted mesh and
     /// exposes its parameters (base PBR sliders, a procedural normal-detail strength, and
-    /// the cavity recess/peak coloring) so they're editable live from the Material UI panel
+    /// the single-colour cavity recess shading) so they're editable live from the Material UI panel
     /// instead of only through the Inspector.
     public class SculptMaterialController : MonoBehaviour
     {
@@ -18,9 +18,11 @@ namespace Sculpting
         // SculptableMesh's shared-vertex data model.
         [SerializeField] private bool flatShading = false;
 
+        // Cavity is ONE colour, and it only goes into recesses - see SculptPBR.shader's
+        // ApplyCavity for why the near-white "peak" colour that used to sit alongside this was
+        // removed rather than just turned down.
         [SerializeField] private bool cavityEnabled = false;
         [SerializeField] private Color recessColor = new Color(0.12f, 0.10f, 0.09f);
-        [SerializeField] private Color peakColor = new Color(1f, 0.96f, 0.86f);
         [SerializeField, Range(0f, 2f)] private float cavityIntensity = 1f;
         [SerializeField, Range(0.05f, 0.6f)] private float cavityRange = 0.25f;
 
@@ -43,7 +45,6 @@ namespace Sculpting
         public bool FlatShading { get => flatShading; set { flatShading = value; Push(); } }
         public bool CavityEnabled { get => cavityEnabled; set { cavityEnabled = value; Push(); } }
         public Color RecessColor { get => recessColor; set { recessColor = value; Push(); } }
-        public Color PeakColor { get => peakColor; set { peakColor = value; Push(); } }
         public float CavityIntensity { get => cavityIntensity; set { cavityIntensity = Mathf.Clamp(value, 0f, 2f); Push(); } }
         public float CavityRange { get => cavityRange; set { cavityRange = Mathf.Clamp(value, 0.05f, 0.6f); Push(); } }
 
@@ -76,6 +77,20 @@ namespace Sculpting
         {
             get => matcapName;
             set { matcapName = value ?? string.Empty; ResolveMatcap(); Push(); }
+        }
+
+        /// Selects a specific library entry directly, bypassing MatcapLibrary.Find's name-only
+        /// lookup - for callers (a palette click, an import) that already hold the exact Entry.
+        /// Going through the MatcapName setter instead would re-resolve by name and, if another
+        /// entry elsewhere shares that name, could silently apply a different image than the one
+        /// actually picked. matcapName is still recorded from the entry for the .sculpt format
+        /// and for a plain-name re-resolution to survive things like a mid-Play domain reload.
+        public void SetMatcap(MatcapLibrary.Entry entry)
+        {
+            matcapName = entry != null ? entry.Name : string.Empty;
+            _matcapTexture = entry != null ? MatcapLibrary.GetFull(entry) : null;
+            matcapEnabled = _matcapTexture != null;
+            Push();
         }
 
         public float MatcapIntensity { get => matcapIntensity; set { matcapIntensity = Mathf.Clamp(value, 0f, 3f); Push(); } }
@@ -143,7 +158,6 @@ namespace Sculpting
             _material.SetFloat("_FlatShading", flatShading ? 1f : 0f);
             _material.SetFloat("_CavityEnabled", cavityEnabled ? 1f : 0f);
             _material.SetColor("_RecessColor", recessColor);
-            _material.SetColor("_PeakColor", peakColor);
             _material.SetFloat("_CavityIntensity", cavityIntensity);
             _material.SetFloat("_CavityRange", cavityRange);
 

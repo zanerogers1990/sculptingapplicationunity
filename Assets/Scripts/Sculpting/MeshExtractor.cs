@@ -283,7 +283,7 @@ namespace Sculpting
         /// still owns it, so nothing has to be kept per edge except the count.
         private static void FindBoundaryEdges(int[] tris, out List<int> boundaryU, out List<int> boundaryV)
         {
-            var counts = new Dictionary<long, int>(tris.Length);
+            var counts = new Dictionary<long, int>(tris.Length, EdgeKeyComparer.Instance);
             for (int j = 0; j < tris.Length; j += 3)
             {
                 Bump(counts, tris[j], tris[j + 1]);
@@ -410,7 +410,7 @@ namespace Sculpting
         /// packed edge keys plus two flat arrays does the same job with three allocations.
         private static void BuildAdjacency(int vertexCount, IReadOnlyList<int> tris, out int[] offsets, out int[] neighbours)
         {
-            var edges = new HashSet<long>();
+            var edges = new HashSet<long>(EdgeKeyComparer.Instance);
             for (int j = 0; j < tris.Count; j += 3)
             {
                 edges.Add(EdgeKey(tris[j], tris[j + 1]));

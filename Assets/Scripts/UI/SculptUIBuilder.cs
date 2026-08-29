@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem.UI;
@@ -31,8 +31,6 @@ namespace Sculpting
         // uses for "an action reported success" versus "here is what this section does".
         private static readonly Color SymmetryOkColor = new Color(0.55f, 0.85f, 0.55f);
         private static readonly Color SymmetryHintColor = new Color(0.65f, 0.65f, 0.7f);
-
-        private const float ResizeGaugeWidth = 160f;
 
         private Font _font;
         private Text _positiveToggleLabel;
@@ -95,6 +93,7 @@ namespace Sculpting
         private Image[] _symmetryAxisImages = new Image[3];
         private Text _symmetryStatusLabel;
         private Text _symPosToNegLabel, _symNegToPosLabel;
+        private Text _symCutPosToNegLabel, _symCutNegToPosLabel;
         private int _lastShownSymmetryAxis = -1;
         private Text _extractStatusLabel;
         private bool _lastShownExtractPreviewing;
@@ -108,29 +107,39 @@ namespace Sculpting
         };
         private readonly Image[] _alphaButtonImages = new Image[AlphaTypes.Length];
 
-        // ZBrush/Blender-style popup gauge shown while SculptController.IsResizingBrush is
-        // true, positioned at the screen point where the S-drag started (see Update()).
-        private GameObject _resizeGaugeGO;
-        private RectTransform _resizeGaugeRect;
-        private RectTransform _resizeGaugeFillRect;
-
-        // Same popup-gauge pattern, shown while SculptController.IsAdjustingStrength is true
-        // (holding F), positioned at the screen point the F-drag started (see Update()).
-        private GameObject _strengthGaugeGO;
-        private RectTransform _strengthGaugeRect;
-        private RectTransform _strengthGaugeFillRect;
-
         // ZBrush/Blender-style 2D ring cursor (see SculptController.ShowBrushCursor and
         // friends) - a halo (dark, slightly larger, for contrast against any background), a
-        // tinted ring at the actual brush diameter, and a small fixed-size center dot for
-        // precision. Replaces the old world-space BrushPreview sphere entirely; the OS cursor
-        // (Cursor.visible) is toggled opposite this by SculptController itself, not here.
+        // tinted ring at the actual brush diameter (brush size - S to resize, or scroll), a
+        // small fixed-size center dot for precision, and an inner filled circle that only
+        // appears while holding F (SculptController.IsAdjustingStrength), scaled from a tiny
+        // dot up to the full ring diameter to show BrushStrength - see Update(). No standalone
+        // popup gauges anymore for either value: the ring itself IS the size readout, and the
+        // inner circle IS the strength readout. Replaces the old world-space BrushPreview
+        // sphere entirely; the OS cursor (Cursor.visible) is toggled opposite this by
+        // SculptController itself, not here.
         private GameObject _cursorRingGO;
         private RectTransform _cursorRingRect;
-        private Image _cursorHaloImage, _cursorRingImage, _cursorDotImage;
-        private RectTransform _cursorHaloRect, _cursorRingVisualRect;
+        private Image _cursorHaloImage, _cursorRingImage, _cursorDotImage, _cursorStrengthImage;
+        private RectTransform _cursorHaloRect, _cursorRingVisualRect, _cursorStrengthRect;
         private const float CursorHaloExtraPx = 3f;
         private const float CursorDotSizePx = 4f;
+
+        // Lazy Mouse tether (see SculptController.LazyMouseTetherActive) - a thin line from the
+        // ring, which sits where the brush is actually working, back to a small dot at the raw
+        // pointer, exactly the affordance ZBrush and Nomad draw for their own stabilizers. Two
+        // independent children rather than a positioned parent with local offsets: the line is
+        // rotated and stretched while the dot is neither, so sharing a parent transform would
+        // mean undoing the parent's rotation on the dot every frame.
+        //
+        // Deliberately understated - thin, translucent, no halo. It is a running readout of a
+        // gap the user is already looking straight at, and anything heavier would compete with
+        // the ring for attention exactly when they are concentrating on a stroke.
+        private GameObject _lazyTetherGO;
+        private RectTransform _lazyTetherLineRect, _lazyTetherDotRect;
+        private Image _lazyTetherLineImage, _lazyTetherDotImage;
+        private const float LazyTetherThicknessPx = 1.5f;
+        private const float LazyTetherDotSizePx = 5f;
+        private const float LazyTetherAlpha = 0.5f;
 
         // "Undo"/"Redo" toast (see SculptController.ShowUndoToast and friends) - a short-lived
         // text popup, independent of the brush cursor above, anchored bottom-center of the
@@ -157,38 +166,25 @@ namespace Sculpting
             BuildUI();
         }
 
+        // Inner strength-circle color - deliberately the same red as SculptController's own
+        // NegativeColor (private to that class) rather than reusing BrushCursorColor: the ring
+        // keeps its ordinary polarity/Smooth tint while adjusting strength (see
+        // SculptController.UpdateBrushCursor), so the circle needs its own fixed "this is the
+        // strength gesture" tint independent of whatever color the outer ring happens to be.
+        private static readonly Color StrengthCircleColor = new Color(1f, 0.3f, 0.3f);
+        // Kept translucent (rather than the fully-opaque disc a bare Color gives by default) so
+        // it reads as a HUD overlay - the same reasoning as the halo's fixed 0.55 alpha below.
+        private const float StrengthCircleBaseAlpha = 0.45f;
+
         private void Update()
         {
-            if (controller == null || _resizeGaugeGO == null) return;
+            if (controller == null || _cursorRingGO == null) return;
 
-            bool show = controller.IsResizingBrush;
-            if (_resizeGaugeGO.activeSelf != show) _resizeGaugeGO.SetActive(show);
-
-            // Keep the panel's own Brush Size slider in sync while the popup gauge drives
-            // BrushRadius directly - SetValueWithoutNotify avoids feeding the change back
-            // into controller.BrushRadius through the slider's own onValueChanged.
-            if (show)
-            {
-                _resizeGaugeRect.position = controller.ResizeAnchorScreenPosition + new Vector2(0f, 50f);
-                float t01 = Mathf.InverseLerp(SculptController.MinBrushRadius, SculptController.MaxBrushRadius, controller.BrushRadius);
-                _resizeGaugeFillRect.sizeDelta = new Vector2(ResizeGaugeWidth * t01, _resizeGaugeFillRect.sizeDelta.y);
-            }
-
+            // Panel's own Brush Size/Strength sliders stay in sync with S-drag/F-drag/scroll
+            // adjustments made straight from the viewport - SetValueWithoutNotify avoids
+            // feeding the change back into the controller through the slider's own
+            // onValueChanged.
             if (_brushSizeSlider != null) _brushSizeSlider.SetValueWithoutNotify(controller.BrushRadius);
-
-            // Same as the resize gauge above, but for BrushStrength while holding F.
-            bool showStrength = controller.IsAdjustingStrength;
-            if (_strengthGaugeGO != null)
-            {
-                if (_strengthGaugeGO.activeSelf != showStrength) _strengthGaugeGO.SetActive(showStrength);
-                if (showStrength)
-                {
-                    _strengthGaugeRect.position = controller.StrengthAdjustAnchorScreenPosition + new Vector2(0f, 50f);
-                    float st01 = Mathf.InverseLerp(0.01f, 1f, controller.BrushStrength);
-                    _strengthGaugeFillRect.sizeDelta = new Vector2(ResizeGaugeWidth * st01, _strengthGaugeFillRect.sizeDelta.y);
-                }
-            }
-
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
             // 2D ring cursor - position/size/tint follow the controller every frame it's shown
@@ -219,6 +215,56 @@ namespace Sculpting
                     _cursorRingImage.color = c;
                     _cursorDotImage.color = c;
                     _cursorHaloImage.color = new Color(0f, 0f, 0f, 0.55f * fade);
+
+                    // Inner strength circle - only while holding F (see
+                    // SculptController.IsAdjustingStrength). 0 strength reads as a tiny dot
+                    // (floored at CursorDotSizePx so it never fully vanishes), scaling up
+                    // linearly until max strength exactly fills the outer ring - re-deriving
+                    // the diameter from the live outer `diameter` above (rather than caching a
+                    // pixel size) is what keeps it correct across brush-size changes too.
+                    bool showStrength = controller.IsAdjustingStrength;
+                    _cursorStrengthImage.enabled = showStrength;
+                    if (showStrength)
+                    {
+                        float st01 = Mathf.InverseLerp(0.01f, 1f, controller.BrushStrength);
+                        float strengthDiameter = Mathf.Max(CursorDotSizePx, diameter * st01);
+                        _cursorStrengthRect.sizeDelta = new Vector2(strengthDiameter, strengthDiameter);
+                        Color sc = StrengthCircleColor;
+                        sc.a = StrengthCircleBaseAlpha * fade;
+                        _cursorStrengthImage.color = sc;
+                    }
+                }
+            }
+
+            // Lazy Mouse tether - the line from the ring back to the pointer, drawn only while
+            // the stabilizer actually has the rope taut (see SculptController's tether remarks).
+            if (_lazyTetherGO != null)
+            {
+                bool showTether = controller.LazyMouseTetherActive;
+                if (_lazyTetherGO.activeSelf != showTether) _lazyTetherGO.SetActive(showTether);
+                if (showTether)
+                {
+                    Vector2 from = controller.LazyMouseTetherFrom; // raw pointer
+                    Vector2 to = controller.LazyMouseTetherTo;     // where the brush is working
+                    Vector2 span = from - to;
+                    float length = span.magnitude;
+
+                    _lazyTetherLineRect.position = to;
+                    _lazyTetherLineRect.sizeDelta = new Vector2(length, LazyTetherThicknessPx);
+                    // Atan2 rather than Vector2.Angle: the latter is unsigned, so the line would
+                    // mirror onto the wrong side of the ring for half of all cursor directions.
+                    _lazyTetherLineRect.localEulerAngles =
+                        new Vector3(0f, 0f, Mathf.Atan2(span.y, span.x) * Mathf.Rad2Deg);
+                    _lazyTetherDotRect.position = from;
+
+                    // Same tint as the ring (so polarity and Smooth's blue read consistently
+                    // across both) at a fixed lower alpha, and multiplied by the same stroke-end
+                    // fade so the whole cursor assembly pulses as one thing rather than the line
+                    // outliving the ring it belongs to.
+                    Color tc = controller.BrushCursorColor;
+                    tc.a = LazyTetherAlpha * controller.BrushCursorFadeAlpha;
+                    _lazyTetherLineImage.color = tc;
+                    _lazyTetherDotImage.color = tc;
                 }
             }
 
@@ -405,9 +451,16 @@ namespace Sculpting
                 _accumulateToggleLabel.text = v ? "Accumulate" : "Accumulate (Off)";
             }, out _accumulateToggleLabel);
 
-            CreateLabel(panel.transform, "Accumulate Strength", 14, FontStyle.Normal);
+            // Applies to both build-up paths, not just Accumulate-on - see
+            // SculptController.accumulateStrength for why the label no longer says "Accumulate".
+            CreateLabel(panel.transform, "Build-Up Strength", 14, FontStyle.Normal);
             _accumulateStrengthSlider = CreateSlider(panel.transform, 0.1f, 3f, controller.AccumulateStrength,
                 v => controller.AccumulateStrength = v);
+
+            // Shared across every brush (like Lazy Mouse, not per-brush like Accumulate above),
+            // so it needs no resync in the brush-changed handler.
+            CreateToggle(panel.transform, "Build Up on Hold", controller.BuildUpOnHold,
+                v => controller.BuildUpOnHold = v, out _);
 
             _frontFacingOnlyToggle = CreateToggle(panel.transform, "Front Facing Only", controller.FrontFacingOnly, v =>
             {
@@ -589,15 +642,16 @@ namespace Sculpting
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (cursor turns red)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
-
-            _resizeGaugeGO = CreateResizeGauge(canvasGO.transform);
-            _strengthGaugeGO = CreateStrengthGauge(canvasGO.transform);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
             // (Unity UI draws later siblings over earlier ones) - the brush cursor should never
             // be occluded by a panel, even for the one frame before _isOverUI would hide it.
+            // The tether goes immediately BEFORE the ring, for the same reason in miniature: it
+            // clears the panels, but the ring still draws over the line rather than the line
+            // cutting across the ring's middle.
+            _lazyTetherGO = CreateLazyMouseTether(canvasGO.transform);
             _cursorRingGO = CreateBrushCursor(canvasGO.transform);
             _undoToastGO = CreateUndoToast(canvasGO.transform);
         }
@@ -679,6 +733,13 @@ namespace Sculpting
 
             CreateButton(foldout, "Check Symmetry", () => SetSymmetryStatus(controller.SymmetryStatus(), Color.white));
 
+            // Two rows, two different operations, and the split is the point. "Match Up" nudges
+            // vertices onto their counterparts and needs the two halves to already correspond;
+            // "Cut & Mirror" throws one side away and rebuilds it, and needs nothing at all. The
+            // first is non-destructive and keeps mask/topology, so it stays the top row - but it
+            // is also the one that can honestly do nothing on a model whose halves were built
+            // separately, which is exactly when the row below is the answer.
+            CreateLabel(foldout, "Match Up (keeps topology, needs matching halves)", 12, FontStyle.Normal);
             var mirrorRow = CreateRow(foldout);
             Button posToNeg = CreateButton(mirrorRow.transform, "+X to -X",
                 () => SetSymmetryStatus(controller.MakeSymmetric(true), SymmetryOkColor));
@@ -687,11 +748,21 @@ namespace Sculpting
             _symPosToNegLabel = posToNeg.GetComponentInChildren<Text>();
             _symNegToPosLabel = negToPos.GetComponentInChildren<Text>();
 
+            CreateLabel(foldout, "Cut & Mirror (rebuilds the far side, always works)", 12, FontStyle.Normal);
+            var cutRow = CreateRow(foldout);
+            Button cutPosToNeg = CreateButton(cutRow.transform, "+X to -X",
+                () => SetSymmetryStatus(controller.MirrorAndWeld(true), SymmetryOkColor));
+            Button cutNegToPos = CreateButton(cutRow.transform, "-X to +X",
+                () => SetSymmetryStatus(controller.MirrorAndWeld(false), SymmetryOkColor));
+            _symCutPosToNegLabel = cutPosToNeg.GetComponentInChildren<Text>();
+            _symCutNegToPosLabel = cutNegToPos.GetComponentInChildren<Text>();
+
             CreateButton(foldout, "Symmetry Cleanup (Snap + Weld)",
                 () => SetSymmetryStatus(controller.SymmetryCleanup(), SymmetryOkColor));
 
             _symmetryStatusLabel = CreateLabel(foldout,
-                "Check Symmetry reports how many vertices pair across the plane.", 11, FontStyle.Italic);
+                "Check Symmetry reports how many vertices pair across the plane. If most of them " +
+                "don't pair, the halves were built separately - use Cut & Mirror.", 11, FontStyle.Italic);
             _symmetryStatusLabel.color = SymmetryHintColor;
 
             RefreshSymmetryAxis();
@@ -726,6 +797,8 @@ namespace Sculpting
             string name = SymmetryOps.AxisName(axis);
             if (_symPosToNegLabel != null) _symPosToNegLabel.text = $"+{name} to -{name}";
             if (_symNegToPosLabel != null) _symNegToPosLabel.text = $"-{name} to +{name}";
+            if (_symCutPosToNegLabel != null) _symCutPosToNegLabel.text = $"+{name} to -{name}";
+            if (_symCutNegToPosLabel != null) _symCutNegToPosLabel.text = $"-{name} to +{name}";
         }
 
         private void BuildExtractSection(Transform panel)
@@ -1018,75 +1091,6 @@ namespace Sculpting
             return toggle;
         }
 
-        // Small floating track+fill bar, not an interactive Slider - Update() drives its
-        // fill width directly from controller.BrushRadius while resizing, and positions it
-        // at the screen point the S-drag started from.
-        private GameObject CreateResizeGauge(Transform canvasParent)
-        {
-            var go = new GameObject("BrushResizeGauge", typeof(RectTransform));
-            go.transform.SetParent(canvasParent, false);
-            var rect = go.GetComponent<RectTransform>();
-            rect.sizeDelta = new Vector2(ResizeGaugeWidth, 12);
-            rect.pivot = new Vector2(0.5f, 0.5f);
-            rect.anchorMin = rect.anchorMax = new Vector2(0f, 0f);
-
-            var trackGO = new GameObject("Track", typeof(RectTransform), typeof(Image));
-            trackGO.transform.SetParent(go.transform, false);
-            var trackRect = trackGO.GetComponent<RectTransform>();
-            trackRect.anchorMin = Vector2.zero;
-            trackRect.anchorMax = Vector2.one;
-            trackRect.sizeDelta = Vector2.zero;
-            trackGO.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.6f);
-
-            var fillGO = new GameObject("Fill", typeof(RectTransform), typeof(Image));
-            fillGO.transform.SetParent(go.transform, false);
-            _resizeGaugeFillRect = fillGO.GetComponent<RectTransform>();
-            _resizeGaugeFillRect.anchorMin = new Vector2(0f, 0f);
-            _resizeGaugeFillRect.anchorMax = new Vector2(0f, 1f);
-            _resizeGaugeFillRect.pivot = new Vector2(0f, 0.5f);
-            _resizeGaugeFillRect.anchoredPosition = Vector2.zero;
-            fillGO.GetComponent<Image>().color = new Color(0.2f, 1f, 0.4f);
-
-            _resizeGaugeRect = rect;
-            go.SetActive(false);
-            return go;
-        }
-
-        // Same track+fill gauge as CreateResizeGauge, but red-tinted to match the brush
-        // cursor's forced-red NegativeColor while adjusting strength (see
-        // SculptController.UpdateBrushPreview) - a consistent "this is the strength gesture,
-        // not the size one" cue between the 3D cursor and this HUD bar.
-        private GameObject CreateStrengthGauge(Transform canvasParent)
-        {
-            var go = new GameObject("BrushStrengthGauge", typeof(RectTransform));
-            go.transform.SetParent(canvasParent, false);
-            var rect = go.GetComponent<RectTransform>();
-            rect.sizeDelta = new Vector2(ResizeGaugeWidth, 12);
-            rect.pivot = new Vector2(0.5f, 0.5f);
-            rect.anchorMin = rect.anchorMax = new Vector2(0f, 0f);
-
-            var trackGO = new GameObject("Track", typeof(RectTransform), typeof(Image));
-            trackGO.transform.SetParent(go.transform, false);
-            var trackRect = trackGO.GetComponent<RectTransform>();
-            trackRect.anchorMin = Vector2.zero;
-            trackRect.anchorMax = Vector2.one;
-            trackRect.sizeDelta = Vector2.zero;
-            trackGO.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.6f);
-
-            var fillGO = new GameObject("Fill", typeof(RectTransform), typeof(Image));
-            fillGO.transform.SetParent(go.transform, false);
-            _strengthGaugeFillRect = fillGO.GetComponent<RectTransform>();
-            _strengthGaugeFillRect.anchorMin = new Vector2(0f, 0f);
-            _strengthGaugeFillRect.anchorMax = new Vector2(0f, 1f);
-            _strengthGaugeFillRect.pivot = new Vector2(0f, 0.5f);
-            _strengthGaugeFillRect.anchoredPosition = Vector2.zero;
-            fillGO.GetComponent<Image>().color = new Color(1f, 0.3f, 0.3f);
-
-            _strengthGaugeRect = rect;
-            go.SetActive(false);
-            return go;
-        }
-
         // Halo (dark, slightly larger) + tinted ring at the live brush diameter + a small
         // fixed-size center dot - all centered on one positioning parent so Update() only has
         // to move/resize that one RectTransform's children, not juggle three independent
@@ -1094,6 +1098,41 @@ namespace Sculpting
         // sibling order (see BuildUI), and a hit-testable cursor would make itself count as
         // "over UI" the instant it appeared under the mouse, fighting the very check
         // (SculptController._isOverUI) that decides whether to show it at all.
+        // The Lazy Mouse tether - see the field remarks. The line's pivot is its LEFT edge
+        // (0, 0.5) so Update() can anchor it at the ring, point it at the cursor with a single
+        // Z rotation, and set its length as plain width; a centred pivot would need the
+        // midpoint computed every frame as well. No sprite on the line at all: an Image with a
+        // null sprite draws a flat filled rect, which is exactly what a 1.5px line is.
+        private GameObject CreateLazyMouseTether(Transform canvasParent)
+        {
+            var go = new GameObject("LazyMouseTether", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            var root = go.GetComponent<RectTransform>();
+            root.anchorMin = root.anchorMax = Vector2.zero;
+            root.sizeDelta = Vector2.zero;
+
+            var lineGO = new GameObject("Line", typeof(RectTransform), typeof(Image));
+            lineGO.transform.SetParent(go.transform, false);
+            _lazyTetherLineRect = lineGO.GetComponent<RectTransform>();
+            _lazyTetherLineRect.anchorMin = _lazyTetherLineRect.anchorMax = Vector2.zero;
+            _lazyTetherLineRect.pivot = new Vector2(0f, 0.5f);
+            _lazyTetherLineImage = lineGO.GetComponent<Image>();
+            _lazyTetherLineImage.raycastTarget = false;
+
+            var dotGO = new GameObject("PointerDot", typeof(RectTransform), typeof(Image));
+            dotGO.transform.SetParent(go.transform, false);
+            _lazyTetherDotRect = dotGO.GetComponent<RectTransform>();
+            _lazyTetherDotRect.anchorMin = _lazyTetherDotRect.anchorMax = Vector2.zero;
+            _lazyTetherDotRect.pivot = new Vector2(0.5f, 0.5f);
+            _lazyTetherDotRect.sizeDelta = new Vector2(LazyTetherDotSizePx, LazyTetherDotSizePx);
+            _lazyTetherDotImage = dotGO.GetComponent<Image>();
+            _lazyTetherDotImage.sprite = GetDotSprite();
+            _lazyTetherDotImage.raycastTarget = false;
+
+            go.SetActive(false);
+            return go;
+        }
+
         private GameObject CreateBrushCursor(Transform canvasParent)
         {
             var go = new GameObject("BrushCursorRing", typeof(RectTransform));
@@ -1119,6 +1158,21 @@ namespace Sculpting
             _cursorRingImage = ringGO.GetComponent<Image>();
             _cursorRingImage.sprite = GetRingSprite();
             _cursorRingImage.raycastTarget = false;
+
+            // Inner strength circle, between the ring and the center dot in sibling order so
+            // the precision dot always stays visible on top even when strength is near max and
+            // this circle nearly fills the ring. Reuses GetDotSprite (a generic filled-circle
+            // texture, not exclusive to the small dot below) since Image.type Simple stretches
+            // it to whatever sizeDelta Update() sets, same as the dot does at its own fixed
+            // size. Starts disabled (Update() only enables it while IsAdjustingStrength).
+            var strengthGO = new GameObject("StrengthCircle", typeof(RectTransform), typeof(Image));
+            strengthGO.transform.SetParent(go.transform, false);
+            _cursorStrengthRect = strengthGO.GetComponent<RectTransform>();
+            _cursorStrengthRect.anchorMin = _cursorStrengthRect.anchorMax = new Vector2(0.5f, 0.5f);
+            _cursorStrengthImage = strengthGO.GetComponent<Image>();
+            _cursorStrengthImage.sprite = GetDotSprite();
+            _cursorStrengthImage.raycastTarget = false;
+            _cursorStrengthImage.enabled = false;
 
             var dotGO = new GameObject("Dot", typeof(RectTransform), typeof(Image));
             dotGO.transform.SetParent(go.transform, false);

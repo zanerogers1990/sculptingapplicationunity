@@ -74,7 +74,21 @@ namespace Sculpting
 
         private Light CreateLightObject(string label, LightSlot slot)
         {
-            GameObject go = GameObject.Find("Light_" + label) ?? new GameObject("Light_" + label);
+            // Searches _rigRoot's own children rather than GameObject.Find: Find SKIPS INACTIVE
+            // objects, and a slot that is currently switched off is exactly that - the two
+            // kickers whenever the rig is in ThreePoint mode, or every light while studio
+            // lighting is disabled. Missing them meant each rebuild (BuildRig re-runs on a
+            // mid-Play domain reload - see Update's remarks) created a SECOND GameObject with
+            // the same name: the old one orphaned in the scene, the new one sitting ACTIVE at
+            // the world origin, because a fresh GameObject starts active and unpositioned.
+            //
+            // That is not a cosmetic leak. These lights are spot lights with shadows off, and
+            // the world origin is inside the sculpted mesh the moment a stroke or a remesh grows
+            // its bounds past it - so an origin-parked light burns a bright round pool straight
+            // through the surface. Reproduced directly: one simulated rebuild took the scene
+            // from one "Light_Kicker 1" to two, the new one active at (0,0,0).
+            Transform existing = _rigRoot.Find("Light_" + label);
+            GameObject go = existing != null ? existing.gameObject : new GameObject("Light_" + label);
             go.transform.SetParent(_rigRoot, false);
             Light light = go.GetComponent<Light>();
             if (light == null) light = go.AddComponent<Light>();
@@ -116,10 +130,14 @@ namespace Sculpting
                 var slot = (LightSlot)i;
                 RigLight cfg = _rig[i];
                 if (cfg.light == null) cfg.light = CreateLightObject(cfg.label, slot);
-                bool wantActive = studioLightingEnabled && cfg.enabled && IsSlotAvailable(slot);
-                if (cfg.light.gameObject.activeSelf != wantActive) cfg.light.gameObject.SetActive(wantActive);
-                if (!wantActive) continue;
 
+                // Place and configure EVERY slot, including the ones that are switched off,
+                // before deciding whether it renders. Positioning only the active ones left a
+                // disabled light parked at wherever it was created - the origin - for its whole
+                // disabled life, so whatever switched it back on (a mode change, a rebuild) had
+                // one frame in which it lit the model from the inside before the next tick moved
+                // it out. Placing first costs a transform write on two lights that may not be
+                // drawn, and removes that window entirely.
                 Quaternion rot = Quaternion.Euler(cfg.pitch, cfg.yaw, 0f);
                 Vector3 pos = pivot + rot * (Vector3.back * cfg.distance);
                 Vector3 aim = pivot - pos;
@@ -127,6 +145,9 @@ namespace Sculpting
                 cfg.light.transform.SetPositionAndRotation(pos, look);
                 cfg.light.intensity = cfg.intensity;
                 cfg.light.color = cfg.color;
+
+                bool wantActive = studioLightingEnabled && cfg.enabled && IsSlotAvailable(slot);
+                if (cfg.light.gameObject.activeSelf != wantActive) cfg.light.gameObject.SetActive(wantActive);
             }
         }
     }

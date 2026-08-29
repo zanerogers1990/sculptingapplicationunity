@@ -504,7 +504,6 @@ namespace Sculpting.IO
                 data.material.flatShading = mat.FlatShading;
                 data.material.cavityEnabled = mat.CavityEnabled;
                 data.material.recessColor = mat.RecessColor;
-                data.material.peakColor = mat.PeakColor;
                 data.material.cavityIntensity = mat.CavityIntensity;
                 data.material.cavityRange = mat.CavityRange;
                 data.material.matcapEnabled = mat.MatcapEnabled;
@@ -589,7 +588,6 @@ namespace Sculpting.IO
                 mat.FlatShading = data.material.flatShading;
                 mat.CavityEnabled = data.material.cavityEnabled;
                 mat.RecessColor = data.material.recessColor;
-                mat.PeakColor = data.material.peakColor;
                 mat.CavityIntensity = data.material.cavityIntensity;
                 mat.CavityRange = data.material.cavityRange;
                 mat.MatcapIntensity = data.material.matcapIntensity;

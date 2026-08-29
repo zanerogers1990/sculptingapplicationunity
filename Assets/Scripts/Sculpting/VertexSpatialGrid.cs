@@ -62,11 +62,12 @@ namespace Sculpting
         /// case, since cell size tracks the brush radius - costs one CellOf and a compare.
         /// The List.Remove below is O(bucket size), which is fine precisely because cell size
         /// is chosen relative to the brush footprint, keeping buckets to a handful of entries.
-        public void UpdateVertices(IReadOnlyCollection<int> movedVertices)
+        public void UpdateVertices(List<int> movedVertices)
         {
             if (movedVertices == null) return;
-            foreach (int i in movedVertices)
+            for (int k = 0; k < movedVertices.Count; k++)
             {
+                int i = movedVertices[k];
                 if (i < 0 || i >= _vertexCell.Length) continue;
 
                 Vector3Int now = CellOf(_vertices[i]);

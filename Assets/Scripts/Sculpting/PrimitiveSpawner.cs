@@ -12,7 +12,10 @@ namespace Sculpting
         // Spawned primitives default to this fraction of the main object's average bounds
         // extent, so they arrive at a usable size relative to the rest of the scene instead of
         // Unity's primitive default (1 world unit), which could dwarf or vanish next to it.
-        private const float SpawnSizeFraction = 0.4f;
+        // Close to 1 (not exactly 1) so a fresh primitive reads as "on par with" the main
+        // object's own size rather than a small satellite next to it, while still being
+        // distinguishable from an exact duplicate.
+        private const float SpawnSizeFraction = 0.9f;
         private const float FallbackSize = 0.3f; // used only if there's no main object yet
 
         private SelectionManager _selection;
@@ -48,8 +51,20 @@ namespace Sculpting
             float size = FallbackSize;
             if (main != null && main.Mesh != null)
             {
-                Vector3 e = main.Mesh.bounds.extents;
-                size = ((e.x + e.y + e.z) / 3f) * SpawnSizeFraction;
+                // Mesh.bounds is in the mesh's own LOCAL space - scale by the object's actual
+                // lossyScale to get its real on-screen extent, so this still matches if the main
+                // object has itself been resized via the Scale tool.
+                Vector3 e = Vector3.Scale(main.Mesh.bounds.extents, main.transform.lossyScale);
+                float targetExtent = ((e.x + e.y + e.z) / 3f) * SpawnSizeFraction;
+
+                // Unity's built-in primitives (Cube/Sphere/Cylinder/Capsule) all have an
+                // intrinsic extent of 0.5 in their own local mesh space, so localScale has to be
+                // DOUBLE the target world extent to actually reach it - using targetExtent
+                // directly as localScale (the previous version of this code) silently landed
+                // every spawned primitive at HALF the size the comment above describes, on top
+                // of SpawnSizeFraction already being conservative. Together that's why spawned
+                // shapes read as noticeably smaller than the starting sphere.
+                size = targetExtent * 2f;
             }
 
             go.name = NextName(type);

@@ -108,6 +108,15 @@ namespace Sculpting
                 {
                     var list = bins[BinIndex(x, y, z)];
                     if (list == null) return;
+
+                    // Reject the whole bin when even its NEAREST point is farther than a
+                    // triangle already found. Exact - it can only skip triangles that could
+                    // not have won anyway - but it removes most of the work in the outer
+                    // shells, which the loop below still has to visit because the shell walk
+                    // cannot know in advance which of them hold the true nearest triangle.
+                    // One AABB test replaces a full pass over that bin's triangle list.
+                    if (bestSqrDist < float.MaxValue && SqrDistanceToBin(p, x, y, z) >= bestSqrDist) return;
+
                     for (int k = 0; k < list.Count; k++)
                     {
                         int t = list[k];
@@ -127,6 +136,21 @@ namespace Sculpting
             }
 
             return bestSqrDist < float.MaxValue ? Mathf.Sqrt(bestSqrDist) : float.MaxValue;
+        }
+
+        /// Squared distance from `p` to the axis-aligned box of bin (x,y,z) - zero when p is
+        /// inside it. Standard point/AABB distance: per axis, the overshoot past whichever
+        /// face is nearer, or zero between them.
+        private float SqrDistanceToBin(Vector3 p, int x, int y, int z)
+        {
+            float minX = bounds.min.x + x * cellSize, maxX = minX + cellSize;
+            float minY = bounds.min.y + y * cellSize, maxY = minY + cellSize;
+            float minZ = bounds.min.z + z * cellSize, maxZ = minZ + cellSize;
+
+            float dx = p.x < minX ? minX - p.x : (p.x > maxX ? p.x - maxX : 0f);
+            float dy = p.y < minY ? minY - p.y : (p.y > maxY ? p.y - maxY : 0f);
+            float dz = p.z < minZ ? minZ - p.z : (p.z > maxZ ? p.z - maxZ : 0f);
+            return dx * dx + dy * dy + dz * dz;
         }
 
         // Fills insideOut (flattened x + sx*(y + sy*z), matching MeshRemesher's sdf layout)

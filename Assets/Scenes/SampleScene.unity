@@ -668,7 +668,6 @@ MonoBehaviour:
   flatShading: 0
   cavityEnabled: 0
   recessColor: {r: 0.12, g: 0.1, b: 0.09, a: 1}
-  peakColor: {r: 1, g: 0.96, b: 0.86, a: 1}
   cavityIntensity: 1
   cavityRange: 0.25
   matcapEnabled: 0
@@ -766,6 +765,7 @@ MonoBehaviour:
   accumulate: 1
   accumulateStrength: 1
   frontFacingOnly: 0
+  buildUpOnHold: 0
   lazyMouseEnabled: 0
   lazyMouseRadius: 25
   lazyMouseStrength: 1

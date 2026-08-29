@@ -124,6 +124,63 @@ namespace Sculpting
             return changed;
         }
 
+        /// Cuts the model at the mirror plane and rebuilds the discarded side as a reflection of
+        /// the kept one - SymmetryTools.MirrorAndWeld applied to a live object.
+        ///
+        /// This is the answer for everything MakeSymmetric refuses. MakeSymmetric can only move
+        /// vertices that already have a counterpart across the plane, so on a model whose two
+        /// halves were built separately - two arms joined in, one side remeshed, an imported mesh
+        /// that never matched - it correctly declines rather than tearing the surface, and from
+        /// the outside that reads as "symmetry does nothing". Nothing about a correspondence map
+        /// can fix that case: the correspondence genuinely is not there. Throwing one side away
+        /// and reflecting the other always can, because it never needs to know which vertex was
+        /// which.
+        ///
+        /// Goes through ReplaceMesh, not ApplyVertices - the vertex count and the triangle list
+        /// both change, so adjacency, the raycast grid, cavity, mask and the GPU scatter binding
+        /// all have to be rebuilt (see this class's remarks).
+        ///
+        /// Returns false only when there was nothing to do: no geometry, or nothing at all on the
+        /// side being kept. `keptTriangles`/`discardedTriangles` describe the cut, and
+        /// `vertexCount` is the size of the result.
+        public static bool MirrorAndWeld(SculptableMesh mesh, int axis, float toleranceScale,
+                                         bool sourceIsPositive,
+                                         out int keptTriangles, out int discardedTriangles, out int vertexCount)
+        {
+            keptTriangles = 0;
+            discardedTriangles = 0;
+            vertexCount = 0;
+            if (mesh == null) return false;
+
+            Vector3[] verts = mesh.Vertices;
+            if (verts == null || verts.Length == 0) return false;
+
+            // Same seam band the pairing uses, so the "Match Tolerance" slider means one
+            // consistent thing across the whole panel: how far off the centreline a vertex may
+            // sit and still count as being on it.
+            float seam = SymmetryMap.DefaultTolerance(verts) * Mathf.Max(toleranceScale, 0.01f);
+
+            if (!SymmetryTools.MirrorAndWeld(verts, mesh.Triangles, axis, sourceIsPositive, seam,
+                                             out Vector3[] newVerts, out int[] newTris,
+                                             out keptTriangles, out discardedTriangles))
+                return false;
+
+            mesh.SnapshotForUndo();
+
+            var rebuilt = new Mesh();
+            // Same threshold the rest of this file uses - a 16-bit index buffer silently wraps
+            // past 65k vertices instead of failing loudly.
+            if (newVerts.Length > 65000) rebuilt.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            rebuilt.vertices = newVerts;
+            rebuilt.triangles = newTris;
+            rebuilt.RecalculateNormals();
+            rebuilt.RecalculateBounds();
+
+            mesh.ReplaceMesh(rebuilt);
+            vertexCount = newVerts.Length;
+            return true;
+        }
+
         /// The symmetry cleanup pass: snap near-centreline vertices exactly onto the plane, then
         /// weld the duplicates that leaves behind, so a seam that was two coincident shells
         /// becomes one shared edge loop.

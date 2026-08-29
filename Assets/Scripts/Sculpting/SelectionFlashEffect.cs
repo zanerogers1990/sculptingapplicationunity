@@ -57,14 +57,31 @@ namespace Sculpting
 
             // Extra material slots beyond the mesh's own submesh count re-render submesh 0
             // with each extra material - the same trick outline shaders use - so this overlay
-            // needs no second mesh/renderer of its own. `.materials` returns per-renderer
-            // instances already, so mutating this array doesn't touch any other object sharing
-            // the base material.
-            Material[] mats = _renderer.materials;
+            // needs no second mesh/renderer of its own.
+            //
+            // sharedMaterials, NOT materials, on both the read and the write, and this is the
+            // whole correctness of this class. Renderer.materials is a getter that INSTANTIATES:
+            // it replaces every slot with a fresh per-renderer clone and hands back references to
+            // the clones. Two things broke because of that, both verified in Play mode:
+            //
+            //  - The clone is not the Material this component holds in _flashMaterial, so
+            //    OnDestroy's Array.IndexOf(mats, _flashMaterial) found nothing and left the
+            //    overlay slot on the renderer forever. Every Undo/Redo press appended another
+            //    one, and the surface got visibly whiter with each press until it was a flat
+            //    wash - the reported "undo turns the mesh lighter, matcaps go solid".
+            //  - Slot 0 got cloned too, detaching the object from the single runtime material
+            //    SculptMaterialController pushes every material setting into. After one flash,
+            //    switching matcap/base color/cavity silently stopped affecting that object.
+            //
+            // sharedMaterials round-trips the exact references it was given, so the overlay can
+            // be found and removed again and the base material stays the shared one. Nothing is
+            // shared-mutated by this: _flashMaterial is a fresh instance owned by this component,
+            // and the base material's own entry is only ever copied across, never written to.
+            Material[] mats = _renderer.sharedMaterials;
             var extended = new Material[mats.Length + 1];
             mats.CopyTo(extended, 0);
             extended[mats.Length] = _flashMaterial;
-            _renderer.materials = extended;
+            _renderer.sharedMaterials = extended;
 
             _startTime = Time.unscaledTime;
         }
@@ -85,14 +102,17 @@ namespace Sculpting
         {
             if (_renderer != null && _flashMaterial != null)
             {
-                Material[] mats = _renderer.materials;
+                // sharedMaterials for the same reason Init uses it - see there. Reading
+                // .materials here would clone every slot and then look for this component's own
+                // Material among the clones, which is exactly the lookup that always failed.
+                Material[] mats = _renderer.sharedMaterials;
                 int idx = System.Array.IndexOf(mats, _flashMaterial);
                 if (idx >= 0)
                 {
                     var trimmed = new Material[mats.Length - 1];
                     for (int i = 0, w = 0; i < mats.Length; i++)
                         if (i != idx) trimmed[w++] = mats[i];
-                    _renderer.materials = trimmed;
+                    _renderer.sharedMaterials = trimmed;
                 }
             }
             if (_flashMaterial != null) Destroy(_flashMaterial);

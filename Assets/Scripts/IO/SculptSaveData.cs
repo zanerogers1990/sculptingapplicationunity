@@ -63,9 +63,11 @@ namespace Sculpting.IO
             public float normalStrength;
             public float normalNoiseScale = 60f;
             public bool flatShading;
+            // Cavity is one colour now, into recesses only. A file saved before that also
+            // carries a `peakColor`; JsonUtility drops fields it has no member for, so those
+            // files still load - they just lose a setting that no longer does anything.
             public bool cavityEnabled;
             public Color recessColor = Color.black;
-            public Color peakColor = Color.white;
             public float cavityIntensity = 1f;
             public float cavityRange = 0.25f;
 

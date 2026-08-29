@@ -65,6 +65,165 @@ namespace Sculpting
             return changed;
         }
 
+        /// Replaces one whole side of the model with a reflection of the other, cutting the mesh
+        /// at the plane and rebuilding the discarded half from scratch. Topology-changing, which
+        /// is the point: unlike MakeSymmetric it needs NO vertex correspondence, so it works on
+        /// exactly the models MakeSymmetric has to refuse - two arms modelled or joined
+        /// separately, one side remeshed, an imported asset whose halves never matched.
+        ///
+        /// MakeSymmetric and this are the two halves of "make it symmetric", and which one is
+        /// right depends entirely on whether a correspondence exists. MakeSymmetric preserves the
+        /// destination side's topology and only nudges vertices, so mask, resolution and every
+        /// index into the mesh survive - but it can only move vertices that HAVE a counterpart,
+        /// and mirroring through a partial correspondence tears the surface (see
+        /// SymmetryOps.MaxUnmatchedFraction). This throws the destination side away entirely, so
+        /// it always produces an exactly symmetric result, at the cost of rebuilding the mesh.
+        ///
+        /// The cut is decided per TRIANGLE by its centroid, not per vertex, so every triangle
+        /// goes wholly one way or the other and none is left with a dangling corner. A kept
+        /// triangle that straddles the plane then has its crossed-over corners pinned onto the
+        /// plane, which is what makes the cut edge exactly planar instead of a ragged fringe
+        /// following whatever the tessellation happened to do there. Because the boundary loop
+        /// ends up exactly on the plane, the mirrored half can SHARE those vertices rather than
+        /// duplicating them, and the two halves come out already joined - watertight, one shared
+        /// edge loop, nothing left to weld afterward.
+        ///
+        /// `seamTolerance` is the band around the plane whose vertices are pinned onto it before
+        /// anything is cut - the same "nearly on the centreline is what actually breaks a
+        /// symmetric model" reasoning as SnapToPlane, applied up front so a centre vertex sitting
+        /// a hair off the plane cannot decide a triangle's side by accident.
+        ///
+        /// Returns false (out params null) when there is nothing to work with: no geometry, or
+        /// no triangle at all on the source side.
+        public static bool MirrorAndWeld(Vector3[] vertices, int[] triangles, int axis,
+                                         bool sourceIsPositive, float seamTolerance,
+                                         out Vector3[] mirroredVertices, out int[] mirroredTriangles,
+                                         out int keptTriangleCount, out int discardedTriangleCount)
+        {
+            mirroredVertices = null;
+            mirroredTriangles = null;
+            keptTriangleCount = 0;
+            discardedTriangleCount = 0;
+            if (vertices == null || triangles == null || vertices.Length == 0 || triangles.Length < 3)
+                return false;
+
+            float seam = Mathf.Max(seamTolerance, 1e-6f);
+            float sign = sourceIsPositive ? 1f : -1f;
+
+            // Everything works against a copy: this pins vertices onto the plane as it goes, and
+            // the caller's array is the live mesh buffer.
+            var work = (Vector3[])vertices.Clone();
+            for (int i = 0; i < work.Length; i++)
+                if (Mathf.Abs(SymmetryMap.Coord(work[i], axis)) <= seam) work[i] = Pin(work[i], axis);
+
+            // Pass 1: which triangles survive the cut. By centroid, so a triangle spanning the
+            // plane goes whichever way most of it lies rather than being split - this is a
+            // rebuild, not a boolean, and a triangle-accurate cut would buy nothing here since
+            // the surviving corners are pinned onto the plane immediately afterward anyway.
+            int triCount = triangles.Length / 3;
+            var keep = new bool[triCount];
+            for (int t = 0; t < triCount; t++)
+            {
+                int b = t * 3;
+                float centroid = (SymmetryMap.Coord(work[triangles[b]], axis) +
+                                  SymmetryMap.Coord(work[triangles[b + 1]], axis) +
+                                  SymmetryMap.Coord(work[triangles[b + 2]], axis)) / 3f;
+                // Strictly greater than zero: a triangle lying exactly IN the plane would
+                // otherwise be kept and then mirrored onto itself, giving two coincident faces.
+                keep[t] = centroid * sign > 0f;
+                if (keep[t]) keptTriangleCount++; else discardedTriangleCount++;
+            }
+            if (keptTriangleCount == 0) return false;
+
+            // Pass 2: pin the kept triangles' crossed-over corners onto the plane. Only vertices
+            // a KEPT triangle actually uses - one belonging solely to discarded triangles is
+            // about to disappear, and moving it would be pointless work.
+            var used = new bool[work.Length];
+            for (int t = 0; t < triCount; t++)
+            {
+                if (!keep[t]) continue;
+                int b = t * 3;
+                used[triangles[b]] = true;
+                used[triangles[b + 1]] = true;
+                used[triangles[b + 2]] = true;
+            }
+            for (int i = 0; i < work.Length; i++)
+                if (used[i] && SymmetryMap.Coord(work[i], axis) * sign < 0f) work[i] = Pin(work[i], axis);
+
+            // Pass 3: compact the kept vertices, giving each off-plane one a reflected twin.
+            // On-plane vertices get no twin - they ARE the join, and duplicating them is exactly
+            // what would leave the result as two shells touching rather than one closed surface.
+            var sourceIndex = new int[work.Length];
+            var mirrorIndex = new int[work.Length];
+            var outVerts = new List<Vector3>(keptTriangleCount * 2);
+            for (int i = 0; i < work.Length; i++)
+            {
+                sourceIndex[i] = -1;
+                mirrorIndex[i] = -1;
+                if (!used[i]) continue;
+
+                sourceIndex[i] = outVerts.Count;
+                outVerts.Add(work[i]);
+                if (SymmetryMap.Coord(work[i], axis) == 0f)
+                {
+                    mirrorIndex[i] = sourceIndex[i]; // shared - a seam vertex is its own twin
+                }
+                else
+                {
+                    mirrorIndex[i] = outVerts.Count;
+                    outVerts.Add(SymmetryMap.Reflect(work[i], axis));
+                }
+            }
+
+            var outTris = new List<int>(keptTriangleCount * 6);
+            for (int t = 0; t < triCount; t++)
+            {
+                if (!keep[t]) continue;
+                int b = t * 3;
+                int i0 = triangles[b], i1 = triangles[b + 1], i2 = triangles[b + 2];
+
+                // Pinning can collapse a triangle that had two corners just across the plane down
+                // onto a line. Dropped rather than kept: a zero-area face has an undefined normal,
+                // and both halves would carry one.
+                int a0 = sourceIndex[i0], a1 = sourceIndex[i1], a2 = sourceIndex[i2];
+                if (Degenerate(outVerts, a0, a1, a2)) continue;
+
+                outTris.Add(a0);
+                outTris.Add(a1);
+                outTris.Add(a2);
+                // Reflection flips handedness, so the mirrored copy needs its winding reversed or
+                // the whole new half renders inside-out - the same fix, for the same reason, as
+                // MeshMirror.MirrorAcross's odd-axis-count swap.
+                outTris.Add(mirrorIndex[i0]);
+                outTris.Add(mirrorIndex[i2]);
+                outTris.Add(mirrorIndex[i1]);
+            }
+
+            if (outTris.Count == 0) return false;
+
+            mirroredVertices = outVerts.ToArray();
+            mirroredTriangles = outTris.ToArray();
+            return true;
+        }
+
+        /// Zeroes the mirror-plane component of a point, putting it exactly on the plane.
+        private static Vector3 Pin(Vector3 v, int axis)
+        {
+            switch (axis)
+            {
+                case SymmetryMap.AxisX: v.x = 0f; break;
+                case SymmetryMap.AxisY: v.y = 0f; break;
+                default: v.z = 0f; break;
+            }
+            return v;
+        }
+
+        private static bool Degenerate(List<Vector3> verts, int a, int b, int c)
+        {
+            if (a == b || b == c || a == c) return true;
+            return Vector3.Cross(verts[b] - verts[a], verts[c] - verts[a]).sqrMagnitude <= 1e-20f;
+        }
+
         /// Snaps every on-plane vertex exactly onto the mirror plane, zeroing the axis component
         /// that the tolerance band allowed to drift.
         ///

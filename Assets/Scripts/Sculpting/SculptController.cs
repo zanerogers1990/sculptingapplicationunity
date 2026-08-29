@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using Unity.Burst;
@@ -41,10 +41,13 @@ namespace Sculpting
         [SerializeField] private BrushType currentBrush = BrushType.Move;
         [SerializeField] private bool isPositive = true;
         [SerializeField] private bool accumulate = true;
-        // Multiplies the accumulate-mode build-up rate (see EffectiveBrushStrengthAccumulate) -
-        // lets a held stroke build up faster or slower than brushStrength alone would give,
-        // without touching brushStrength itself (which also drives the non-accumulate plateau
-        // path). Only meaningful while Accumulate is on for the current brush.
+        // Multiplies the build-up rate of BOTH paths - the Accumulate-on rate
+        // (EffectiveBrushStrengthAccumulate) and the Accumulate-off ease-toward-a-plateau rate
+        // (EffectiveBrushStrengthPlateau). Lets a stroke build up faster or slower than
+        // brushStrength alone would give, without touching brushStrength itself. Shown as
+        // "Build-Up Strength" rather than "Accumulate Strength": it used to apply only to the
+        // Accumulate-on path, which made it a dead control on every brush that defaults to
+        // Accumulate off (Crease, Smooth, Move) while still looking like the strength knob.
         [SerializeField, Range(0.1f, 3f)] private float accumulateStrength = 1f;
         // Rejects every backfacing vertex from this brush's footprint (own mesh normal facing
         // away from the camera) before any falloff/mask weighting - lets a stroke reach into a
@@ -53,6 +56,13 @@ namespace Sculpting
         // default everywhere: it's a precision aid for tricky geometry, not something that
         // should silently thin out an ordinary broad stroke.
         [SerializeField] private bool frontFacingOnly = false;
+        // When ON, a brush held motionless keeps deforming (the ZBrush/Blender "airbrush" feel).
+        // When OFF - the default - a stroke's build-up is paced by how far the cursor TRAVELS
+        // rather than how long it is held, so stopping stops, and slowing down to place a
+        // careful crease no longer buries it under extra material. See AccumulateSpeedFactor.
+        // Shared across brushes rather than per-brush (like Lazy Mouse, unlike Accumulate): it
+        // is a statement about how strokes should feel, not about one brush's behaviour.
+        [SerializeField] private bool buildUpOnHold = false;
 
         // Remembers each brush's own polarity across switches this session (ZBrush/Blender-
         // style per-tool state), instead of one flag shared by every brush regardless of which
@@ -147,6 +157,11 @@ namespace Sculpting
         // _lazyMouseActive is true (see GetStrokeScreenPosition).
         private Vector2 _lazyMouseScreenPos;
         private bool _lazyMouseActive;
+        // The rope's FAR end - the raw cursor, recorded on the same frame _lazyMouseScreenPos
+        // was last advanced, so the two describe one consistent rope rather than two positions
+        // sampled at different moments. Read only through LazyMouseTetherFrom, for the tether
+        // line SculptUIBuilder draws between them.
+        private Vector2 _lazyMouseRawScreenPos;
 
         [Header("Clay Brush")]
         // Peak plateau depth as a fraction of brushRadius. Default halved (was 0.6) at the same
@@ -369,8 +384,8 @@ namespace Sculpting
         // ZBrush/Blender-style ring that tracks the mouse directly rather than a 3D object
         // positioned via raycast hit point, so it reads correctly even when hovering empty
         // space beside the model. SculptUIBuilder polls these every frame to position/size/tint
-        // its ring Image, same delegation pattern as IsResizingBrush/ResizeAnchorScreenPosition
-        // below. The OS cursor is hidden directly here (see UpdateBrushCursor) whenever this
+        // its ring Image, same delegation pattern as IsResizingBrush/IsAdjustingStrength below.
+        // The OS cursor is hidden directly here (see UpdateBrushCursor) whenever this
         // ring is shown, and restored whenever it isn't - over a UI panel, over no sculptable
         // target, or while another tool (Transpose/Scale/ZSphere) owns the viewport.
         private bool _showBrushCursor;
@@ -429,13 +444,18 @@ namespace Sculpting
         private bool _isResizingBrush;
         private float _resizeStartRadius;
         private float _resizeStartMouseX;
+        // Where the S-drag started - UpdateBrushCursor freezes the ring here instead of
+        // following the live mouse position while resizing, since the drag scrubs BrushRadius
+        // by horizontal delta alone and the ring flying across the screen with the mouse would
+        // otherwise fight the "grow/shrink in place" feedback the gesture is meant to give.
         private Vector2 _resizeAnchorScreenPos;
 
-        // Same S-drag-gauge pattern as above (see HandleBrushStrengthKey), but for
-        // per-brush BrushStrength instead of the shared BrushRadius.
+        // Same S-drag pattern as above (see HandleBrushStrengthKey), but for per-brush
+        // BrushStrength instead of the shared BrushRadius.
         private bool _isAdjustingStrength;
         private float _strengthAdjustStartValue;
         private float _strengthAdjustStartMouseX;
+        // Same freeze-in-place reasoning as _resizeAnchorScreenPos above, for the F-drag.
         private Vector2 _strengthAdjustAnchorScreenPos;
 
         private bool _isShiftSmoothActive;
@@ -1199,7 +1219,29 @@ namespace Sculpting
         // eliminating the deliberate ZBrush/Blender-style "hold in place to keep building"
         // feature outright - AccumulateSpeedFloor keeps a genuine stationary hold still building,
         // just more gently, rather than stopping dead.
-        private const float AccumulateFullSpeedReference = 1f; // world units/sec treated as "fully moving" - starting value, tune to taste
+        // Was a flat 1 world unit/sec. That made pacing depend on scene scale AND on brush
+        // size: the same physical drag reads as a much "slower" stroke with a small brush or on
+        // a small object, so the carve quietly faded toward nothing on exactly the close-in
+        // detail work Crease/Dam Standard exist for. Pacing is a statement about travel relative
+        // to the BRUSH ("how many brush widths did this stroke cover"), so the reference is one
+        // brush diameter per second and the absolute constant is gone.
+        private float StrokePacingReference => Mathf.Max(brushRadius * 2f, 0.001f);
+        // Diameters/sec past which the pacing stops counting extra speed. Purely a spike guard
+        // for a frame in which the cursor teleports (a drag re-entering the mesh, a frame
+        // hitch); ordinary strokes live far below it, and inside it the factor stays LINEAR in
+        // speed, which is what makes the deposit per centimetre of travel speed-invariant.
+        private const float StrokePacingCeiling = 3f;
+        // Calibration gain - the counterpart of ClayReferenceStrokeSpeed. Clay got an explicit
+        // constant so that switching it to distance pacing deposited what time pacing used to;
+        // Crease/Dam Standard/Inflate got the speed factor with no such compensation, and at a
+        // normal carving speed that silently cost them roughly 4x. That is the difference
+        // between "calmer" and the reported "straight up not working". Sized so one pass at max
+        // Brush Strength reaches the full plateau/dab depth, which puts the 0.1 default at a
+        // clearly visible cut rather than a rounding error.
+        private const float StrokePacingGain = 4f;
+        // Rate a motionless cursor still builds at, as a fraction of a full-speed stroke's.
+        // Only used when Build Up on Hold is ON; with it OFF there is no floor at all, which is
+        // what turns "held in place" into "deposits nothing" - see AccumulateSpeedFactor.
         private const float AccumulateSpeedFloor = 0.35f;
         private const float StrokeSpeedSmoothingSpeed = 15f;
         private Vector3? _lastStrokeHitPointWorld;
@@ -1224,9 +1266,55 @@ namespace Sculpting
             _strokeSpeed = Mathf.Lerp(_strokeSpeed, instant, Mathf.Clamp01(dt * StrokeSpeedSmoothingSpeed));
         }
 
-        private float AccumulateSpeedFactor => Mathf.Lerp(AccumulateSpeedFloor, 1f, Mathf.Clamp01(_strokeSpeed / AccumulateFullSpeedReference));
+        // With Build Up on Hold OFF the floor drops to zero, which makes the per-frame deposit
+        // proportional to stroke speed - and that is exactly distance pacing: a stroke half as
+        // fast deposits half as much per frame but spends twice as many frames covering the same
+        // ground, so the material laid down per centimetre is the same either way. A stopped
+        // cursor has zero speed and so deposits nothing. This is the cheap form of the
+        // "distance-based stroke spacing" the comment above calls the real fix; Clay does the
+        // full sub-stepped version (ApplyClayStroke) because its flat stamp leaves visible gaps
+        // between dabs if a fast drag outruns the frame rate, which these smooth-falloff brushes
+        // do not.
+        //
+        // Note _strokeSpeed is smoothed, so lifting off or stopping dead fades out over ~0.2s
+        // rather than cutting instantly. That is deliberate - it reads as a soft stroke end
+        // rather than a hard clip - but it does mean "stop" is a fast taper, not a hard stop.
+        // Build Up on Hold ON keeps the original capped shape verbatim: a floor so a genuine
+        // stationary hold still builds, saturating at 1 once the stroke is moving normally.
+        //
+        // With it OFF the factor is LINEAR in speed (up to the spike guard) and carries the
+        // calibration gain. The linearity is the distance pacing - clamping it at 1 was the
+        // other half of why the carving brushes went quiet, because every stroke faster than
+        // the reference fell straight back to time pacing and so still deposited less the
+        // faster it moved. A stopped cursor is still exactly zero, which is the behaviour this
+        // whole mechanism exists for.
+        private float AccumulateSpeedFactor => buildUpOnHold
+            ? Mathf.Lerp(AccumulateSpeedFloor, 1f, Mathf.Clamp01(_strokeSpeed / StrokePacingReference))
+            : StrokePacingGain * Mathf.Min(_strokeSpeed / StrokePacingReference, StrokePacingCeiling);
 
         private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * AccumulateSpeedFactor * accumulateStrength;
+
+        /// Build-up rate for the Accumulate-OFF path - the one that eases toward a single dab's
+        /// worth of depth and stops - as used by Crease, Dam Standard and Inflate.
+        ///
+        /// That path is self-limiting, so it was never the runaway "digs forever" case Accumulate
+        /// is. But it still approaches its plateau on a CLOCK, which means holding still keeps
+        /// deepening the cut until it bottoms out, and easing off to place a careful crease cuts
+        /// deeper than drawing the same line at speed. Pacing the approach by stroke speed makes
+        /// the depth a function of the path drawn rather than how long the cursor lingered on it.
+        /// This can only ever slow the approach, never overshoot: the plateau still caps it.
+        ///
+        /// Deliberately NOT applied to Smooth, Flatten or Move. Holding those in place to keep
+        /// working an area is the point of them, and every sculpting app behaves that way - the
+        /// complaint this addresses was specifically about carving brushes deepening under a
+        /// stationary or slowing cursor.
+        /// Multiplied by accumulateStrength for the same reason the Accumulate path is: with
+        /// Accumulate OFF (Crease's default) that slider was a dead control, so the one knob a
+        /// user reaches for when a carve is too shallow did nothing at all on the brush most
+        /// likely to need it. It is the build-up strength for BOTH build-up modes now - see the
+        /// field's own remarks and its "Build-Up Strength" label in SculptUIBuilder.
+        private float EffectiveBrushStrengthPlateau => EffectiveBrushStrength * accumulateStrength
+            * (buildUpOnHold ? 1f : AccumulateSpeedFactor);
 
         /// Clay's own accumulate strength, identical to the above minus AccumulateSpeedFactor.
         /// That factor exists to stop a time-driven brush dumping material wherever the cursor
@@ -1244,17 +1332,32 @@ namespace Sculpting
             set => brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
         }
         public bool IsResizingBrush => _isResizingBrush;
-        public Vector2 ResizeAnchorScreenPosition => _resizeAnchorScreenPos;
         public bool IsAdjustingStrength => _isAdjustingStrength;
-        public Vector2 StrengthAdjustAnchorScreenPosition => _strengthAdjustAnchorScreenPos;
 
         // Polled by SculptUIBuilder every frame to draw the 2D ring cursor (see
-        // UpdateBrushCursor) - same read-only delegation as the resize/strength gauges above.
+        // UpdateBrushCursor) - same read-only delegation pattern as IsResizingBrush/
+        // IsAdjustingStrength above.
         public bool ShowBrushCursor => _showBrushCursor;
         public Vector2 BrushCursorScreenPosition => _brushCursorScreenPos;
         public float BrushCursorScreenDiameter => _brushCursorScreenDiameter;
         public Color BrushCursorColor => _brushCursorColor;
         public bool BrushCursorDashed => _brushCursorDashed;
+
+        // The Lazy Mouse rope, for the tether line SculptUIBuilder draws while a stabilized
+        // stroke is running (ZBrush/Nomad both draw the same thing). Without it the stabilizer
+        // is invisible: the brush is acting somewhere the pointer is not, with nothing on screen
+        // to say so, and a lag you cannot see reads as the app dropping input rather than as the
+        // smoothing you asked for. The line also makes the rope's LENGTH legible, which is what
+        // the Radius slider is actually setting.
+        //
+        // `To` is where the brush is really working (and where UpdateBrushCursor now puts the
+        // ring, so the ring never lies about where a dab is about to land); `From` is the raw
+        // pointer. Only meaningful while Active - the two lag one frame behind a brush handler
+        // having run, which is invisible at frame rate and is why both come from the same
+        // recorded pair rather than one being re-read live here.
+        public bool LazyMouseTetherActive => _lazyMouseActive && _showBrushCursor;
+        public Vector2 LazyMouseTetherFrom => _lazyMouseRawScreenPos;
+        public Vector2 LazyMouseTetherTo => _lazyMouseScreenPos;
 
         // 0 right on stroke-release, easing back to 1 over StrokeEndFadeDuration - see
         // _strokeEndFadeTimer. SculptUIBuilder multiplies every cursor layer's own alpha by this.
@@ -1368,6 +1471,7 @@ namespace Sculpting
         // One value shared by every brush (unlike BrushStrength) - lazy mouse is an input-
         // smoothing behavior, not a property of any particular brush's effect.
         public bool LazyMouseEnabled { get => lazyMouseEnabled; set => lazyMouseEnabled = value; }
+        public bool BuildUpOnHold { get => buildUpOnHold; set => buildUpOnHold = value; }
         public float LazyMouseRadius { get => lazyMouseRadius; set => lazyMouseRadius = Mathf.Clamp(value, 1f, 150f); }
         public float LazyMouseStrength { get => lazyMouseStrength; set => lazyMouseStrength = Mathf.Clamp(value, 0.05f, 1f); }
 
@@ -1682,8 +1786,9 @@ namespace Sculpting
         }
 
         // Holding S enters a resize mode (instead of sculpting) where horizontal mouse
-        // movement scrubs BrushRadius live, ZBrush/Blender-style, with the popup gauge
-        // SculptUIBuilder draws at ResizeAnchorScreenPosition tracking the value.
+        // movement scrubs BrushRadius live, ZBrush/Blender-style - the ring cursor itself
+        // (UpdateBrushCursor/SculptUIBuilder) grows and shrinks with it, so there's no
+        // separate popup readout to keep in sync.
         private void HandleBrushResizeKey()
         {
             var kb = Keyboard.current;
@@ -1692,7 +1797,7 @@ namespace Sculpting
 
             if (kb.sKey.wasPressedThisFrame)
             {
-                EndMoveDrag(); // don't leave a grab mid-drag while the resize gauge is up
+                EndMoveDrag(); // don't leave a grab mid-drag while resizing
                 _isResizingBrush = true;
                 _resizeStartRadius = brushRadius;
                 _resizeStartMouseX = mouse.position.ReadValue().x;
@@ -1710,12 +1815,11 @@ namespace Sculpting
         }
 
         // Holding F enters a strength-adjust mode (instead of sculpting) where horizontal
-        // mouse movement scrubs BrushStrength live - same S-drag gauge UX as
-        // HandleBrushResizeKey above, but for the CURRENT brush's own strength (see
-        // _brushStrengthPerType) rather than the shared BrushRadius. SculptUIBuilder draws the
-        // popup gauge at StrengthAdjustAnchorScreenPosition, and UpdateBrushCursor forces the
-        // brush cursor to NegativeColor/red for the duration so it reads unambiguously as "not
-        // sculpting right now" rather than an ordinary negative-polarity brush dab.
+        // mouse movement scrubs BrushStrength live - same S-drag UX as HandleBrushResizeKey
+        // above, but for the CURRENT brush's own strength (see _brushStrengthPerType) rather
+        // than the shared BrushRadius. UpdateBrushCursor/SculptUIBuilder show a red inner
+        // circle inside the ring cursor for the duration, scaled to the live strength value -
+        // see IsAdjustingStrength.
         private void HandleBrushStrengthKey()
         {
             var kb = Keyboard.current;
@@ -1724,7 +1828,7 @@ namespace Sculpting
 
             if (kb.fKey.wasPressedThisFrame)
             {
-                EndMoveDrag(); // don't leave a grab mid-drag while the strength gauge is up
+                EndMoveDrag(); // don't leave a grab mid-drag while adjusting strength
                 _isAdjustingStrength = true;
                 _strengthAdjustStartValue = brushStrength;
                 _strengthAdjustStartMouseX = mouse.position.ReadValue().x;
@@ -1929,6 +2033,7 @@ namespace Sculpting
         private Vector2 GetStrokeScreenPosition(Mouse mouse)
         {
             Vector2 raw = mouse.position.ReadValue();
+            _lazyMouseRawScreenPos = raw;
             if (!lazyMouseEnabled) { _lazyMouseActive = false; return raw; }
 
             bool pressed = mouse.leftButton.isPressed || mouse.rightButton.isPressed;
@@ -2093,8 +2198,9 @@ namespace Sculpting
         // time-driven pacing did. Purely a calibration constant so existing Brush Strength /
         // Clay Depth settings keep feeling the same: at this speed the two schemes agree
         // exactly, below it the new one deposits less per second (but the same per centimetre),
-        // above it more per second. Matches AccumulateFullSpeedReference, which encodes the same
-        // "this is what a normal stroke speed looks like" judgement.
+        // above it more per second. Its counterpart on the carving brushes is StrokePacingGain,
+        // which encodes the same "keep the existing settings feeling the same" calibration for
+        // their own switch to distance pacing.
         private const float ClayReferenceStrokeSpeed = 1f;
 
         // Distance travelled since the last dab was placed, carried ACROSS frames. Without it a
@@ -2519,7 +2625,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrength;
+            float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
 
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
@@ -2554,7 +2660,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrength;
+            float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             float depth = brushRadius * creaseDepthFactor * sign;
             Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
@@ -2682,7 +2788,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrength;
+            float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             float depth = brushRadius * creaseDepthFactor * sign;
             float lip = brushRadius * damLipHeight * sign;
@@ -2803,7 +2909,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrength;
+            float effectiveStrength = EffectiveBrushStrengthPlateau;
             float amount = sign * EffectiveBrushStrengthAccumulate * InflateSpeed * dt;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
@@ -2833,7 +2939,7 @@ namespace Sculpting
         {
             float sign = positive ? 1f : -1f;
             float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrength;
+            float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             Vector3 target = localPoint + localNormal * (brushRadius * InflateOffCapFactor * sign);
             Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
@@ -3194,16 +3300,24 @@ namespace Sculpting
             NativeArray<Vector3> writeBuf = _nativePositionsOut;
             bool anyPassRan = fullIterations > 0 || partialFactor > 0.001f;
 
+            // Every pass is scheduled up front as one dependency chain and waited on ONCE, rather
+            // than Schedule().Complete() per pass. The passes are inherently sequential (each
+            // reads the previous one's output - see SmoothRelaxJob's Jacobi remarks) and the
+            // chain preserves that exactly; what it drops is the 9 extra main-thread sync points
+            // a high-strength application used to pay, which at MaxSmoothIterations is most of
+            // what makes Smooth cost more per frame than the single-pass brushes.
+            JobHandle chain = default;
             for (int pass = 0; pass < fullIterations; pass++)
             {
-                RunSmoothRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, 1f, lerpFactorScale);
+                chain = ScheduleSmoothRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, 1f, lerpFactorScale, chain);
                 (readBuf, writeBuf) = (writeBuf, readBuf);
             }
             if (partialFactor > 0.001f)
             {
-                RunSmoothRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, partialFactor, lerpFactorScale);
+                chain = ScheduleSmoothRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, partialFactor, lerpFactorScale, chain);
                 (readBuf, writeBuf) = (writeBuf, readBuf);
             }
+            chain.Complete();
 
             // Scatter the final (post-swap, so it's in readBuf) result back - mirrors the
             // managed method's own dirty rule (weight > 0), constant across every pass. The
@@ -3223,8 +3337,8 @@ namespace Sculpting
             }
         }
 
-        private void RunSmoothRelaxJob(int candidateCount, NativeArray<Vector3> readBuf, NativeArray<Vector3> writeBuf,
-            NativeArray<int> adjOffsets, NativeArray<int> adjNeighbors, float passFactor, float lerpFactorScale)
+        private JobHandle ScheduleSmoothRelaxJob(int candidateCount, NativeArray<Vector3> readBuf, NativeArray<Vector3> writeBuf,
+            NativeArray<int> adjOffsets, NativeArray<int> adjNeighbors, float passFactor, float lerpFactorScale, JobHandle dependency)
         {
             var job = new SmoothRelaxJob
             {
@@ -3239,7 +3353,7 @@ namespace Sculpting
                 PassFactor = passFactor,
                 LerpFactorScale = lerpFactorScale,
             };
-            job.Schedule(candidateCount, 32).Complete();
+            return job.Schedule(candidateCount, 32, dependency);
         }
 
         private void ApplySmoothBrushLocalManaged(Vector3 localPoint, List<int> candidates, Vector3[] verts)
@@ -3426,9 +3540,10 @@ namespace Sculpting
             // The message names the alternative, because "too asymmetric to mirror" with no way
             // forward is what makes a refusal read as the tool being broken.
             if (changed == SymmetryOps.TooAsymmetric)
-                return $"Too asymmetric to mirror: {unmatched} vertices have no counterpart " +
-                       $"across {axis} ({pairs} pairs do). Mirroring would tear those apart. " +
-                       "Use Mirror to build a matching half, or Symmetry Cleanup first.";
+                return $"Too asymmetric to match up: {unmatched} vertices have no counterpart " +
+                       $"across {axis} ({pairs} pairs do). Nudging vertices would tear those " +
+                       $"apart - use Cut & Mirror {from} to {to} instead, which rebuilds that " +
+                       "side outright.";
 
             if (changed < 0) return "No geometry to mirror";
             if (pairs == 0) return $"Nothing paired across {axis} - raise Match Tolerance";
@@ -3439,6 +3554,32 @@ namespace Sculpting
             // like a complete one.
             string leftover = unmatched > 0 ? $", {unmatched} unmatched" : string.Empty;
             return $"Mirrored {from} onto {to}: {changed} of {pairs} pairs{leftover}";
+        }
+
+        /// Cuts the selected object at the symmetry plane and rebuilds the far side as a
+        /// reflection of the near one. The unconditional version of MakeSymmetric: it needs no
+        /// vertex correspondence, so it is what to reach for when MakeSymmetric reports the model
+        /// is too asymmetric to match up (see SymmetryOps.MirrorAndWeld).
+        public string MirrorAndWeld(bool sourceIsPositive)
+        {
+            if (sculptableMesh == null) return "No object selected";
+            EndMoveDrag();
+
+            string axis = SymmetryOps.AxisName(symmetryAxis);
+            string from = sourceIsPositive ? "+" + axis : "-" + axis;
+            string to = sourceIsPositive ? "-" + axis : "+" + axis;
+
+            if (!SymmetryOps.MirrorAndWeld(sculptableMesh, symmetryAxis, symmetryToleranceScale,
+                                           sourceIsPositive,
+                                           out int kept, out int discarded, out int vertexCount))
+                return $"Nothing on the {from} side to mirror";
+
+            // Reports what was THROWN AWAY as well as what was built, because that is the part
+            // this operation cannot undo by pressing the other direction - the far side's own
+            // shape is gone, and a user who meant the opposite direction should see that
+            // immediately rather than discover it later.
+            return $"Cut & mirrored {from} onto {to}: kept {kept} triangles, " +
+                   $"replaced {discarded}, now {vertexCount} vertices";
         }
 
         /// Snaps the centreline onto the mirror plane and welds the duplicate vertices that
@@ -3500,7 +3641,22 @@ namespace Sculpting
                 Mouse mouse = Mouse.current;
                 if (mouse != null)
                 {
-                    Vector2 screenPos = mouse.position.ReadValue();
+                    // Frozen at the drag's start point while resizing/adjusting strength,
+                    // instead of following the live mouse - the S/F drags scrub their value off
+                    // horizontal mouse DELTA alone (see HandleBrushResizeKey/
+                    // HandleBrushStrengthKey), so the ring only needs to grow/shrink in place,
+                    // not chase the mouse across the screen while the gesture plays out.
+                    // While Lazy Mouse has the rope taut the ring follows the ROPE's near end,
+                    // not the pointer: that is where the dab is actually landing (it is the
+                    // position every brush handler just raycast from, and the position
+                    // _hoverPoint below was derived from), so a ring left under the pointer
+                    // would be drawing the brush somewhere it is not about to touch. The
+                    // pointer end is not lost - SculptUIBuilder draws the tether line back to
+                    // it, see LazyMouseTetherActive.
+                    Vector2 screenPos = _isResizingBrush ? _resizeAnchorScreenPos
+                        : _isAdjustingStrength ? _strengthAdjustAnchorScreenPos
+                        : _lazyMouseActive ? _lazyMouseScreenPos
+                        : mouse.position.ReadValue();
                     Vector3 worldPoint;
                     bool positive;
 
@@ -3530,15 +3686,14 @@ namespace Sculpting
                         // Smooth gets its own blue/dashed look (see SmoothColor/
                         // BrushCursorDashed) since it has no add/subtract polarity at all -
                         // showing it as an ordinary "positive" green dab would suggest it adds
-                        // material the way Clay/Inflate/etc. do. The strength gauge (F) still
-                        // overrides everything, including Smooth's own styling, with a forced
-                        // solid red - a distinct, unambiguous "you're adjusting strength, not
-                        // sculpting" cue that takes priority over which brush is even selected.
+                        // material the way Clay/Inflate/etc. do. The outer ring keeps this same
+                        // tint while adjusting strength (F) too - it's still showing brush
+                        // radius/polarity, unchanged - and SculptUIBuilder layers a separate red
+                        // inner circle on top for the strength readout (see IsAdjustingStrength).
                         bool isSmooth = currentBrush == BrushType.Smooth;
-                        color = _isAdjustingStrength ? NegativeColor
-                            : isSmooth ? SmoothColor
+                        color = isSmooth ? SmoothColor
                             : positive ? PositiveColor : NegativeColor;
-                        _brushCursorDashed = isSmooth && !_isAdjustingStrength;
+                        _brushCursorDashed = isSmooth;
                     }
                 }
             }
@@ -3609,6 +3764,7 @@ namespace Sculpting
             public bool accumulate;
             public float accumulateStrength;
             public bool frontFacingOnly;
+            public bool buildUpOnHold;
 
             public float clayHeightFactor;
             public float clayTipRoundness;
@@ -3669,6 +3825,7 @@ namespace Sculpting
                 accumulate = accumulate,
                 accumulateStrength = accumulateStrength,
                 frontFacingOnly = frontFacingOnly,
+                buildUpOnHold = buildUpOnHold,
 
                 clayHeightFactor = clayHeightFactor,
                 clayTipRoundness = clayTipRoundness,
@@ -3749,6 +3906,7 @@ namespace Sculpting
             Accumulate = s.accumulate;
             AccumulateStrength = s.accumulateStrength;
             FrontFacingOnly = s.frontFacingOnly;
+            BuildUpOnHold = s.buildUpOnHold;
 
             IsMaskPaintMode = s.maskPaintMode;
 

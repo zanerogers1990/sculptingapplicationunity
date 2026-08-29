@@ -509,30 +509,41 @@ namespace Sculpting
             _mesh.colors = _cavityColors;
         }
 
-        // Reused across RecomputeNormalsLocal calls - same "grow, don't reallocate" pattern as
-        // _dirtyCavityScratch/_dirtyTriangleScratch.
+        // The dirty vertices plus their direct one-ring neighbors - the set of vertices whose
+        // normal AND cavity value a frame's movement can change, and exactly what gets uploaded
+        // to the GPU. Built ONCE per ApplyVerticesLocal (see BuildAffectedSet) and then read by
+        // the normal pass, the cavity pass and the scatter; normals and cavity each used to
+        // build their own private copy of this identical set, which meant walking every dirty
+        // vertex's adjacency twice for no difference in the result.
         private readonly HashSet<int> _dirtyNormalScratch = new HashSet<int>();
 
-        /// Recomputes normals for exactly the affected vertices (dirty vertices plus their
-        /// direct neighbors, mirroring RecomputeCavityLocal's scope) instead of Mesh.
-        /// RecalculateNormals()'s full-mesh scan - a vertex's normal only changes when one of
-        /// its incident triangles changes shape, and two vertices share a triangle iff they're
-        /// adjacent, so this scope is already exactly correct, no wider walk needed. Sums each
-        /// incident triangle's raw (unnormalized) face-normal cross product - its magnitude is
-        /// proportional to the triangle's area, so this naturally area-weights the average,
-        /// matching what RecalculateNormals() itself does - just scoped to the affected set
-        /// instead of the whole mesh. See ApplyVerticesLocal.
-        private void RecomputeNormalsLocal(IReadOnlyCollection<int> dirtyVertices)
+        /// Fills _dirtyNormalScratch with the dirty vertices and their direct neighbors. That
+        /// scope is already exactly right for both consumers, no wider walk needed: a vertex's
+        /// normal only changes when one of its incident triangles changes shape, and two
+        /// vertices share a triangle iff they're adjacent; a vertex's cavity value only changes
+        /// when it moves or one of its neighbors does, since it is derived from the offsets to
+        /// those neighbors.
+        private void BuildAffectedSet(List<int> dirtyVertices)
         {
             EnsureAdjacency();
             _dirtyNormalScratch.Clear();
-            foreach (int vi in dirtyVertices)
+            for (int k = 0; k < dirtyVertices.Count; k++)
             {
+                int vi = dirtyVertices[k];
                 _dirtyNormalScratch.Add(vi);
                 int[] neighbors = _adjacency[vi];
                 for (int i = 0; i < neighbors.Length; i++) _dirtyNormalScratch.Add(neighbors[i]);
             }
+        }
 
+        /// Recomputes normals for exactly the affected vertices instead of Mesh.
+        /// RecalculateNormals()'s full-mesh scan. Sums each incident triangle's raw
+        /// (unnormalized) face-normal cross product - its magnitude is proportional to the
+        /// triangle's area, so this naturally area-weights the average, matching what
+        /// RecalculateNormals() itself does - just scoped to the affected set instead of the
+        /// whole mesh. Reads the set BuildAffectedSet just filled. See ApplyVerticesLocal.
+        private void RecomputeNormalsLocal()
+        {
             foreach (int i in _dirtyNormalScratch)
                 RecomputeNormalAt(i);
         }
@@ -552,7 +563,17 @@ namespace Sculpting
             // Degenerate (zero-area) triangles can null out the sum for an isolated vertex -
             // keep the previous normal rather than collapsing it to zero, same "leave it alone"
             // behavior GetNeighborAverage uses for a neighborless vertex.
-            if (sum.sqrMagnitude > 1e-12f) _workingNormals[i] = sum.normalized;
+            //
+            // Normalized by hand rather than via Vector3.normalized, which has its OWN epsilon
+            // (magnitude < 1e-5, i.e. sqrMagnitude < 1e-10) and silently returns the ZERO vector
+            // below it. That threshold is a hundred times looser than this guard, so any sum
+            // landing in the gap between them passed the guard and then got assigned zero -
+            // exactly the collapse the guard exists to prevent, and a black-shaded vertex on
+            // screen. It takes genuinely sliver-thin triangles to reach, but a dense mesh's
+            // triangles are small enough in absolute terms to get there (measured: 1124 vertices
+            // zeroed around a 157k-vertex sphere's pole, where the triangles degenerate).
+            float sqrMag = sum.sqrMagnitude;
+            if (sqrMag > 1e-12f) _workingNormals[i] = sum / Mathf.Sqrt(sqrMag);
         }
 
         /// Grows the mesh's bounds to include the given vertices' current positions - O(dirty
@@ -562,12 +583,12 @@ namespace Sculpting
         /// approximation any incremental-bounds scheme makes. ApplyVertices() (Remesh/Reset/
         /// topology-crossing Undo's full-rebuild path) keeps calling the real
         /// RecalculateBounds() - already-infrequent full-mesh operations that don't need this.
-        private void ExpandBoundsLocal(IReadOnlyCollection<int> dirtyVertices)
+        private void ExpandBoundsLocal(List<int> dirtyVertices)
         {
             if (dirtyVertices.Count == 0) return;
             Bounds b = _mesh.bounds;
-            foreach (int i in dirtyVertices)
-                b.Encapsulate(_workingVertices[i]);
+            for (int k = 0; k < dirtyVertices.Count; k++)
+                b.Encapsulate(_workingVertices[dirtyVertices[k]]);
             _mesh.bounds = b;
         }
 
@@ -591,8 +612,17 @@ namespace Sculpting
         /// Remesh - see their call sites).
         public void ApplyVerticesLocal(IReadOnlyCollection<int> dirtyVertices)
         {
-            RecomputeNormalsLocal(dirtyVertices);
-            ExpandBoundsLocal(dirtyVertices);
+            // Copied into a concrete List once, and every step below iterates THAT. Callers pass
+            // a HashSet (the brushes' per-frame dirty set) or an int[] (undo's RestoreDelta), so
+            // walking the parameter directly means an interface-dispatched enumerator per step -
+            // and for the HashSet case a boxed one, i.e. a fresh heap allocation per step per
+            // frame of a held stroke. Five such walks became one.
+            _dirtyVertexList.Clear();
+            foreach (int vi in dirtyVertices) _dirtyVertexList.Add(vi);
+
+            BuildAffectedSet(_dirtyVertexList);
+            RecomputeNormalsLocal();
+            ExpandBoundsLocal(_dirtyVertexList);
 
             // Re-bucket the moved vertices in the vertex index so it stays exact for the rest
             // of this stroke and for whatever queries it next (mask painting in particular,
@@ -601,9 +631,9 @@ namespace Sculpting
             // out of every future candidate list - see VertexSpatialGrid's class remarks for
             // the artifacts that caused.
             if (_spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length)
-                _spatialGrid.UpdateVertices(dirtyVertices);
+                _spatialGrid.UpdateVertices(_dirtyVertexList);
 
-            if (_triangleGrid != null && dirtyVertices.Count > 0)
+            if (_triangleGrid != null && _dirtyVertexList.Count > 0)
             {
                 if (!MeshBoundsFitInsideTriangleGrid())
                 {
@@ -621,24 +651,24 @@ namespace Sculpting
                 {
                     EnsureAdjacency();
                     _dirtyTriangleScratch.Clear();
-                    foreach (int vi in dirtyVertices)
+                    for (int k = 0; k < _dirtyVertexList.Count; k++)
                     {
-                        int[] incident = _vertexTriangles[vi];
+                        int[] incident = _vertexTriangles[_dirtyVertexList[k]];
                         for (int i = 0; i < incident.Length; i++) _dirtyTriangleScratch.Add(incident[i]);
                     }
                     _triangleGrid.UpdateTriangles(_dirtyTriangleScratch, _workingVertices, _workingTriangles);
                 }
             }
 
-            RecomputeCavityLocal(dirtyVertices);
+            RecomputeCavityLocal();
 
             // Replaces the full _mesh.vertices=/.colors= reassignment (and the .normals=
             // assignment removed above) with a compute-shader scatter write scoped to just the
             // affected vertices - see GpuVertexScatter remarks. _dirtyNormalScratch is exactly
-            // that "dirty ∪ neighbors" set (already computed by RecomputeNormalsLocal above,
-            // and identical to what RecomputeCavityLocal just used) - position is redundant-but-
-            // harmless for neighbor-only entries whose position didn't change, only their
-            // normal/cavity color did.
+            // that "dirty ∪ neighbors" set (built once by BuildAffectedSet above and shared with
+            // both the normal and cavity passes) - position is redundant-but-harmless for
+            // neighbor-only entries whose position didn't change, only their normal/cavity
+            // color did.
             EnsureGpuScatter();
             _gpuScatter.ScatterDirty(_dirtyNormalScratch, _dirtyNormalScratch.Count, _workingVertices, _workingNormals, _cavityColors);
         }
@@ -690,33 +720,26 @@ namespace Sculpting
             if (_cavityColors == null || _cavityColors.Length != n) _cavityColors = new Color[n];
         }
 
-        // Reused across RecomputeCavityLocal calls - see ApplyVerticesLocal.
-        private readonly HashSet<int> _dirtyCavityScratch = new HashSet<int>();
+        // Reused across ApplyVerticesLocal calls - see its remarks for why the dirty set is
+        // flattened into a concrete List before anything walks it.
+        private readonly List<int> _dirtyVertexList = new List<int>();
 
         /// Same effect as RecomputeCavity(), but only for the given vertices plus their direct
         /// neighbors - a moved vertex changes not just its own cavity value but every
         /// neighbor's too, since their GetNeighborAverage includes it. Measured as the dominant
         /// remaining per-frame cost after the triangle-grid fix (this app's high-poly-brush-lag
         /// investigation) - see [[project_sculpting_application]] memory.
-        private void RecomputeCavityLocal(IReadOnlyCollection<int> dirtyVertices)
+        private void RecomputeCavityLocal()
         {
-            EnsureAdjacency();
             EnsureCavityBuffers();
-            _dirtyCavityScratch.Clear();
-            foreach (int vi in dirtyVertices)
-            {
-                _dirtyCavityScratch.Add(vi);
-                int[] neighbors = _adjacency[vi];
-                for (int i = 0; i < neighbors.Length; i++) _dirtyCavityScratch.Add(neighbors[i]);
-            }
 
             // Same two-pass split as the full recompute. The encode pass reads raw values one
             // ring beyond this set, which are left over from before the stroke and so are very
             // slightly stale - that only softens the blur at the footprint's rim by a fraction
             // of a vertex, and widening the recompute by another ring every frame would cost
             // far more than it could possibly be worth.
-            foreach (int i in _dirtyCavityScratch) _cavityRaw[i] = CurvatureAt(i);
-            foreach (int i in _dirtyCavityScratch) EncodeCavityAt(i);
+            foreach (int i in _dirtyNormalScratch) _cavityRaw[i] = CurvatureAt(i);
+            foreach (int i in _dirtyNormalScratch) EncodeCavityAt(i);
         }
 
         /// Discrete mean curvature at a vertex, expressed relative to the object's own size:

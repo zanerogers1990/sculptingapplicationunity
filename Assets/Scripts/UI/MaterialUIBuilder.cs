@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -7,7 +8,7 @@ using Sculpting.IO;
 namespace Sculpting
 {
     /// Builds the "Material" section: base PBR sliders (color, metallic, smoothness, normal
-    /// detail), the cavity recess/peak coloring controls, and the matcap palette, all wired
+    /// detail), the single-colour cavity recess controls, and the matcap palette, all wired
     /// directly to SculptMaterialController.
     ///
     /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
@@ -31,6 +32,9 @@ namespace Sculpting
         private Toggle _matcapToggle;
         private Text _matcapStatus;
         private Transform _paletteRoot;
+        // Keyed by entry.Path rather than entry.Name: two matcaps in different categories can
+        // share a file name (e.g. a user-imported "Red" colliding with a bundled one), and Path
+        // is the one thing MatcapLibrary already guarantees unique per entry.
         private readonly List<KeyValuePair<string, Image>> _paletteButtons = new List<KeyValuePair<string, Image>>();
         private bool _paletteFilled;
         private string _lastImportDirectory = string.Empty;
@@ -38,6 +42,11 @@ namespace Sculpting
         // being changed from somewhere else (a scene load) without polling the whole UI.
         private bool _shownMatcapEnabled;
         private string _shownMatcapName;
+        // Path of the entry actually selected in the palette. SculptMaterialController.MatcapName
+        // is a bare name (that's the .sculpt save format), so it can't disambiguate two entries
+        // that share a name - this field is the disambiguated identity, set directly whenever we
+        // have the real Entry in hand (a click, an import) rather than re-derived from the name.
+        private string _selectedPath;
 
         public void BuildContent(Transform panel)
         {
@@ -63,7 +72,6 @@ namespace Sculpting
             Transform cavity = UIFactory.CreateFoldoutSection(panel, "Cavity", false);
             UIFactory.CreateToggle(cavity, "Enabled", _material.CavityEnabled, v => _material.CavityEnabled = v);
             UIFactory.CreateColorPicker(cavity, "Recess Color", _material.RecessColor, c => _material.RecessColor = c);
-            UIFactory.CreateColorPicker(cavity, "Peak Color", _material.PeakColor, c => _material.PeakColor = c);
             UIFactory.CreateLabel(cavity, "Cavity Intensity", 12, FontStyle.Normal);
             UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityIntensity, v => _material.CavityIntensity = v);
             UIFactory.CreateLabel(cavity, "Cavity Range", 12, FontStyle.Normal);
@@ -155,7 +163,7 @@ namespace Sculpting
                     inRow = 0;
                 }
 
-                _paletteButtons.Add(new KeyValuePair<string, Image>(entry.Name, CreateMatcapButton(row, entry)));
+                _paletteButtons.Add(new KeyValuePair<string, Image>(entry.Path, CreateMatcapButton(row, entry)));
                 inRow++;
             }
 
@@ -182,9 +190,11 @@ namespace Sculpting
             button.onClick.AddListener(() =>
             {
                 // Picking one turns matcap shading on: clicking a matcap and having nothing
-                // change is indistinguishable from the click not having registered.
-                _material.MatcapName = entry.Name;
-                _material.MatcapEnabled = true;
+                // change is indistinguishable from the click not having registered. Goes through
+                // the entry directly rather than by name - MatcapLibrary.Find only takes a name
+                // and would resolve ambiguously if another entry elsewhere shares this one.
+                _material.SetMatcap(entry);
+                _selectedPath = entry.Path;
                 RefreshMatcapUi();
             });
 
@@ -227,7 +237,7 @@ namespace Sculpting
             int decoded = 0;
             foreach (MatcapLibrary.Entry entry in MatcapLibrary.Entries)
             {
-                Image frame = FindPaletteButton(entry.Name);
+                Image frame = FindPaletteButton(entry.Path);
                 if (frame == null) continue;
 
                 Texture2D thumbnail = MatcapLibrary.GetThumbnail(entry);
@@ -243,10 +253,10 @@ namespace Sculpting
             }
         }
 
-        private Image FindPaletteButton(string name)
+        private Image FindPaletteButton(string path)
         {
             foreach (KeyValuePair<string, Image> pair in _paletteButtons)
-                if (pair.Key == name)
+                if (string.Equals(pair.Key, path, StringComparison.OrdinalIgnoreCase))
                     return pair.Value != null ? pair.Value : null;
             return null;
         }
@@ -256,15 +266,41 @@ namespace Sculpting
             foreach (KeyValuePair<string, Image> pair in _paletteButtons)
             {
                 if (pair.Value == null) continue;
-                bool selected = _material.MatcapEnabled && pair.Key == _material.MatcapName;
+                bool selected = _material.MatcapEnabled &&
+                                string.Equals(pair.Key, _selectedPath, StringComparison.OrdinalIgnoreCase);
                 pair.Value.color = selected ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             }
+        }
+
+        /// True if the entry at `path` (as of the last scan) still has the given Name. Used to
+        /// tell "the selection we recorded is still the one the material is showing" apart from
+        /// "the material's name changed out from under us" (a scene load, a rescan that dropped
+        /// the file, MatcapEnabled auto-picking the first entry) - only the latter needs to fall
+        /// back to a name-only re-resolution.
+        private static bool PathMatchesName(string path, string name)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            foreach (MatcapLibrary.Entry entry in MatcapLibrary.Entries)
+                if (string.Equals(entry.Path, path, StringComparison.OrdinalIgnoreCase))
+                    return string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase);
+            return false;
         }
 
         private void RefreshMatcapUi()
         {
             _shownMatcapEnabled = _material.MatcapEnabled;
             _shownMatcapName = _material.MatcapName;
+
+            // If the entry we last recorded no longer matches the controller's name, the change
+            // came from somewhere that only had a name to give us (scene load, rescan, the
+            // toggle's own auto-pick) - re-resolve by name as a best effort. When it still
+            // matches (the common case: we just set it ourselves from a click or import), leave
+            // it alone so a same-named entry in another category never overwrites the real pick.
+            if (!PathMatchesName(_selectedPath, _material.MatcapName))
+            {
+                MatcapLibrary.Entry resolved = MatcapLibrary.Find(_material.MatcapName);
+                _selectedPath = resolved?.Path;
+            }
 
             if (_matcapToggle != null)
             {
@@ -318,9 +354,11 @@ namespace Sculpting
             }
 
             // Select what was just imported. Importing a matcap and then having to hunt for it
-            // in the palette is the kind of step that makes a feature feel unfinished.
-            _material.MatcapName = imported.Name;
-            _material.MatcapEnabled = true;
+            // in the palette is the kind of step that makes a feature feel unfinished. Direct
+            // from the Entry, not by name - an import that happens to collide with an existing
+            // entry's name must still select the file that was just imported, not that one.
+            _material.SetMatcap(imported);
+            _selectedPath = imported.Path;
             RefreshMatcapUi();
         }
 

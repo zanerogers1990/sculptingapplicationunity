@@ -29,10 +29,30 @@ namespace Sculpting
         private readonly Bounds _bounds;
         private readonly Vector3Int _dims;
         private readonly List<int>[] _cellContents;
-        // Per triangle, which flat cell ids it's currently registered in - needed so
-        // UpdateTriangles knows exactly which cells to remove a moved triangle from before
-        // re-inserting it at its new position, without a wider search.
-        private readonly List<int>[] _triangleCells;
+        // Per triangle, where it's currently registered - needed so UpdateTriangles knows
+        // exactly which cells to remove a moved triangle from before re-inserting it at its
+        // new position, without a wider search. Stores the SLOT inside each cell's list
+        // alongside the cell id so removal is O(1) - see CellSlot/RemoveTriangle.
+        private readonly List<CellSlot>[] _triangleCells;
+        // The cell RANGE each triangle currently spans, packed so it can be compared in one
+        // integer test - see UpdateTriangles, which skips a triangle whose range is unchanged.
+        private readonly long[] _triangleCellRange;
+
+        /// One registration of a triangle: which cell's list it sits in, and at which index
+        /// within that list. The index is what makes RemoveTriangle O(1): the previous version
+        /// stored only the cell id and removed via List.Remove(ti), a linear scan plus a
+        /// memmove over the whole cell. That reads as cheap because cells are sized for ~8
+        /// triangles each, but the sizing is derived from the grid's BOX volume while triangles
+        /// only occupy its surface SHELL, so occupied cells really hold 100+ - measured at
+        /// 16.6ms of a 23.4ms brush frame (71%) on a 157k-vertex sphere, the single dominant
+        /// per-frame cost of every brush. Swap-with-last plus a slot fixup replaces both the
+        /// scan and the memmove.
+        private readonly struct CellSlot
+        {
+            public readonly int Cell;
+            public readonly int Slot;
+            public CellSlot(int cell, int slot) { Cell = cell; Slot = slot; }
+        }
 
         private readonly HashSet<int> _visitedCellIdScratch = new HashSet<int>();
         private readonly HashSet<int> _candidateScratch = new HashSet<int>();
@@ -58,23 +78,42 @@ namespace Sculpting
             int triCount = triangles.Length / 3;
             int cellCount = _dims.x * _dims.y * _dims.z;
             _cellContents = new List<int>[cellCount];
-            _triangleCells = new List<int>[triCount];
+            _triangleCells = new List<CellSlot>[triCount];
+            _triangleCellRange = new long[triCount];
 
             for (int ti = 0; ti < triCount; ti++)
-                InsertTriangle(ti, vertices, triangles);
+            {
+                CellRangeOf(ti, vertices, triangles, out Vector3Int cmin, out Vector3Int cmax);
+                InsertTriangle(ti, cmin, cmax);
+            }
         }
 
-        private void InsertTriangle(int ti, Vector3[] vertices, int[] triangles)
+        /// The inclusive cell range the triangle's bounding box covers. Split out from
+        /// InsertTriangle so UpdateTriangles can compute it once and use it both to decide
+        /// whether anything changed and, if so, to do the re-insert.
+        private void CellRangeOf(int ti, Vector3[] vertices, int[] triangles, out Vector3Int cmin, out Vector3Int cmax)
         {
             Vector3 a = vertices[triangles[ti * 3]];
             Vector3 b = vertices[triangles[ti * 3 + 1]];
             Vector3 c = vertices[triangles[ti * 3 + 2]];
 
-            Vector3Int cmin = ClampedCellOf(Vector3.Min(a, Vector3.Min(b, c)));
-            Vector3Int cmax = ClampedCellOf(Vector3.Max(a, Vector3.Max(b, c)));
+            cmin = ClampedCellOf(Vector3.Min(a, Vector3.Min(b, c)));
+            cmax = ClampedCellOf(Vector3.Max(a, Vector3.Max(b, c)));
+        }
 
-            List<int> membership = _triangleCells[ti];
-            if (membership == null) { membership = new List<int>(); _triangleCells[ti] = membership; }
+        // Both cell coordinates fit in 8 bits each - _dims is clamped to 256 per axis at
+        // construction - so a whole min/max range packs into one long and compares in one
+        // instruction.
+        private static long PackRange(Vector3Int cmin, Vector3Int cmax) =>
+            ((long)((cmin.x << 16) | (cmin.y << 8) | cmin.z) << 32) |
+            (uint)((cmax.x << 16) | (cmax.y << 8) | cmax.z);
+
+        private void InsertTriangle(int ti, Vector3Int cmin, Vector3Int cmax)
+        {
+            _triangleCellRange[ti] = PackRange(cmin, cmax);
+
+            List<CellSlot> membership = _triangleCells[ti];
+            if (membership == null) { membership = new List<CellSlot>(4); _triangleCells[ti] = membership; }
 
             for (int z = cmin.z; z <= cmax.z; z++)
             for (int y = cmin.y; y <= cmax.y; y++)
@@ -84,16 +123,47 @@ namespace Sculpting
                 List<int> cell = _cellContents[flat];
                 if (cell == null) { cell = new List<int>(4); _cellContents[flat] = cell; }
                 cell.Add(ti);
-                membership.Add(flat);
+                membership.Add(new CellSlot(flat, cell.Count - 1));
             }
         }
 
+        /// Unregisters a triangle from every cell it currently sits in, in O(cells it spans)
+        /// regardless of how many triangles those cells hold. Each registration is removed by
+        /// overwriting its slot with the cell's last entry and popping the tail - which moves
+        /// that last triangle to a new slot, so its own membership record has to be corrected
+        /// to match. That fixup scans only the MOVED triangle's membership list (the handful of
+        /// cells one triangle spans, typically 1-4), never a cell's contents. Cell order is not
+        /// meaningful here - Raycast collects candidates into a set and tests them all - so
+        /// swapping the tail into the hole is free.
         private void RemoveTriangle(int ti)
         {
-            List<int> membership = _triangleCells[ti];
+            List<CellSlot> membership = _triangleCells[ti];
             if (membership == null) return;
+
             for (int i = 0; i < membership.Count; i++)
-                _cellContents[membership[i]]?.Remove(ti);
+            {
+                CellSlot entry = membership[i];
+                List<int> cell = _cellContents[entry.Cell];
+                if (cell == null) continue;
+
+                int lastSlot = cell.Count - 1;
+                int movedTi = cell[lastSlot];
+                cell[entry.Slot] = movedTi;
+                cell.RemoveAt(lastSlot);
+
+                // ti was itself the tail - nothing moved, so nothing to correct. (A triangle is
+                // registered at most once per cell, so movedTi == ti implies exactly this.)
+                if (movedTi == ti) continue;
+
+                List<CellSlot> movedMembership = _triangleCells[movedTi];
+                for (int k = 0; k < movedMembership.Count; k++)
+                {
+                    if (movedMembership[k].Cell != entry.Cell || movedMembership[k].Slot != lastSlot) continue;
+                    movedMembership[k] = new CellSlot(entry.Cell, entry.Slot);
+                    break;
+                }
+            }
+
             membership.Clear();
         }
 
@@ -101,12 +171,22 @@ namespace Sculpting
         /// wherever their (already-moved) vertices put them now - O(dirty triangle count), not
         /// O(total triangle count). Callers pass the exact triangles incident to whichever
         /// vertices moved this frame (see SculptableMesh.ApplyVerticesLocal).
-        public void UpdateTriangles(IEnumerable<int> dirtyTriangles, Vector3[] vertices, int[] triangles)
+        ///
+        /// A triangle whose cell range didn't actually change is already registered in exactly
+        /// the right cells, so it's skipped outright - the same "did it even leave its cell"
+        /// test VertexSpatialGrid.UpdateVertices makes. That's the overwhelmingly common case:
+        /// cell size is chosen so a cell holds several triangles, while one frame of a stroke
+        /// moves a vertex by a small fraction of a cell, so a dirty triangle usually sits
+        /// exactly where it already was and only the ones near a cell boundary really move.
+        public void UpdateTriangles(HashSet<int> dirtyTriangles, Vector3[] vertices, int[] triangles)
         {
             foreach (int ti in dirtyTriangles)
             {
+                CellRangeOf(ti, vertices, triangles, out Vector3Int cmin, out Vector3Int cmax);
+                if (_triangleCells[ti] != null && _triangleCellRange[ti] == PackRange(cmin, cmax)) continue;
+
                 RemoveTriangle(ti);
-                InsertTriangle(ti, vertices, triangles);
+                InsertTriangle(ti, cmin, cmax);
             }
         }
 

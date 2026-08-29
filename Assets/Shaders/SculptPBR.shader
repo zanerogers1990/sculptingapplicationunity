@@ -10,9 +10,10 @@ Shader "Custom/SculptPBR"
         _NormalNoiseScale("Normal Detail Scale", Range(1,300)) = 60
         _FlatShading("Flat Shading", Float) = 0
 
+        // One colour, and it only ever goes INTO recesses - see ApplyCavity for why the
+        // matching "peak" tint that used to sit alongside it was removed.
         _CavityEnabled("Cavity Enabled", Float) = 1
         _RecessColor("Recess Color", Color) = (0.12,0.10,0.09,1)
-        _PeakColor("Peak Color", Color) = (1.0,0.96,0.86,1)
         _CavityIntensity("Cavity Intensity", Range(0,2)) = 1.0
         _CavityRange("Cavity Range", Range(0.05,0.6)) = 0.25
 
@@ -111,7 +112,6 @@ Shader "Custom/SculptPBR"
                 half _FlatShading;
                 half _CavityEnabled;
                 half4 _RecessColor;
-                half4 _PeakColor;
                 half _CavityIntensity;
                 half _CavityRange;
                 half4 _MaskTintColor;
@@ -180,17 +180,22 @@ Shader "Custom/SculptPBR"
             // every stroke. Pulled out of the fragment body so the matcap path can run the same
             // ramp over the matcap's color that the PBR path runs over the albedo: cavity is a
             // property of the geometry, not of which shading model happens to be switched on.
+            //
+            // ONE colour, into recesses only. This used to also lerp convex vertices toward a
+            // separate near-white "peak" colour, which is what made cavity shading read as a
+            // mess rather than as depth: the two ramps met at the 0.5 flat baseline, so every
+            // surface was being tinted towards something almost everywhere, the light half
+            // washed the base colour (and, on the matcap path, the matcap's own baked lighting)
+            // out toward white, and the two tints fought over which of them a given area was
+            // "mostly" in. Cavity's whole job is to darken the creases the light does not reach;
+            // brightening the bits that already catch the light adds no information and destroys
+            // the surface colour that the material or the matcap was chosen for. Below 0.5 this
+            // now does nothing at all, which is the point - a convex surface is simply left as
+            // whatever it was already being shaded.
             half3 ApplyCavity(half3 color, half cavity)
             {
                 half recessT = smoothstep(0.5, 0.5 + _CavityRange, cavity);
-                // HLSL's smoothstep is documented as undefined when the first argument
-                // is greater than the second, so this ramps the same "low edge" -> "0.5"
-                // range and inverts the result rather than calling smoothstep(0.5, 0.5 -
-                // _CavityRange, ...) directly.
-                half peakT = 1.0 - smoothstep(0.5 - _CavityRange, 0.5, cavity);
-                color = lerp(color, _RecessColor.rgb, saturate(recessT * _CavityIntensity));
-                color = lerp(color, _PeakColor.rgb, saturate(peakT * _CavityIntensity));
-                return color;
+                return lerp(color, _RecessColor.rgb, saturate(recessT * _CavityIntensity));
             }
 
             Varyings SculptPBRVertex(Attributes input)
