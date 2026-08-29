@@ -1,0 +1,2 @@
+MatCaps in this folder are from the free "Blender Clay MatCaps" pack (gray, brown, red).
+Resized from the original 1920x1920 to 512x512 to match the other bundled sets.
