@@ -641,6 +641,7 @@ GameObject:
   - component: {fileID: 803899615}
   - component: {fileID: 803899620}
   - component: {fileID: 803899621}
+  - component: {fileID: 803899622}
   m_Layer: 0
   m_Name: SceneSystems
   m_TagString: Untagged
@@ -850,6 +851,19 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f036cd005b3a4efaa4b2f4f4dde76d26, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.ZSphereController
+--- !u!114 &803899622
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 803899609}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fb82f977ad967da4c89426e7a58364b1, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.RegionSelectTool
+  mode: 1
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

@@ -20,6 +20,11 @@ namespace Sculpting
     /// - MaskInvert: no payload at all. Inverting the mask is its own inverse, so storing a
     ///   whole-mesh mask delta for it would be pure waste - at a million vertices that is 8MB
     ///   per press of a button people press repeatedly while dialling a selection in.
+    /// - VisibilityDelta: the TRIANGLE indices a hide/show operation flipped plus each one's
+    ///   previous hidden flag (see SculptableMesh's _hiddenTriangles). Indexed by triangle
+    ///   rather than by vertex because hiding is per-polygon - a vertex on the border of a
+    ///   hidden region belongs to both hidden and visible triangles, so a per-vertex record
+    ///   could not describe the change without ambiguity.
     ///
     /// Delta entries are self-symmetric: undoing one means swapping the stored "before" values
     /// into those same indices while capturing whatever is CURRENTLY there as the reciprocal
@@ -34,6 +39,9 @@ namespace Sculpting
     {
         public delegate Vector3 VertexReader(int index);
         public delegate float MaskReader(int index);
+        /// Reads the CURRENT hidden flag of a triangle, for the reciprocal entry when undoing
+        /// or redoing a VisibilityDelta - the visibility counterpart of VertexReader/MaskReader.
+        public delegate bool VisibilityReader(int triangleIndex);
 
         /// Supplies a full snapshot of the CURRENT mesh, for the reciprocal entry when undoing
         /// or redoing a Full. A delegate rather than a parameter because it is needed for
@@ -41,7 +49,7 @@ namespace Sculpting
         /// that turns out to be undoing a 200-vertex brush stroke is the expensive mistake.
         public delegate void FullCapture(out Vector3[] vertices, out int[] triangles);
 
-        public enum EntryKind { Full, VertexDelta, MaskDelta, MaskInvert }
+        public enum EntryKind { Full, VertexDelta, MaskDelta, MaskInvert, VisibilityDelta, VisibilityInvert }
 
         private readonly struct Entry
         {
@@ -51,10 +59,11 @@ namespace Sculpting
             public readonly int[] Indices;
             public readonly Vector3[] Positions;
             public readonly float[] MaskValues;
+            public readonly bool[] Flags;
             public readonly long Bytes;
 
             private Entry(EntryKind kind, Vector3[] fullVertices, int[] fullTriangles,
-                          int[] indices, Vector3[] positions, float[] maskValues)
+                          int[] indices, Vector3[] positions, float[] maskValues, bool[] flags)
             {
                 Kind = kind;
                 FullVertices = fullVertices;
@@ -62,6 +71,7 @@ namespace Sculpting
                 Indices = indices;
                 Positions = positions;
                 MaskValues = maskValues;
+                Flags = flags;
 
                 long bytes = 32; // object headers and the entry itself - small but not nothing at depth
                 if (fullVertices != null) bytes += (long)fullVertices.Length * 12;
@@ -69,20 +79,27 @@ namespace Sculpting
                 if (indices != null) bytes += (long)indices.Length * 4;
                 if (positions != null) bytes += (long)positions.Length * 12;
                 if (maskValues != null) bytes += (long)maskValues.Length * 4;
+                if (flags != null) bytes += flags.Length;
                 Bytes = bytes;
             }
 
             public static Entry Full(Vector3[] vertices, int[] triangles) =>
-                new Entry(EntryKind.Full, vertices, triangles, null, null, null);
+                new Entry(EntryKind.Full, vertices, triangles, null, null, null, null);
 
             public static Entry VertexDelta(int[] indices, Vector3[] positions) =>
-                new Entry(EntryKind.VertexDelta, null, null, indices, positions, null);
+                new Entry(EntryKind.VertexDelta, null, null, indices, positions, null, null);
 
             public static Entry MaskDelta(int[] indices, float[] values) =>
-                new Entry(EntryKind.MaskDelta, null, null, indices, null, values);
+                new Entry(EntryKind.MaskDelta, null, null, indices, null, values, null);
 
             public static Entry MaskInvert() =>
-                new Entry(EntryKind.MaskInvert, null, null, null, null, null);
+                new Entry(EntryKind.MaskInvert, null, null, null, null, null, null);
+
+            public static Entry VisibilityDelta(int[] triangleIndices, bool[] flags) =>
+                new Entry(EntryKind.VisibilityDelta, null, null, triangleIndices, null, null, flags);
+
+            public static Entry VisibilityInvert() =>
+                new Entry(EntryKind.VisibilityInvert, null, null, null, null, null, null);
         }
 
         /// What an undo/redo press wants applied. `Kind` says which fields are meaningful; see
@@ -95,9 +112,10 @@ namespace Sculpting
             public readonly int[] Indices;
             public readonly Vector3[] Positions;
             public readonly float[] MaskValues;
+            public readonly bool[] Flags;
 
             internal Restore(EntryKind kind, Vector3[] fullVertices, int[] fullTriangles,
-                             int[] indices, Vector3[] positions, float[] maskValues)
+                             int[] indices, Vector3[] positions, float[] maskValues, bool[] flags)
             {
                 Kind = kind;
                 FullVertices = fullVertices;
@@ -105,6 +123,7 @@ namespace Sculpting
                 Indices = indices;
                 Positions = positions;
                 MaskValues = maskValues;
+                Flags = flags;
             }
         }
 
@@ -140,6 +159,17 @@ namespace Sculpting
         /// Records that the whole mask was inverted. Payload-free - see the class remarks.
         public void PushMaskInvert() => Push(Entry.MaskInvert());
 
+        /// Records a hide/show operation: exactly the triangles whose hidden flag changed, and
+        /// what that flag was before. Only CHANGED triangles are stored (see
+        /// SculptableMesh.ApplyVisibilityChange), so re-hiding an already-hidden region costs
+        /// nothing rather than pushing a no-op entry the user then has to undo twice.
+        public void PushVisibilityDelta(int[] triangleIndices, bool[] beforeFlags) =>
+            Push(Entry.VisibilityDelta(triangleIndices, beforeFlags));
+
+        /// Records that hidden and visible were swapped mesh-wide. Payload-free for exactly the
+        /// reason PushMaskInvert is - see the class remarks.
+        public void PushVisibilityInvert() => Push(Entry.VisibilityInvert());
+
         private void Push(Entry entry)
         {
             _undoStack.Add(entry);
@@ -151,19 +181,21 @@ namespace Sculpting
 
         /// Pops the newest undo entry, pushes its reciprocal onto redo, and reports what to
         /// apply. False (stack untouched) if there is nothing to undo.
-        public bool TryUndo(VertexReader readVertex, MaskReader readMask, FullCapture captureFull, out Restore restore) =>
-            TryStep(_undoStack, _redoStack, readVertex, readMask, captureFull, out restore);
+        public bool TryUndo(VertexReader readVertex, MaskReader readMask, VisibilityReader readVisibility,
+                            FullCapture captureFull, out Restore restore) =>
+            TryStep(_undoStack, _redoStack, readVertex, readMask, readVisibility, captureFull, out restore);
 
         /// Symmetric to TryUndo, walking the redo stack back onto undo.
-        public bool TryRedo(VertexReader readVertex, MaskReader readMask, FullCapture captureFull, out Restore restore) =>
-            TryStep(_redoStack, _undoStack, readVertex, readMask, captureFull, out restore);
+        public bool TryRedo(VertexReader readVertex, MaskReader readMask, VisibilityReader readVisibility,
+                            FullCapture captureFull, out Restore restore) =>
+            TryStep(_redoStack, _undoStack, readVertex, readMask, readVisibility, captureFull, out restore);
 
         /// One shared implementation for both directions. Undo and redo of any entry kind here
         /// are the identical "take the stored values, hand back whatever is currently in their
         /// place" swap - they differ only in which stack is the source and which is the
         /// destination, so writing them twice only creates two places for a fix to be missed.
         private bool TryStep(List<Entry> from, List<Entry> to, VertexReader readVertex, MaskReader readMask,
-                             FullCapture captureFull, out Restore restore)
+                             VisibilityReader readVisibility, FullCapture captureFull, out Restore restore)
         {
             restore = default;
             if (from.Count == 0) return false;
@@ -180,7 +212,7 @@ namespace Sculpting
                 {
                     captureFull(out Vector3[] currentVertices, out int[] currentTriangles);
                     reciprocal = Entry.Full(currentVertices, currentTriangles);
-                    restore = new Restore(EntryKind.Full, entry.FullVertices, entry.FullTriangles, null, null, null);
+                    restore = new Restore(EntryKind.Full, entry.FullVertices, entry.FullTriangles, null, null, null, null);
                     break;
                 }
                 case EntryKind.VertexDelta:
@@ -188,7 +220,7 @@ namespace Sculpting
                     var current = new Vector3[entry.Indices.Length];
                     for (int i = 0; i < entry.Indices.Length; i++) current[i] = readVertex(entry.Indices[i]);
                     reciprocal = Entry.VertexDelta(entry.Indices, current);
-                    restore = new Restore(EntryKind.VertexDelta, null, null, entry.Indices, entry.Positions, null);
+                    restore = new Restore(EntryKind.VertexDelta, null, null, entry.Indices, entry.Positions, null, null);
                     break;
                 }
                 case EntryKind.MaskDelta:
@@ -196,13 +228,27 @@ namespace Sculpting
                     var current = new float[entry.Indices.Length];
                     for (int i = 0; i < entry.Indices.Length; i++) current[i] = readMask(entry.Indices[i]);
                     reciprocal = Entry.MaskDelta(entry.Indices, current);
-                    restore = new Restore(EntryKind.MaskDelta, null, null, entry.Indices, null, entry.MaskValues);
+                    restore = new Restore(EntryKind.MaskDelta, null, null, entry.Indices, null, entry.MaskValues, null);
+                    break;
+                }
+                case EntryKind.VisibilityDelta:
+                {
+                    var current = new bool[entry.Indices.Length];
+                    for (int i = 0; i < entry.Indices.Length; i++) current[i] = readVisibility(entry.Indices[i]);
+                    reciprocal = Entry.VisibilityDelta(entry.Indices, current);
+                    restore = new Restore(EntryKind.VisibilityDelta, null, null, entry.Indices, null, null, entry.Flags);
+                    break;
+                }
+                case EntryKind.VisibilityInvert:
+                {
+                    reciprocal = Entry.VisibilityInvert();
+                    restore = new Restore(EntryKind.VisibilityInvert, null, null, null, null, null, null);
                     break;
                 }
                 default:
                 {
                     reciprocal = Entry.MaskInvert();
-                    restore = new Restore(EntryKind.MaskInvert, null, null, null, null, null);
+                    restore = new Restore(EntryKind.MaskInvert, null, null, null, null, null, null);
                     break;
                 }
             }

@@ -336,7 +336,7 @@ namespace Sculpting
             float localMaxDistance = maxDistance / Mathf.Max(0.0001f, MinScale());
 
             if (!_triangleGrid.Raycast(localOrigin, localDir, localMaxDistance, _workingVertices, _workingTriangles,
-                    out float hitT, out Vector3 localNormal))
+                    out float hitT, out Vector3 localNormal, _hiddenTriangles))
                 return false;
 
             Vector3 localPoint = localOrigin + localDir * hitT;
@@ -490,9 +490,22 @@ namespace Sculpting
         public void ApplyVertices(bool fullRebuild)
         {
             _mesh.vertices = _workingVertices;
-            _mesh.RecalculateNormals();
+            if (_anyHidden)
+            {
+                // Mesh.RecalculateNormals() derives normals from the INDEX BUFFER, which while
+                // something is hidden no longer references the hidden vertices at all - it would
+                // hand them a zero normal, and they would come back black the moment they were
+                // shown again. Deriving from the full topology instead keeps every vertex's
+                // normal correct whether or not it is currently drawn.
+                RecomputeAllNormalsFromTopology();
+                _mesh.normals = _workingNormals;
+            }
+            else
+            {
+                _mesh.RecalculateNormals();
+                _workingNormals = _mesh.normals;
+            }
             _mesh.RecalculateBounds();
-            _workingNormals = _mesh.normals;
             if (fullRebuild)
             {
                 // A wholesale vertex reassignment invalidates any index built over the old
@@ -546,6 +559,45 @@ namespace Sculpting
         {
             foreach (int i in _dirtyNormalScratch)
                 RecomputeNormalAt(i);
+        }
+
+        // Face-normal accumulator for RecomputeAllNormalsFromTopology. Its own array rather than
+        // summing into _workingNormals directly, so a vertex whose faces cancel out to nothing
+        // (a degenerate sliver - see RecomputeNormalAt) can keep its PREVIOUS normal instead of
+        // being handed an arbitrary one. Allocated only if that path is ever taken, i.e. only on
+        // a whole-mesh reapply while part of the mesh is hidden.
+        private Vector3[] _normalAccumScratch;
+
+        /// Whole-mesh version of RecomputeNormalAt. Matches Mesh.RecalculateNormals' own
+        /// area-weighted average (a face's raw cross product has magnitude proportional to its
+        /// area), but reads the FULL triangle list rather than the mesh's current index buffer -
+        /// see ApplyVertices for why that distinction matters while geometry is hidden.
+        private void RecomputeAllNormalsFromTopology()
+        {
+            if (_workingNormals == null || _workingNormals.Length != _workingVertices.Length)
+                _workingNormals = new Vector3[_workingVertices.Length];
+            if (_normalAccumScratch == null || _normalAccumScratch.Length != _workingVertices.Length)
+                _normalAccumScratch = new Vector3[_workingVertices.Length];
+            Array.Clear(_normalAccumScratch, 0, _normalAccumScratch.Length);
+
+            for (int b = 0; b + 2 < _workingTriangles.Length; b += 3)
+            {
+                int i0 = _workingTriangles[b], i1 = _workingTriangles[b + 1], i2 = _workingTriangles[b + 2];
+                Vector3 a = _workingVertices[i0];
+                Vector3 face = Vector3.Cross(_workingVertices[i1] - a, _workingVertices[i2] - a);
+                _normalAccumScratch[i0] += face;
+                _normalAccumScratch[i1] += face;
+                _normalAccumScratch[i2] += face;
+            }
+
+            for (int i = 0; i < _workingNormals.Length; i++)
+            {
+                // Same hand-rolled normalize, epsilon and keep-the-old-value fallback
+                // RecomputeNormalAt uses - see its remarks for why Vector3.normalized's own
+                // epsilon is a hundred times too loose to be safe here.
+                float sqrMag = _normalAccumScratch[i].sqrMagnitude;
+                if (sqrMag > 1e-12f) _workingNormals[i] = _normalAccumScratch[i] / Mathf.Sqrt(sqrMag);
+            }
         }
 
         private void RecomputeNormalAt(int i)
@@ -952,6 +1004,310 @@ namespace Sculpting
             MaskVersion++;
         }
 
+        // Vertices whose mask a region op is about to clear, gathered once rather than
+        // allocated per call - see ClearMask.
+        private readonly List<int> _maskClearScratch = new List<int>();
+
+        /// Sets a HARD mask value over an explicit set of vertices as one undoable step - what
+        /// box/lasso masking uses (see RegionSelectTool), as against PaintMask's soft, ramped
+        /// brush footprint. Routes through the same mask-stroke accumulator a painted stroke
+        /// uses, so it lands in history in exactly the same shape and needs no new entry kind.
+        /// Vertices already at `value` are skipped entirely: a second drag over the same region
+        /// then records nothing instead of pushing an undo step that visibly does nothing.
+        public void SetMaskOnVertices(IReadOnlyList<int> indices, float value)
+        {
+            if (_mask == null || indices == null || indices.Count == 0) return;
+            value = Mathf.Clamp01(value);
+
+            BeginMaskStroke();
+            _paintMaskScratch.Clear();
+            for (int k = 0; k < indices.Count; k++)
+            {
+                int i = indices[k];
+                if (i < 0 || i >= _mask.Length || Mathf.Approximately(_mask[i], value)) continue;
+                RecordMaskBeforeIfNeeded(i);
+                _mask[i] = value;
+                Color c = _cavityColors[i];
+                c.g = value;
+                _cavityColors[i] = c;
+                _paintMaskScratch.Add(i);
+            }
+            if (_paintMaskScratch.Count == 0) return;
+
+            MaskVersion++;
+            UploadMaskColors();
+            EndStrokeUndo();
+        }
+
+        /// Unmasks everything, as one undoable step. The complement of InvertMask for a mask
+        /// built up by dragging regions, where "start over" is a far more common wish than
+        /// "flip what I have".
+        public void ClearMask()
+        {
+            if (_mask == null) return;
+            _maskClearScratch.Clear();
+            for (int i = 0; i < _mask.Length; i++)
+                if (_mask[i] > 0f) _maskClearScratch.Add(i);
+            SetMaskOnVertices(_maskClearScratch, 0f);
+        }
+
+        // Above this fraction of the mesh, a scatter write is the wrong tool: it stages one
+        // index/position/normal/color entry per vertex into GPU buffers sized for the whole
+        // mesh, which is strictly more work than the single full-array upload it exists to
+        // avoid. Region ops routinely touch most of the mesh at once (masking everything but a
+        // limb, clearing the mask), unlike the brush footprints ScatterDirty was written for.
+        private const float FullUploadVertexFraction = 0.25f;
+
+        /// Pushes whatever is in _paintMaskScratch to the GPU - the scatter path for a small
+        /// footprint, a whole-mesh reupload past FullUploadVertexFraction. See
+        /// SyncMeshFromWorkingArrays for why the big path reassigns positions and normals too
+        /// rather than colors alone.
+        private void UploadMaskColors()
+        {
+            if (_paintMaskScratch.Count > _workingVertices.Length * FullUploadVertexFraction)
+            {
+                SyncMeshFromWorkingArrays();
+                return;
+            }
+            EnsureGpuScatter();
+            _gpuScatter.ScatterDirty(_paintMaskScratch, _paintMaskScratch.Count, _workingVertices, _workingNormals, _cavityColors);
+        }
+
+        /// Re-uploads the three CPU arrays this class treats as authoritative into Unity's own
+        /// managed mesh data, so the two agree again.
+        ///
+        /// Needed before ANY operation that makes Unity re-derive the mesh from its managed
+        /// copy (SetTriangles, in practice), because ordinary sculpting writes moved vertices
+        /// STRAIGHT into the GPU buffer via GpuVertexScatter and deliberately never syncs them
+        /// back - so Unity's managed copy still holds the pre-sculpt shape. Letting it drive a
+        /// reupload would silently revert the sculpt on screen (the same class of bug the
+        /// [[feedback_unity_gpu_buffer_verification]] memory records for Remesh). Assigning
+        /// vertices also recalculates the mesh bounds from the FULL vertex array, which is what
+        /// keeps bounds correct while part of the index buffer is hidden.
+        private void SyncMeshFromWorkingArrays()
+        {
+            _mesh.vertices = _workingVertices;
+            _mesh.normals = _workingNormals;
+            _mesh.colors = _cavityColors;
+        }
+
+        // ------------------------------------------------------------------ hidden geometry
+
+        // Per-TRIANGLE visibility (true = hidden), the store behind box/lasso hide - see
+        // RegionSelectTool. Per-triangle rather than per-vertex because that is what hiding a
+        // region of a mesh actually means: a vertex on the border of the region is shared with
+        // triangles that stay visible, so "is this vertex hidden" has no single right answer,
+        // while "is this polygon drawn" always does. Null until something is first hidden, so
+        // an ordinary sculpt pays nothing at all for this.
+        private bool[] _hiddenTriangles;
+        // Derived from _hiddenTriangles (see RefreshVisibility): a vertex is hidden only when
+        // EVERY triangle using it is. This is what the brushes read, via QueryNear - border
+        // vertices stay sculptable, so the visible edge of a partly-hidden mesh behaves like
+        // ordinary surface rather than a frozen wall.
+        private bool[] _hiddenVertices;
+        // One-bool "is any of this in play" test, so the hot paths (QueryNear, RaycastMesh,
+        // ApplyVertices) skip the visibility logic entirely in the normal case.
+        private bool _anyHidden;
+        // The visible-only index buffer handed to the Mesh, rebuilt in place on each visibility
+        // change rather than reallocated.
+        private int[] _visibleTriangleScratch;
+        private readonly List<int> _visibilityChangedScratch = new List<int>();
+
+        /// True while any part of this mesh is hidden - what the UI reads to enable Show All.
+        public bool AnyHidden => _anyHidden;
+
+        /// Bumped by every visibility change, for the same cheap "did anything move" polling
+        /// MaskVersion serves.
+        public int VisibilityVersion { get; private set; }
+
+        /// Per-triangle hidden flags, or null when nothing is hidden. Handed to
+        /// TriangleSpatialGrid.Raycast so every hit test passes through hidden geometry.
+        public bool[] HiddenTriangles => _hiddenTriangles;
+
+        /// Number of triangles in the CURRENT topology - what a caller building a per-triangle
+        /// selection needs to size its own buffers.
+        public int TriangleCount => _workingTriangles != null ? _workingTriangles.Length / 3 : 0;
+
+        /// True if this vertex sits strictly inside a hidden region (see _hiddenVertices).
+        public bool IsVertexHidden(int index) =>
+            _anyHidden && _hiddenVertices != null && index >= 0 && index < _hiddenVertices.Length && _hiddenVertices[index];
+
+        /// Hides (or shows) the given triangles as one undoable step.
+        public void SetTrianglesHidden(IReadOnlyList<int> triangleIndices, bool hidden)
+        {
+            if (triangleIndices == null || triangleIndices.Count == 0 || _workingTriangles == null) return;
+            EnsureVisibilityBuffer();
+
+            _visibilityChangedScratch.Clear();
+            for (int k = 0; k < triangleIndices.Count; k++)
+            {
+                int t = triangleIndices[k];
+                if (t < 0 || t >= _hiddenTriangles.Length || _hiddenTriangles[t] == hidden) continue;
+                _visibilityChangedScratch.Add(t);
+            }
+            CommitVisibilityChange(_visibilityChangedScratch, hidden);
+        }
+
+        /// Brings every hidden triangle back, as one undoable step. No-op (and no undo entry)
+        /// when nothing is hidden.
+        public void ShowAllGeometry()
+        {
+            if (!_anyHidden || _hiddenTriangles == null) return;
+
+            _visibilityChangedScratch.Clear();
+            for (int t = 0; t < _hiddenTriangles.Length; t++)
+                if (_hiddenTriangles[t]) _visibilityChangedScratch.Add(t);
+            CommitVisibilityChange(_visibilityChangedScratch, false);
+        }
+
+        /// Swaps hidden for visible across the whole mesh (ZBrush's Ctrl+Shift+I). Payload-free
+        /// in history - inverting is its own inverse, exactly as InvertMask is, and at a couple
+        /// of million triangles a stored delta for a button people press repeatedly while
+        /// dialling in a selection would be megabytes a press.
+        public void InvertVisibleGeometry()
+        {
+            if (!_anyHidden || _hiddenTriangles == null) return;
+            _history.PushVisibilityInvert();
+            EditHistory.RecordMeshEdit(this);
+            InvertVisibilityWithoutUndo();
+        }
+
+        private void InvertVisibilityWithoutUndo()
+        {
+            EnsureVisibilityBuffer();
+            for (int t = 0; t < _hiddenTriangles.Length; t++) _hiddenTriangles[t] = !_hiddenTriangles[t];
+            RefreshVisibility();
+        }
+
+        private void EnsureVisibilityBuffer()
+        {
+            int triCount = TriangleCount;
+            if (_hiddenTriangles == null || _hiddenTriangles.Length != triCount)
+                _hiddenTriangles = new bool[triCount];
+        }
+
+        // Records the undo entry for `changed` (whose flags are still at their OLD values),
+        // writes the new value, and rebuilds everything derived from visibility. Every hide/
+        // show entry point funnels through here so none of them can forget the undo push, the
+        // version bump or the index-buffer rebuild.
+        private void CommitVisibilityChange(List<int> changed, bool newValue)
+        {
+            if (changed.Count == 0) return;
+
+            int[] indices = changed.ToArray();
+            var before = new bool[indices.Length];
+            for (int k = 0; k < indices.Length; k++)
+            {
+                before[k] = _hiddenTriangles[indices[k]];
+                _hiddenTriangles[indices[k]] = newValue;
+            }
+
+            _history.PushVisibilityDelta(indices, before);
+            EditHistory.RecordMeshEdit(this);
+            RefreshVisibility();
+        }
+
+        /// Undo/redo counterpart of CommitVisibilityChange - writes the stored flags back with
+        /// no history push of its own (going through the public path would push a fresh entry
+        /// from inside an undo, which is how an undo stack ends up unable to reach past the last
+        /// thing you undid - same reasoning as InvertMaskWithoutUndo).
+        private void RestoreVisibilityDelta(int[] indices, bool[] flags)
+        {
+            if (indices == null || flags == null) return;
+            EnsureVisibilityBuffer();
+            for (int k = 0; k < indices.Length; k++)
+            {
+                int t = indices[k];
+                if (t < 0 || t >= _hiddenTriangles.Length) continue;
+                _hiddenTriangles[t] = flags[k];
+            }
+            RefreshVisibility();
+        }
+
+        /// Rebuilds _anyHidden, _hiddenVertices and the mesh's index buffer from
+        /// _hiddenTriangles. O(triangle count), paid once per hide/show gesture - never per
+        /// frame.
+        ///
+        /// The vertex buffer keeps every vertex, hidden ones included: only the INDEX buffer
+        /// shrinks. That keeps every vertex index in this class (undo deltas, mask, symmetry
+        /// maps, the spatial grids) valid and stable across a hide, which is what lets hiding
+        /// be a display-only concern that no other system has to know about.
+        private void RefreshVisibility()
+        {
+            VisibilityVersion++;
+            int triCount = TriangleCount;
+
+            _anyHidden = false;
+            if (_hiddenTriangles != null)
+                for (int t = 0; t < triCount; t++)
+                    if (_hiddenTriangles[t]) { _anyHidden = true; break; }
+
+            if (!_anyHidden)
+            {
+                _hiddenTriangles = null;
+                _hiddenVertices = null;
+                SyncMeshFromWorkingArrays();
+                _mesh.SetTriangles(_workingTriangles, 0, false);
+                BindGpuScatter();
+                return;
+            }
+
+            // Start every vertex hidden and clear it on the first VISIBLE triangle that uses
+            // it - that is exactly the "hidden only if all its triangles are" rule, in one
+            // pass. A vertex no triangle references at all stays flagged hidden, which is
+            // honest: nothing draws it either way.
+            if (_hiddenVertices == null || _hiddenVertices.Length != _workingVertices.Length)
+                _hiddenVertices = new bool[_workingVertices.Length];
+            for (int i = 0; i < _hiddenVertices.Length; i++) _hiddenVertices[i] = true;
+
+            int visibleCount = 0;
+            for (int t = 0; t < triCount; t++)
+            {
+                if (_hiddenTriangles[t]) continue;
+                visibleCount++;
+                int b = t * 3;
+                _hiddenVertices[_workingTriangles[b]] = false;
+                _hiddenVertices[_workingTriangles[b + 1]] = false;
+                _hiddenVertices[_workingTriangles[b + 2]] = false;
+            }
+
+            if (_visibleTriangleScratch == null || _visibleTriangleScratch.Length != visibleCount * 3)
+                _visibleTriangleScratch = new int[visibleCount * 3];
+            int w = 0;
+            for (int t = 0; t < triCount; t++)
+            {
+                if (_hiddenTriangles[t]) continue;
+                int b = t * 3;
+                _visibleTriangleScratch[w++] = _workingTriangles[b];
+                _visibleTriangleScratch[w++] = _workingTriangles[b + 1];
+                _visibleTriangleScratch[w++] = _workingTriangles[b + 2];
+            }
+
+            // calculateBounds:false, because SyncMeshFromWorkingArrays just recalculated them
+            // over every vertex by assigning positions - letting SetTriangles redo it would
+            // shrink the bounds to the visible part alone, and both the culling volume and
+            // MeshBoundsFitInsideTriangleGrid's check want the whole mesh.
+            SyncMeshFromWorkingArrays();
+            _mesh.SetTriangles(_visibleTriangleScratch, 0, false);
+            // The MeshCollider is deliberately NOT re-cooked here - it keeps the full mesh.
+            // Nothing hit-tests through it (RaycastMesh goes to _triangleGrid, which does honor
+            // visibility), and re-cooking runs into tens of milliseconds at high polycounts,
+            // which would turn every hide drag into a visible hitch for no observable gain.
+            BindGpuScatter();
+        }
+
+        // A topology change (Remesh/Join/an undo that crosses one) leaves the old per-triangle
+        // flags describing triangles that no longer exist, so visibility starts fresh - the same
+        // choice, for the same reason, that the mask already makes at those points.
+        private void ResetVisibility()
+        {
+            _hiddenTriangles = null;
+            _hiddenVertices = null;
+            _visibleTriangleScratch = null;
+            _anyHidden = false;
+            VisibilityVersion++;
+        }
+
         /// True if anything at all is masked - what TransformGizmo checks to decide whether a
         /// Transpose/Scale drag should move the whole object's Transform (nothing masked, the
         /// original behaviour) or deform the vertices around the frozen masked region instead
@@ -1213,20 +1569,25 @@ namespace Sculpting
         /// to undo, which tells EditHistory to skip this step and try the one before it.
         public bool ApplyUndoStep()
         {
-            if (!_history.TryUndo(ReadVertex, ReadMask, CaptureFull, out SculptHistory.Restore restore)) return false;
+            if (!_history.TryUndo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, out SculptHistory.Restore restore)) return false;
             ApplyRestore(restore);
             return true;
         }
 
         public bool ApplyRedoStep()
         {
-            if (!_history.TryRedo(ReadVertex, ReadMask, CaptureFull, out SculptHistory.Restore restore)) return false;
+            if (!_history.TryRedo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, out SculptHistory.Restore restore)) return false;
             ApplyRestore(restore);
             return true;
         }
 
         private Vector3 ReadVertex(int index) => _workingVertices[index];
         private float ReadMask(int index) => _mask[index];
+        // Null _hiddenTriangles means nothing is hidden, so every triangle reads back visible -
+        // which is exactly right for the reciprocal of an entry that is about to re-hide them.
+        private bool ReadVisibility(int triangleIndex) =>
+            _hiddenTriangles != null && triangleIndex >= 0 && triangleIndex < _hiddenTriangles.Length
+            && _hiddenTriangles[triangleIndex];
 
         private void CaptureFull(out Vector3[] vertices, out int[] triangles)
         {
@@ -1249,6 +1610,12 @@ namespace Sculpting
                     break;
                 case SculptHistory.EntryKind.MaskInvert:
                     InvertMaskWithoutUndo();
+                    break;
+                case SculptHistory.EntryKind.VisibilityDelta:
+                    RestoreVisibilityDelta(restore.Indices, restore.Flags);
+                    break;
+                case SculptHistory.EntryKind.VisibilityInvert:
+                    InvertVisibilityWithoutUndo();
                     break;
             }
         }
@@ -1359,6 +1726,7 @@ namespace Sculpting
             // from the pre-undo mask is describing geometry that no longer exists). Matches what
             // ReplaceMesh already does for the same reason.
             MaskVersion++;
+            ResetVisibility();
             RecomputeCavity();
             _mesh.colors = _cavityColors;
             BindGpuScatter();
@@ -1382,10 +1750,26 @@ namespace Sculpting
         /// Candidate vertex indices near a local-space point - callers still need to check
         /// exact distance themselves (see VertexSpatialGrid.Query). Lazily builds the index
         /// with a radius-derived cell size if nothing has called RebuildSpatialIndex yet.
+        /// Hidden vertices are dropped from the result, which is what makes hidden geometry
+        /// un-sculptable: every brush, the mask brush and SelectGrab all reach the mesh through
+        /// this one method, so filtering here covers all of them at once and cannot be forgotten
+        /// by a brush added later. Compacts the grid's own reused buffer in place rather than
+        /// allocating a filtered copy per call.
         public List<int> QueryNear(Vector3 localPoint, float radius)
         {
             if (_spatialGrid == null) RebuildSpatialIndex(Mathf.Max(radius * 0.5f, 0.01f));
-            return _spatialGrid.Query(localPoint, radius);
+            List<int> candidates = _spatialGrid.Query(localPoint, radius);
+            if (!_anyHidden || _hiddenVertices == null) return candidates;
+
+            int w = 0;
+            for (int k = 0; k < candidates.Count; k++)
+            {
+                int i = candidates[k];
+                if (i >= 0 && i < _hiddenVertices.Length && _hiddenVertices[i]) continue;
+                candidates[w++] = i;
+            }
+            candidates.RemoveRange(w, candidates.Count - w);
+            return candidates;
         }
 
         /// Selects every vertex within radius of a local-space point, weighted by
@@ -1484,6 +1868,7 @@ namespace Sculpting
             // itself a mask change any watcher needs to hear about (a live extract preview
             // built from the pre-remesh mask is describing geometry that no longer exists).
             MaskVersion++;
+            ResetVisibility();
             RecomputeCavity();
             _mesh.colors = _cavityColors;
             BindGpuScatter();

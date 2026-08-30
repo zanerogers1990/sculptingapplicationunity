@@ -20,6 +20,16 @@ namespace Sculpting
         // color keeps the two kinds of highlight from reading as the same kind of state.
         private static readonly Color MaskActiveColor = new Color(0.95f, 0.65f, 0.15f);
 
+        // Region tools (see RegionSelectTool). The hide gestures get their own teal rather than
+        // sharing MaskActiveColor: hiding and masking are different kinds of state that happen
+        // to share a gesture, and one armed-tool color for both would make it easy to draw a
+        // box expecting one and get the other. The mask gestures DO share MaskActiveColor,
+        // since they edit exactly what the Mask button edits.
+        private static readonly Color RegionHideActiveColor = new Color(0.3f, 0.75f, 0.8f);
+        // The marquee's tint while the drag would REMOVE (show/unmask) - the same red the
+        // brushes already use for their negative/erase polarity.
+        private static readonly Color RegionRemoveColor = new Color(1f, 0.3f, 0.3f);
+
         // Matches Unity's axis-handle/gizmo convention (X red, Y green, Z blue), and
         // MirrorController's own plane colors.
         private static readonly Color MirrorXColor = new Color(1f, 0.25f, 0.25f);
@@ -48,6 +58,42 @@ namespace Sculpting
         private Image _flattenButtonImage;
         private Image _maskButtonImage;
         private bool _lastShownMaskMode;
+
+        // Box/lasso hide and mask (see BuildRegionSection). The tool owns all the state; these
+        // are the controls whose highlight, enabled-ness and status text have to follow it.
+        private RegionSelectTool _regionSelect;
+        private Image _boxHideButtonImage, _lassoHideButtonImage, _boxMaskButtonImage, _lassoMaskButtonImage;
+        private Button _showAllButton, _invertVisibleButton;
+        private Text _regionStatusLabel;
+        private RegionSelectMode _lastShownRegionMode = (RegionSelectMode)(-1);
+        private string _lastShownRegionStatus = "\0"; // sentinel: never equal to a real value, so the first poll draws
+        private GameObject _regionMarqueeGO;
+        private RegionMarqueeGraphic _regionMarquee;
+        // The crosshair shown in place of the brush ring while a region mode is armed (see
+        // SculptController.ShowRegionCrosshair). Four arms with a gap at the centre rather than
+        // two crossing lines: the gap leaves the exact point you are aiming at unobscured, which
+        // is the whole reason a marquee tool draws a crosshair instead of a dot.
+        private GameObject _regionCrosshairGO;
+        private RectTransform _regionCrosshairRect;
+        private readonly Image[] _regionCrosshairArms = new Image[4];
+        private const float CrosshairArmLengthPx = 9f;
+        private const float CrosshairGapPx = 3f;
+        private const float CrosshairThicknessPx = 1.5f;
+
+        // Resynced every frame like _brushSizeSlider - RemeshResolution can now change from the
+        // R-hold gauge as well as this slider, so leaving it un-polled would go stale the first
+        // time someone used the hotkey.
+        private Slider _remeshResolutionSlider;
+
+        // Density readout for the R-hold remesh gauge (see RemeshDensityGrid) - anchored under
+        // the world-space grid's screen projection, same "controller/tool owns the state, this
+        // just follows it" idiom as the region status label above.
+        private RemeshDensityGrid _densityGrid;
+        private GameObject _densityLabelGO;
+        private RectTransform _densityLabelRect;
+        private Text _densityLabelText;
+        private const float DensityLabelOffsetYPx = -28f;
+        private int _lastShownDensity = -1;
         private Slider _brushSizeSlider;
         // Was previously created but never captured, so this slider went stale the moment a
         // hotkey (or the F-drag gauge below) changed controller.BrushStrength out from under
@@ -73,6 +119,12 @@ namespace Sculpting
         private Toggle _mirrorXToggle, _mirrorYToggle, _mirrorZToggle, _showPlanesToggle;
         private SelectionManager _selection;
         private int _lastShownSelectionVersion = -1;
+
+        // Mirror X can now also flip from the X hotkey (see SculptController.HandleBrushSwitchKeys),
+        // so the toggle needs the same per-frame value sync the brush buttons get, not just a
+        // resync on selection change - see RefreshMirrorToggles.
+        private bool _lastShownMirrorX, _lastShownMirrorY, _lastShownMirrorZ, _lastShownShowPlanes;
+        private bool _mirrorTogglesShown;
 
         // Mask extract (see BuildExtractSection). The controller owns all the state; these are
         // just the controls whose enabled-ness and text have to follow it.
@@ -184,6 +236,7 @@ namespace Sculpting
             // feeding the change back into the controller through the slider's own
             // onValueChanged.
             if (_brushSizeSlider != null) _brushSizeSlider.SetValueWithoutNotify(controller.BrushRadius);
+            if (_remeshResolutionSlider != null) _remeshResolutionSlider.SetValueWithoutNotify(controller.RemeshResolution);
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
             // 2D ring cursor - position/size/tint follow the controller every frame it's shown
@@ -328,6 +381,8 @@ namespace Sculpting
             RefreshMirrorToggles();
             RefreshSymmetryAxis();
             RefreshExtractStatus();
+            RefreshRegionState();
+            UpdateDensityLabel();
 
             if (_polyCountLabel != null)
             {
@@ -341,19 +396,31 @@ namespace Sculpting
             }
         }
 
-        /// Re-reads the Mirror toggles off the CURRENT selection whenever it changes, so the
-        /// panel describes the object the brushes are actually about to mirror through. Uses
-        /// SetIsOnWithoutNotify for the same reason the polarity/accumulate resyncs above do:
-        /// firing onChange here would just write the value straight back where it came from.
+        /// Re-reads the Mirror toggles off the CURRENT selection whenever it (or one of the
+        /// mirror axes itself, e.g. from the X hotkey) changes, so the panel describes the
+        /// object the brushes are actually about to mirror through. Uses SetIsOnWithoutNotify
+        /// for the same reason the polarity/accumulate resyncs above do: firing onChange here
+        /// would just write the value straight back where it came from.
         private void RefreshMirrorToggles()
         {
             if (_mirrorXToggle == null) return;
             if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
-            if (_selection == null || _selection.SelectionVersion == _lastShownSelectionVersion) return;
-            _lastShownSelectionVersion = _selection.SelectionVersion;
+            if (_selection == null) return;
 
             MirrorController mirror = controller.Mirror;
             if (mirror == null) return;
+
+            bool changed = !_mirrorTogglesShown || _selection.SelectionVersion != _lastShownSelectionVersion ||
+                mirror.MirrorX != _lastShownMirrorX || mirror.MirrorY != _lastShownMirrorY ||
+                mirror.MirrorZ != _lastShownMirrorZ || mirror.ShowPlanes != _lastShownShowPlanes;
+            if (!changed) return;
+
+            _mirrorTogglesShown = true;
+            _lastShownSelectionVersion = _selection.SelectionVersion;
+            _lastShownMirrorX = mirror.MirrorX;
+            _lastShownMirrorY = mirror.MirrorY;
+            _lastShownMirrorZ = mirror.MirrorZ;
+            _lastShownShowPlanes = mirror.ShowPlanes;
 
             _mirrorXToggle.SetIsOnWithoutNotify(mirror.MirrorX);
             _mirrorYToggle.SetIsOnWithoutNotify(mirror.MirrorY);
@@ -496,7 +563,15 @@ namespace Sculpting
             Transform maskFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Masking", false);
             CreateLabel(maskFoldout, "Hardness (Soft <-> Hard)", 12, FontStyle.Normal);
             CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v);
-            CreateButton(maskFoldout, "Invert Mask", () => controller.InvertMask());
+            var maskActionRow = CreateRow(maskFoldout);
+            CreateButton(maskActionRow.transform, "Invert Mask", () => controller.InvertMask());
+            CreateButton(maskActionRow.transform, "Clear Mask", () =>
+            {
+                SculptableMesh target = SelectedMesh();
+                if (target != null) target.ClearMask();
+            });
+
+            BuildRegionSection(panel.transform);
 
             // One shared setting for every brush (not per-brush like Accumulate), so no resync
             // is needed elsewhere in this file - nothing but this panel ever changes it, same as
@@ -633,12 +708,12 @@ namespace Sculpting
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
-            CreateSlider(panel.transform, 4f, 500f, controller.RemeshResolution,
+            _remeshResolutionSlider = CreateSlider(panel.transform, 4f, 500f, controller.RemeshResolution,
                 v => controller.RemeshResolution = Mathf.RoundToInt(v));
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint  R Remesh\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask (Esc cancels)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
@@ -650,6 +725,14 @@ namespace Sculpting
             _lazyTetherGO = CreateLazyMouseTether(canvasGO.transform);
             _cursorRingGO = CreateBrushCursor(canvasGO.transform);
             _undoToastGO = CreateUndoToast(canvasGO.transform);
+            _densityGrid = controller.DensityGrid; // triggers the self-install, see its remarks
+            _densityLabelGO = CreateRemeshDensityLabel(canvasGO.transform);
+            // Last of all: the marquee is drawn over the model AND over the panels, since a
+            // drag that starts in the viewport can easily be dragged out across one. It never
+            // competes with the brush ring for attention - a region gesture being armed is
+            // exactly when the ring is suppressed (see SculptController.UpdateBrushCursor).
+            _regionMarqueeGO = CreateRegionMarquee(canvasGO.transform);
+            _regionCrosshairGO = CreateRegionCrosshair(canvasGO.transform);
         }
 
         // Throttled rather than refreshed every frame: EditHistory.TotalBytes walks every step
@@ -703,6 +786,211 @@ namespace Sculpting
         /// while these ask "are the two halves of this model actually the same, and make them so"
         /// - which is only meaningful about ONE plane at a time. See SculptController's
         /// symmetryAxis remarks.
+        /// The object this panel's per-object buttons act on - the same primary selection the
+        /// brushes target. Resolved per click rather than captured when the button is built:
+        /// the selection changes from the Scene panel, from a viewport double-click and on a
+        /// scene load, and a captured reference would quietly act on the wrong object (or a
+        /// destroyed one) after any of those.
+        private SculptableMesh SelectedMesh()
+        {
+            if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
+            return _selection != null ? _selection.PrimarySelection : null;
+        }
+
+        /// Box/lasso hide and mask (see RegionSelectTool). Sits directly under Masking because
+        /// two of its four gestures edit exactly what that section edits - the other two edit
+        /// visibility, which is the same idea pointed at a different piece of per-vertex state.
+        ///
+        /// The four gesture buttons are radio-style: clicking the armed one disarms it, so the
+        /// panel can always get back to plain sculpting without reaching for a hotkey.
+        private void BuildRegionSection(Transform panel)
+        {
+            _regionSelect = controller.RegionSelect;
+            // Starts OPEN, unlike the shaping foldouts around it: those tune a brush you already
+            // picked from a row of buttons that is always visible, whereas these gestures have
+            // no other entry point in the panel at all - collapsed, the feature is invisible
+            // unless you already know it exists. The panel scrolls, so the extra height costs
+            // nothing but a little scrolling.
+            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Hide / Region Select", true);
+
+            CreateLabel(foldout,
+                "Drag a shape out from the cursor to hide or mask\nwhat it covers, front and back. RMB or Ctrl reverses\n(show/unmask), Shift acts OUTSIDE the shape, a click\nwith no drag resets, Esc cancels.",
+                11, FontStyle.Italic);
+
+            var hideRow = CreateRow(foldout);
+            _boxHideButtonImage = CreateButton(hideRow.transform, "Box Hide (H)",
+                () => ToggleRegionMode(RegionSelectMode.BoxHide)).GetComponent<Image>();
+            _lassoHideButtonImage = CreateButton(hideRow.transform, "Lasso Hide",
+                () => ToggleRegionMode(RegionSelectMode.LassoHide)).GetComponent<Image>();
+
+            var maskRow = CreateRow(foldout);
+            _boxMaskButtonImage = CreateButton(maskRow.transform, "Box Mask (N)",
+                () => ToggleRegionMode(RegionSelectMode.BoxMask)).GetComponent<Image>();
+            _lassoMaskButtonImage = CreateButton(maskRow.transform, "Lasso Mask",
+                () => ToggleRegionMode(RegionSelectMode.LassoMask)).GetComponent<Image>();
+
+            var actionRow = CreateRow(foldout);
+            _showAllButton = CreateButton(actionRow.transform, "Show All", () =>
+            {
+                SculptableMesh target = SelectedMesh();
+                if (target != null) target.ShowAllGeometry();
+            });
+            _invertVisibleButton = CreateButton(actionRow.transform, "Invert Visible", () =>
+            {
+                SculptableMesh target = SelectedMesh();
+                if (target != null) target.InvertVisibleGeometry();
+            });
+
+            _regionStatusLabel = CreateLabel(foldout, "", 11, FontStyle.Italic);
+            RefreshRegionButtons();
+        }
+
+        private void ToggleRegionMode(RegionSelectMode target)
+        {
+            if (_regionSelect == null) return;
+            _regionSelect.Mode = _regionSelect.Mode == target ? RegionSelectMode.Off : target;
+            RefreshRegionButtons();
+        }
+
+        private void RefreshRegionButtons()
+        {
+            if (_boxHideButtonImage == null || _regionSelect == null) return;
+            RegionSelectMode m = _regionSelect.Mode;
+            _boxHideButtonImage.color = m == RegionSelectMode.BoxHide ? RegionHideActiveColor : UIFactory.InactiveColor;
+            _lassoHideButtonImage.color = m == RegionSelectMode.LassoHide ? RegionHideActiveColor : UIFactory.InactiveColor;
+            _boxMaskButtonImage.color = m == RegionSelectMode.BoxMask ? MaskActiveColor : UIFactory.InactiveColor;
+            _lassoMaskButtonImage.color = m == RegionSelectMode.LassoMask ? MaskActiveColor : UIFactory.InactiveColor;
+        }
+
+        /// Follows the tool once per frame: the mode can change from a hotkey (H/N, or any
+        /// brush key leaving the mode) as well as from these buttons, and the status line is
+        /// written by the tool itself when a gesture lands.
+        private void RefreshRegionState()
+        {
+            if (_regionSelect == null) return;
+
+            if (_regionSelect.Mode != _lastShownRegionMode)
+            {
+                _lastShownRegionMode = _regionSelect.Mode;
+                RefreshRegionButtons();
+            }
+
+            if (_regionStatusLabel != null && _regionSelect.Status != _lastShownRegionStatus)
+            {
+                _lastShownRegionStatus = _regionSelect.Status;
+                _regionStatusLabel.text = _lastShownRegionStatus;
+            }
+
+            // Both act on hidden geometry, so both are dead ends with nothing hidden - greying
+            // them out says so before the click rather than after it does nothing.
+            SculptableMesh target = SelectedMesh();
+            bool anyHidden = target != null && target.AnyHidden;
+            if (_showAllButton != null) _showAllButton.interactable = anyHidden;
+            if (_invertVisibleButton != null) _invertVisibleButton.interactable = anyHidden;
+
+            UpdateRegionMarquee();
+            UpdateRegionCrosshair();
+        }
+
+        /// The armed-mode pointer. Tinted like the mode it belongs to (teal for hide, orange for
+        /// mask) so the crosshair says WHICH gesture is armed, not merely that one is - the
+        /// panel's highlighted button is the other half of that, and it can be scrolled out of
+        /// sight or collapsed inside its foldout.
+        private void UpdateRegionCrosshair()
+        {
+            if (_regionCrosshairGO == null) return;
+
+            bool show = controller.ShowRegionCrosshair;
+            if (_regionCrosshairGO.activeSelf != show) _regionCrosshairGO.SetActive(show);
+            if (!show) return;
+
+            _regionCrosshairRect.position = controller.RegionCrosshairScreenPosition;
+            Color tint = _regionSelect != null && _regionSelect.IsHideMode ? RegionHideActiveColor : MaskActiveColor;
+            for (int i = 0; i < _regionCrosshairArms.Length; i++)
+                if (_regionCrosshairArms[i] != null) _regionCrosshairArms[i].color = tint;
+        }
+
+        private GameObject CreateRegionCrosshair(Transform canvasParent)
+        {
+            var go = new GameObject("RegionCrosshair", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            _regionCrosshairRect = go.GetComponent<RectTransform>();
+            _regionCrosshairRect.anchorMin = _regionCrosshairRect.anchorMax = Vector2.zero;
+            _regionCrosshairRect.pivot = new Vector2(0.5f, 0.5f);
+            _regionCrosshairRect.sizeDelta = Vector2.zero;
+
+            float offset = CrosshairGapPx + CrosshairArmLengthPx * 0.5f;
+            var arms = new[]
+            {
+                (new Vector2(offset, 0f), new Vector2(CrosshairArmLengthPx, CrosshairThicknessPx)),
+                (new Vector2(-offset, 0f), new Vector2(CrosshairArmLengthPx, CrosshairThicknessPx)),
+                (new Vector2(0f, offset), new Vector2(CrosshairThicknessPx, CrosshairArmLengthPx)),
+                (new Vector2(0f, -offset), new Vector2(CrosshairThicknessPx, CrosshairArmLengthPx)),
+            };
+            for (int i = 0; i < arms.Length; i++)
+            {
+                var armGO = new GameObject("Arm" + i, typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+                armGO.transform.SetParent(go.transform, false);
+                var armRect = armGO.GetComponent<RectTransform>();
+                armRect.anchorMin = armRect.anchorMax = new Vector2(0.5f, 0.5f);
+                armRect.anchoredPosition = arms[i].Item1;
+                armRect.sizeDelta = arms[i].Item2;
+                // No sprite: an Image with a null sprite draws a flat filled rect, which is all
+                // a 1.5px arm is - same as the Lazy Mouse tether line.
+                _regionCrosshairArms[i] = armGO.GetComponent<Image>();
+                _regionCrosshairArms[i].raycastTarget = false;
+            }
+
+            go.SetActive(false);
+            return go;
+        }
+
+        /// Feeds the marquee overlay this frame's shape and tint. Tint carries the two
+        /// modifiers, so what the release will do is legible mid-drag rather than only after:
+        /// red for a reversing drag (RMB/Ctrl), and washed toward white while Shift has it
+        /// acting on everything outside the shape.
+        private void UpdateRegionMarquee()
+        {
+            if (_regionMarqueeGO == null) return;
+
+            bool show = _regionSelect.IsDragging;
+            if (_regionMarqueeGO.activeSelf != show) _regionMarqueeGO.SetActive(show);
+            if (!show) return;
+
+            Color tint = _regionSelect.DragRemoves ? RegionRemoveColor
+                : _regionSelect.IsHideMode ? RegionHideActiveColor
+                : MaskActiveColor;
+            if (_regionSelect.DragActsOnOutside) tint = Color.Lerp(tint, Color.white, 0.4f);
+            _regionMarquee.color = tint;
+
+            if (_regionSelect.IsLassoMode) _regionMarquee.SetPath(_regionSelect.LassoPoints);
+            else _regionMarquee.SetBox(_regionSelect.DragRect);
+        }
+
+        // Stretched over the whole canvas with a (0,0) pivot so its local coordinate space IS
+        // screen pixels - see RegionMarqueeGraphic, which draws the tool's screen-space points
+        // straight into it with no conversion.
+        private GameObject CreateRegionMarquee(Transform canvasParent)
+        {
+            // CanvasRenderer listed explicitly rather than left to RequireComponent: a Graphic
+            // built through the GameObject constructor does not inherit the base class's
+            // attribute, and one without a renderer draws nothing at all while reporting no
+            // error (see RegionMarqueeGraphic's remarks).
+            var go = new GameObject("RegionMarquee", typeof(RectTransform), typeof(CanvasRenderer), typeof(RegionMarqueeGraphic));
+            go.transform.SetParent(canvasParent, false);
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.pivot = Vector2.zero;
+            rect.offsetMin = Vector2.zero;
+            rect.offsetMax = Vector2.zero;
+
+            _regionMarquee = go.GetComponent<RegionMarqueeGraphic>();
+            _regionMarquee.raycastTarget = false;
+            go.SetActive(false);
+            return go;
+        }
+
         private void BuildSymmetrySection(Transform panel)
         {
             Transform foldout = UIFactory.CreateFoldoutSection(panel, "Symmetry Repair", false);
@@ -1317,6 +1605,55 @@ namespace Sculpting
             _undoToastLabel = text;
             go.SetActive(false);
             return go;
+        }
+
+        /// Follows the world-space grid's screen projection every frame (see UpdateDensityLabel)
+        /// rather than sitting at a fixed screen anchor like the undo toast above - the grid
+        /// itself moves and rescales with the selected object, so a fixed anchor would drift
+        /// away from "underneath the grid" the moment the object wasn't dead-center on screen.
+        private GameObject CreateRemeshDensityLabel(Transform canvasParent)
+        {
+            var go = new GameObject("RemeshDensityLabel", typeof(RectTransform));
+            go.transform.SetParent(canvasParent, false);
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = rect.anchorMax = Vector2.zero;
+            rect.pivot = new Vector2(0.5f, 1f); // top-center pivot: sits just below the anchor point
+            rect.sizeDelta = new Vector2(160f, 28f);
+
+            var text = go.AddComponent<Text>();
+            text.font = _font;
+            text.fontSize = 18;
+            text.fontStyle = FontStyle.Bold;
+            text.alignment = TextAnchor.MiddleCenter;
+            text.color = Color.white;
+            text.raycastTarget = false;
+
+            _densityLabelRect = rect;
+            _densityLabelText = text;
+            go.SetActive(false);
+            return go;
+        }
+
+        private void UpdateDensityLabel()
+        {
+            if (_densityLabelGO == null || _densityGrid == null) return;
+
+            bool show = _densityGrid.IsVisible;
+            if (_densityLabelGO.activeSelf != show) _densityLabelGO.SetActive(show);
+            if (!show) return;
+
+            Vector2 screen = _densityGrid.LabelScreenPosition;
+            _densityLabelRect.position = new Vector3(screen.x, screen.y + DensityLabelOffsetYPx, 0f);
+
+            // Only-on-change, same reasoning as the poly count label below - this runs every
+            // frame the gauge is up, and a fresh concatenation for a value that hasn't moved
+            // since last frame is wasted garbage.
+            int density = controller.RemeshResolution;
+            if (density != _lastShownDensity)
+            {
+                _lastShownDensity = density;
+                _densityLabelText.text = "Density: " + density;
+            }
         }
     }
 }

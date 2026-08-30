@@ -208,8 +208,13 @@ namespace Sculpting
         /// matches what Physics.Raycast against a MeshCollider returned before this replaced it
         /// (Clay already area-averages its own plane normal over the brush footprint regardless,
         /// see SculptController.ApplyClayBrushLocal, so this doesn't affect Clay's flattening).
+        /// `hiddenTriangles` (optional, one bool per triangle - see SculptableMesh's box/lasso
+        /// hide) removes those triangles from consideration entirely, so a ray passes straight
+        /// through hidden geometry to whatever is behind it. Filtering here rather than at the
+        /// caller is what makes hidden geometry consistently un-hoverable, un-sculptable and
+        /// un-clickable: every hit test in the app goes through this one method.
         public bool Raycast(Vector3 origin, Vector3 dir, float maxDistance, Vector3[] vertices, int[] triangles,
-            out float hitT, out Vector3 hitNormal)
+            out float hitT, out Vector3 hitNormal, bool[] hiddenTriangles = null)
         {
             hitT = 0f;
             hitNormal = default;
@@ -256,6 +261,7 @@ namespace Sculpting
 
             foreach (int ti in _candidateScratch)
             {
+                if (hiddenTriangles != null && ti < hiddenTriangles.Length && hiddenTriangles[ti]) continue;
                 Vector3 a = vertices[triangles[ti * 3]];
                 Vector3 b = vertices[triangles[ti * 3 + 1]];
                 Vector3 c = vertices[triangles[ti * 3 + 2]];

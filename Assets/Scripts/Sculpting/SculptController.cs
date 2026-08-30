@@ -358,6 +358,14 @@ namespace Sculpting
         // the width of BrushRadius's (0.01-2) - same "full-width drag covers roughly the whole
         // range" feel, scaled to the smaller range.
         private const float StrengthAdjustSensitivity = 0.00125f;
+        // Same "full-width drag covers roughly the whole range" tuning, for RemeshResolution's
+        // 4-500 span - see HandleRemeshDensityKey.
+        private const float RemeshDensityDragSensitivity = 0.3f;
+        // How long R must stay down before it arms the density gauge instead of firing a plain
+        // Remesh() - long enough that the existing tap-to-remesh shortcut still lands cleanly
+        // without a drag attached, short enough that reaching for the gauge on purpose doesn't
+        // feel laggy.
+        private const float RemeshHoldThreshold = 0.35f;
         // Was 0.05 - too coarse once the camera is zoomed in close (CameraOrbitController's
         // minDistance is 0.5) for fine detail work: the smallest available brush still covered
         // a visibly large patch of the zoomed-in surface. 0.01 matches the floor
@@ -421,13 +429,18 @@ namespace Sculpting
         private const float UndoFlashDuration = 0.1f;
         private static readonly Color UndoFlashColor = new Color(1f, 1f, 1f, 0.5f);
 
-        // Previous stroke sample in the mesh's local space, used only by Dam Standard to
-        // derive a stroke-travel direction for its leading-edge lip; null between strokes
-        // (mouse up / hover lost / brush switched) so a fresh stroke starts symmetric.
-        private Vector3? _lastDamHoverLocal;
+        // Crease/Dam Standard's stroke-continuity memory, in mesh-local space - null between
+        // strokes (mouse up / hover lost / brush switched) so a fresh stroke starts clean.
+        // Drives BOTH the distance-spaced dab stepper (ApplyCarveStroke) and the stroke-travel
+        // direction the carve is built around: Crease pinches ACROSS that direction, and Dam
+        // Standard additionally biases its lip onto the leading edge.
+        private Vector3? _lastCarveStrokeLocal;
+        private Vector3 _carveStrokeNormal;
+        private Vector3 _carveStrokeDir;
+        private float _carveDabCarry;
 
         // Clay's own stroke-continuity memory, in mesh-local space - null between strokes
-        // (mouse up / hover lost / brush switched), same lifecycle as _lastDamHoverLocal
+        // (mouse up / hover lost / brush switched), same lifecycle as _lastCarveStrokeLocal
         // above. Used by ApplyClayStroke to sub-divide a fast drag into multiple dabs instead
         // of one dab per rendered frame - see its remarks for why.
         private Vector3? _lastClayStrokeLocal;
@@ -457,6 +470,17 @@ namespace Sculpting
         private float _strengthAdjustStartMouseX;
         // Same freeze-in-place reasoning as _resizeAnchorScreenPos above, for the F-drag.
         private Vector2 _strengthAdjustAnchorScreenPos;
+
+        // Same S-drag pattern again (see HandleRemeshDensityKey), but gated behind a hold
+        // threshold rather than starting the instant R goes down - R already has a meaning on a
+        // plain tap (Remesh at whatever resolution is set), so the gauge only arms once the key
+        // has been held long enough to tell a drag-in-progress from that tap.
+        private bool _isAdjustingRemeshDensity;
+        private float _remeshDensityStartValue;
+        private float _remeshDensityStartMouseX;
+        // -1 while R is up; the time it went down otherwise, so the hold threshold and the
+        // tap-vs-hold decision on release can both be measured off it.
+        private float _rKeyDownTime = -1f;
 
         private bool _isShiftSmoothActive;
         private BrushType _preShiftBrush;
@@ -503,10 +527,11 @@ namespace Sculpting
         // Each candidate's position as of THIS stroke's start (see
         // SculptableMesh.StrokeStartPosition) - the reference ClampStrokeDepth measures Clay's
         // per-stroke buildup cap against (and Flatten's contrast cap - see
-        // FlattenContrastLimit). Gathered in the Clay/Flatten job paths only, alongside
+        // FlattenContrastLimit, and Crease/Dam Standard's whole carve target - see CreaseJob).
+        // Gathered in the Clay/Flatten/Crease job paths only, alongside
         // GatherCandidatesNative's shared arrays; the managed path reads StrokeStartPosition
         // directly.
-        private NativeArray<Vector3> _nativeClayStrokeStart;
+        private NativeArray<Vector3> _nativeStrokeStart;
         private int _nativeScratchCapacity;
 
         // Clay's alpha stamp (see BrushAlphaLibrary) baked into a NativeArray once per type
@@ -531,7 +556,7 @@ namespace Sculpting
                 _nativeClayWeights = new NativeArray<float>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedPos = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedNormal = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
-                _nativeClayStrokeStart = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
+                _nativeStrokeStart = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
             }
         }
 
@@ -545,7 +570,7 @@ namespace Sculpting
             if (_nativeClayWeights.IsCreated) _nativeClayWeights.Dispose();
             if (_nativeClayWeightedPos.IsCreated) _nativeClayWeightedPos.Dispose();
             if (_nativeClayWeightedNormal.IsCreated) _nativeClayWeightedNormal.Dispose();
-            if (_nativeClayStrokeStart.IsCreated) _nativeClayStrokeStart.Dispose();
+            if (_nativeStrokeStart.IsCreated) _nativeStrokeStart.Dispose();
         }
 
         private void EnsureAlphaNative()
@@ -700,12 +725,15 @@ namespace Sculpting
         }
 
         // Shared by Crease and DamStandard, which already share the same pinch+carve core in
-        // their managed form - DirLocal/Lip default to zero for plain Crease (a zero DirLocal
-        // makes the leading-edge dot-product test never fire, so the lip term naturally never
-        // applies, no separate "HasDir" flag needed). AppliedOut mirrors the managed loops' own
-        // rule: ANY candidate within BrushRadius counts as touched/dirty, regardless of the
-        // resulting lerp factor - unlike Inflate/Clay, Crease/DamStandard never skip on
-        // weight <= 0 alone (see ApplyCreaseBrushLocalManaged/ApplyDamStandardBrushLocalManaged).
+        // their managed form - Lip defaults to 0 for plain Crease, which zeroes the leading-edge
+        // term without a separate flag. AppliedOut mirrors the managed loop's own rule: ANY
+        // candidate within BrushRadius counts as touched/dirty, regardless of the resulting lerp
+        // factor - unlike Inflate/Clay, the carving brushes never skip on weight <= 0 alone
+        // (see ApplyCarveDabLocalManaged).
+        //
+        // Every term here is measured from StrokeStartIn - where the stroke FOUND each vertex -
+        // rather than from the dab's own tangent plane, and that is the whole shape of this
+        // brush. See ApplyCarveDabLocal for why.
         [BurstCompile(CompileSynchronously = true)]
         private struct CreaseJob : IJobParallelFor
         {
@@ -714,21 +742,23 @@ namespace Sculpting
             // always populates all three arrays regardless of brush) - now actually read below.
             [ReadOnly] public NativeArray<Vector3> NormalsIn;
             [ReadOnly] public NativeArray<float> MaskIn;
+            [ReadOnly] public NativeArray<Vector3> StrokeStartIn;
             public NativeArray<Vector3> PositionsOut;
             public NativeArray<byte> AppliedOut;
 
             public Vector3 LocalPoint;
             public Vector3 LocalNormal;
-            public Vector3 DirLocal; // Vector3.zero for plain Crease
+            public Vector3 DirLocal; // stroke travel direction in the tangent plane; zero on a tap
             public float BrushRadius;
             public float Depth;
             public float Lip; // 0 for plain Crease
             public float Pinch;
-            public float LerpFactorScale; // brushStrength * CreaseSpeed * dt
+            public float Sign;
+            public float LerpFactorScale; // brushStrength * CreaseSpeed * dabDt
             public bool Accumulate;
-            public float DepthRate; // sign * creaseDepthFactor * brushStrength * CreaseSpeed * dt
+            public float DepthRate; // sign * creaseDepthFactor * brushStrength * CreaseSpeed * dabDt
             public float LipRate; // 0 for plain Crease
-            public float PinchRateScale; // creasePinch * brushStrength * CreaseSpeed * dt
+            public float PinchRateScale; // creasePinch * brushStrength * CreaseSpeed * dabDt
             public bool FrontFacingOnly;
             public Vector3 CameraLocalPos;
 
@@ -739,34 +769,68 @@ namespace Sculpting
                 float dist = toVert.magnitude;
                 if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
 
-                float t01 = 1f - dist / BrushRadius;
-                float weight = t01 * t01 * t01 * (1f - MaskIn[index]) // sharper falloff than Clay's smoothstep
+                float weight = CarveFalloff(1f - dist / BrushRadius) * (1f - MaskIn[index])
                     * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
 
-                float alongNormal = Vector3.Dot(toVert, LocalNormal);
-                Vector3 tangentialOffset = toVert - LocalNormal * alongNormal;
-                bool hasLip = Vector3.Dot(tangentialOffset, DirLocal) > 0f;
+                Vector3 start = StrokeStartIn[index];
+                SplitCarveFrame(start - LocalPoint, LocalNormal, DirLocal,
+                    out float startNormal, out float startAlong, out Vector3 startAcross);
+                bool hasLip = startAlong > 0f;
 
                 if (Accumulate)
                 {
                     float normalRate = DepthRate;
                     if (hasLip) normalRate += LipRate;
-                    Vector3 pinchDelta = -tangentialOffset * Mathf.Clamp01(weight * PinchRateScale);
+                    // Pinch pulls across the stroke line only - see ApplyCarveDabLocalManaged.
+                    SplitCarveFrame(toVert, LocalNormal, DirLocal, out _, out _, out Vector3 across);
+                    Vector3 pinchDelta = -across * Mathf.Clamp01(weight * PinchRateScale);
                     PositionsOut[index] = pos + LocalNormal * (normalRate * weight) + pinchDelta;
                 }
                 else
                 {
-                    Vector3 pinched = tangentialOffset * (1f - Pinch * weight);
-                    float normalOffset = Depth * weight;
-                    if (hasLip) normalOffset += Lip * weight;
+                    float carve = Depth * weight;
+                    if (hasLip) carve += Lip * weight;
+                    float achieved = Vector3.Dot(pos - start, LocalNormal);
+                    if (Sign * achieved > Sign * carve) carve = achieved;
 
-                    Vector3 target = LocalPoint + pinched + LocalNormal * normalOffset;
-                    Vector3 toTarget = target - pos;
+                    Vector3 pinched = startAcross * (1f - Pinch * weight);
+                    SplitCarveFrame(toVert, LocalNormal, DirLocal, out _, out _, out Vector3 across);
+                    if (across.sqrMagnitude < pinched.sqrMagnitude) pinched = across;
+
+                    Vector3 target = LocalPoint + LocalNormal * (startNormal + carve)
+                        + DirLocal * startAlong + pinched;
                     float lerp = Mathf.Clamp01(weight * LerpFactorScale);
-                    PositionsOut[index] = pos + toTarget * lerp;
+                    PositionsOut[index] = pos + (target - pos) * lerp;
                 }
                 AppliedOut[index] = 1;
             }
+        }
+
+        /// Crease/Dam Standard's radial profile. Was t01^3, which is a CONE: its slope is
+        /// steepest exactly at the tip, so every dab left a pointed dimple and a line of them
+        /// read as a row of pokes rather than one groove. Cubing a smoothstep instead keeps the
+        /// same overall narrowness (both are 1/8 at half radius, so existing Crease Depth
+        /// settings still feel the same) while flattening the slope to zero at BOTH ends - a
+        /// rounded valley floor that neighbouring dabs blend into continuously.
+        /// Plain float math so Burst inlines it, same as ClayFalloff.
+        private static float CarveFalloff(float t01)
+        {
+            float s = t01 * t01 * (3f - 2f * t01);
+            return s * s * s;
+        }
+
+        /// Decomposes an offset from the dab centre into the carve frame: along the carve
+        /// normal, along the stroke's travel direction, and across it. The across component is
+        /// the only one Crease's pinch is allowed to touch - see ApplyCarveDabLocalManaged.
+        /// A zero dir (a tap, or the stroke's first dab) collapses `along` to 0 and leaves the
+        /// whole tangential offset in `across`, which is the old radial pinch exactly.
+        private static void SplitCarveFrame(Vector3 offset, Vector3 normal, Vector3 dir,
+            out float alongNormal, out float alongDir, out Vector3 across)
+        {
+            alongNormal = Vector3.Dot(offset, normal);
+            Vector3 tangential = offset - normal * alongNormal;
+            alongDir = Vector3.Dot(tangential, dir);
+            across = tangential - dir * alongDir;
         }
 
         // Shared by every brush's weight computation, multiplied in alongside the mask term
@@ -1238,6 +1302,8 @@ namespace Sculpting
         // between "calmer" and the reported "straight up not working". Sized so one pass at max
         // Brush Strength reaches the full plateau/dab depth, which puts the 0.1 default at a
         // clearly visible cut rather than a rounding error.
+        // Only Inflate is left on this path: Crease and Dam Standard have since moved to real
+        // distance-spaced dabs (ApplyCarveStroke), which is what this factor was approximating.
         private const float StrokePacingGain = 4f;
         // Rate a motionless cursor still builds at, as a fraction of a full-speed stroke's.
         // Only used when Build Up on Hold is ON; with it OFF there is no floor at all, which is
@@ -1295,7 +1361,9 @@ namespace Sculpting
         private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * AccumulateSpeedFactor * accumulateStrength;
 
         /// Build-up rate for the Accumulate-OFF path - the one that eases toward a single dab's
-        /// worth of depth and stops - as used by Crease, Dam Standard and Inflate.
+        /// worth of depth and stops - as used by Inflate. Crease and Dam Standard used it too
+        /// until they moved to distance-spaced dabs (see ApplyCarveStroke) and took Clay's
+        /// speed-free pacing with them - see EffectiveCarveStrength.
         ///
         /// That path is self-limiting, so it was never the runaway "digs forever" case Accumulate
         /// is. But it still approaches its plateau on a CLOCK, which means holding still keeps
@@ -1325,6 +1393,15 @@ namespace Sculpting
         /// are still time-driven and still want it.
         private float EffectiveClayStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
 
+        /// Crease/Dam Standard's equivalents of the two above, and speed-free for exactly the
+        /// same reason: those brushes now place a fixed quantum of carve every CreaseDabSpacing
+        /// of travel (see ApplyCarveStroke) rather than a slice of each frame's time, so the
+        /// deposit per centimetre is already stroke-speed-invariant. AccumulateSpeedFactor on
+        /// top of that would double-count speed. Build Up on Hold is honoured by feeding the
+        /// stepper virtual travel while the cursor sits still, not by scaling these.
+        private float EffectiveCarveStrength => EffectiveBrushStrength * accumulateStrength;
+        private float EffectiveCarveStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
+
         // One value for every brush, unlike BrushStrength above - see _brushStrengthPerType.
         public float BrushRadius
         {
@@ -1336,6 +1413,13 @@ namespace Sculpting
         // Polled by SculptUIBuilder every frame to draw the 2D ring cursor (see
         // UpdateBrushCursor) - same read-only delegation pattern as IsAdjustingStrength
         // above.
+        // The crosshair drawn in place of the ring while a region gesture is armed - see
+        // UpdateBrushCursor for why the ring alone left the viewport looking cursorless.
+        private bool _showRegionCrosshair;
+        private Vector2 _regionCrosshairScreenPos;
+        public bool ShowRegionCrosshair => _showRegionCrosshair;
+        public Vector2 RegionCrosshairScreenPosition => _regionCrosshairScreenPos;
+
         public bool ShowBrushCursor => _showBrushCursor;
         public Vector2 BrushCursorScreenPosition => _brushCursorScreenPos;
         public float BrushCursorScreenDiameter => _brushCursorScreenDiameter;
@@ -1381,7 +1465,13 @@ namespace Sculpting
             {
                 if (_isMaskPaintMode == value) return;
                 _isMaskPaintMode = value;
-                if (_isMaskPaintMode) EndMoveDrag(); // don't leave a grab mid-drag while painting mask
+                if (_isMaskPaintMode)
+                {
+                    EndMoveDrag(); // don't leave a grab mid-drag while painting mask
+                    // Mask painting and the box/lasso region gestures both want the same click -
+                    // see RegionSelectTool.Mode's setter, which disarms this one in the same way.
+                    if (RegionSelect != null) RegionSelect.Mode = RegionSelectMode.Off;
+                }
             }
         }
 
@@ -1393,7 +1483,7 @@ namespace Sculpting
                 if (currentBrush != value)
                 {
                     EndMoveDrag();
-                    _lastDamHoverLocal = null;
+                    _lastCarveStrokeLocal = null;
                     _lastClayStrokeLocal = null;
                     _brushPolarity[(int)currentBrush] = isPositive;
                     _brushAccumulate[(int)currentBrush] = accumulate;
@@ -1550,6 +1640,53 @@ namespace Sculpting
         private SelectionManager Selection => _selection != null ? _selection : (_selection = FindFirstObjectByType<SelectionManager>());
         private SculptableMesh Target => Selection != null ? Selection.PrimarySelection : null;
 
+        /// The camera every brush raycast and every screen-space projection in the app goes
+        /// through. Exposed so RegionSelectTool projects vertices with the SAME camera the
+        /// brushes use, rather than making its own Camera.main guess that could differ.
+        public Camera ActiveCamera => cam;
+
+        // Box/lasso hide and mask (see RegionSelectTool). Found lazily, and ADDED to this
+        // GameObject if the scene has none - the scene file is edited through Unity MCP, which
+        // cannot wire object references (see [[feedback_unity_mcp_object_refs]] memory), so a
+        // tool that self-installs is the one that reliably exists at runtime. Added rather than
+        // required, so an older scene picks the feature up with no scene edit at all.
+        private RegionSelectTool _regionSelect;
+        public RegionSelectTool RegionSelect
+        {
+            get
+            {
+                if (_regionSelect != null) return _regionSelect;
+                _regionSelect = FindFirstObjectByType<RegionSelectTool>();
+                if (_regionSelect == null) _regionSelect = gameObject.AddComponent<RegionSelectTool>();
+                return _regionSelect;
+            }
+        }
+
+        // True while a region gesture is armed - the brushes, the shift-to-smooth override and
+        // the ring cursor all stand down, exactly as they do for a non-Sculpt gizmo mode.
+        private bool RegionSelectActive => RegionSelect != null && RegionSelect.IsActive;
+
+        // World-space grid that previews RemeshResolution while the R gauge is held (see
+        // HandleRemeshDensityKey) - same self-installing idiom as RegionSelect above, and for
+        // the same reason (no scene wiring reaches it through Unity MCP).
+        private RemeshDensityGrid _densityGrid;
+        public RemeshDensityGrid DensityGrid
+        {
+            get
+            {
+                if (_densityGrid != null) return _densityGrid;
+                _densityGrid = FindFirstObjectByType<RemeshDensityGrid>();
+                if (_densityGrid == null) _densityGrid = gameObject.AddComponent<RemeshDensityGrid>();
+                return _densityGrid;
+            }
+        }
+
+        /// True while the R-hold gauge is armed - RemeshDensityGrid reads this to know when to
+        /// show/fade in, SculptUIBuilder reads it to know when to show the density label, and
+        /// UpdateBrushCursor reads it to suppress the ordinary brush ring for the same reason it
+        /// already suppresses it for a region gesture or a non-Sculpt gizmo.
+        public bool ShowRemeshDensityGrid => _isAdjustingRemeshDensity;
+
         // Double-click-in-viewport object switching (see HandleObjectPickDoubleClick) - lets
         // you make a different scene object the sculpt target without hunting for its row in
         // the Scene Graph panel. Tracked here rather than via EventSystem's PointerClick
@@ -1628,6 +1765,7 @@ namespace Sculpting
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
             HandleBrushStrengthKey();
+            HandleRemeshDensityKey();
             HandleUndoRedoKeys();
             UpdatePenPressure();
             HandleSculptInput();
@@ -1664,7 +1802,7 @@ namespace Sculpting
 
             EndMoveDrag();
             _isHovering = false;
-            _lastDamHoverLocal = null;
+            _lastCarveStrokeLocal = null;
             _lastClayStrokeLocal = null;
             _lastClayStrokeNormalLocal = null;
             _lastStrokeHitPointWorld = null;
@@ -1706,7 +1844,7 @@ namespace Sculpting
         private void HandleUndoRedoKeys()
         {
             var kb = Keyboard.current;
-            if (kb == null || _isResizingBrush || _isAdjustingStrength) return;
+            if (kb == null || _isResizingBrush || _isAdjustingStrength || _isAdjustingRemeshDensity) return;
             if (!kb.zKey.wasPressedThisFrame) return;
 
             bool redo = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
@@ -1756,10 +1894,19 @@ namespace Sculpting
             else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
 
             // M used to trigger Remesh directly; moved to R (still reachable via the Remesh
-            // button in the Brush panel either way) so M is free for the mask-paint toggle,
-            // matching most sculpting apps' M-for-mask convention.
+            // button in the Brush panel either way, or a plain R tap - see
+            // HandleRemeshDensityKey) so M is free for the mask-paint toggle, matching most
+            // sculpting apps' M-for-mask convention.
             if (kb.mKey.wasPressedThisFrame) IsMaskPaintMode = !IsMaskPaintMode;
-            if (kb.rKey.wasPressedThisFrame) Remesh();
+
+            // X toggles Mirror X on the selected object, Blender/ZBrush-style. Mirror resolves
+            // against the live selection (see its getter) and self-heals a missing
+            // MirrorController, so this is safe the moment anything is selected.
+            if (kb.xKey.wasPressedThisFrame)
+            {
+                MirrorController mirror = Mirror;
+                if (mirror != null) mirror.MirrorX = !mirror.MirrorX;
+            }
         }
 
         // Holding Shift temporarily switches to the Smooth brush, ZBrush/Blender-style,
@@ -1768,8 +1915,15 @@ namespace Sculpting
         // during the resize gauge for the same reason other input handlers are.
         private void HandleShiftSmoothOverride(Keyboard kb)
         {
-            if (_isResizingBrush || _isAdjustingStrength) return;
+            if (_isResizingBrush || _isAdjustingStrength || _isAdjustingRemeshDensity) return;
             bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
+
+            // Shift means "act on everything outside the region" while a region gesture is armed
+            // (see RegionSelectTool), so it must not also swap the brush underneath it - that
+            // would repaint the brush row and leave the panel highlighting Smooth for the whole
+            // gesture. The release branch is deliberately still reachable, so an override that
+            // was already running when the mode was armed still gets unwound.
+            if (shiftHeld && !_isShiftSmoothActive && RegionSelectActive) return;
 
             if (shiftHeld && !_isShiftSmoothActive)
             {
@@ -1844,6 +1998,49 @@ namespace Sculpting
             BrushStrength = _strengthAdjustStartValue + deltaX * StrengthAdjustSensitivity;
         }
 
+        // R is dual-purpose: a plain tap still fires the old immediate Remesh() at whatever
+        // resolution is already set, but holding it past RemeshHoldThreshold instead arms a
+        // density gauge - same S/F-drag feel as the two handlers above (horizontal mouse
+        // movement scrubs the value), except the changed value isn't applied to the geometry
+        // live. Remeshing is too expensive to run on every mouse-move frame of a drag (see
+        // MeshRemesher's own hitch-at-high-resolution remarks), so the drag only scrubs
+        // RemeshResolution and the DensityGrid preview; the actual rebuild happens once, on
+        // release.
+        private void HandleRemeshDensityKey()
+        {
+            var kb = Keyboard.current;
+            var mouse = Mouse.current;
+            if (kb == null || mouse == null) return;
+
+            if (kb.rKey.wasPressedThisFrame)
+            {
+                _rKeyDownTime = Time.unscaledTime;
+            }
+            else if (_rKeyDownTime >= 0f && kb.rKey.isPressed && !_isAdjustingRemeshDensity
+                     && !_isResizingBrush && !_isAdjustingStrength
+                     && Time.unscaledTime - _rKeyDownTime >= RemeshHoldThreshold)
+            {
+                EndMoveDrag(); // don't leave a grab mid-drag while adjusting density
+                _isAdjustingRemeshDensity = true;
+                _remeshDensityStartValue = remeshResolution;
+                _remeshDensityStartMouseX = mouse.position.ReadValue().x;
+            }
+            else if (_rKeyDownTime >= 0f && !kb.rKey.isPressed)
+            {
+                // A tap that never crossed the hold threshold keeps the pre-existing shortcut
+                // (Remesh at whatever resolution was already set); a completed drag commits the
+                // gauge's final value the same way the Remesh button does. Same call either way.
+                _isAdjustingRemeshDensity = false;
+                _rKeyDownTime = -1f;
+                Remesh();
+            }
+
+            if (!_isAdjustingRemeshDensity) return;
+
+            float deltaX = mouse.position.ReadValue().x - _remeshDensityStartMouseX;
+            RemeshResolution = Mathf.RoundToInt(_remeshDensityStartValue + deltaX * RemeshDensityDragSensitivity);
+        }
+
         // Shared by every brush handler's invert check below - Ctrl mirrors Blender's
         // hold-to-invert sculpt convention, alongside this app's pre-existing right-mouse-
         // inverts convention (kept for parity with users already used to that scheme).
@@ -1864,7 +2061,8 @@ namespace Sculpting
         private void HandleBrushSizeScroll()
         {
             var mouse = Mouse.current;
-            IsHoveringSculptSurface = mouse != null && _isHovering && !_isOverUI && !_isResizingBrush && !_isAdjustingStrength;
+            IsHoveringSculptSurface = mouse != null && _isHovering && !_isOverUI
+                && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingRemeshDensity;
             if (!IsHoveringSculptSurface) return;
 
             float scroll = mouse.scroll.ReadValue().y;
@@ -1939,6 +2137,32 @@ namespace Sculpting
             if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt)
             {
                 _isHovering = false;
+                return;
+            }
+
+            // Same carve-out for a box/lasso region gesture: it owns the drag while armed (see
+            // RegionSelectTool), and a brush firing under the marquee would sculpt whatever the
+            // user was only trying to draw a selection around. _isOverUI is still refreshed on
+            // the way out - the region crosshair below reads it, and leaving it frozen at
+            // whatever the last sculpting frame saw made the crosshair vanish (or persist over a
+            // panel) depending on where the pointer happened to be when the mode was armed.
+            if (RegionSelectActive)
+            {
+                _isHovering = false;
+                _isOverUI = UnityEngine.EventSystems.EventSystem.current != null &&
+                            UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject();
+                return;
+            }
+
+            // Same carve-out again for the R-hold density gauge: it owns horizontal mouse
+            // movement while armed, and the grid/label are its whole visual, so - unlike the S/F
+            // gauges below - the brush ring is suppressed rather than frozen in place (see
+            // UpdateBrushCursor's sculptToolActive).
+            if (_isAdjustingRemeshDensity)
+            {
+                _isHovering = false;
+                _isOverUI = UnityEngine.EventSystems.EventSystem.current != null &&
+                            UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject();
                 return;
             }
 
@@ -2348,7 +2572,7 @@ namespace Sculpting
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
             for (int ci = 0; ci < candidates.Count; ci++)
-                _nativeClayStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
 
             var weightJob = new ClayWeightJob
             {
@@ -2392,7 +2616,7 @@ namespace Sculpting
             var dispJob = new ClayDisplacementJob
             {
                 PositionsIn = _nativePositionsIn,
-                StrokeStartIn = _nativeClayStrokeStart,
+                StrokeStartIn = _nativeStrokeStart,
                 WeightsIn = _nativeClayWeights,
                 AlphaSamples = useAlpha ? _nativeAlphaSamples : _nativeClayWeights, // unread when !UseAlpha; just needs to be a valid array
                 PositionsOut = _nativePositionsOut,
@@ -2567,18 +2791,35 @@ namespace Sculpting
 
         private void HandleCreaseInput(Mouse mouse, bool overUI, bool altHeld)
         {
+            HandleCarveInput(mouse, overUI, altHeld, 0f);
+        }
+
+        private void HandleDamStandardInput(Mouse mouse, bool overUI, bool altHeld)
+        {
+            HandleCarveInput(mouse, overUI, altHeld, damLipHeight);
+        }
+
+        // Crease and Dam Standard differ by exactly one number - the leading-edge lip height -
+        // so they share one input path, one stroke stepper and one dab. Dam Standard IS Crease
+        // with lip > 0; it always was in the inner loop, this just stops the outer layers
+        // duplicating each other.
+        //
+        // Deliberately no UpdateStrokeSpeed call: these brushes no longer pace themselves off a
+        // measured cursor speed, they place a fixed carve every fixed distance travelled (see
+        // ApplyCarveStroke). Inflate is the only brush still on the speed factor.
+        private void HandleCarveInput(Mouse mouse, bool overUI, bool altHeld, float lipFactor)
+        {
             _isHovering = false;
-            if (overUI) return;
+            if (overUI) { _lastCarveStrokeLocal = null; return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
-            if (!_isHovering) return;
+            if (!_isHovering) { _lastCarveStrokeLocal = null; return; }
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
-            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             bool invertHeld = rightHeld || CtrlHeld;
@@ -2586,62 +2827,209 @@ namespace Sculpting
 
             LogRayHit(mouse, ray, hitPoint, hitNormal);
 
-            if (mouse.leftButton.isPressed && !altHeld)
-                ApplyCreaseBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
-            else if (rightHeld)
-                ApplyCreaseBrush(hitPoint, hitNormal, !isPositive);
+            bool leftSculpting = mouse.leftButton.isPressed && !altHeld;
+            if (!leftSculpting && !rightHeld) { _lastCarveStrokeLocal = null; return; }
+
+            ApplyCarveStroke(hitPoint, hitNormal,
+                leftSculpting ? (invertHeld ? !isPositive : isPositive) : !isPositive, lipFactor);
         }
 
-        private void ApplyCreaseBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive)
+        // Travel between consecutive carve dabs, as a fraction of brush radius. Half of Clay's
+        // ClayDabSpacingFraction: Clay's stamp is a wide flat plateau that hides a seam, while a
+        // crease is a narrow groove where the same gap reads as a visible scallop in the valley
+        // floor. This is the same fix Clay got and Crease never did - carving on a clock meant
+        // the depth a stroke cut depended on the frame rate and on how fast the hand moved, so
+        // the same drawn line came out deep where the cursor slowed and shallow where it didn't.
+        private const float CreaseDabSpacingFraction = 0.1f;
+        // Cost ceiling for a frame in which the cursor teleports (a drag re-entering the mesh, a
+        // frame hitch) - same role as ClayMaxDabsPerFrame, and higher only because the spacing
+        // above is half of Clay's. Still covers ~4.8 brush radii of travel in one frame.
+        private const int CreaseMaxDabsPerFrame = 48;
+        // The dt one dab is worth. A calibration constant, not a real elapsed time: at this
+        // value the distance-driven pacing cuts per centimetre of travel what the old
+        // time-driven pacing cut at an ordinary carving speed, so existing Brush Strength /
+        // Crease Depth settings keep feeling the same. Sized so a single pass at full Brush
+        // Strength reaches the plateau depth - the same calibration StrokePacingGain encoded for
+        // the scheme this replaces. Counterpart of Clay's ClayReferenceStrokeSpeed.
+        private const float CreaseDabTimeQuantum = 0.2f;
+        // How fast the carve frame (normal and travel direction) eases toward each new sample.
+        // The raycast hands back the hit TRIANGLE's flat face normal (see
+        // TriangleSpatialGrid.Raycast), which flips from facet to facet along a stroke and -
+        // once the groove has any depth at all - starts reporting the groove WALL rather than
+        // the surface, so the cut steers itself sideways and wanders off the line being drawn.
+        // Averaging the footprint's vertex normals kills the facet jitter; easing toward that
+        // average across dabs kills the wander.
+        private const float CarveFrameTracking = 0.35f;
+
+        private void ApplyCarveStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive, float lipFactor)
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
             // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
             Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+            Vector3 sampledNormal = AverageFootprintNormal(localPoint, localNormal);
+            float spacing = Mathf.Max(brushRadius * CreaseDabSpacingFraction, 0.0005f);
 
+            if (!_lastCarveStrokeLocal.HasValue)
+            {
+                // Fresh stroke: no travel direction yet, so this first dab pinches radially (a
+                // zero dir leaves the whole tangential offset in SplitCarveFrame's `across`) and
+                // a tap still marks the surface - the distance path below never fires for a
+                // click that doesn't move.
+                _carveStrokeNormal = sampledNormal;
+                _carveStrokeDir = Vector3.zero;
+                _carveDabCarry = 0f;
+                _lastCarveStrokeLocal = localPoint;
+                ApplyCarveDab(localPoint, positive, lipFactor);
+                return;
+            }
+
+            Vector3 from = _lastCarveStrokeLocal.Value;
+            Vector3 travel = localPoint - from;
+            float dist = travel.magnitude;
+
+            _carveStrokeNormal = Vector3.Slerp(_carveStrokeNormal, sampledNormal, CarveFrameTracking).normalized;
+            // Only re-read the direction from a segment long enough to mean something - below a
+            // quarter of the dab spacing the travel is hand tremor, and normalizing it hands the
+            // pinch a random axis.
+            if (dist > spacing * 0.25f)
+            {
+                Vector3 tangential = travel - _carveStrokeNormal * Vector3.Dot(travel, _carveStrokeNormal);
+                if (tangential.sqrMagnitude > 1e-10f)
+                {
+                    Vector3 dir = tangential.normalized;
+                    // Slerp rather than Lerp: a hairpin turn mid-stroke passes through zero
+                    // length under a straight lerp, which would hand that dab a garbage axis.
+                    _carveStrokeDir = _carveStrokeDir.sqrMagnitude > 1e-8f
+                        ? Vector3.Slerp(_carveStrokeDir, dir, CarveFrameTracking).normalized
+                        : dir;
+                }
+            }
+
+            // A stationary cursor covers no ground and so carves nothing - that is the whole
+            // point of distance pacing, and it is what stops a pause from drilling a hole.
+            // Build Up on Hold opts back into a held cut by feeding the stepper virtual travel,
+            // at the same fraction of a moving stroke's rate the old time-paced floor used.
+            float advance = dist;
+            if (buildUpOnHold) advance += StrokePacingReference * AccumulateSpeedFloor * Time.deltaTime;
+            _carveDabCarry += advance;
+
+            int placed = 0;
+            while (_carveDabCarry >= spacing && placed < CreaseMaxDabsPerFrame)
+            {
+                _carveDabCarry -= spacing;
+                // Where along THIS frame's segment the dab falls. dist can be ~0 while the carry
+                // still crosses the threshold (a Build Up on Hold dab, or one banked by earlier
+                // frames finally firing), in which case the dab belongs at the current point.
+                float u = dist > 1e-9f ? Mathf.Clamp01((dist - _carveDabCarry) / dist) : 1f;
+                ApplyCarveDab(Vector3.Lerp(from, localPoint, u), positive, lipFactor);
+                placed++;
+            }
+            // Hit the ceiling: drop the unspent travel instead of banking it into a burst of
+            // dabs next frame, which would dig hardest exactly where the stroke was already
+            // struggling to keep up.
+            if (placed >= CreaseMaxDabsPerFrame) _carveDabCarry = 0f;
+
+            _lastCarveStrokeLocal = localPoint;
+        }
+
+        /// The footprint's own vertex normals, weighted toward the OUTSIDE of the brush rather
+        /// than by the carve falloff. Deliberately not the falloff: that peaks at the centre,
+        /// which is exactly where the groove this brush is digging has already tipped the
+        /// normals sideways, so a falloff-weighted average would chase the cut and steer it
+        /// deeper into its own wall. A broad linear weight lets the surrounding surface - the
+        /// thing the crease is being cut INTO - set the direction. Falls back to the raycast
+        /// normal if the footprint is empty or its normals cancel out.
+        private Vector3 AverageFootprintNormal(Vector3 localPoint, Vector3 fallback)
+        {
+            List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
+            Vector3[] verts = sculptableMesh.Vertices;
+            Vector3[] normals = sculptableMesh.Normals;
+            float invRadius = 1f / Mathf.Max(brushRadius, 0.0001f);
+            Vector3 sum = Vector3.zero;
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                int i = candidates[ci];
+                float dist = Vector3.Distance(verts[i], localPoint);
+                if (dist > brushRadius) continue;
+                sum += normals[i] * (1f - dist * invRadius);
+            }
+            return sum.sqrMagnitude > 1e-8f ? sum.normalized : fallback;
+        }
+
+        private void ApplyCarveDab(Vector3 localPoint, bool positive, float lipFactor)
+        {
             _dirtyVertexScratch.Clear();
             foreach (Vector3 sign in Mirror.GetMirrorSigns())
             {
                 Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
-                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                ApplyCreaseBrushLocal(mirroredPoint, mirroredNormal, positive);
+                Vector3 mirroredNormal = Vector3.Scale(_carveStrokeNormal, sign).normalized;
+                // Mirror the stroke frame the same way Clay mirrors its frozen tip axes, rather
+                // than rebuilding it from the mirrored normal - keeps a mirrored groove exactly
+                // as stable as the primary one. Scaling by a sign vector preserves length, so
+                // the direction stays unit without a re-normalize.
+                Vector3 mirroredDir = Vector3.Scale(_carveStrokeDir, sign);
+                ApplyCarveDabLocal(mirroredPoint, mirroredNormal, mirroredDir, positive, lipFactor);
             }
 
             sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
         }
 
-        // Pinches the tangential footprint toward the stroke centerline while carving along
-        // the normal with a depth that's scaled by the same per-vertex weight (unlike Clay's
-        // constant plateau height), so the profile tapers to a sharp ridge/valley along the
-        // stroke instead of a flat-topped dome.
-        private void ApplyCreaseBrushLocal(Vector3 localPoint, Vector3 localNormal, bool positive)
+        // Carves along the stroke's normal while pinching the footprint ACROSS the stroke line,
+        // with every term measured from where this stroke found each vertex
+        // (SculptableMesh.StrokeStartPosition) rather than from the dab's own tangent plane.
+        // Both of those are the difference between an even groove and what this used to do:
+        //
+        // - Pinching toward the dab's CENTRE POINT vacuums the footprint inward from every side,
+        //   including along the stroke. A moving stroke therefore drags material along with the
+        //   cursor, which is what smeared creases into hooks and swirls and piled a bead up
+        //   wherever the stroke ended. Only the across-stroke component of that pull is a
+        //   crease; the along-stroke component was pure artefact.
+        //
+        // - Targeting `localPoint + tangentialOffset + normal * depth` snaps the whole footprint
+        //   onto the tangent plane AT THE HIT POINT. On anything curved that FLATTENS the
+        //   footprint: rim vertices sit behind that plane, so they were pulled outward and every
+        //   stroke raised a puffy lip around itself on top of the groove it cut. Anchoring to
+        //   each vertex's stroke-start position and preserving its own normal offset
+        //   (`startNormal`) carves relative to the surface that is actually there.
+        //
+        // Anchoring also makes the plateau real: the target no longer moves as the brush's own
+        // output moves, so repeated dabs converge on one depth instead of chasing themselves.
+        // And successive dabs take the DEEPEST result rather than the latest, so the shallow
+        // trailing edge of a passing dab cannot lift a cut that dab's own centre just made -
+        // which is what turns a line of overlapping dabs into one groove of even depth.
+        private void ApplyCarveDabLocal(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal,
+            bool positive, float lipFactor)
         {
             Vector3[] verts = sculptableMesh.Vertices;
             List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
             if (candidates.Count == 0) return;
 
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyCreaseBrushLocalJob(localPoint, localNormal, positive, Vector3.zero, 0f, candidates, verts);
+                ApplyCarveDabLocalJob(localPoint, localNormal, dirLocal, positive, lipFactor, candidates, verts);
             else
-                ApplyCreaseBrushLocalManaged(localPoint, localNormal, positive, candidates, verts);
+                ApplyCarveDabLocalManaged(localPoint, localNormal, dirLocal, positive, lipFactor, candidates, verts);
         }
 
-        // Shared by Crease (dirLocal=zero, lip=0 - see CreaseJob remarks) and DamStandard.
-        private void ApplyCreaseBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive,
-            Vector3 dirLocal, float lipFactor, List<int> candidates, Vector3[] verts)
+        private void ApplyCarveDabLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal,
+            bool positive, float lipFactor, List<int> candidates, Vector3[] verts)
         {
             float sign = positive ? 1f : -1f;
-            float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrengthPlateau;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
+            float effectiveStrength = EffectiveCarveStrength;
+            float effectiveStrengthAccumulate = EffectiveCarveStrengthAccumulate;
 
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
+            // The dab's whole target is measured from here - see ApplyCarveDabLocal's remarks.
+            for (int ci = 0; ci < candidates.Count; ci++)
+                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+
             var job = new CreaseJob
             {
                 PositionsIn = _nativePositionsIn,
                 NormalsIn = _nativeNormalsIn,
                 MaskIn = _nativeMaskIn,
+                StrokeStartIn = _nativeStrokeStart,
                 PositionsOut = _nativePositionsOut,
                 AppliedOut = _nativeAppliedOut,
                 LocalPoint = localPoint,
@@ -2651,11 +3039,12 @@ namespace Sculpting
                 Depth = brushRadius * creaseDepthFactor * sign,
                 Lip = brushRadius * lipFactor * sign,
                 Pinch = creasePinch,
-                LerpFactorScale = effectiveStrength * CreaseSpeed * dt,
+                Sign = sign,
+                LerpFactorScale = effectiveStrength * CreaseSpeed * CreaseDabTimeQuantum,
                 Accumulate = accumulate,
-                DepthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * dt,
-                LipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * dt,
-                PinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * dt,
+                DepthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
+                LipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
+                PinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
                 FrontFacingOnly = frontFacingOnly,
                 CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
             };
@@ -2664,13 +3053,18 @@ namespace Sculpting
             ScatterJobResults(candidates, verts);
         }
 
-        private void ApplyCreaseBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts)
+        private void ApplyCarveDabLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal,
+            bool positive, float lipFactor, List<int> candidates, Vector3[] verts)
         {
             float sign = positive ? 1f : -1f;
-            float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrengthPlateau;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
+            float effectiveStrength = EffectiveCarveStrength;
+            float effectiveStrengthAccumulate = EffectiveCarveStrengthAccumulate;
             float depth = brushRadius * creaseDepthFactor * sign;
+            float lip = brushRadius * lipFactor * sign;
+            float lerpScale = effectiveStrength * CreaseSpeed * CreaseDabTimeQuantum;
+            float depthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
+            float lipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
+            float pinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
             Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
 
             for (int ci = 0; ci < candidates.Count; ci++)
@@ -2680,164 +3074,47 @@ namespace Sculpting
                 float dist = toVert.magnitude;
                 if (dist > brushRadius) continue;
 
-                float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i]) // sharper falloff than Clay's smoothstep - a narrower peak
+                float weight = CarveFalloff(1f - dist / brushRadius) * (1f - sculptableMesh.Mask[i])
                     * FrontFacingWeight(frontFacingOnly, sculptableMesh.Normals[i], verts[i], cameraLocalPos);
 
-                float alongNormal = Vector3.Dot(toVert, localNormal);
-                Vector3 tangentialOffset = toVert - localNormal * alongNormal;
+                Vector3 start = sculptableMesh.StrokeStartPosition(i);
+                SplitCarveFrame(start - localPoint, localNormal, dirLocal,
+                    out float startNormal, out float startAlong, out Vector3 startAcross);
+                SplitCarveFrame(toVert, localNormal, dirLocal, out _, out _, out Vector3 across);
+                bool hasLip = startAlong > 0f;
 
                 sculptableMesh.RecordUndoBeforeIfNeeded(i);
 
                 if (accumulate)
                 {
-                    // Depth keeps digging deeper for as long as the brush is held - a
-                    // continuous rate, not a target/plateau (same shape as Clay/Inflate's
-                    // accumulate-on push).
-                    verts[i] += localNormal * (sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * dt) * weight;
-                    // Pinch stays a bounded pull toward the stroke centerline - it's a shape
-                    // control, not a depth amount, so letting it run away would just make the
-                    // groove's cross-section overshoot past center and oscillate instead of
-                    // digging deeper.
-                    verts[i] += -tangentialOffset * Mathf.Clamp01(creasePinch * weight * effectiveStrengthAccumulate * CreaseSpeed * dt);
-                }
-                else
-                {
-                    Vector3 pinched = tangentialOffset * (1f - creasePinch * weight);
-                    Vector3 target = localPoint + pinched + localNormal * (depth * weight);
-                    Vector3 toTarget = target - verts[i];
-                    verts[i] += toTarget * Mathf.Clamp01(weight * effectiveStrength * CreaseSpeed * dt); // see Clamp01 note on Clay
-                }
-
-                _dirtyVertexScratch.Add(i);
-            }
-        }
-
-        private void HandleDamStandardInput(Mouse mouse, bool overUI, bool altHeld)
-        {
-            _isHovering = false;
-            if (overUI) { _lastDamHoverLocal = null; return; }
-
-            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
-
-            _isHovering = hasHit;
-            if (!_isHovering) { _lastDamHoverLocal = null; return; }
-
-            _hoverPoint = hitPoint;
-            _hoverNormal = hitNormal;
-            UpdateStrokeSpeed(hitPoint);
-
-            bool rightHeld = mouse.rightButton.isPressed;
-            bool invertHeld = rightHeld || CtrlHeld;
-            _previewPositive = invertHeld ? !isPositive : isPositive;
-
-            LogRayHit(mouse, ray, hitPoint, hitNormal);
-
-            bool sculpting = (mouse.leftButton.isPressed && !altHeld) || rightHeld;
-            if (!sculpting) { _lastDamHoverLocal = null; return; }
-
-            ApplyDamStandardBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
-        }
-
-        private void ApplyDamStandardBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive)
-        {
-            Transform t = sculptableMesh.transform;
-            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
-            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
-
-            // Stroke-travel direction in the tangent plane, used to bias a raised lip onto the
-            // leading edge and leave a groove on the trailing edge - the asymmetry that
-            // distinguishes Dam Standard from a plain symmetric Crease. No reliable direction
-            // exists yet on the stroke's first sample or a stationary dab, so this falls back
-            // to symmetric Crease-like carving in that case - an honest simplification rather
-            // than full directional Dam Standard behavior.
-            Vector3 dirLocal = Vector3.zero;
-            if (_lastDamHoverLocal.HasValue)
-            {
-                Vector3 raw = localPoint - _lastDamHoverLocal.Value;
-                Vector3 tangential = raw - localNormal * Vector3.Dot(raw, localNormal);
-                if (tangential.sqrMagnitude > 1e-8f) dirLocal = tangential.normalized;
-            }
-            _lastDamHoverLocal = localPoint;
-
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
-            {
-                Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
-                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                Vector3 mirroredDir = Vector3.Scale(dirLocal, sign);
-                ApplyDamStandardBrushLocal(mirroredPoint, mirroredNormal, mirroredDir, positive);
-            }
-
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
-        }
-
-        private void ApplyDamStandardBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal, bool positive)
-        {
-            Vector3[] verts = sculptableMesh.Vertices;
-            List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
-            if (candidates.Count == 0) return;
-
-            // A zero dirLocal (no reliable stroke direction yet - see ApplyDamStandardBrush's
-            // remarks) naturally disables the lip term in both paths: the managed loop's own
-            // hasDir/dot-product gate, and CreaseJob's dot-product-with-zero-vector (always 0,
-            // never > 0) - no separate "hasDir" needed there either.
-            if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyCreaseBrushLocalJob(localPoint, localNormal, positive, dirLocal, damLipHeight, candidates, verts);
-            else
-                ApplyDamStandardBrushLocalManaged(localPoint, localNormal, dirLocal, positive, candidates, verts);
-        }
-
-        private void ApplyDamStandardBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal, bool positive, List<int> candidates, Vector3[] verts)
-        {
-            float sign = positive ? 1f : -1f;
-            float dt = Time.deltaTime;
-            float effectiveStrength = EffectiveBrushStrengthPlateau;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
-            float depth = brushRadius * creaseDepthFactor * sign;
-            float lip = brushRadius * damLipHeight * sign;
-            bool hasDir = dirLocal.sqrMagnitude > 1e-6f;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
-
-            for (int ci = 0; ci < candidates.Count; ci++)
-            {
-                int i = candidates[ci];
-                Vector3 toVert = verts[i] - localPoint;
-                float dist = toVert.magnitude;
-                if (dist > brushRadius) continue;
-
-                float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * t01 * (1f - sculptableMesh.Mask[i])
-                    * FrontFacingWeight(frontFacingOnly, sculptableMesh.Normals[i], verts[i], cameraLocalPos);
-
-                float alongNormal = Vector3.Dot(toVert, localNormal);
-                Vector3 tangentialOffset = toVert - localNormal * alongNormal;
-                bool hasLip = hasDir && Vector3.Dot(tangentialOffset, dirLocal) > 0f;
-
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
-
-                if (accumulate)
-                {
-                    // Depth (and the leading-edge lip, when active) keep digging/building for as
-                    // long as the brush is held - continuous rates, not a target/plateau, same
-                    // as Crease's own accumulate-on branch.
-                    float normalRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * dt;
-                    if (hasLip) normalRate += sign * damLipHeight * effectiveStrengthAccumulate * CreaseSpeed * dt;
+                    // Depth (and the leading-edge lip, when active) keep digging for as long as
+                    // the stroke keeps travelling - continuous rates, not a target/plateau, same
+                    // as Clay/Inflate's accumulate-on push. The pinch stays a bounded pull
+                    // toward the stroke line: it's a shape control, not a depth amount, so
+                    // letting it run away would just make the groove's cross-section overshoot
+                    // past the centreline and oscillate instead of cutting deeper.
+                    float normalRate = depthRate;
+                    if (hasLip) normalRate += lipRate;
                     verts[i] += localNormal * (normalRate * weight);
-                    verts[i] += -tangentialOffset * Mathf.Clamp01(creasePinch * weight * effectiveStrengthAccumulate * CreaseSpeed * dt);
+                    verts[i] += -across * Mathf.Clamp01(weight * pinchRateScale);
                 }
                 else
                 {
-                    Vector3 pinched = tangentialOffset * (1f - creasePinch * weight);
-                    float normalOffset = depth * weight;
-                    if (hasLip) normalOffset += lip * weight;
+                    float carve = depth * weight;
+                    if (hasLip) carve += lip * weight;
+                    // Deepest dab wins - see ApplyCarveDabLocal's remarks.
+                    float achieved = Vector3.Dot(verts[i] - start, localNormal);
+                    if (sign * achieved > sign * carve) carve = achieved;
 
-                    Vector3 target = localPoint + pinched + localNormal * normalOffset;
-                    Vector3 toTarget = target - verts[i];
-                    verts[i] += toTarget * Mathf.Clamp01(weight * effectiveStrength * CreaseSpeed * dt); // see Clamp01 note on Clay
+                    Vector3 pinched = startAcross * (1f - creasePinch * weight);
+                    // Same "never undo a neighbouring dab's work" rule, for the pinch.
+                    if (across.sqrMagnitude < pinched.sqrMagnitude) pinched = across;
+
+                    Vector3 target = localPoint + localNormal * (startNormal + carve)
+                        + dirLocal * startAlong + pinched;
+                    // Clamp01: a lerp fraction toward a target, not a velocity - see the
+                    // matching note on Clay for what an unclamped factor does on a frame hitch.
+                    verts[i] += (target - verts[i]) * Mathf.Clamp01(weight * lerpScale);
                 }
 
                 _dirtyVertexScratch.Add(i);
@@ -3073,7 +3350,7 @@ namespace Sculpting
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
             for (int ci = 0; ci < candidates.Count; ci++)
-                _nativeClayStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
 
             // Clay's pass-1 job, reused with the round tip (TipRoundness 1) and a full-radius
             // taper (EdgeSoftness 1) - which reduces ClayTipShapeT01/ClayFalloff to exactly the
@@ -3103,7 +3380,7 @@ namespace Sculpting
 
             // Sequential reduction across the footprint, on the main thread for the same reason
             // Clay's is (see ClayWeightJob). Weights come from the job; the weighted sums are
-            // recomputed here from _nativeClayStrokeStart rather than read out of the job's
+            // recomputed here from _nativeStrokeStart rather than read out of the job's
             // WeightedPosOut, because Flatten's plane is anchored to where the stroke FOUND the
             // surface, not to where its own earlier frames have already pushed it - see
             // ApplyFlattenBrushLocal. Two multiplies per candidate in a loop that already runs,
@@ -3113,7 +3390,7 @@ namespace Sculpting
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 float w = _nativeClayWeights[ci];
-                planeOriginSum += _nativeClayStrokeStart[ci] * w;
+                planeOriginSum += _nativeStrokeStart[ci] * w;
                 planeNormalSum += _nativeNormalsIn[ci] * w;
                 planeWeightSum += w;
             }
@@ -3125,7 +3402,7 @@ namespace Sculpting
             var dispJob = new FlattenDisplacementJob
             {
                 PositionsIn = _nativePositionsIn,
-                StrokeStartIn = _nativeClayStrokeStart,
+                StrokeStartIn = _nativeStrokeStart,
                 WeightsIn = _nativeClayWeights,
                 PositionsOut = _nativePositionsOut,
                 AppliedOut = _nativeAppliedOut,
@@ -3533,7 +3810,8 @@ namespace Sculpting
             EndMoveDrag();
 
             int changed = SymmetryOps.MakeSymmetric(sculptableMesh, symmetryAxis, symmetryToleranceScale,
-                                                    sourceIsPositive, out int pairs, out int unmatched);
+                                                    sourceIsPositive, out int pairs, out int unmatched,
+                                                    out int carried);
 
             string axis = SymmetryOps.AxisName(symmetryAxis);
             string from = sourceIsPositive ? "+" + axis : "-" + axis;
@@ -3553,10 +3831,15 @@ namespace Sculpting
             if (pairs == 0) return $"Nothing paired across {axis} - raise Match Tolerance";
             if (changed == 0) return $"Already symmetric across {axis} - {pairs} pairs match";
 
-            // The unmatched count rides along on success too: it is the part of the model this
-            // operation could not touch, and leaving it out is what let a partial mirror look
-            // like a complete one.
-            string leftover = unmatched > 0 ? $", {unmatched} unmatched" : string.Empty;
+            // The unmatched count rides along on success too: it is the part of the model that
+            // has no counterpart to be mirrored onto, and leaving it out is what let a partial
+            // mirror look like a complete one. It is now carried along with the surface around it
+            // rather than left standing (see SymmetryTools.CarryUnmatched), so the message says
+            // which of the two happened to it.
+            string leftover = unmatched > 0
+                ? (carried > 0 ? $", {carried} of {unmatched} unmatched carried along"
+                               : $", {unmatched} unmatched")
+                : string.Empty;
             return $"Mirrored {from} onto {to}: {changed} of {pairs} pairs{leftover}";
         }
 
@@ -3637,8 +3920,11 @@ namespace Sculpting
 
             // Same "another tool owns the cursor" carve-out the old preview had - Transpose/
             // Scale drag the transform, ZSpheres place and grow rig spheres, and each shows its
-            // own affordance instead.
-            bool sculptToolActive = sculptableMesh != null && cam != null && (Gizmo == null || Gizmo.Mode == GizmoMode.Sculpt);
+            // own affordance instead - the R-hold density gauge joins them here, its grid/label
+            // being its own affordance the same way (see DensityGrid).
+            bool sculptToolActive = sculptableMesh != null && cam != null && !RegionSelectActive
+                                    && !_isAdjustingRemeshDensity
+                                    && (Gizmo == null || Gizmo.Mode == GizmoMode.Sculpt);
 
             if (sculptToolActive && !_isOverUI)
             {
@@ -3702,9 +3988,20 @@ namespace Sculpting
                 }
             }
 
+            // An armed region gesture suppresses the ring (sculptToolActive above) - but leaving
+            // the viewport with NOTHING under the pointer is what made arming a mode read as
+            // "my cursor is gone". Unity's own arrow does come back, and over a dark viewport at
+            // the moment the familiar ring disappears that is not something anyone notices. So
+            // the tool gets its own affordance instead: a crosshair, which every marquee tool in
+            // every app draws, and which doubles as the signal that a region mode is armed at
+            // all. Drawn by SculptUIBuilder from the two properties below, exactly like the ring.
+            Mouse regionMouse = Mouse.current;
+            _showRegionCrosshair = RegionSelectActive && !_isOverUI && regionMouse != null;
+            if (_showRegionCrosshair) _regionCrosshairScreenPos = regionMouse.position.ReadValue();
+
             _showBrushCursor = show;
             if (show) _brushCursorColor = color;
-            Cursor.visible = !show;
+            Cursor.visible = !show && !_showRegionCrosshair;
         }
 
         // Measures how many screen pixels `worldRadius` covers at `worldCenter` by projecting

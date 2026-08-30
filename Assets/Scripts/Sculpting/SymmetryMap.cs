@@ -35,6 +35,23 @@ namespace Sculpting
         /// question to ask about instead.
         public const int NoPartner = -1;
 
+        /// How far a topological propagation step may reach, as a multiple of Tolerance.
+        ///
+        /// Propagation (see Propagate) grows the pairing along the mesh's own edges out of pairs
+        /// already found, so the distance test is no longer being asked "are these two the same
+        /// vertex" on its own - the topology has already said they are the corresponding
+        /// neighbours of a known pair, and this only has to be wide enough to cover how far the
+        /// two sides have DRIFTED. That is a different, much looser question than the seeding
+        /// pass answers, which is why it gets its own, wider radius: the drift this tool exists
+        /// to repair is routinely a whole vertex spacing, and Tolerance is deliberately sized
+        /// below that.
+        public const float PropagationReach = 4f;
+
+        /// Propagation is a fixed point - each round can only pair vertices adjacent to a pair
+        /// found in an earlier one - so it stops on its own. The cap is a guard against a
+        /// pathological mesh, not a tuning knob; meshes here settle in two or three rounds.
+        private const int MaxPropagationRounds = 64;
+
         /// Which local axis the mirror plane is perpendicular to (AxisX = the YZ plane, etc).
         public int Axis { get; private set; }
 
@@ -46,10 +63,32 @@ namespace Sculpting
         private int[] _partner;
         private bool[] _onPlane;
 
+        // Direct-edge neighbours in CSR form, built only when Build is given triangles: vertex
+        // i's neighbours are _adjNeighbours[_adjStart[i] .. _adjStart[i] + _adjCount[i]).
+        // Deliberately built here rather than borrowed from SculptableMesh - this class is pure
+        // geometry over plain arrays (it runs outside Unity against the shim harness), and the
+        // map has to describe the vertex array it was HANDED, which during a repair is a working
+        // copy rather than the live mesh.
+        private int[] _adjStart;
+        private int[] _adjCount;
+        private int[] _adjNeighbours;
+
         public int VertexCount => _partner.Length;
+
+        /// Whether the map was built with triangles, and so can answer neighbour queries and
+        /// propagate a pairing along the surface.
+        public bool HasTopology => _adjNeighbours != null;
+
+        public int NeighbourCount(int index) => _adjCount == null ? 0 : _adjCount[index];
+        public int Neighbour(int index, int k) => _adjNeighbours[_adjStart[index] + k];
 
         /// Vertex pairs found (counted once per pair, not once per vertex).
         public int PairCount { get; private set; }
+
+        /// How many of those pairs came from propagating along the surface rather than from the
+        /// distance test alone (counted once per pair). Zero when the map was built without
+        /// triangles.
+        public int PropagatedPairCount { get; private set; }
 
         /// Vertices sitting on the mirror plane - the centreline of a symmetric model.
         public int OnPlaneCount { get; private set; }
@@ -126,6 +165,17 @@ namespace Sculpting
         /// mid-iteration, and because this wants a snapshot that cannot be invalidated by a
         /// stroke moving vertices underneath it.
         public static SymmetryMap Build(Vector3[] vertices, int axis, float tolerance)
+            => Build(vertices, null, axis, tolerance);
+
+        /// Builds the pairing, then - given the mesh's triangles - grows it along the surface out
+        /// of what the distance test found (see Propagate).
+        ///
+        /// Always prefer this overload where the triangles are to hand. Distance alone can only
+        /// pair vertices that are still within Tolerance of their reflection, which is a
+        /// judgement about DRIFT made with no way to tell drift from a different vertex nearby;
+        /// once the topology is available, the two questions separate and the pairing stops
+        /// depending on how far the model has been pushed out of shape.
+        public static SymmetryMap Build(Vector3[] vertices, int[] triangles, int axis, float tolerance)
         {
             int n = vertices?.Length ?? 0;
             var map = new SymmetryMap
@@ -225,6 +275,16 @@ namespace Sculpting
                 map._partner[edge.B] = edge.A;
             }
 
+            // Pass 3: grow that pairing along the mesh's own edges. Everything above is a
+            // distance test, and a distance test can only ever pair the parts of the model that
+            // have not drifted far - which on a model that needs repairing is precisely the parts
+            // that did not need it.
+            if (triangles != null && triangles.Length >= 3)
+            {
+                map.BuildAdjacency(triangles);
+                map.Propagate(vertices);
+            }
+
             for (int i = 0; i < n; i++)
             {
                 if (map._onPlane[i]) map.OnPlaneCount++;
@@ -234,6 +294,133 @@ namespace Sculpting
             map.PairCount /= 2; // counted from both ends above
 
             return map;
+        }
+
+        /// Fills the CSR neighbour tables from a triangle list. Duplicates are removed per vertex
+        /// (every interior edge is named by two triangles) so a neighbour is visited once, which
+        /// matters because Propagate's inner loop is a product of two neighbour lists.
+        private void BuildAdjacency(int[] triangles)
+        {
+            int n = _partner.Length;
+            var degree = new int[n];
+            int triEnd = triangles.Length - 2;
+
+            for (int t = 0; t < triEnd; t += 3)
+            {
+                int a = triangles[t], b = triangles[t + 1], c = triangles[t + 2];
+                if (a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n) continue;
+                degree[a] += 2; degree[b] += 2; degree[c] += 2;
+            }
+
+            _adjStart = new int[n];
+            int total = 0;
+            for (int i = 0; i < n; i++) { _adjStart[i] = total; total += degree[i]; }
+
+            var raw = new int[total];
+            var fill = new int[n];
+            for (int t = 0; t < triEnd; t += 3)
+            {
+                int a = triangles[t], b = triangles[t + 1], c = triangles[t + 2];
+                if (a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n) continue;
+                raw[_adjStart[a] + fill[a]++] = b; raw[_adjStart[a] + fill[a]++] = c;
+                raw[_adjStart[b] + fill[b]++] = a; raw[_adjStart[b] + fill[b]++] = c;
+                raw[_adjStart[c] + fill[c]++] = a; raw[_adjStart[c] + fill[c]++] = b;
+            }
+
+            _adjCount = new int[n];
+            for (int i = 0; i < n; i++)
+            {
+                int start = _adjStart[i], len = fill[i];
+                if (len == 0) continue;
+
+                System.Array.Sort(raw, start, len);
+                int write = start + 1;
+                for (int read = start + 1; read < start + len; read++)
+                    if (raw[read] != raw[write - 1]) raw[write++] = raw[read];
+                _adjCount[i] = write - start;
+            }
+
+            _adjNeighbours = raw;
+        }
+
+        /// Grows the pairing outward along the surface: where i and j are already partners, a
+        /// neighbour of i should pair with a neighbour of j, and the only question left is which
+        /// one. That is a far weaker demand than the seeding pass makes - it is asked of a
+        /// handful of candidates that the topology has already vouched for, instead of of every
+        /// vertex in a tolerance ball - so it keeps working long after the two sides have drifted
+        /// past any distance the seeding pass could safely use.
+        ///
+        /// This is what decides whether a repair is exact. Distance-only pairing left 540 of a
+        /// 17,650-vertex sculpted torso unpaired, and MakeSymmetric cannot move a vertex it has
+        /// no counterpart for: those 540 stayed exactly where they were while every vertex around
+        /// them snapped onto its mirror, which is visible as the repair "not quite lining up".
+        /// Propagation pairs all but 136 of them - and what is left over after it is genuinely
+        /// unpairable, being the places where the two halves are not even tessellated alike
+        /// (SymmetryTools.CarryUnmatched is what those need instead).
+        ///
+        /// Rounds are batched rather than run vertex-by-vertex, and each round's candidates are
+        /// accepted closest-first, for the same reason the seeding pass is greedy: the order
+        /// vertices happen to be visited in must not decide which of two near-equal candidates
+        /// wins, or the map stops being a property of the geometry.
+        private void Propagate(Vector3[] vertices)
+        {
+            float limitSqr = Tolerance * PropagationReach;
+            limitSqr *= limitSqr;
+            int n = _partner.Length;
+            var edges = new List<Edge>();
+
+            for (int round = 0; round < MaxPropagationRounds; round++)
+            {
+                edges.Clear();
+
+                for (int i = 0; i < n; i++)
+                {
+                    // An on-plane vertex is its own reflection, so it seeds propagation into
+                    // BOTH sides at once - which is what carries the pairing off the centreline
+                    // on a model whose halves only meet there.
+                    int j = _onPlane[i] ? i : _partner[i];
+                    if (j == NoPartner) continue;
+
+                    int iCount = _adjCount[i], jCount = _adjCount[j];
+                    for (int x = 0; x < iCount; x++)
+                    {
+                        int a = _adjNeighbours[_adjStart[i] + x];
+                        if (_onPlane[a] || _partner[a] != NoPartner) continue;
+
+                        Vector3 target = Reflect(vertices[a], Axis);
+                        float sideA = Coord(vertices[a], Axis);
+
+                        for (int y = 0; y < jCount; y++)
+                        {
+                            int b = _adjNeighbours[_adjStart[j] + y];
+                            if (b == a || _onPlane[b] || _partner[b] != NoPartner) continue;
+                            // Same rule the seeding pass uses: a reflection lives across the
+                            // plane, so two vertices on one side are never each other's partner
+                            // however close the reflected position happens to land.
+                            if (Coord(vertices[b], Axis) * sideA > 0f) continue;
+
+                            float d = (vertices[b] - target).sqrMagnitude;
+                            if (d <= limitSqr) edges.Add(new Edge { Sqr = d, A = a, B = b });
+                        }
+                    }
+                }
+
+                if (edges.Count == 0) return;
+                edges.Sort((p, q) => p.Sqr.CompareTo(q.Sqr));
+
+                int accepted = 0;
+                for (int e = 0; e < edges.Count; e++)
+                {
+                    Edge edge = edges[e];
+                    if (_partner[edge.A] != NoPartner || _partner[edge.B] != NoPartner) continue;
+                    _partner[edge.A] = edge.B;
+                    _partner[edge.B] = edge.A;
+                    accepted++;
+                }
+
+                if (accepted == 0) return;
+                PropagatedPairCount += accepted;
+            }
         }
 
         private static Vector3Int CellOf(Vector3 p, float cell) => new Vector3Int(

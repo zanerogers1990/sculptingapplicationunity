@@ -22,10 +22,12 @@ namespace Sculpting
         /// and every later stroke leaves them a little further apart. Given a correspondence, the
         /// fix is exact and instant: write each source vertex's reflection into its partner.
         ///
-        /// Unmatched vertices are deliberately left untouched rather than approximated - the map
-        /// found no counterpart for them, so any position written there would be a guess, and a
-        /// guess is how a "cleanup" tool ends up mangling geometry it was pointed at by mistake.
-        /// The count of what was skipped is reported back so the UI can say so.
+        /// Unmatched vertices are deliberately left untouched rather than approximated HERE - the
+        /// map found no counterpart for them, so any position written by this pass would be a
+        /// guess, and a guess is how a "cleanup" tool ends up mangling geometry it was pointed at
+        /// by mistake. Leaving them exactly where they were is not the finished answer either
+        /// (they end up standing proud of a surface that moved out from under them), which is
+        /// what CarryUnmatched is for - run it after this, as SymmetryOps.MakeSymmetric does.
         /// Returns how many vertices were rewritten.
         public static int MakeSymmetric(Vector3[] vertices, SymmetryMap map, bool sourceIsPositive)
         {
@@ -63,6 +65,114 @@ namespace Sculpting
             }
 
             return changed;
+        }
+
+        /// Carries the vertices MakeSymmetric could not touch along with the ones it moved, so a
+        /// repair leaves a continuous surface instead of a torn one.
+        ///
+        /// A vertex with no partner is not a vertex that should stay put - it is a vertex the map
+        /// has nothing to say about. Leaving it exactly where it was while every vertex around it
+        /// jumps onto its mirror is what makes a repair read as "nearly aligned": the two halves
+        /// match everywhere except at a scatter of points that now stick out of the surface by
+        /// the whole distance their neighbours just moved. Those points are precisely where the
+        /// two sides are not tessellated alike (one side has a vertex the other does not), which
+        /// no correspondence can fix and which the eye reads as pimples along the repaired half.
+        ///
+        /// The rule here is the one thing that can be said about such a vertex without guessing
+        /// at geometry: it should move the way its surroundings moved. Each unmatched vertex
+        /// takes the average of its known neighbours' displacements, which then becomes known
+        /// itself, so a cluster of them fills inward from its rim. This deforms the surface
+        /// exactly as much as the repair deformed it locally and no more - unlike projecting the
+        /// vertex onto the mirrored surface, which would be a guess about where the model ought
+        /// to be, and unlike leaving it, which is a guess that the model was already right there.
+        ///
+        /// The source side is never carried, only used as an anchor: MakeSymmetric leaves it
+        /// untouched by definition, and a repair that quietly reshaped the half it was copying
+        /// FROM would be a different operation than the one the button says it is.
+        ///
+        /// `before` is the vertex array as it stood before the repair, `vertices` the array being
+        /// repaired; they must be the same length as the map. `sourceIsPositive` is the same flag
+        /// MakeSymmetric was given. Needs a map built WITH triangles (SymmetryMap.HasTopology) -
+        /// there is no notion of "its neighbours" without them. Returns how many vertices were
+        /// carried.
+        public static int CarryUnmatched(Vector3[] vertices, Vector3[] before, SymmetryMap map,
+                                         bool sourceIsPositive)
+        {
+            if (vertices == null || before == null || map == null) return 0;
+            if (map.VertexCount != vertices.Length || before.Length != vertices.Length) return 0;
+            if (!map.HasTopology) return 0;
+
+            int n = vertices.Length;
+            int axis = map.Axis;
+            var shift = new Vector3[n];
+            var known = new bool[n];
+            int unmatched = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                float side = SymmetryMap.Coord(before[i], axis);
+                bool isSource = sourceIsPositive ? side > 0f : side < 0f;
+                bool assigned = map.IsOnPlane(i) || map.PartnerOf(i) != SymmetryMap.NoPartner;
+
+                if (assigned || isSource)
+                {
+                    // Zero for anything MakeSymmetric did not move, which is exactly what makes
+                    // an untouched region hold its unmatched vertices still.
+                    shift[i] = vertices[i] - before[i];
+                    known[i] = true;
+                }
+                else unmatched++;
+            }
+            if (unmatched == 0) return 0;
+
+            // Rounds are batched - every vertex in a round reads only what was known when the
+            // round started - so the result does not depend on vertex ordering. One round per
+            // ring of unmatched vertices; the loop runs until nothing more can be reached, which
+            // for a scatter of isolated vertices is a single pass.
+            var pending = new Vector3[n];
+            var pendingSet = new bool[n];
+            int carried = 0;
+
+            while (true)
+            {
+                int filled = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    if (known[i]) continue;
+
+                    Vector3 sum = Vector3.zero;
+                    int count = 0;
+                    int neighbours = map.NeighbourCount(i);
+                    for (int k = 0; k < neighbours; k++)
+                    {
+                        int nb = map.Neighbour(i, k);
+                        if (!known[nb]) continue;
+                        sum += shift[nb];
+                        count++;
+                    }
+                    if (count == 0) continue;
+
+                    pending[i] = sum / count;
+                    pendingSet[i] = true;
+                    filled++;
+                }
+
+                if (filled == 0) break;
+
+                for (int i = 0; i < n; i++)
+                {
+                    if (!pendingSet[i]) continue;
+                    pendingSet[i] = false;
+                    shift[i] = pending[i];
+                    known[i] = true;
+
+                    if (pending[i].sqrMagnitude <= 0f) continue;
+                    vertices[i] = before[i] + pending[i];
+                    carried++;
+                }
+            }
+
+            return carried;
         }
 
         /// Replaces one whole side of the model with a reflection of the other, cutting the mesh
