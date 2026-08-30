@@ -50,10 +50,37 @@ namespace Sculpting
         {
             const int pad = 2;
             origin = bounds.min - Vector3.one * (pad * cellSize);
+
+            // Snap the lattice onto whole multiples of cellSize, so sample planes land on
+            // x=0, y=0 and z=0 - which is exactly where MirrorController puts its mirror
+            // planes (they pass through the object's local origin).
+            //
+            // Anchored to bounds.min alone, the lattice straddles the mirror plane by an
+            // arbitrary fraction of a cell, and Surface Nets then places each half's vertices
+            // at different offsets within their cells. A perfectly symmetric input came back
+            // asymmetric BY CONSTRUCTION: measured on an exactly mirrored ellipsoid, 92% of
+            // output vertices moved, with a mean error of 0.32 of a cell at every resolution -
+            // constant in CELLS, which is what says the cause is the lattice and not the
+            // surface extraction. Whether a model survived a remesh was pure luck: it came out
+            // symmetric only when its X extent happened to be its largest, which makes the
+            // offset land on a whole number of cells.
+            //
+            // Downstream this is what broke symmetry repair. After a remesh the two halves no
+            // longer share a vertex layout, so SymmetryMap cannot pair them, MakeSymmetric has
+            // no correspondence to repair through, and mirrored brush strokes land on
+            // differently-tessellated surfaces and leave one side faceted.
+            //
+            // Snapping only ever moves the origin OUTWARD (Floor), so coverage is never lost;
+            // the extra cell per axis below restores the padding that shift consumes.
+            origin = new Vector3(
+                Mathf.Floor(origin.x / cellSize),
+                Mathf.Floor(origin.y / cellSize),
+                Mathf.Floor(origin.z / cellSize)) * cellSize;
+
             return new Vector3Int(
-                Mathf.CeilToInt(bounds.size.x / cellSize) + pad * 2,
-                Mathf.CeilToInt(bounds.size.y / cellSize) + pad * 2,
-                Mathf.CeilToInt(bounds.size.z / cellSize) + pad * 2);
+                Mathf.CeilToInt(bounds.size.x / cellSize) + pad * 2 + 1,
+                Mathf.CeilToInt(bounds.size.y / cellSize) + pad * 2 + 1,
+                Mathf.CeilToInt(bounds.size.z / cellSize) + pad * 2 + 1);
         }
 
         /// Stand-in distance for a sample outside the narrow band (see SampleSignedField).
