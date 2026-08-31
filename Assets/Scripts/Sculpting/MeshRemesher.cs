@@ -5,40 +5,78 @@ using UnityEngine;
 namespace Sculpting
 {
     /// Voxel-based remesher: samples a signed distance field around the input mesh on a
-    /// uniform grid, then extracts a new, evenly-tessellated surface with Surface Nets.
-    /// Unlike sculpting a fixed-topology mesh, this redistributes polygons evenly over
-    /// whatever shape resulted, instead of leaving stretched/thin triangles behind.
-    /// Resolution controls voxel count along the mesh's largest bounding-box axis - higher
-    /// gives more detail everywhere, at higher cost. Sampling is parallelized across cores,
-    /// but the call itself still blocks the calling thread until it finishes, so very high
-    /// resolutions will still cause a hitch.
+    /// uniform grid, then extracts a new, evenly-tessellated surface. Unlike sculpting a
+    /// fixed-topology mesh, this redistributes polygons evenly over whatever shape resulted,
+    /// instead of leaving stretched/thin triangles behind. Resolution controls voxel count
+    /// along the mesh's largest bounding-box axis.
+    ///
+    /// There are two extraction paths, and they exist for different inputs, not as alternatives:
+    ///
+    ///   - Remesh() goes through SparseRemesher, which has a SOURCE MESH and so can find the
+    ///     cells holding surface directly from it. Its cost and memory scale with the surface,
+    ///     which is what lets it reach several million triangles; see that class for the
+    ///     measurements behind the change.
+    ///   - BuildFromSdf() takes a grid the caller filled in itself - ZSphereSkinner's analytic
+    ///     field, MeshBoolean's combined one - where there is no source mesh to read occupancy
+    ///     from, so the grid is dense by construction and the extraction walks it.
+    ///
+    /// Both place their vertices with DualContourSolver rather than at the average of the edge
+    /// crossings, which is what stops sharp detail being rounded off (see there).
+    ///
+    /// Sampling and extraction are parallelized across cores, but the call itself blocks the
+    /// calling thread until it finishes - it feeds an interactive edit, where a finished mesh
+    /// on return is worth more than a background job.
     public static class MeshRemesher
     {
         private static readonly int[][] CubeEdges = BuildCubeEdges();
         private static readonly Vector3Int[] CubeCorners = BuildCubeCorners();
 
-        // Reused across remesh calls instead of allocating fresh each time (List.Clear() keeps
-        // capacity, so repeated remeshes at similar resolutions settle into zero growth).
-        // Safe because Remesh() is always called synchronously to completion from the main
-        // thread only - never concurrently or re-entrantly - so there's no aliasing hazard.
-        private static readonly List<Vector3> _scratchVerts = new List<Vector3>();
-        private static readonly List<int> _scratchTris = new List<int>();
+        /// Highest grid resolution the extraction will attempt. Well past what the UI offers -
+        /// this is the structural limit, and it is here so a saved scene or a script asking for
+        /// something absurd is clamped rather than trusted.
+        public const int MaxResolution = 2048;
+
+        /// Vertices, normals and indices of a remesh, before any of it becomes a Unity Mesh.
+        ///
+        /// Returned instead of a Mesh because SculptableMesh needs these arrays anyway (they
+        /// become its working buffers) and because it re-specifies the vertex buffer layout the
+        /// moment it takes ownership. Handing it a Mesh meant building one, reading it straight
+        /// back out through Mesh.vertices/.normals/.triangles - three full managed copies, over
+        /// 100 MB of them at three million triangles - and then overwriting the buffer that had
+        /// just been uploaded.
+        internal struct RemeshResult
+        {
+            public Vector3[] Vertices;
+            public Vector3[] Normals;
+            public int[] Triangles;
+            public Bounds Bounds;
+
+            public bool IsEmpty => Vertices == null || Vertices.Length == 0 || Triangles == null || Triangles.Length < 3;
+        }
+
+        // Reused across remesh calls instead of allocating fresh each time. Safe because the
+        // remesh entry points are always called synchronously to completion from the main
+        // thread only - never concurrently or re-entrantly - so there is no aliasing hazard.
+        private static readonly MeshGeometryBuffer _buffer = new MeshGeometryBuffer();
 
         public static Mesh Remesh(Vector3[] sourceVertices, int[] sourceTriangles, int resolution)
+            => BuildMesh(RemeshGeometry(sourceVertices, sourceTriangles, resolution));
+
+        /// The remesh proper. See RemeshResult for why this, and not a Mesh, is the primary form.
+        internal static RemeshResult RemeshGeometry(Vector3[] sourceVertices, int[] sourceTriangles, int resolution)
         {
-            resolution = Mathf.Clamp(resolution, 4, 512);
+            resolution = Mathf.Clamp(resolution, 4, MaxResolution);
 
             Bounds bounds = ComputeBounds(sourceVertices);
             float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
             float cellSize = maxExtent / resolution;
-
             Vector3Int dims = GridDimensions(bounds, cellSize, out Vector3 origin);
-            int sx = dims.x + 1, sy = dims.y + 1, sz = dims.z + 1;
 
-            var sdf = new float[sx * sy * sz];
-            SampleSignedField(sourceVertices, sourceTriangles, origin, cellSize, sx, sy, sz, sdf);
+            _buffer.Reset();
+            SparseRemesher.Build(sourceVertices, sourceTriangles, origin, cellSize, dims, _buffer, out _);
+            PatchHoles(_buffer);
 
-            return BuildSurface(sdf, dims, sx, sy, origin, cellSize);
+            return Finish(_buffer);
         }
 
         /// Cell dimensions (and, via `origin`, the corner sample the grid starts at) of a
@@ -56,7 +94,7 @@ namespace Sculpting
             // planes (they pass through the object's local origin).
             //
             // Anchored to bounds.min alone, the lattice straddles the mirror plane by an
-            // arbitrary fraction of a cell, and Surface Nets then places each half's vertices
+            // arbitrary fraction of a cell, and the extraction then places each half's vertices
             // at different offsets within their cells. A perfectly symmetric input came back
             // asymmetric BY CONSTRUCTION: measured on an exactly mirrored ellipsoid, 92% of
             // output vertices moved, with a mean error of 0.32 of a cell at every resolution -
@@ -89,25 +127,27 @@ namespace Sculpting
         /// fields carrying it and relies on it being a symmetric, negatable stand-in.
         internal const float FarSentinel = 1e6f;
 
+        /// Smallest distance magnitude a sampled field is allowed to carry, so that the sign of
+        /// a stored value is always readable. See SampleSignedField's use of it. Far below any
+        /// cell size the remesher works at, so it cannot move a crossing anywhere visible.
+        internal const float MinSignedMagnitude = 1e-20f;
+
         /// Fills `sdf` (layout x + sx*(y + sy*z), negative inside) with the signed distance
-        /// field of one triangle soup, sampled on a grid the CALLER chose. Split out of Remesh
-        /// so MeshBoolean can sample several meshes onto one shared grid and combine them - a
-        /// boolean is exactly this pass run per operand and then min/max'd together, and having
-        /// it in one place keeps the sign/narrow-band subtleties below from being reimplemented
-        /// slightly differently there.
+        /// field of one triangle soup, sampled on a grid the CALLER chose.
+        ///
+        /// This is the DENSE sampler, and MeshBoolean is what it is for: a boolean is this pass
+        /// run per operand and then min/max'd together, so the operands have to land on one
+        /// shared grid before anything can be extracted from the combination. Remesh does not
+        /// use it - it has a single source mesh and goes through SparseRemesher instead, which
+        /// never materialises a whole-grid array at all.
         internal static void SampleSignedField(Vector3[] verts, int[] tris, Vector3 origin, float cellSize, int sx, int sy, int sz, float[] sdf)
         {
-            // SignedDistanceField's own binning grid is a triangle-lookup accelerator for the
-            // SOURCE mesh - it has nothing to do with the OUTPUT sampling resolution, so it
-            // must not reuse `cellSize` (that was a correctness-preserving but performance-
-            // pathological shortcut). Sizing it off the output grid meant remeshing a coarse
-            // source mesh (few, large triangles) at a fine target resolution made every large
-            // triangle's bounding box span thousands of tiny bins, each insertion bloating
-            // every bin it touched and degrading every later lookup against it too - this was
-            // the actual reason high resolutions were unusably slow (28s+ at res=128 on a
-            // ~768-triangle source), not the sampling/extraction work itself. Sizing bins off
-            // the source mesh's own triangle density (~1 triangle per bin on average) keeps
-            // insertion and lookup cost roughly constant regardless of target resolution.
+            // The triangle-lookup accelerator is sized off the SOURCE mesh's own triangle
+            // density (about one triangle per bin), never off the output resolution. Sizing it
+            // off the output grid meant remeshing a coarse source mesh (few, large triangles)
+            // at a fine target resolution made every large triangle's bounding box span
+            // thousands of tiny bins, each insertion bloating every bin it touched and
+            // degrading every later lookup against it too.
             Bounds sourceBounds = ComputeBounds(verts);
             float sourceExtent = Mathf.Max(sourceBounds.size.x, sourceBounds.size.y, sourceBounds.size.z, 0.0001f);
             float triCount = Mathf.Max(1, tris.Length / 3);
@@ -118,16 +158,12 @@ namespace Sculpting
             var inside = new bool[sx * sy * sz];
             field.ComputeInsideMask(origin, cellSize, sx, sy, sz, inside);
 
-            // Narrow band: BuildSurface only ever interpolates a vertex position using an
-            // ACTIVE cell's own corners (one whose 8 corners aren't all the same inside/
-            // outside sign) - every other sample only needs its correct sign, which `inside[]`
-            // already gives for free. Without this, every one of the res^3 grid samples paid
-            // for an expensive nearest-triangle query even though only the O(res^2) samples
-            // actually near the surface are ever used for anything beyond their sign - that
-            // was the real reason very high resolutions were intractable (found by
-            // benchmarking: res=400 took 187s despite the triangle-binning fix above). This
-            // cell scan itself is O(res^3) too, but cheap (plain bool comparisons, no
-            // triangle queries), so it doesn't reintroduce the cost it's removing.
+            // Narrow band: extraction only ever interpolates a vertex position using an ACTIVE
+            // cell's own corners (one whose 8 corners aren't all the same inside/outside sign) -
+            // every other sample only needs its correct sign, which `inside[]` already gives for
+            // free. Without this, every one of the res^3 grid samples paid for an expensive
+            // nearest-triangle query even though only the O(res^2) samples actually near the
+            // surface are ever used for anything beyond their sign.
             //
             // Combining two such fields (MeshBoolean) keeps this exact rather than approximate:
             // a sample only holds a sentinel where its own mesh's sign is uniform across every
@@ -172,6 +208,14 @@ namespace Sculpting
                     {
                         Vector3 p = origin + new Vector3(x * cellSize, y * cellSize, z * cellSize);
                         float dist = field.NearestUnsignedDistance(p);
+                        // A sample lying exactly ON the surface has distance 0, and an inside
+                        // one would then store -0.0f - for which `< 0f` is FALSE, so every
+                        // later reader of this array silently disagrees with the winding mask
+                        // that produced it. That is not an exotic input: any face flush against
+                        // a sample plane (an unrotated box, a fresh primitive, anything snapped
+                        // to the grid) produces thousands of them. Floor the magnitude to a
+                        // negligible but genuinely non-zero distance so the sign always survives.
+                        if (dist < MinSignedMagnitude) dist = MinSignedMagnitude;
                         sdf[idx] = inside[idx] ? -dist : dist;
                     }
                     else
@@ -182,46 +226,45 @@ namespace Sculpting
             });
         }
 
-        /// Runs only the second half of the pipeline above - Surface Nets extraction, quad
-        /// stitching and hole patching - over a signed distance grid the caller filled in
-        /// itself, instead of one sampled from an existing mesh.
+        /// Extracts a surface from a signed distance grid the caller filled in itself, instead
+        /// of one sampled from an existing mesh.
         ///
         /// Exists for ZSphereSkinner, which has an ANALYTIC field (a smooth union of tapered
-        /// capsules) rather than a triangle soup, so everything Remesh does above this line -
-        /// SignedDistanceField's triangle bins, the winding-number inside mask, the narrow-band
-        /// pass - is not just unnecessary but inapplicable. Everything below it is exactly what
-        /// that skinner needs and would otherwise be a second, subtly-different copy of: the
-        /// even tessellation, the mostly-quad output, and PatchHoles' watertightness guarantee.
+        /// capsules) rather than a triangle soup, and for MeshBoolean, whose field is several
+        /// sampled fields folded together. Neither has a source mesh to read cell occupancy
+        /// from, so neither can use the sparse path; both want everything below that line -
+        /// even tessellation, mostly-quad output, feature-preserving vertex placement, and the
+        /// watertightness guarantee hole patching gives.
         ///
         /// `sdf` is laid out x + sx*(y + sy*z) with sx/sy/sz one MORE than the cell dims (corner
-        /// samples, not cell centres) - the same layout Remesh builds above. Negative is inside.
-        /// Main thread only, like Remesh, since both share this class's static scratch buffers.
+        /// samples, not cell centres). Negative is inside. Main thread only, like Remesh, since
+        /// both share this class's static scratch buffers.
         internal static Mesh BuildFromSdf(float[] sdf, Vector3Int dims, Vector3 origin, float cellSize)
-            => BuildSurface(sdf, dims, dims.x + 1, dims.y + 1, origin, cellSize);
+            => BuildMesh(BuildFromSdfGeometry(sdf, dims, origin, cellSize));
+
+        internal static RemeshResult BuildFromSdfGeometry(float[] sdf, Vector3Int dims, Vector3 origin, float cellSize)
+        {
+            _buffer.Reset();
+            BuildDenseSurface(sdf, dims, dims.x + 1, dims.y + 1, origin, cellSize, _buffer);
+            PatchHoles(_buffer);
+            return Finish(_buffer);
+        }
 
         private static int SampleIndex(int x, int y, int z, int sx, int sy) => x + sx * (y + sy * z);
 
-        // Reused across BuildSurface calls for the same reason as _scratchVerts/_scratchTris -
-        // avoids a fresh multi-million-element allocation on every remesh. Sized up (never
-        // down) on demand.
+        // Reused across BuildDenseSurface calls for the same reason as the geometry buffer -
+        // avoids a fresh multi-million-element allocation on every call. Sized up (never down)
+        // on demand.
         private static bool[] _scratchCellHasVertex = new bool[0];
         private static Vector3[] _scratchCellLocalPos = new Vector3[0];
+        private static Vector3[] _scratchCellNormal = new Vector3[0];
         private static int[] _scratchCellVertexIndex = new int[0];
 
         // The cells pass 1 found a crossing in, in pass 2's scan order - i.e. exactly the cells
-        // that own a Surface Nets vertex, and so the only cells EmitQuads has any reason to
-        // look at. Same reuse rationale as the buffers above.
+        // that own a vertex, and so the only cells the quad pass has any reason to look at.
         private static readonly List<int> _scratchActiveCells = new List<int>();
 
-        // PatchHoles' counting-sort buffers (see there). Same grow-on-demand reuse as the cell
-        // buffers above - these are the largest transient allocations left in the pipeline, and
-        // a remesh at maximum resolution would otherwise churn tens of megabytes per call.
-        private static int[] _scratchEdgeStart = new int[0];
-        private static int[] _scratchEdgeCursor = new int[0];
-        private static int[] _scratchEdgeOther = new int[0];
-        private static readonly List<long> _scratchBoundaryEdges = new List<long>();
-
-        private static Mesh BuildSurface(float[] sdf, Vector3Int dims, int sx, int sy, Vector3 origin, float cellSize)
+        private static void BuildDenseSurface(float[] sdf, Vector3Int dims, int sx, int sy, Vector3 origin, float cellSize, MeshGeometryBuffer output)
         {
             int nx = dims.x, ny = dims.y, nz = dims.z;
             int cellCount = nx * ny * nz;
@@ -230,22 +273,23 @@ namespace Sculpting
             {
                 _scratchCellHasVertex = new bool[cellCount];
                 _scratchCellLocalPos = new Vector3[cellCount];
+                _scratchCellNormal = new Vector3[cellCount];
                 _scratchCellVertexIndex = new int[cellCount];
             }
             bool[] cellHasVertex = _scratchCellHasVertex;
             Vector3[] cellLocalPos = _scratchCellLocalPos;
+            Vector3[] cellNormal = _scratchCellNormal;
             int[] cellVertexIndex = _scratchCellVertexIndex;
 
-            // Pass 1 (parallel): work out whether each cell is active and, if so, its local
-            // Surface Nets vertex position. Each cell only reads sdf[] and writes its own
-            // slot, so - unlike the single shared List<Vector3> this used to append straight
-            // into - this part is embarrassingly parallel across cores. This was the last
-            // remaining single-threaded O(resolution^3) pass in the whole remesh pipeline
-            // (found by benchmarking: still 45-86s at 1-2M output triangles even after the
-            // triangle-binning fix and the narrow-band SDF sampling above).
+            // Pass 1 (parallel): work out whether each cell is active and, if so, where its dual
+            // vertex goes. Each cell only reads sdf[] and writes its own slot, so this is
+            // embarrassingly parallel across cores.
             System.Threading.Tasks.Parallel.For(0, nz, z =>
             {
                 Span<float> corner = stackalloc float[8];
+                var points = new Vector3[12];
+                var normals = new Vector3[12];
+
                 for (int y = 0; y < ny; y++)
                 for (int x = 0; x < nx; x++)
                 {
@@ -259,9 +303,8 @@ namespace Sculpting
                         if (v < 0f) mask |= 1 << c;
                     }
 
-                    if (mask == 0 || mask == 255) { cellHasVertex[cellIndex] = false; continue; } // all-inside or all-outside: no crossing
+                    if (mask == 0 || mask == 255) { cellHasVertex[cellIndex] = false; continue; } // no crossing
 
-                    Vector3 sum = Vector3.zero;
                     int crossings = 0;
                     for (int e = 0; e < CubeEdges.Length; e++)
                     {
@@ -270,22 +313,31 @@ namespace Sculpting
                         if ((va < 0f) == (vb < 0f)) continue;
 
                         float t = va / (va - vb);
-                        sum += Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
+                        Vector3 p = Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
+                        points[crossings] = p;
+                        // There is no source mesh here to take a true face normal from, so the
+                        // normal comes from the gradient of the trilinear interpolant of this
+                        // cell's OWN eight corners. Staying inside the cell matters: the narrow
+                        // band only guarantees real distances at an active cell's own corners,
+                        // and a central difference would reach into neighbours that may hold
+                        // nothing but the far sentinel.
+                        normals[crossings] = TrilinearGradient(corner, p);
                         crossings++;
                     }
 
-                    cellLocalPos[cellIndex] = sum / crossings;
+                    if (crossings == 0) { cellHasVertex[cellIndex] = false; continue; }
+
+                    cellLocalPos[cellIndex] = DualContourSolver.Solve(points, normals, crossings);
+
+                    Vector3 n = Vector3.zero;
+                    for (int i = 0; i < crossings; i++) n += normals[i];
+                    cellNormal[cellIndex] = n.sqrMagnitude > 1e-12f ? n.normalized : Vector3.up;
                     cellHasVertex[cellIndex] = true;
                 }
             });
 
-            // Pass 2 (sequential, but cheap - pure array reads + list appends, no per-cell
-            // math): compacts pass 1's per-cell results into the final vertex list and
-            // cell->index map, walking cells in the same fixed order the old single-threaded
-            // loop used so output vertex ordering/indexing is unchanged.
-            var verts = _scratchVerts;
-            verts.Clear();
-
+            // Pass 2 (sequential, but cheap - pure array reads, no per-cell math): compacts
+            // pass 1's per-cell results into the final vertex list and cell->index map.
             var activeCells = _scratchActiveCells;
             activeCells.Clear();
 
@@ -297,68 +349,54 @@ namespace Sculpting
                 if (!cellHasVertex[cellIndex]) { cellVertexIndex[cellIndex] = -1; continue; }
 
                 Vector3 worldPos = origin + (new Vector3(x, y, z) + cellLocalPos[cellIndex]) * cellSize;
-                cellVertexIndex[cellIndex] = verts.Count;
-                verts.Add(worldPos);
+                cellVertexIndex[cellIndex] = output.AddVertex(worldPos, cellNormal[cellIndex]);
                 activeCells.Add(cellIndex);
             }
 
-            var tris = _scratchTris;
-            tris.Clear();
-            EmitQuads(sdf, cellVertexIndex, verts, activeCells, dims, sx, sy, tris, origin, cellSize);
+            EmitDenseQuads(sdf, cellVertexIndex, activeCells, dims, sx, sy, output);
+        }
 
-            PatchHoles(verts, tris);
-
-            var mesh = new Mesh
+        /// Gradient of the trilinear interpolant of a cell's eight corner values, at a point in
+        /// the cell's own [0,1]^3 coordinates, normalised. For a distance field this is the
+        /// surface normal; the sign convention (negative inside) makes it point outward.
+        private static Vector3 TrilinearGradient(Span<float> corner, Vector3 p)
+        {
+            float u = p.x, v = p.y, w = p.z;
+            float gx = 0f, gy = 0f, gz = 0f;
+            for (int c = 0; c < 8; c++)
             {
-                indexFormat = verts.Count > 65000
-                    ? UnityEngine.Rendering.IndexFormat.UInt32
-                    : UnityEngine.Rendering.IndexFormat.UInt16
-            };
-            mesh.SetVertices(verts);
-            mesh.SetTriangles(tris, 0);
-            mesh.RecalculateNormals();
-            mesh.RecalculateBounds();
-
-            var uvs = new Vector2[verts.Count];
-            Vector3 center = mesh.bounds.center;
-            for (int i = 0; i < verts.Count; i++)
-            {
-                Vector3 n = (verts[i] - center).normalized;
-                uvs[i] = new Vector2(
-                    0.5f + Mathf.Atan2(n.z, n.x) / (2f * Mathf.PI),
-                    0.5f - Mathf.Asin(Mathf.Clamp(n.y, -1f, 1f)) / Mathf.PI);
+                int ix = c & 1, iy = (c >> 1) & 1, iz = (c >> 2) & 1;
+                float wx = ix == 1 ? u : 1f - u;
+                float wy = iy == 1 ? v : 1f - v;
+                float wz = iz == 1 ? w : 1f - w;
+                float sx = ix == 1 ? 1f : -1f;
+                float sy = iy == 1 ? 1f : -1f;
+                float sz = iz == 1 ? 1f : -1f;
+                gx += corner[c] * sx * wy * wz;
+                gy += corner[c] * wx * sy * wz;
+                gz += corner[c] * wx * wy * sz;
             }
-            mesh.SetUVs(0, uvs);
-            mesh.RecalculateTangents();
-
-            return mesh;
+            var g = new Vector3(gx, gy, gz);
+            return g.sqrMagnitude > 1e-20f ? g.normalized : Vector3.zero;
         }
 
         // Emits the quad for every grid-lattice edge the SDF changes sign across: the four
-        // cells sharing such an edge each hold a Surface Nets vertex, and stitching those four
-        // together gives one quad (two triangles).
+        // cells sharing such an edge each hold a vertex, and stitching those four together
+        // gives one quad (two triangles).
         //
         // Driven by the list of ACTIVE cells rather than by scanning the lattice. The previous
         // version walked every edge of the whole grid once per axis - O(resolution^3) x 3 - and
         // benchmarking showed 99.4% of that was wasted: at resolution 256 it tested 45,687,370
-        // edges to find 289,750 sign flips, and those three scans cost more than the Surface
-        // Nets extraction they feed.
+        // edges to find 289,750 sign flips, and those three scans cost more than the extraction
+        // they feed.
         //
         // Skipping straight to the active cells is exact, not an approximation. A sign-flipping
         // edge is one of the twelve edges of each of the four cells around it, so all four of
         // those cells have mixed corner signs and are active by definition. Taking the cell at
-        // the maximum end of the edge in both cross-axis directions (`p2` in each block below)
-        // as that edge's single owner gives exactly one owner per edge, so walking active cells
-        // and testing each one's three owned edges reaches every quad exactly once - and reaches
-        // nothing else, which is the whole point.
-        //
-        // Triangle ORDER differs from the old axis-by-axis walk: the same triangles come out in
-        // a different sequence. Nothing downstream depends on it (a mesh's triangle list is a
-        // soup, and vertex numbering is unchanged - that still comes from pass 2's scan order).
-        // The one visible consequence is that PatchHoles walks boundary vertices in first-seen
-        // order, so on the rare non-watertight output it may pick a different - equally valid -
-        // triangulation for the same cap.
-        private static void EmitQuads(float[] sdf, int[] cellVertexIndex, List<Vector3> verts, List<int> activeCells, Vector3Int dims, int sx, int sy, List<int> tris, Vector3 origin, float cellSize)
+        // the maximum end of the edge in both cross-axis directions as that edge's single owner
+        // gives exactly one owner per edge, so walking active cells and testing each one's three
+        // owned edges reaches every quad exactly once - and reaches nothing else.
+        private static void EmitDenseQuads(float[] sdf, int[] cellVertexIndex, List<int> activeCells, Vector3Int dims, int sx, int sy, MeshGeometryBuffer output)
         {
             int nx = dims.x, ny = dims.y;
             int slice = nx * ny;
@@ -378,104 +416,49 @@ namespace Sculpting
                 // Edge along +X. Its four cells step back in Y and Z.
                 if (y >= 1 && z >= 1 && (sdf[SampleIndex(x + 1, y, z, sx, sy)] < 0f) != signA)
                 {
-                    StitchQuad(sdf, cellVertexIndex, verts, tris, signA,
-                        new Vector3Int(x, y - 1, z - 1), new Vector3Int(x, y, z - 1),
-                        new Vector3Int(x, y, z), new Vector3Int(x, y - 1, z),
-                        nx, ny, sx, sy, origin, cellSize);
+                    StitchDenseQuad(cellVertexIndex, output, signA,
+                        x, y - 1, z - 1, x, y, z - 1, x, y, z, x, y - 1, z, nx, ny);
                 }
 
                 // Edge along +Y. Its four cells step back in Z and X.
                 if (z >= 1 && x >= 1 && (sdf[SampleIndex(x, y + 1, z, sx, sy)] < 0f) != signA)
                 {
-                    StitchQuad(sdf, cellVertexIndex, verts, tris, signA,
-                        new Vector3Int(x - 1, y, z - 1), new Vector3Int(x - 1, y, z),
-                        new Vector3Int(x, y, z), new Vector3Int(x, y, z - 1),
-                        nx, ny, sx, sy, origin, cellSize);
+                    StitchDenseQuad(cellVertexIndex, output, signA,
+                        x - 1, y, z - 1, x - 1, y, z, x, y, z, x, y, z - 1, nx, ny);
                 }
 
                 // Edge along +Z. Its four cells step back in X and Y.
                 if (x >= 1 && y >= 1 && (sdf[SampleIndex(x, y, z + 1, sx, sy)] < 0f) != signA)
                 {
-                    StitchQuad(sdf, cellVertexIndex, verts, tris, signA,
-                        new Vector3Int(x - 1, y - 1, z), new Vector3Int(x, y - 1, z),
-                        new Vector3Int(x, y, z), new Vector3Int(x - 1, y, z),
-                        nx, ny, sx, sy, origin, cellSize);
+                    StitchDenseQuad(cellVertexIndex, output, signA,
+                        x - 1, y - 1, z, x, y - 1, z, x, y, z, x - 1, y, z, nx, ny);
                 }
             }
         }
 
         // Turns the four cells around one sign-flipping edge into two triangles, wound so the
         // face points out of the solid (`insideFirst` is the sign at the edge's start sample).
-        //
-        // The four cells MUST already hold Surface Nets vertices - see EmitQuads' remarks - but
-        // this still goes through GetOrCreateCellVertex rather than reading cellVertexIndex
-        // directly, keeping the pre-existing safety net for geometry where the per-cell mask
-        // check and this direct edge check disagree. Measured across wrinkled, pinched and
-        // overlapping-shell test meshes at resolutions 128 and 256, that fallback fired zero
-        // times; it costs one array read and a branch when it doesn't.
-        private static void StitchQuad(float[] sdf, int[] cellVertexIndex, List<Vector3> verts, List<int> tris, bool insideFirst, Vector3Int p0, Vector3Int p1, Vector3Int p2, Vector3Int p3, int nx, int ny, int sx, int sy, Vector3 origin, float cellSize)
+        private static void StitchDenseQuad(int[] cellVertexIndex, MeshGeometryBuffer output, bool insideFirst,
+                                            int ax, int ay, int az, int bx, int by, int bz,
+                                            int cx, int cy, int cz, int dx, int dy, int dz, int nx, int ny)
         {
-            int i0 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p0, nx, ny, sx, sy, origin, cellSize);
-            int i1 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p1, nx, ny, sx, sy, origin, cellSize);
-            int i2 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p2, nx, ny, sx, sy, origin, cellSize);
-            int i3 = GetOrCreateCellVertex(sdf, cellVertexIndex, verts, p3, nx, ny, sx, sy, origin, cellSize);
+            int i0 = cellVertexIndex[ax + nx * (ay + ny * az)];
+            int i1 = cellVertexIndex[bx + nx * (by + ny * bz)];
+            int i2 = cellVertexIndex[cx + nx * (cy + ny * cz)];
+            int i3 = cellVertexIndex[dx + nx * (dy + ny * dz)];
 
-            if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) return; // truly degenerate (out of grid bounds)
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) return; // hole patching closes whatever this leaves
 
             if (insideFirst)
             {
-                tris.Add(i0); tris.Add(i1); tris.Add(i2);
-                tris.Add(i0); tris.Add(i2); tris.Add(i3);
+                output.AddTriangle(i0, i1, i2);
+                output.AddTriangle(i0, i2, i3);
             }
             else
             {
-                tris.Add(i0); tris.Add(i2); tris.Add(i1);
-                tris.Add(i0); tris.Add(i3); tris.Add(i2);
+                output.AddTriangle(i0, i2, i1);
+                output.AddTriangle(i0, i3, i2);
             }
-        }
-
-        // See EmitQuads' fallback remarks above - lazily computes (and caches in
-        // cellVertexIndex, so a second lookup for the same cell from a different axis/edge is
-        // free) a Surface Nets vertex for a cell, mirroring BuildSurface's pass-1 math exactly.
-        // Returns -1 only if this cell's 8 corners turn out to be genuinely uniform (all-inside
-        // or all-outside) despite the caller having just observed a sign flip on one of this
-        // cell's edges - defensive; a plain skip is safer than fabricating a wrong position for
-        // a case that (per EmitQuads' remarks) shouldn't occur.
-        private static int GetOrCreateCellVertex(float[] sdf, int[] cellVertexIndex, List<Vector3> verts, Vector3Int cell, int nx, int ny, int sx, int sy, Vector3 origin, float cellSize)
-        {
-            int cellIndex = cell.x + nx * (cell.y + ny * cell.z);
-            int existing = cellVertexIndex[cellIndex];
-            if (existing >= 0) return existing;
-
-            Span<float> corner = stackalloc float[8];
-            int mask = 0;
-            for (int c = 0; c < 8; c++)
-            {
-                Vector3Int co = CubeCorners[c];
-                float val = sdf[SampleIndex(cell.x + co.x, cell.y + co.y, cell.z + co.z, sx, sy)];
-                corner[c] = val;
-                if (val < 0f) mask |= 1 << c;
-            }
-            if (mask == 0 || mask == 255) return -1;
-
-            Vector3 sum = Vector3.zero;
-            int crossings = 0;
-            for (int e = 0; e < CubeEdges.Length; e++)
-            {
-                int a = CubeEdges[e][0], b = CubeEdges[e][1];
-                float va = corner[a], vb = corner[b];
-                if ((va < 0f) == (vb < 0f)) continue;
-                float t = va / (va - vb);
-                sum += Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
-                crossings++;
-            }
-
-            Vector3 localPos = sum / crossings;
-            Vector3 worldPos = origin + (new Vector3(cell.x, cell.y, cell.z) + localPos) * cellSize;
-            int newIndex = verts.Count;
-            verts.Add(worldPos);
-            cellVertexIndex[cellIndex] = newIndex;
-            return newIndex;
         }
 
         // Packs a pair of vertex indices into one key. PatchHoles uses only the UNDIRECTED
@@ -484,37 +467,42 @@ namespace Sculpting
         private static long EdgeKey(int a, int b) => ((long)a << 32) | (uint)b;
         private static long UndirectedEdgeKey(int a, int b) => a < b ? EdgeKey(a, b) : EdgeKey(b, a);
 
-        /// Finds every boundary edge Surface Nets left open - used by exactly one triangle,
+        // PatchHoles' counting-sort buffers (see there). Same grow-on-demand reuse as the cell
+        // buffers above - these are the largest transient allocations left in the pipeline, and
+        // a remesh at maximum resolution would otherwise churn tens of megabytes per call.
+        private static int[] _scratchEdgeStart = new int[0];
+        private static int[] _scratchEdgeCursor = new int[0];
+        private static int[] _scratchEdgeOther = new int[0];
+        private static readonly List<long> _scratchBoundaryEdges = new List<long>();
+
+        /// Finds every boundary edge the extraction left open - used by exactly one triangle,
         /// with no matching triangle on the other side - walks each into a closed loop, and
         /// caps it with a fan of triangles from a new centroid vertex. This is what makes the
         /// output watertight the way DynaMesh/Blender's Voxel Remesh guarantee, rather than
-        /// leaving a permanent hole: naive Surface Nets places exactly one vertex per active
-        /// grid cell, so a genuinely concave pinch where two close/near-touching sculpted
-        /// features pass through the SAME cell as two distinct surface sheets can't be
-        /// represented there - EmitQuads already has a fallback for a related edge case
-        /// (GetOrCreateCellVertex), but the underlying one-vertex-per-cell ambiguity itself
-        /// isn't fixable at the per-cell level; patching the resulting hole afterward is. A
-        /// missing face has no vertex-position fix, which is why this couldn't be solved by
-        /// smoothing/sculpting after the fact before this pass existed - see
-        /// [[project_scene_graph_epic]] memory for the original investigation.
+        /// leaving a permanent hole: one vertex per active grid cell means a genuinely concave
+        /// pinch where two close sculpted features pass through the SAME cell as two distinct
+        /// surface sheets can't be represented there. That one-vertex-per-cell ambiguity isn't
+        /// fixable at the per-cell level; patching the resulting hole afterward is. A missing
+        /// face has no vertex-position fix, which is why this couldn't be solved by
+        /// smoothing/sculpting after the fact before this pass existed.
         ///
         /// No-ops (after one cheap O(triangle count) scan) on the overwhelmingly common
         /// watertight case - this only does real work on the rare geometry that actually needs
-        /// it, and even then only touches the small boundary loops themselves, not the mesh at
-        /// large.
-        private static void PatchHoles(List<Vector3> verts, List<int> tris)
+        /// it, and even then only touches the small boundary loops themselves.
+        private static void PatchHoles(MeshGeometryBuffer buffer)
         {
-            int triCount = tris.Count / 3;
+            int triCount = buffer.TriangleCount;
             if (triCount == 0) return;
+            int[] tris = buffer.Indices;
 
             // Finding the boundary edges is the only part of this method that costs anything on
             // the normal, watertight output - the patching below almost never runs at all. So it
             // is done with a counting sort into flat arrays rather than a hash map: every
             // undirected edge is bucketed by its LOWER vertex index, which leaves each vertex's
-            // handful of edges (a Surface Nets vertex has ~4-6 neighbours) in one short
-            // contiguous run that can be scanned directly. No hashing and no per-entry objects,
-            // and the common "nothing to patch" answer comes back without building a map at all.
-            int vertCount = verts.Count;
+            // handful of edges (a dual vertex has ~4-6 neighbours) in one short contiguous run
+            // that can be scanned directly. No hashing and no per-entry objects, and the common
+            // "nothing to patch" answer comes back without building a map at all.
+            int vertCount = buffer.VertexCount;
             int edgeSlots = triCount * 3;
             if (_scratchEdgeStart.Length < vertCount + 2) _scratchEdgeStart = new int[vertCount + 2];
             if (_scratchEdgeCursor.Length < vertCount + 2) _scratchEdgeCursor = new int[vertCount + 2];
@@ -616,10 +604,15 @@ namespace Sculpting
                 if (!closed || loop.Count < 3) continue;
 
                 Vector3 centroid = Vector3.zero;
-                for (int i = 0; i < loop.Count; i++) centroid += verts[loop[i]];
+                Vector3 normal = Vector3.zero;
+                for (int i = 0; i < loop.Count; i++)
+                {
+                    centroid += buffer.Vertices[loop[i]];
+                    normal += buffer.Normals[loop[i]];
+                }
                 centroid /= loop.Count;
-                int centroidIndex = verts.Count;
-                verts.Add(centroid);
+                int centroidIndex = buffer.AddVertex(centroid,
+                    normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up);
 
                 for (int i = 0; i < loop.Count; i++)
                 {
@@ -629,7 +622,7 @@ namespace Sculpting
                     // directions - since the boundary edge itself is a->b, the cap triangle
                     // filling the gap on the other side must list it b->a to keep the new
                     // face's normal pointing the same way as the surrounding surface.
-                    tris.Add(b); tris.Add(a); tris.Add(centroidIndex);
+                    buffer.AddTriangle(b, a, centroidIndex);
                 }
             }
         }
@@ -650,6 +643,62 @@ namespace Sculpting
             // can't represent. Mark it unpatchable (-1) rather than silently picking one branch.
             if (boundaryNext.ContainsKey(a)) boundaryNext[a] = -1;
             else boundaryNext[a] = b;
+        }
+
+        /// Trims the shared buffer down to arrays the caller owns, and computes the bounds
+        /// while the vertices are still hot in cache (Mesh.RecalculateBounds would walk them
+        /// again from managed memory).
+        private static RemeshResult Finish(MeshGeometryBuffer buffer)
+        {
+            var result = new RemeshResult
+            {
+                Vertices = buffer.CopyVertices(),
+                Normals = buffer.CopyNormals(),
+                Triangles = buffer.CopyIndices()
+            };
+
+            if (result.Vertices.Length > 0)
+            {
+                Vector3 min = result.Vertices[0], max = result.Vertices[0];
+                for (int i = 1; i < result.Vertices.Length; i++)
+                {
+                    min = Vector3.Min(min, result.Vertices[i]);
+                    max = Vector3.Max(max, result.Vertices[i]);
+                }
+                var b = new Bounds();
+                b.SetMinMax(min, max);
+                result.Bounds = b;
+            }
+
+            // The copies above are the caller's now, so anything the shared buffer is still
+            // holding beyond what the next remesh is likely to need is dead weight.
+            buffer.TrimExcess();
+            return result;
+        }
+
+        /// Wraps a result up as a Mesh, for callers that want one directly.
+        ///
+        /// Deliberately does NOT generate UVs or tangents, and does not call
+        /// RecalculateNormals. The normals are already exact - they come from the source
+        /// surface itself rather than from re-averaging the discretized triangles - and the
+        /// other two were pure waste: SculptableMesh re-specifies the vertex buffer as
+        /// position/normal/colour the moment it takes the mesh, and SculptPBR's vertex input
+        /// has no TEXCOORD0 or TANGENT, so a spherical UV projection (an Atan2 and an Asin per
+        /// vertex, single-threaded) and a full tangent solve were both computed and then
+        /// immediately discarded, on every remesh, at millions of vertices.
+        internal static Mesh BuildMesh(RemeshResult result)
+        {
+            var mesh = new Mesh
+            {
+                indexFormat = result.Vertices.Length > 65000
+                    ? UnityEngine.Rendering.IndexFormat.UInt32
+                    : UnityEngine.Rendering.IndexFormat.UInt16
+            };
+            mesh.SetVertices(result.Vertices);
+            mesh.SetNormals(result.Normals);
+            mesh.SetTriangles(result.Triangles, 0);
+            mesh.bounds = result.Bounds;
+            return mesh;
         }
 
         internal static Bounds ComputeBounds(Vector3[] verts)

@@ -63,7 +63,7 @@ namespace Sculpting
             go.transform.position = newPosition;
             go.GetComponent<MeshFilter>().sharedMesh = mesh;
 
-            SculptableMesh mirrored = go.AddComponent<SculptableMesh>();
+            SculptableMesh mirrored = SculptableMesh.AddOwning(go, mesh);
             go.AddComponent<MirrorController>();
 
             SculptMaterialController materialController = Object.FindFirstObjectByType<SculptMaterialController>();

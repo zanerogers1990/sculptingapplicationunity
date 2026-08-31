@@ -389,6 +389,9 @@ namespace Sculpting.IO
         /// Turns a bare Mesh into a fully live, sculptable scene object. Public because model
         /// import (see ImportAny) needs the identical construction sequence, and getting that
         /// sequence wrong fails in a confusing way rather than an obvious one.
+        ///
+        /// TAKES OWNERSHIP of `mesh` and destroys it once the object has copied it (see
+        /// SculptableMesh.AddOwning) - pass a mesh built for this call, not one you keep using.
         public static SculptableMesh CreateSculptable(Mesh mesh, string name, Vector3 position, Quaternion rotation, Vector3 scale)
         {
             var go = new GameObject(name);
@@ -402,7 +405,7 @@ namespace Sculpting.IO
             go.AddComponent<MeshFilter>().sharedMesh = mesh;
             go.AddComponent<MeshRenderer>();
 
-            var sculptable = go.AddComponent<SculptableMesh>();
+            var sculptable = SculptableMesh.AddOwning(go, mesh);
             go.AddComponent<MirrorController>();
 
             UnityEngine.Object.FindFirstObjectByType<SculptMaterialController>()

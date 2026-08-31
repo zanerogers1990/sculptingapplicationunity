@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Threading;
 using UnityEngine;
 
 namespace Sculpting
@@ -9,6 +8,21 @@ namespace Sculpting
     /// MeshRemesher to sample its voxel grid. Distance magnitude comes from the nearest
     /// triangle; sign comes from a winding-number ray cast, which (unlike a nearest-face-normal
     /// heuristic) stays correct across concave folds and overhangs that sculpting produces.
+    ///
+    /// Two independent acceleration structures, because the two queries have different shapes:
+    ///
+    ///   - A 3D bin grid for nearest-triangle distance, which is a genuinely spatial search.
+    ///   - A 2D bin grid over (y,z) for the sign rays, which are all parallel to +X. Binning
+    ///     those in 3D was making every column walk the whole x extent of the 3D grid and
+    ///     de-duplicate the triangles it met with a HashSet; projected to 2D, a column maps to
+    ///     exactly ONE bin holding exactly the triangles that can possibly be on its ray, so
+    ///     the walk and the de-duplication both disappear.
+    ///
+    /// Both grids are stored CSR-style (a start offset per bin into one flat item array) rather
+    /// than as an array of Lists. On a dense source mesh the List-per-bin form allocated one
+    /// object per occupied bin - hundreds of thousands of them for a sculpted mesh - and spread
+    /// the triangle indices across the heap; the flat form allocates twice, total, and keeps
+    /// each bin's indices contiguous.
     internal class SignedDistanceField
     {
         private readonly Vector3[] _vertices;
@@ -16,7 +30,16 @@ namespace Sculpting
         private readonly Bounds _bounds;
         private readonly float _cellSize;
         private readonly Vector3Int _binDims;
-        private readonly List<int>[] _bins;
+
+        // 3D bins, CSR: triangles of bin i are _binItems[_binStart[i] .. _binStart[i+1]).
+        private readonly int[] _binStart;
+        private readonly int[] _binItems;
+
+        // 2D bins over (y,z) for the +X sign rays, same CSR layout.
+        private readonly float _colCellSize;
+        private readonly int _colDimY, _colDimZ;
+        private readonly int[] _colStart;
+        private readonly int[] _colItems;
 
         public SignedDistanceField(Vector3[] verts, int[] tris, float cellSize)
         {
@@ -42,26 +65,110 @@ namespace Sculpting
                 Mathf.Max(1, Mathf.CeilToInt(_bounds.size.y / _cellSize)),
                 Mathf.Max(1, Mathf.CeilToInt(_bounds.size.z / _cellSize)));
 
-            _bins = new List<int>[_binDims.x * _binDims.y * _binDims.z];
+            BuildBins3D(triCount, out _binStart, out _binItems);
 
+            // The 2D grid is sized off the source mesh's own triangle density, deliberately
+            // COARSER than the 3D one (a bin gathers triangles from the front and the back of
+            // the shell, so equal spacing would leave it far denser). A column reads a single
+            // bin, so what this trades is a slightly longer per-column triangle list against a
+            // much smaller build - and the column count scales with the OUTPUT resolution
+            // while this build scales with the input, so keeping the build cheap is the right
+            // side to err on.
+            float area = Mathf.Max(_bounds.size.y * _bounds.size.z, 1e-8f);
+            _colCellSize = Mathf.Max(Mathf.Sqrt(area / Mathf.Max(1, triCount)) * 2f, 1e-6f);
+            _colDimY = Mathf.Max(1, Mathf.CeilToInt(_bounds.size.y / _colCellSize));
+            _colDimZ = Mathf.Max(1, Mathf.CeilToInt(_bounds.size.z / _colCellSize));
+            BuildBins2D(triCount, out _colStart, out _colItems);
+        }
+
+        private void BuildBins3D(int triCount, out int[] start, out int[] items)
+        {
+            int binCount = _binDims.x * _binDims.y * _binDims.z;
+            start = new int[binCount + 1];
+
+            // Counting sort: one pass to size every bin, a prefix sum, then one pass to fill.
             for (int t = 0; t < triCount; t++)
             {
-                Vector3 a = verts[tris[t * 3]];
-                Vector3 b = verts[tris[t * 3 + 1]];
-                Vector3 c = verts[tris[t * 3 + 2]];
-                Vector3Int bmin = CellOf(Vector3.Min(a, Vector3.Min(b, c)));
-                Vector3Int bmax = CellOf(Vector3.Max(a, Vector3.Max(b, c)));
-
+                TriangleBinRange(t, out Vector3Int bmin, out Vector3Int bmax);
                 for (int z = bmin.z; z <= bmax.z; z++)
                 for (int y = bmin.y; y <= bmax.y; y++)
                 for (int x = bmin.x; x <= bmax.x; x++)
-                {
-                    int idx = BinIndex(x, y, z);
-                    if (_bins[idx] == null) _bins[idx] = new List<int>();
-                    _bins[idx].Add(t);
-                }
+                    start[BinIndex(x, y, z)]++;
+            }
+
+            int running = 0;
+            for (int i = 0; i <= binCount; i++)
+            {
+                int c = i < binCount ? start[i] : 0;
+                start[i] = running;
+                running += c;
+            }
+
+            items = new int[running];
+            var cursor = (int[])start.Clone();
+            for (int t = 0; t < triCount; t++)
+            {
+                TriangleBinRange(t, out Vector3Int bmin, out Vector3Int bmax);
+                for (int z = bmin.z; z <= bmax.z; z++)
+                for (int y = bmin.y; y <= bmax.y; y++)
+                for (int x = bmin.x; x <= bmax.x; x++)
+                    items[cursor[BinIndex(x, y, z)]++] = t;
             }
         }
+
+        private void TriangleBinRange(int t, out Vector3Int bmin, out Vector3Int bmax)
+        {
+            Vector3 a = _vertices[_triangles[t * 3]];
+            Vector3 b = _vertices[_triangles[t * 3 + 1]];
+            Vector3 c = _vertices[_triangles[t * 3 + 2]];
+            bmin = CellOf(Vector3.Min(a, Vector3.Min(b, c)));
+            bmax = CellOf(Vector3.Max(a, Vector3.Max(b, c)));
+        }
+
+        private void BuildBins2D(int triCount, out int[] start, out int[] items)
+        {
+            int binCount = _colDimY * _colDimZ;
+            start = new int[binCount + 1];
+
+            for (int t = 0; t < triCount; t++)
+            {
+                ColumnBinRange(t, out int y0, out int y1, out int z0, out int z1);
+                for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    start[y + _colDimY * z]++;
+            }
+
+            int running = 0;
+            for (int i = 0; i <= binCount; i++)
+            {
+                int c = i < binCount ? start[i] : 0;
+                start[i] = running;
+                running += c;
+            }
+
+            items = new int[running];
+            var cursor = (int[])start.Clone();
+            for (int t = 0; t < triCount; t++)
+            {
+                ColumnBinRange(t, out int y0, out int y1, out int z0, out int z1);
+                for (int z = z0; z <= z1; z++)
+                for (int y = y0; y <= y1; y++)
+                    items[cursor[y + _colDimY * z]++] = t;
+            }
+        }
+
+        private void ColumnBinRange(int t, out int y0, out int y1, out int z0, out int z1)
+        {
+            Vector3 a = _vertices[_triangles[t * 3]];
+            Vector3 b = _vertices[_triangles[t * 3 + 1]];
+            Vector3 c = _vertices[_triangles[t * 3 + 2]];
+            y0 = ColumnCell(Mathf.Min(a.y, b.y, c.y) - _bounds.min.y, _colDimY);
+            y1 = ColumnCell(Mathf.Max(a.y, b.y, c.y) - _bounds.min.y, _colDimY);
+            z0 = ColumnCell(Mathf.Min(a.z, b.z, c.z) - _bounds.min.z, _colDimZ);
+            z1 = ColumnCell(Mathf.Max(a.z, b.z, c.z) - _bounds.min.z, _colDimZ);
+        }
+
+        private int ColumnCell(float local, int dim) => Mathf.Clamp(Mathf.FloorToInt(local / _colCellSize), 0, dim - 1);
 
         private Vector3Int CellOf(Vector3 p)
         {
@@ -74,19 +181,13 @@ namespace Sculpting
 
         private int BinIndex(int x, int y, int z) => x + _binDims.x * (y + _binDims.y * z);
 
-        // ComputeColumn runs once per (y,z) column, concurrently across Parallel.For
-        // iterations in ComputeInsideMask - a resolution^2-scaling number of calls per remesh.
-        // Thread-local + Clear() instead of a fresh HashSet/List per call avoids that many
-        // allocations while staying safe under concurrent access (a single shared buffer
-        // would not be).
-        private static readonly ThreadLocal<HashSet<int>> _testedPool = new ThreadLocal<HashSet<int>>(() => new HashSet<int>());
-        private static readonly ThreadLocal<List<Crossing>> _crossingsPool = new ThreadLocal<List<Crossing>>(() => new List<Crossing>());
+        /// Where the mesh's own geometry starts along -X. A sign ray has to begin at or before
+        /// this to count every crossing in front of it (see ColumnCrossings).
+        public float MinX => _bounds.min.x;
 
         /// One ray/surface crossing along a column's +X ray: where it happened, and whether the
-        /// ray was entering (+1) or leaving (-1) the surface there. Implements IComparable so
-        /// List.Sort() orders by X through the default comparer - no Comparison delegate, since
-        /// this sorts once per (y,z) column and that is a resolution^2-scaling call count.
-        private readonly struct Crossing : IComparable<Crossing>
+        /// ray was entering (+1) or leaving (-1) the surface there.
+        public readonly struct Crossing : IComparable<Crossing>
         {
             public readonly float X;
             public readonly int Winding;
@@ -94,48 +195,88 @@ namespace Sculpting
             public int CompareTo(Crossing other) => X.CompareTo(other.X);
         }
 
-        public float NearestUnsignedDistance(Vector3 p)
+        public float NearestUnsignedDistance(Vector3 p) => NearestUnsignedDistance(p, out _);
+
+        /// Distance to the nearest point of the triangle soup, and the index of the triangle
+        /// that point lies on.
+        ///
+        /// The triangle index is what lets the remesher put a real surface NORMAL on every
+        /// edge crossing, which is what its feature-preserving vertex placement needs
+        /// (DualContourSolver). It falls straight out of the search that was already running,
+        /// so it costs one register - the alternative, re-querying the mesh per crossing, would
+        /// have roughly tripled the distance work.
+        public float NearestUnsignedDistance(Vector3 p, out int triangle)
         {
             Vector3Int center = CellOf(p);
             int maxRadius = Mathf.Max(_binDims.x, _binDims.y, _binDims.z);
 
             float bestSqrDist = float.MaxValue;
+            int best = -1;
             int foundAtRadius = -1;
 
             for (int radius = 0; radius <= maxRadius; radius++)
             {
-                ForEachCellInShell(center, radius, _binDims, (x, y, z) =>
+                int x0 = center.x - radius, x1 = center.x + radius;
+                int y0 = center.y - radius, y1 = center.y + radius;
+                int z0 = center.z - radius, z1 = center.z + radius;
+
+                for (int z = z0; z <= z1; z++)
                 {
-                    var list = _bins[BinIndex(x, y, z)];
-                    if (list == null) return;
-
-                    // Reject the whole bin when even its NEAREST point is farther than a
-                    // triangle already found. Exact - it can only skip triangles that could
-                    // not have won anyway - but it removes most of the work in the outer
-                    // shells, which the loop below still has to visit because the shell walk
-                    // cannot know in advance which of them hold the true nearest triangle.
-                    // One AABB test replaces a full pass over that bin's triangle list.
-                    if (bestSqrDist < float.MaxValue && SqrDistanceToBin(p, x, y, z) >= bestSqrDist) return;
-
-                    for (int k = 0; k < list.Count; k++)
+                    if (z < 0 || z >= _binDims.z) continue;
+                    for (int y = y0; y <= y1; y++)
                     {
-                        int t = list[k];
-                        Vector3 a = _vertices[_triangles[t * 3]];
-                        Vector3 b = _vertices[_triangles[t * 3 + 1]];
-                        Vector3 c = _vertices[_triangles[t * 3 + 2]];
-                        Vector3 closest = ClosestPointOnTriangle(p, a, b, c);
-                        float sqr = (closest - p).sqrMagnitude;
-                        if (sqr < bestSqrDist) bestSqrDist = sqr;
-                    }
-                });
+                        if (y < 0 || y >= _binDims.y) continue;
+                        for (int x = x0; x <= x1; x++)
+                        {
+                            if (x < 0 || x >= _binDims.x) continue;
+                            bool onShell = x == x0 || x == x1 || y == y0 || y == y1 || z == z0 || z == z1;
+                            if (radius > 0 && !onShell) continue;
 
-                if (bestSqrDist < float.MaxValue && foundAtRadius < 0) foundAtRadius = radius;
+                            int bin = BinIndex(x, y, z);
+                            int from = _binStart[bin], to = _binStart[bin + 1];
+                            if (from == to) continue;
+
+                            // Reject the whole bin when even its NEAREST point is farther than
+                            // a triangle already found. Exact - it can only skip triangles that
+                            // could not have won anyway - but it removes most of the work in
+                            // the outer shells, which the walk still has to visit because it
+                            // cannot know in advance which of them holds the true nearest
+                            // triangle. One AABB test replaces a full pass over that bin.
+                            if (best >= 0 && SqrDistanceToBin(p, x, y, z) >= bestSqrDist) continue;
+
+                            for (int k = from; k < to; k++)
+                            {
+                                int t = _binItems[k];
+                                Vector3 a = _vertices[_triangles[t * 3]];
+                                Vector3 b = _vertices[_triangles[t * 3 + 1]];
+                                Vector3 c = _vertices[_triangles[t * 3 + 2]];
+                                Vector3 closest = ClosestPointOnTriangle(p, a, b, c);
+                                float sqr = (closest - p).sqrMagnitude;
+                                if (sqr < bestSqrDist) { bestSqrDist = sqr; best = t; }
+                            }
+                        }
+                    }
+                }
+
+                if (best >= 0 && foundAtRadius < 0) foundAtRadius = radius;
                 // Keep searching a couple of shells past the first hit - the true nearest
                 // triangle can sit in a farther bin than the one containing its closest point.
                 if (foundAtRadius >= 0 && radius >= foundAtRadius + 2) break;
             }
 
-            return bestSqrDist < float.MaxValue ? Mathf.Sqrt(bestSqrDist) : float.MaxValue;
+            triangle = best;
+            return best >= 0 ? Mathf.Sqrt(bestSqrDist) : float.MaxValue;
+        }
+
+        /// Outward geometric normal of triangle `t`, matching the winding Unity's own
+        /// RecalculateNormals assumes. Not normalised by area - callers normalise once after
+        /// combining several.
+        public Vector3 TriangleNormal(int t)
+        {
+            Vector3 a = _vertices[_triangles[t * 3]];
+            Vector3 b = _vertices[_triangles[t * 3 + 1]];
+            Vector3 c = _vertices[_triangles[t * 3 + 2]];
+            return Vector3.Cross(b - a, c - a).normalized;
         }
 
         /// Squared distance from `p` to the axis-aligned box of bin (x,y,z) - zero when p is
@@ -153,104 +294,106 @@ namespace Sculpting
             return dx * dx + dy * dy + dz * dz;
         }
 
-        // Fills insideOut (flattened x + sx*(y + sy*z), matching MeshRemesher's sdf layout)
-        // with the inside/outside sign for every sample on the grid. Casts one +X ray per
-        // (y,z) column instead of one per sample point: the crossings along that column are
-        // shared by every sample on it, so a single sorted sweep gives every sample's winding
-        // in one pass instead of a full column walk per sample. Columns are independent, so
-        // they run in parallel across cores.
+        /// Every crossing the +X ray through (wy, wz) starting at `rayStartX` makes with the
+        /// surface, sorted by X, appended into `into` (which is cleared first).
+        ///
+        /// Caller-owned buffer and no instance state touched, so this is safe to call
+        /// concurrently from as many worker threads as there are.
+        ///
+        /// The ray must START at or before the mesh's own -X bound (see MinX): a ray beginning
+        /// INSIDE the solid counts none of the crossings behind it and inverts the whole
+        /// column's inside/outside. That is not hypothetical - a boolean cutter can extend past
+        /// the target's grid, and the sparse remesher starts columns at brick boundaries.
+        public void ColumnCrossings(float wy, float wz, float rayStartX, List<Crossing> into)
+        {
+            into.Clear();
+
+            int cy = ColumnCell(wy - _bounds.min.y, _colDimY);
+            int cz = ColumnCell(wz - _bounds.min.z, _colDimZ);
+            if (wy < _bounds.min.y || wy > _bounds.max.y || wz < _bounds.min.z || wz > _bounds.max.z) return;
+
+            int bin = cy + _colDimY * cz;
+            int from = _colStart[bin], to = _colStart[bin + 1];
+            if (from == to) return;
+
+            var rayOrigin = new Vector3(rayStartX, wy, wz);
+            for (int k = from; k < to; k++)
+            {
+                int t = _colItems[k];
+                Vector3 a = _vertices[_triangles[t * 3]];
+                Vector3 b = _vertices[_triangles[t * 3 + 1]];
+                Vector3 c = _vertices[_triangles[t * 3 + 2]];
+                if (RayIntersectsTriangleX(rayOrigin, a, b, c, out float hitX, out int winding))
+                    into.Add(new Crossing(hitX, winding));
+            }
+
+            into.Sort();
+        }
+
+        // ComputeColumn runs once per (y,z) column, concurrently across Parallel.For
+        // iterations in ComputeInsideMask. Thread-local + Clear() instead of a fresh List per
+        // call avoids that many allocations while staying safe under concurrent access.
+        private static readonly System.Threading.ThreadLocal<List<Crossing>> _crossingsPool =
+            new System.Threading.ThreadLocal<List<Crossing>>(() => new List<Crossing>());
+
+        /// Fills insideOut (flattened x + sx*(y + sy*z), matching MeshRemesher's dense sdf
+        /// layout) with the inside/outside sign for every sample on the grid. One +X ray per
+        /// (y,z) column instead of one per sample point: the crossings along a column are
+        /// shared by every sample on it, so a single sorted sweep gives every sample's winding
+        /// in one pass. Columns are independent, so they run in parallel across cores.
+        ///
+        /// Used by the DENSE path (MeshBoolean, and BuildFromSdf's callers). The sparse
+        /// remesher does not call this - it queries ColumnCrossings per brick instead, which
+        /// is what lets it avoid ever materialising a whole-grid array.
         public void ComputeInsideMask(Vector3 origin, float cellSize, int sx, int sy, int sz, bool[] insideOut)
         {
             System.Threading.Tasks.Parallel.For(0, sy * sz, columnIndex =>
             {
                 int y = columnIndex % sy;
                 int z = columnIndex / sy;
-                ComputeColumn(origin, cellSize, sx, sy, y, z, insideOut);
+
+                // Nudge off the sample line so an exactly grid-aligned mesh (e.g. a fresh
+                // primitive) doesn't graze triangle edges/vertices along the whole column.
+                float wy = origin.y + y * cellSize + cellSize * 0.0173f;
+                float wz = origin.z + z * cellSize + cellSize * 0.0091f;
+
+                var crossings = _crossingsPool.Value;
+                ColumnCrossings(wy, wz, Mathf.Min(origin.x, MinX), crossings);
+
+                // Accumulates a WINDING NUMBER rather than flipping an even-odd parity bit.
+                // Parity is only correct for a single closed manifold: MeshJoiner concatenates
+                // two (or more) closed shells without welding them (by design - it's Merge
+                // Down, not a boolean), so a ray through the region where those shells OVERLAP
+                // crosses four surfaces and parity reports "outside" there. That carved a
+                // hollow out of exactly the intersection volume. Parity computes the shells'
+                // XOR; summing signed crossings computes their union. Same fix also covers a
+                // SINGLE mesh sculpted until it self-intersects, which parity broke identically.
+                //
+                // Tested against `!= 0` rather than `> 0` deliberately: a shell whose winding
+                // runs opposite the rest (a mirrored/negatively-scaled object baked in by Join)
+                // still reads as solid instead of vanishing.
+                int ci = 0;
+                int windingNumber = 0;
+                for (int x = 0; x < sx; x++)
+                {
+                    float wx = origin.x + x * cellSize;
+                    while (ci < crossings.Count && crossings[ci].X < wx)
+                    {
+                        windingNumber += crossings[ci].Winding;
+                        ci++;
+                    }
+                    insideOut[x + sx * (y + sy * z)] = windingNumber != 0;
+                }
             });
         }
 
-        private void ComputeColumn(Vector3 origin, float cellSize, int sx, int sy, int y, int z, bool[] insideOut)
-        {
-            // Nudge off the sample line so an exactly grid-aligned mesh (e.g. a fresh
-            // primitive) doesn't graze triangle edges/vertices along the whole column.
-            float wy = origin.y + y * cellSize + cellSize * 0.0173f;
-            float wz = origin.z + z * cellSize + cellSize * 0.0091f;
-            // Starts the ray at whichever is further out: the sample grid's own -X edge, or
-            // this mesh's -X bound. They are the same thing when the grid was built around this
-            // mesh (Remesh), but NOT when a caller samples one mesh on another's grid - a
-            // boolean cutter can extend past the target's bounds (MeshBoolean), and a ray that
-            // starts INSIDE the cutter counts none of the crossings behind it, inverting the
-            // whole column's inside/outside. The sample loop below already consumes every
-            // crossing before the first sample's x, so the extra span costs nothing but the
-            // crossings it correctly picks up.
-            Vector3 rayOrigin = new Vector3(Mathf.Min(origin.x, _bounds.min.x), wy, wz);
-
-            Vector3Int cell = CellOf(rayOrigin);
-            var tested = _testedPool.Value;
-            tested.Clear();
-            var crossings = _crossingsPool.Value;
-            crossings.Clear();
-
-            for (int bx = 0; bx < _binDims.x; bx++)
-            for (int dz = -1; dz <= 1; dz++)
-            for (int dy = -1; dy <= 1; dy++)
-            {
-                int by = cell.y + dy, bz = cell.z + dz;
-                if (by < 0 || by >= _binDims.y || bz < 0 || bz >= _binDims.z) continue;
-
-                var list = _bins[BinIndex(bx, by, bz)];
-                if (list == null) continue;
-                for (int k = 0; k < list.Count; k++)
-                {
-                    int t = list[k];
-                    if (!tested.Add(t)) continue;
-
-                    Vector3 a = _vertices[_triangles[t * 3]];
-                    Vector3 b = _vertices[_triangles[t * 3 + 1]];
-                    Vector3 c = _vertices[_triangles[t * 3 + 2]];
-                    if (RayIntersectsTriangleX(rayOrigin, a, b, c, out float hitX, out int winding))
-                        crossings.Add(new Crossing(hitX, winding));
-                }
-            }
-
-            crossings.Sort();
-
-            // Accumulates a WINDING NUMBER rather than flipping an even-odd parity bit.
-            // Parity is only correct for a single closed manifold: MeshJoiner concatenates two
-            // (or more) closed shells without welding them (by design - it's Merge Down, not a
-            // boolean), so a ray through the region where those shells OVERLAP crosses four
-            // surfaces and parity reports "outside" there. That carved a hollow out of exactly
-            // the intersection volume - the visible breakage when remeshing joined objects.
-            // Parity computes the shells' XOR; summing signed crossings computes their union.
-            // Same fix also covers a SINGLE mesh sculpted until it self-intersects (a fold
-            // pushed through its own surface), which parity broke identically.
-            //
-            // Tested against `!= 0` rather than `> 0` deliberately: a shell whose winding runs
-            // opposite the rest (a mirrored/negatively-scaled object baked in by Join, say)
-            // still reads as solid instead of vanishing. The tradeoff is that inverted winding
-            // can't be used to express a boolean SUBTRACTION - if boolean ops land later, that
-            // wants its own explicit per-shell sign, not an accident of triangle order here.
-            int ci = 0;
-            int windingNumber = 0;
-            for (int x = 0; x < sx; x++)
-            {
-                float wx = origin.x + x * cellSize;
-                while (ci < crossings.Count && crossings[ci].X < wx)
-                {
-                    windingNumber += crossings[ci].Winding;
-                    ci++;
-                }
-                insideOut[x + sx * (y + sy * z)] = windingNumber != 0;
-            }
-        }
-
         // Moller-Trumbore ray-triangle intersection with a fixed +X direction. Also reports
-        // which way the ray passed through the face, for ComputeColumn's winding sum:
-        // det = e1 . (dir x e2) = -dir . (e1 x e2), and (e1 x e2) is exactly the triangle
-        // normal Unity's own RecalculateNormals builds - so it points OUTWARD on a correctly
-        // wound mesh. dir . normal < 0 means the ray is going against the outward normal, i.e.
-        // ENTERING the solid, and that is det > 0. Falling out of the same det the intersection
-        // test already needs means the facing test costs nothing extra.
+        // which way the ray passed through the face, for the winding sum: det = e1 . (dir x e2)
+        // = -dir . (e1 x e2), and (e1 x e2) is exactly the triangle normal Unity's own
+        // RecalculateNormals builds - so it points OUTWARD on a correctly wound mesh.
+        // dir . normal < 0 means the ray is going against the outward normal, i.e. ENTERING the
+        // solid, and that is det > 0. Falling out of the same det the intersection test already
+        // needs means the facing test costs nothing extra.
         private static bool RayIntersectsTriangleX(Vector3 origin, Vector3 a, Vector3 b, Vector3 c, out float hitX, out int winding)
         {
             hitX = 0f;
@@ -275,31 +418,6 @@ namespace Sculpting
             hitX = origin.x + t;
             winding = det > 0f ? 1 : -1;
             return true;
-        }
-
-        private delegate void CellVisitor(int x, int y, int z);
-
-        private static void ForEachCellInShell(Vector3Int center, int radius, Vector3Int dims, CellVisitor visit)
-        {
-            int x0 = center.x - radius, x1 = center.x + radius;
-            int y0 = center.y - radius, y1 = center.y + radius;
-            int z0 = center.z - radius, z1 = center.z + radius;
-
-            for (int z = z0; z <= z1; z++)
-            {
-                if (z < 0 || z >= dims.z) continue;
-                for (int y = y0; y <= y1; y++)
-                {
-                    if (y < 0 || y >= dims.y) continue;
-                    for (int x = x0; x <= x1; x++)
-                    {
-                        if (x < 0 || x >= dims.x) continue;
-                        bool onShell = x == x0 || x == x1 || y == y0 || y == y1 || z == z0 || z == z1;
-                        if (radius > 0 && !onShell) continue;
-                        visit(x, y, z);
-                    }
-                }
-            }
         }
 
         // Ericson, "Real-Time Collision Detection" 5.1.5.

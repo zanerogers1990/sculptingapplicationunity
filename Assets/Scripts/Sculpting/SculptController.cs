@@ -396,8 +396,9 @@ namespace Sculpting
         // range" feel, scaled to the smaller range.
         private const float StrengthAdjustSensitivity = 0.00125f;
         // Same "full-width drag covers roughly the whole range" tuning, for RemeshResolution's
-        // 4-500 span - see HandleRemeshDensityKey.
-        private const float RemeshDensityDragSensitivity = 0.3f;
+        // 4-1024 span - see HandleRemeshDensityKey. Scaled up with the range so a full-width
+        // drag still spans it rather than stopping halfway.
+        private const float RemeshDensityDragSensitivity = 0.62f;
         // How long R must stay down before it arms the density gauge instead of firing a plain
         // Remesh() - long enough that the existing tap-to-remesh shortcut still lands cleanly
         // without a drag attached, short enough that reaching for the gauge on purpose doesn't
@@ -1638,7 +1639,16 @@ namespace Sculpting
         public bool ShowWireframeGizmo { get => showWireframeGizmo; set => showWireframeGizmo = value; }
         public bool LogRayHits { get => logRayHits; set => logRayHits = value; }
         public bool UseBurstJobs { get => useBurstJobs; set => useBurstJobs = value; }
-        public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, 500); }
+        /// Highest remesh density the UI offers. Raised from 500 once the extraction stopped
+        /// allocating whole-lattice arrays: at 500 the old pipeline needed about 2.8 GB of live
+        /// grid to produce 2.7M triangles, and the same cubic growth made anything past that
+        /// unreachable rather than merely slow. The sparse extraction's memory follows the
+        /// SURFACE instead, so 1024 - roughly 6-7 million triangles on a compact model - costs a
+        /// few hundred megabytes. Kept below MeshRemesher.MaxResolution so the structural limit
+        /// stays a backstop and not the thing users bump into.
+        public const int MaxRemeshResolution = 1024;
+
+        public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, MaxRemeshResolution); }
 
         // One value shared by every brush (unlike BrushStrength) - lazy mouse is an input-
         // smoothing behavior, not a property of any particular brush's effect.

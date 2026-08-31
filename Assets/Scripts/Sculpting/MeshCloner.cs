@@ -39,7 +39,7 @@ namespace Sculpting
             // AddComponent runs SculptableMesh.Awake synchronously, so everything below this
             // line is operating on a fully built clone (see PrimitiveSpawner/MeshMirror, which
             // rely on the same guarantee).
-            SculptableMesh clone = go.AddComponent<SculptableMesh>();
+            SculptableMesh clone = SculptableMesh.AddOwning(go, mesh);
             var cloneMirror = go.AddComponent<MirrorController>();
 
             var sourceMirror = source.GetComponent<MirrorController>();

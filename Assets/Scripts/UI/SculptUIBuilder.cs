@@ -729,7 +729,7 @@ namespace Sculpting
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
-            _remeshResolutionSlider = CreateSlider(panel.transform, 4f, 500f, controller.RemeshResolution,
+            _remeshResolutionSlider = CreateSlider(panel.transform, 4f, SculptController.MaxRemeshResolution, controller.RemeshResolution,
                 v => controller.RemeshResolution = Mathf.RoundToInt(v));
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 

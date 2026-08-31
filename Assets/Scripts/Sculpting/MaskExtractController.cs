@@ -171,7 +171,7 @@ namespace Sculpting
             // AddComponent runs SculptableMesh.Awake synchronously, so the object is fully built
             // (working buffers, adjacency, blank mask) by the time this returns - the same
             // guarantee PrimitiveSpawner/MeshMirror/MeshCloner all rely on.
-            SculptableMesh extracted = go.AddComponent<SculptableMesh>();
+            SculptableMesh extracted = SculptableMesh.AddOwning(go, mesh);
             go.AddComponent<MirrorController>();
 
             FindFirstObjectByType<SculptMaterialController>()?.ApplyTo(go.GetComponent<Renderer>());

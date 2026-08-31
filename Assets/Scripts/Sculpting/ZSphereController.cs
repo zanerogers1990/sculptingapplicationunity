@@ -1526,7 +1526,7 @@ namespace Sculpting
 
             // AddComponent runs SculptableMesh.Awake synchronously, so the object is fully built
             // (working buffers, adjacency, blank mask) by the time this returns.
-            SculptableMesh sculptable = go.AddComponent<SculptableMesh>();
+            SculptableMesh sculptable = SculptableMesh.AddOwning(go, skin);
             go.AddComponent<MirrorController>();
 
             FindFirstObjectByType<SculptMaterialController>()?.ApplyTo(go.GetComponent<Renderer>());
