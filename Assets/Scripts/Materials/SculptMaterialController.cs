@@ -24,7 +24,15 @@ namespace Sculpting
         [SerializeField] private bool cavityEnabled = false;
         [SerializeField] private Color recessColor = new Color(0.12f, 0.10f, 0.09f);
         [SerializeField, Range(0f, 2f)] private float cavityIntensity = 1f;
-        [SerializeField, Range(0.05f, 0.6f)] private float cavityRange = 0.25f;
+        // Upper bound is well past the 1.0 the encoded cavity value can ever reach, and that
+        // is deliberate: the ramp is smoothstep(0.5, 0.5 + range, cavity), so a range wider
+        // than the signal is the only way to ask for "deepest creases only". It used to stop
+        // at 0.6, which still darkens a fully-saturated vertex by ~93% - on a dense imported
+        // model, where a large share of vertices clamp to 1.0, that left no way to pull the
+        // tint back off everything but the sharpest recesses. This is NOT a duplicate of
+        // intensity: widening the ramp fades shallow curvature far faster than deep, so the
+        // affected area shrinks rather than the whole tint dimming uniformly.
+        [SerializeField, Range(0.05f, 2f)] private float cavityRange = 0.25f;
 
         // Matcap shading (see MatcapLibrary for where the images come from). Stored by NAME,
         // not by texture reference: names are what a .sculpt file can carry between machines,
@@ -50,7 +58,7 @@ namespace Sculpting
         public bool CavityEnabled { get => cavityEnabled; set { cavityEnabled = value; Push(); } }
         public Color RecessColor { get => recessColor; set { recessColor = value; Push(); } }
         public float CavityIntensity { get => cavityIntensity; set { cavityIntensity = Mathf.Clamp(value, 0f, 2f); Push(); } }
-        public float CavityRange { get => cavityRange; set { cavityRange = Mathf.Clamp(value, 0.05f, 0.6f); Push(); } }
+        public float CavityRange { get => cavityRange; set { cavityRange = Mathf.Clamp(value, 0.05f, 2f); Push(); } }
 
         /// Whether matcap shading replaces the lit PBR result. Turning it on with no matcap
         /// picked selects the first one in the library rather than showing a flat white sphere -

@@ -15,7 +15,7 @@ Shader "Custom/SculptPBR"
         _CavityEnabled("Cavity Enabled", Float) = 1
         _RecessColor("Recess Color", Color) = (0.12,0.10,0.09,1)
         _CavityIntensity("Cavity Intensity", Range(0,2)) = 1.0
-        _CavityRange("Cavity Range", Range(0.05,0.6)) = 0.25
+        _CavityRange("Cavity Range", Range(0.05,2.0)) = 0.25
 
         // Matcap ("material capture", as in ZBrush/Blender/Nomad): a photo of a sphere shaded
         // exactly how the surface should look, indexed by the view-space normal. It replaces

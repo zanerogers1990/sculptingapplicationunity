@@ -75,7 +75,7 @@ namespace Sculpting
             UIFactory.CreateLabel(cavity, "Cavity Intensity", 12, FontStyle.Normal);
             UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityIntensity, v => _material.CavityIntensity = v);
             UIFactory.CreateLabel(cavity, "Cavity Range", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(cavity, 0.05f, 0.6f, _material.CavityRange, v => _material.CavityRange = v);
+            UIFactory.CreateSlider(cavity, 0.05f, 2f, _material.CavityRange, v => _material.CavityRange = v);
 
             BuildMatcapSection(UIFactory.CreateFoldoutSection(panel, "Matcap", false));
         }
