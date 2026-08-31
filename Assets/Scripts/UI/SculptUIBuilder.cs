@@ -56,6 +56,7 @@ namespace Sculpting
         private Image _damButtonImage;
         private Image _inflateButtonImage;
         private Image _flattenButtonImage;
+        private Image _poseButtonImage;
         private Image _maskButtonImage;
         private bool _lastShownMaskMode;
 
@@ -192,15 +193,15 @@ namespace Sculpting
         private const float LazyTetherDotSizePx = 5f;
         private const float LazyTetherAlpha = 0.5f;
 
-        // "Undo"/"Redo" toast (see SculptController.ShowUndoToast and friends) - a short-lived
-        // text popup, independent of the brush cursor above, anchored bottom-center of the
-        // whole screen (clear of both docked side panels regardless of window width) rather
-        // than trying to reproduce any one exact spot in the viewport.
-        private GameObject _undoToastGO;
-        private RectTransform _undoToastRect;
-        private Text _undoToastLabel;
-        private const float UndoToastBaseY = 60f;
-        private const float UndoToastRiseDistancePx = 24f;
+        // Action toast (Undo/Redo/Save/Save As - see SculptController.ShowActionToast and
+        // friends) - a short-lived text popup, independent of the brush cursor above, anchored
+        // bottom-center of the whole screen (clear of both docked side panels regardless of
+        // window width) rather than trying to reproduce any one exact spot in the viewport.
+        private GameObject _actionToastGO;
+        private RectTransform _actionToastRect;
+        private Text _actionToastLabel;
+        private const float ActionToastBaseY = 60f;
+        private const float ActionToastRiseDistancePx = 24f;
 
         // Start(), not Awake(): BuildUI() reads controller.Mirror.MirrorX, which now resolves
         // through SelectionManager.PrimarySelection (see SculptController.Mirror) instead of a
@@ -317,17 +318,18 @@ namespace Sculpting
                 }
             }
 
-            // "Undo"/"Redo" toast - see SculptController.ShowUndoToast and friends.
-            if (_undoToastGO != null)
+            // Action toast (Undo/Redo/Save/Save As) - see SculptController.ShowActionToast and
+            // friends.
+            if (_actionToastGO != null)
             {
-                bool showToast = controller.ShowUndoToast;
-                if (_undoToastGO.activeSelf != showToast) _undoToastGO.SetActive(showToast);
+                bool showToast = controller.ShowActionToast;
+                if (_actionToastGO.activeSelf != showToast) _actionToastGO.SetActive(showToast);
                 if (showToast)
                 {
-                    _undoToastLabel.text = controller.UndoToastText;
-                    _undoToastLabel.color = new Color(1f, 1f, 1f, controller.UndoToastAlpha);
-                    float lift = controller.UndoToastProgress01 * UndoToastRiseDistancePx;
-                    _undoToastRect.anchoredPosition = new Vector2(0f, UndoToastBaseY + lift);
+                    _actionToastLabel.text = controller.ActionToastText;
+                    _actionToastLabel.color = new Color(1f, 1f, 1f, controller.ActionToastAlpha);
+                    float lift = controller.ActionToastProgress01 * ActionToastRiseDistancePx;
+                    _actionToastRect.anchoredPosition = new Vector2(0f, ActionToastBaseY + lift);
                 }
             }
 
@@ -525,6 +527,14 @@ namespace Sculpting
             CreateToggle(panel.transform, "Build Up on Hold", controller.BuildUpOnHold,
                 v => controller.BuildUpOnHold = v, out _);
 
+            // Clay-only (see SculptController.surfaceRelax remarks) - fixes hard creases/
+            // pinching where two Clay lobes/strokes meet, without a full remesh. Labeled
+            // "(Clay)" rather than shown/hidden per brush: it's a single shared field (not
+            // per-brush like Accumulate), so it stays visible and just does nothing on the
+            // other brushes - the label is there so that isn't a silent surprise.
+            CreateLabel(panel.transform, "Surface Relax (Clay)", 14, FontStyle.Normal);
+            CreateSlider(panel.transform, 0f, 1f, controller.SurfaceRelax, v => controller.SurfaceRelax = v);
+
             _frontFacingOnlyToggle = CreateToggle(panel.transform, "Front Facing Only", controller.FrontFacingOnly, v =>
             {
                 controller.FrontFacingOnly = v;
@@ -555,8 +565,10 @@ namespace Sculpting
             var brushRow3 = CreateRow(panel.transform);
             var inflateButton = CreateButton(brushRow3.transform, "Inflate", () => SetBrushType(BrushType.Inflate));
             var flattenButton = CreateButton(brushRow3.transform, "Flatten", () => SetBrushType(BrushType.Flatten));
+            var poseButton = CreateButton(brushRow3.transform, "Pose", () => SetBrushType(BrushType.Pose));
             _inflateButtonImage = inflateButton.GetComponent<Image>();
             _flattenButtonImage = flattenButton.GetComponent<Image>();
+            _poseButtonImage = poseButton.GetComponent<Image>();
             RefreshBrushButtons();
 
             // Collapsed by default, same reasoning as the other shaping foldouts below.
@@ -639,6 +651,15 @@ namespace Sculpting
             CreateSlider(flattenFoldout, -0.5f, 0.5f, controller.FlattenPlaneOffset,
                 v => controller.FlattenPlaneOffset = v);
 
+            // Collapsed by default, same reasoning as "Clay Shaping" above.
+            Transform poseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Pose Shaping", false);
+            CreateLabel(poseFoldout, "Rigidity (Soft <-> Rigid)", 12, FontStyle.Normal);
+            CreateSlider(poseFoldout, 0f, 1f, controller.PoseRigidity, v => controller.PoseRigidity = v);
+            // Blender calls this same idea "Segments" - how many separate places along the limb
+            // you can pivot from, instead of every click bending from the same single anchor.
+            CreateLabel(poseFoldout, "Segments (Joints along the limb)", 12, FontStyle.Normal);
+            CreateSlider(poseFoldout, 1f, 8f, controller.PoseSegments, v => controller.PoseSegments = Mathf.RoundToInt(v));
+
             // Collapsed by default, same reasoning as "Clay Shaping" above. Both controls are
             // inert without a stylus - CurrentPressure short-circuits to 1 when Pen.current is
             // null - but the section is always built rather than hidden on no-pen, since a
@@ -713,7 +734,7 @@ namespace Sculpting
             CreateButton(panel.transform, "Remesh", () => controller.Remesh());
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask (Esc cancels)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  8 Pose  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask (Esc cancels)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
@@ -724,7 +745,7 @@ namespace Sculpting
             // cutting across the ring's middle.
             _lazyTetherGO = CreateLazyMouseTether(canvasGO.transform);
             _cursorRingGO = CreateBrushCursor(canvasGO.transform);
-            _undoToastGO = CreateUndoToast(canvasGO.transform);
+            _actionToastGO = CreateActionToast(canvasGO.transform);
             _densityGrid = controller.DensityGrid; // triggers the self-install, see its remarks
             _densityLabelGO = CreateRemeshDensityLabel(canvasGO.transform);
             // Last of all: the marquee is drawn over the model AND over the panels, since a
@@ -761,6 +782,7 @@ namespace Sculpting
             _damButtonImage.color = controller.CurrentBrush == BrushType.DamStandard ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _poseButtonImage.color = controller.CurrentBrush == BrushType.Pose ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _maskButtonImage.color = controller.IsMaskPaintMode ? MaskActiveColor : UIFactory.InactiveColor;
         }
 
@@ -1582,15 +1604,15 @@ namespace Sculpting
         // with the ring cursor up near the mouse. raycastTarget off, same reasoning as the ring
         // cursor's own children: this sits on top in sibling order and must never itself count
         // as "over UI".
-        private GameObject CreateUndoToast(Transform canvasParent)
+        private GameObject CreateActionToast(Transform canvasParent)
         {
-            var go = new GameObject("UndoToastLabel", typeof(RectTransform));
+            var go = new GameObject("ActionToastLabel", typeof(RectTransform));
             go.transform.SetParent(canvasParent, false);
             var rect = go.GetComponent<RectTransform>();
             rect.anchorMin = new Vector2(0.5f, 0f);
             rect.anchorMax = new Vector2(0.5f, 0f);
             rect.pivot = new Vector2(0.5f, 0f);
-            rect.anchoredPosition = new Vector2(0f, UndoToastBaseY);
+            rect.anchoredPosition = new Vector2(0f, ActionToastBaseY);
             rect.sizeDelta = new Vector2(320f, 40f);
 
             var text = go.AddComponent<Text>();
@@ -1601,14 +1623,14 @@ namespace Sculpting
             text.color = Color.white;
             text.raycastTarget = false;
 
-            _undoToastRect = rect;
-            _undoToastLabel = text;
+            _actionToastRect = rect;
+            _actionToastLabel = text;
             go.SetActive(false);
             return go;
         }
 
         /// Follows the world-space grid's screen projection every frame (see UpdateDensityLabel)
-        /// rather than sitting at a fixed screen anchor like the undo toast above - the grid
+        /// rather than sitting at a fixed screen anchor like the action toast above - the grid
         /// itself moves and rescales with the selected object, so a fixed anchor would drift
         /// away from "underneath the grid" the moment the object wasn't dead-center on screen.
         private GameObject CreateRemeshDensityLabel(Transform canvasParent)

@@ -28,9 +28,13 @@ namespace Sculpting
 
         // Matcap shading (see MatcapLibrary for where the images come from). Stored by NAME,
         // not by texture reference: names are what a .sculpt file can carry between machines,
-        // and the texture itself is loaded on demand.
-        [SerializeField] private bool matcapEnabled = false;
-        [SerializeField] private string matcapName = string.Empty;
+        // and the texture itself is loaded on demand. Defaults to ON with the Ben Simonds pack's
+        // first (brown clay) matcap rather than plain PBR - that's the look a fresh session
+        // should open on; ResolveMatcap() in Awake() falls back to plain PBR on its own if this
+        // name ever goes missing from the library (a stripped build, a user who deleted the
+        // pack), so this default can't leave a new session looking broken.
+        [SerializeField] private bool matcapEnabled = true;
+        [SerializeField] private string matcapName = "MatCap_BS1";
         [SerializeField, Range(0f, 3f)] private float matcapIntensity = 1f;
         [SerializeField, Range(0f, 1f)] private float matcapTintStrength = 0f;
 

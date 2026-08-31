@@ -8,6 +8,7 @@ namespace Sculpting
         Crease,
         DamStandard,
         Inflate,
-        Flatten
+        Flatten,
+        Pose
     }
 }

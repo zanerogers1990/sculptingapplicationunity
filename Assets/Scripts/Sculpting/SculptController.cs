@@ -64,6 +64,41 @@ namespace Sculpting
         // is a statement about how strokes should feel, not about one brush's behaviour.
         [SerializeField] private bool buildUpOnHold = false;
 
+        // Curvature-gated relaxation folded into Clay's own dab, right after its own
+        // displacement (see ApplySurfaceRelaxLocal) - without this, two Clay lobes/strokes
+        // growing toward each other stretch the triangles between them thinner and thinner
+        // (nothing ever relaxes that area back into shape) until they fold into a hard
+        // crease/pinch instead of a smooth bridge. 0 disables it entirely.
+        //
+        // Clay-only: user-reported this is the one brush that actually needs it (bridging
+        // between separately-built volumes is a Clay-specific problem) - Crease/Dam Standard/
+        // Inflate/Flatten don't call ApplySurfaceRelaxLocal at all any more, so this field has
+        // no effect on them regardless of value. Was shared across every brush at first (like
+        // Build Up on Hold); narrowed to Clay-only once it became clear the OTHER brushes'
+        // own sharp, deliberate output (Crease's groove in particular) was getting fought by
+        // the very same pass meant only to fix accidental seams.
+        [SerializeField, Range(0f, 1f)] private float surfaceRelax = 0.22f;
+
+        // How concentrated the Pose brush's root->tip weight ramp is (see
+        // SculptableMesh.SelectPose's rampT remarks) - 0 spreads the transition from 0 to full
+        // weight across the ENTIRE root-to-click distance (soft, "rubber hose" bend: most of a
+        // long-reach chain only ever gets partial rotation weight, which reads as weak even for
+        // a large drag), 1 compresses it into a thin band right at the anchor so nearly
+        // everything past that moves with full weight (a rigid hinge, most of the reached limb
+        // actually follows the drag). Defaults above the old effective behavior (0, unexposed) -
+        // user-reported the un-tunable default felt weak on a long reach even with a big drag.
+        [SerializeField, Range(0f, 1f)] private float poseRigidity = 0.6f;
+
+        // How many discrete joints the true anchor->true tip distance is divided into (see
+        // SculptableMesh.SelectPose's segmentIndex remarks) - Blender's own Pose brush calls
+        // this same idea "Segments". Without it, every click anywhere along a limb pivots from
+        // the SAME single point (the true mask boundary) - user-reported this read as the tool
+        // "snapping to one area" rather than feeling like there were multiple places to grab
+        // from. Each segment boundary becomes its own local root: a click inside segment 2 (say)
+        // pivots from the boundary between segments 1 and 2, not all the way back at the true
+        // anchor, and everything below that boundary stays completely fixed for that gesture.
+        [SerializeField, Range(1, 8)] private int poseSegments = 4;
+
         // Remembers each brush's own polarity across switches this session (ZBrush/Blender-
         // style per-tool state), instead of one flag shared by every brush regardless of which
         // is selected. Crease/Dam Standard default to negative (carve) since that's what most
@@ -352,8 +387,10 @@ namespace Sculpting
 
         // How many world units BrushRadius changes per pixel of horizontal mouse movement
         // while resizing (holding S). Tuned so a full-width drag across a ~1080p window
-        // covers roughly the whole 0.01-2 range.
-        private const float ResizeSensitivity = 0.0025f;
+        // covers roughly the whole MinBrushRadius-MaxBrushRadius range - scale this together
+        // with MaxBrushRadius (same ratio) if that range ever changes again, or a full-width
+        // drag stops reaching the new max.
+        private const float ResizeSensitivity = 0.01f;
         // Half ResizeSensitivity, matching that BrushStrength's range (0.01-1) is about half
         // the width of BrushRadius's (0.01-2) - same "full-width drag covers roughly the whole
         // range" feel, scaled to the smaller range.
@@ -372,7 +409,11 @@ namespace Sculpting
         // RebuildSpatialIndex/QueryNear already clamp their own cell size to, so the rest of the
         // brush pipeline was already exercised at this scale.
         public const float MinBrushRadius = 0.01f;
-        public const float MaxBrushRadius = 2f;
+        // Was 2 - too tight once brush size also had to reach across large masked regions (the
+        // Pose brush's reach is driven by this same value - see SculptableMesh.SelectPose's
+        // effectiveReach), on top of ordinary sculpting on a bigger-than-default figure. See
+        // ResizeSensitivity above, scaled to match.
+        public const float MaxBrushRadius = 8f;
 
         private static readonly Color PositiveColor = new Color(0.2f, 1f, 0.4f);
         private static readonly Color NegativeColor = new Color(1f, 0.3f, 0.3f);
@@ -411,14 +452,18 @@ namespace Sculpting
         private float _strokeEndFadeTimer;
         private const float StrokeEndFadeDuration = 0.1f;
 
-        // "Undo"/"Redo" toast (see Undo/Redo/TriggerUndoRedoFeedback) - a short-lived text
-        // popup independent of the brush cursor above, since it needs to be readable even when
-        // nothing is selected (undoing a ZSphere convert, say - see the remarks on Undo/Redo
-        // below) and shouldn't disappear the instant the mouse moves off the model.
-        private string _undoToastText;
-        private float _undoToastTimer;
-        private const float UndoToastDuration = 0.8f;
-        private const float UndoToastFadeDuration = 0.3f;
+        // Short-lived text popup independent of the brush cursor above, since it needs to be
+        // readable even when nothing is selected (undoing a ZSphere convert, say - see the
+        // remarks on Undo/Redo below) and shouldn't disappear the instant the mouse moves off
+        // the model. Originally Undo/Redo-only (see TriggerUndoRedoFeedback); now shared with
+        // Save/Save As (see TriggerActionToast) since both are the same "confirm a one-shot
+        // action actually happened" need - a mesh flash makes sense for Undo/Redo (something on
+        // the model itself changed) but not for a save, so TriggerActionToast is the toast-only
+        // half of TriggerUndoRedoFeedback, callable on its own.
+        private string _actionToastText;
+        private float _actionToastTimer;
+        private const float ActionToastDuration = 0.8f;
+        private const float ActionToastFadeDuration = 0.3f;
 
         // Very brief, neutral (not brush-polarity-colored) flash across the sculpted surface on
         // Undo/Redo - see TriggerUndoRedoFeedback. Deliberately much shorter than
@@ -453,6 +498,37 @@ namespace Sculpting
         // One selection per active mirror sign, paired with the sign used to make it, so a
         // drag delta can be re-mirrored before being applied to that selection.
         private List<(SculptableMesh.GrabSelection selection, Vector3 sign)> _grabSelections;
+
+        // Pose brush - see HandlePoseInput. Same click/hold-drag/release shape as Move above,
+        // right down to reusing RayPlaneIntersect against a camera-facing plane through the
+        // grab point, but each mirrored selection is a PoseSelection (a chain, not a flat
+        // weighted blob) and the drag target is read fresh from that plane every frame rather
+        // than accumulated - see SculptableMesh.ApplyPoseDelta's remarks on why.
+        private bool _isPoseDragging;
+        private Vector3 _poseDragPlanePoint;
+        private Vector3 _poseDragPlaneNormal;
+        private List<(SculptableMesh.PoseSelection selection, Vector3 sign)> _poseSelections;
+
+        // Guide line (see UpdatePoseChainVisual): a world-space LineRenderer per active pose
+        // selection - up to one per mirror sign, matching _poseSelections. First version used
+        // Sprites/Default with ordinary depth testing and was reported as barely-visible - "maybe
+        // a slight outline" - because the chain runs directly along the mesh's own surface, which
+        // z-fights against that same surface almost everywhere except where floating-point noise
+        // happens to let it win. Custom/BrushPreviewOverlay (ZTest Always, ZWrite Off) is this
+        // project's existing fix for exactly that problem - TransformGizmo's handles and the
+        // brush-preview cursor already draw on top of everything for the identical reason (see
+        // TransformGizmo.ApplyUnlitColor's remarks) - so this reuses it rather than re-solving it.
+        private static Material _poseChainMaterial;
+        private static readonly int PoseChainColorId = Shader.PropertyToID("_Color");
+        private readonly List<LineRenderer> _poseChainLines = new List<LineRenderer>();
+        private static readonly Color PoseChainColor = Color.white;
+        // Fraction of brushRadius, not an absolute width - brushRadius is already the one value
+        // in scope that tracks how big the CURRENT model/selection is (an artist sets it relative
+        // to their own mesh's scale, same as every other brush), so a line this thin relative to
+        // it reads consistently thin whether the mesh is a 1-unit test sphere or a 2-meter figure
+        // - a fixed absolute width would have been fine for the former and invisible on the
+        // latter, which is the other half of why the first version read as barely-there.
+        private const float PoseChainWidthFactor = 0.03f;
 
         private bool _isResizingBrush;
         private float _resizeStartRadius;
@@ -496,6 +572,7 @@ namespace Sculpting
         // (see VertexSpatialGrid/EmitQuads history).
         private float[] _clayWeightScratch = System.Array.Empty<float>();
         private float[] _smoothWeightScratch = System.Array.Empty<float>();
+        private float[] _relaxWeightScratch = System.Array.Empty<float>();
 
         // Vertex indices actually moved by the current frame's brush application (across every
         // mirror sign) - cleared at the start of each Apply*Brush wrapper, filled in by the
@@ -1448,15 +1525,15 @@ namespace Sculpting
             ? 1f
             : Mathf.Clamp01(1f - _strokeEndFadeTimer / StrokeEndFadeDuration);
 
-        // "Undo"/"Redo" toast - see TriggerUndoRedoFeedback/_undoToastTimer.
-        public bool ShowUndoToast => _undoToastTimer > 0f;
-        public string UndoToastText => _undoToastText;
-        public float UndoToastAlpha => _undoToastTimer <= 0f
+        // Action toast (Undo/Redo/Save/Save As) - see TriggerActionToast/_actionToastTimer.
+        public bool ShowActionToast => _actionToastTimer > 0f;
+        public string ActionToastText => _actionToastText;
+        public float ActionToastAlpha => _actionToastTimer <= 0f
             ? 0f
-            : (_undoToastTimer >= UndoToastFadeDuration ? 1f : _undoToastTimer / UndoToastFadeDuration);
+            : (_actionToastTimer >= ActionToastFadeDuration ? 1f : _actionToastTimer / ActionToastFadeDuration);
         // 0 the instant it appears, 1 the instant it's gone - drives a gentle upward drift
         // (SculptUIBuilder) so it reads as "popping up", not just fading in place.
-        public float UndoToastProgress01 => 1f - Mathf.Clamp01(_undoToastTimer / UndoToastDuration);
+        public float ActionToastProgress01 => 1f - Mathf.Clamp01(_actionToastTimer / ActionToastDuration);
 
         public bool IsMaskPaintMode
         {
@@ -1467,7 +1544,7 @@ namespace Sculpting
                 _isMaskPaintMode = value;
                 if (_isMaskPaintMode)
                 {
-                    EndMoveDrag(); // don't leave a grab mid-drag while painting mask
+                    EndActiveDrags(); // don't leave a grab mid-drag while painting mask
                     // Mask painting and the box/lasso region gestures both want the same click -
                     // see RegionSelectTool.Mode's setter, which disarms this one in the same way.
                     if (RegionSelect != null) RegionSelect.Mode = RegionSelectMode.Off;
@@ -1482,7 +1559,7 @@ namespace Sculpting
             {
                 if (currentBrush != value)
                 {
-                    EndMoveDrag();
+                    EndActiveDrags();
                     _lastCarveStrokeLocal = null;
                     _lastClayStrokeLocal = null;
                     _brushPolarity[(int)currentBrush] = isPositive;
@@ -1497,9 +1574,15 @@ namespace Sculpting
                     brushStrength = _brushStrengthPerType[(int)currentBrush];
                     frontFacingOnly = _brushFrontFacingOnly[(int)currentBrush];
                     // brushRadius deliberately carries across the switch untouched.
+                    TriggerActionToast(BrushDisplayName(currentBrush));
                 }
             }
         }
+
+        /// Human-readable brush name for the switch-brush toast above (see TriggerActionToast) -
+        /// BrushType.DamStandard has no space, everything else matches its enum name as-is.
+        private static string BrushDisplayName(BrushType type) =>
+            type == BrushType.DamStandard ? "Dam Standard" : type.ToString();
         public bool IsPositive
         {
             get => isPositive;
@@ -1561,6 +1644,9 @@ namespace Sculpting
         // smoothing behavior, not a property of any particular brush's effect.
         public bool LazyMouseEnabled { get => lazyMouseEnabled; set => lazyMouseEnabled = value; }
         public bool BuildUpOnHold { get => buildUpOnHold; set => buildUpOnHold = value; }
+        public float SurfaceRelax { get => surfaceRelax; set => surfaceRelax = Mathf.Clamp01(value); }
+        public float PoseRigidity { get => poseRigidity; set => poseRigidity = Mathf.Clamp01(value); }
+        public int PoseSegments { get => poseSegments; set => poseSegments = Mathf.Clamp(value, 1, 8); }
         public float LazyMouseRadius { get => lazyMouseRadius; set => lazyMouseRadius = Mathf.Clamp(value, 1f, 150f); }
         public float LazyMouseStrength { get => lazyMouseStrength; set => lazyMouseStrength = Mathf.Clamp(value, 0.05f, 1f); }
 
@@ -1591,7 +1677,7 @@ namespace Sculpting
 
         public void Undo()
         {
-            EndMoveDrag();
+            EndActiveDrags();
             if (!EditHistory.CanUndo) return; // nothing actually happened - no flash/toast for a no-op keypress
             EditHistory.Undo();
             TriggerUndoRedoFeedback("Undo");
@@ -1599,7 +1685,7 @@ namespace Sculpting
 
         public void Redo()
         {
-            EndMoveDrag();
+            EndActiveDrags();
             if (!EditHistory.CanRedo) return;
             EditHistory.Redo();
             TriggerUndoRedoFeedback("Redo");
@@ -1612,8 +1698,16 @@ namespace Sculpting
         private void TriggerUndoRedoFeedback(string label)
         {
             if (sculptableMesh != null) SelectionFlashEffect.Play(sculptableMesh.gameObject, UndoFlashDuration, UndoFlashColor);
-            _undoToastText = label;
-            _undoToastTimer = UndoToastDuration;
+            TriggerActionToast(label);
+        }
+
+        /// Toast-only half of TriggerUndoRedoFeedback above, with no mesh flash - for actions
+        /// like Save/Save As (see SceneGraphUIBuilder.Save/SaveAs) that have no single mesh to
+        /// flash and shouldn't get one anyway (nothing on the model itself changed).
+        public void TriggerActionToast(string label)
+        {
+            _actionToastText = label;
+            _actionToastTimer = ActionToastDuration;
         }
 
         /// Steps of history held and what they cost, for the UI - see EditHistory.Summary.
@@ -1758,7 +1852,7 @@ namespace Sculpting
             // otherwise a fresh trigger this same frame would immediately lose one frame's worth
             // of decay before anyone ever reads the full un-decayed value (e.g. the stroke-end
             // fade would never actually reach its intended "blinks fully out" starting point).
-            if (_undoToastTimer > 0f) _undoToastTimer = Mathf.Max(0f, _undoToastTimer - Time.deltaTime);
+            if (_actionToastTimer > 0f) _actionToastTimer = Mathf.Max(0f, _actionToastTimer - Time.deltaTime);
             if (_strokeEndFadeTimer > 0f) _strokeEndFadeTimer = Mathf.Max(0f, _strokeEndFadeTimer - Time.deltaTime);
 
             SyncSelectionTarget();
@@ -1767,6 +1861,8 @@ namespace Sculpting
             HandleBrushStrengthKey();
             HandleRemeshDensityKey();
             HandleUndoRedoKeys();
+            HandleSaveKeys();
+            UpdatePoseChainVisual();
             UpdatePenPressure();
             HandleSculptInput();
             HandleBrushSizeScroll();
@@ -1800,7 +1896,7 @@ namespace Sculpting
             sculptableMesh = target;
             mirrorController = target != null ? target.GetComponent<MirrorController>() : null;
 
-            EndMoveDrag();
+            EndActiveDrags();
             _isHovering = false;
             _lastCarveStrokeLocal = null;
             _lastClayStrokeLocal = null;
@@ -1864,6 +1960,29 @@ namespace Sculpting
         // scene that has no ZSphereController at all.
         private ZSphereController _zsphereForUndo;
 
+        // Ctrl+S / Ctrl+Shift+S, matching the quick-save/save-as split most creative software
+        // uses (see SceneGraphUIBuilder.Save/SaveAs). Routed via SendMessage rather than a
+        // direct reference - same "invoke a private MonoBehaviour method without reflection"
+        // idiom RebuildOtherPanels already uses - because this controller has no other reason
+        // to depend on the scene-file UI panel.
+        private void HandleSaveKeys()
+        {
+            var kb = Keyboard.current;
+            if (kb == null || !CtrlHeld) return;
+            if (!kb.sKey.wasPressedThisFrame) return;
+
+            bool saveAs = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
+
+            if (_sceneGraphForSave == null) _sceneGraphForSave = FindFirstObjectByType<SceneGraphUIBuilder>();
+            if (_sceneGraphForSave == null) return;
+
+            _sceneGraphForSave.gameObject.SendMessage(saveAs ? "SaveAs" : "Save", SendMessageOptions.DontRequireReceiver);
+        }
+
+        // Only ever looked up on a frame Ctrl+S is actually pressed, so the find costs nothing
+        // otherwise - same reasoning as _zsphereForUndo above.
+        private SceneGraphUIBuilder _sceneGraphForSave;
+
         private void HandleBrushSwitchKeys()
         {
             var kb = Keyboard.current;
@@ -1892,6 +2011,7 @@ namespace Sculpting
             else if (kb.digit5Key.wasPressedThisFrame) CurrentBrush = BrushType.DamStandard;
             else if (kb.digit6Key.wasPressedThisFrame) CurrentBrush = BrushType.Inflate;
             else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
+            else if (kb.digit8Key.wasPressedThisFrame) CurrentBrush = BrushType.Pose;
 
             // M used to trigger Remesh directly; moved to R (still reachable via the Remesh
             // button in the Brush panel either way, or a plain R tap - see
@@ -1948,9 +2068,11 @@ namespace Sculpting
             var mouse = Mouse.current;
             if (kb == null || mouse == null) return;
 
-            if (kb.sKey.wasPressedThisFrame)
+            // CtrlHeld excluded: Ctrl+S is the save hotkey (see HandleSaveKeys) and must not
+            // also drop the brush into resize mode.
+            if (kb.sKey.wasPressedThisFrame && !CtrlHeld)
             {
-                EndMoveDrag(); // don't leave a grab mid-drag while resizing
+                EndActiveDrags(); // don't leave a grab mid-drag while resizing
                 _isResizingBrush = true;
                 _resizeStartRadius = brushRadius;
                 _resizeStartMouseX = mouse.position.ReadValue().x;
@@ -1981,7 +2103,7 @@ namespace Sculpting
 
             if (kb.fKey.wasPressedThisFrame)
             {
-                EndMoveDrag(); // don't leave a grab mid-drag while adjusting strength
+                EndActiveDrags(); // don't leave a grab mid-drag while adjusting strength
                 _isAdjustingStrength = true;
                 _strengthAdjustStartValue = brushStrength;
                 _strengthAdjustStartMouseX = mouse.position.ReadValue().x;
@@ -2020,7 +2142,7 @@ namespace Sculpting
                      && !_isResizingBrush && !_isAdjustingStrength
                      && Time.unscaledTime - _rKeyDownTime >= RemeshHoldThreshold)
             {
-                EndMoveDrag(); // don't leave a grab mid-drag while adjusting density
+                EndActiveDrags(); // don't leave a grab mid-drag while adjusting density
                 _isAdjustingRemeshDensity = true;
                 _remeshDensityStartValue = remeshResolution;
                 _remeshDensityStartMouseX = mouse.position.ReadValue().x;
@@ -2233,6 +2355,9 @@ namespace Sculpting
                     break;
                 case BrushType.Flatten:
                     HandleFlattenInput(mouse, overUI, altHeld);
+                    break;
+                case BrushType.Pose:
+                    HandlePoseInput(mouse, overUI, altHeld);
                     break;
                 default:
                     HandleClayInput(mouse, overUI, altHeld);
@@ -2548,6 +2673,157 @@ namespace Sculpting
         // default clayTipRoundness=1, so this changes nothing for the plain round tip.
         private const float Sqrt2 = 1.4142136f;
 
+        // v1 of ApplySurfaceRelaxLocal reused the calling brush's OWN candidate list and its
+        // OWN brushRadius-sized falloff - which weighted relax by distance from THIS dab's
+        // centre. That put the WEAKEST relax exactly at the dab's own edge, which is exactly
+        // where a neighboring dab's geometry begins - i.e. exactly where a seam pinches.
+        // Verified live: two lobes sculpted right next to each other still pinched hard with
+        // surfaceRelax at its default 0.35. Reaching further than the dab itself (into the
+        // neighbor's territory) fixed that half of it.
+        //
+        // v2/v3 (this version's predecessor) then applied near-full strength across almost the
+        // WHOLE reach, including the brush's own core - which fixed the seam but broke the
+        // brush itself: user-reported, verified live, Crease's own groove couldn't hold shape
+        // and Clay's own accumulate-mode buildup was net LOSING height every dab (relax pulling
+        // a freshly-raised peak back down toward its still-low neighbors faster than Clay could
+        // raise it - eventually undershooting past the start height entirely on a held stroke).
+        // Both are the SAME bug: relax was second-guessing the brush's own CURRENT dab, not
+        // just the seam around it. RelaxInnerFloor is the fix - inside the brush's own radius
+        // (dist <= brushRadius) is exactly where the user is actively shaping RIGHT NOW, sharp
+        // or not, and gets left alone; only the SHELL beyond it (out to relaxRadius) - the
+        // transition into whatever geometry was already there before this dab, which is where a
+        // seam with a NEIGHBORING dab actually forms - gets meaningful relax.
+        private const float RelaxRadiusFactor = 2.5f;
+        private const float RelaxEdgeSoftness = 0.35f;
+        private const float RelaxInnerFloor = 0.05f;
+        // Max relaxation passes surfaceRelax=1 folds into one dab - same "iteration count IS
+        // the strength knob" idea Smooth's own MaxSmoothIterations uses (a single pass is too
+        // weak to visibly close a seam within one ordinary stroke), just a smaller ceiling
+        // since this rides along on top of each brush's own displacement rather than being
+        // the primary tool.
+        private const int MaxRelaxIterations = 4;
+
+        // How much a vertex's ALREADY-EXISTING curvature (see
+        // SculptableMesh.CurvatureDeviationAt) has to depart from the mesh's own baseline
+        // before relax ramps up toward full strength - keeps it mostly out of the way of
+        // ordinary curved shaping (a lobe's own rounded tip, a deliberate broad bump) and
+        // concentrated on genuine creases/pinches, which read as a MUCH sharper local
+        // departure from that baseline than an ordinary rounded feature does. User-reported:
+        // full-strength-everywhere was smoothing "fill" areas away too, not just creases.
+        // RelaxCurvatureFloor keeps a small residual amount everywhere (still enough for
+        // stray-triangle cleanup) rather than an all-or-nothing cutoff that would let ordinary
+        // areas re-develop the same stretched-triangle problem this pass exists to prevent.
+        // Calibrated empirically against this app's own live cavity numbers, not guessed - a
+        // rounded lobe tip measured ~0.07, the mesh-wide 90th/99th percentiles were ~2.9/~12.5,
+        // and an actual reported pinch measured ~21 - a clean 300x separation between ordinary
+        // shaping and a genuine crease, comfortably straddled by Start/Full below. See
+        // [[project_surface_relax]] memory for the full numbers.
+        private const float RelaxCurvatureFloor = 0.08f;
+        private const float RelaxCurvatureStart = 3f;
+        private const float RelaxCurvatureFull = 15f;
+
+        /// Curvature-adaptive relaxation pass, called once per dab right after Clay's own
+        /// displacement - see surfaceRelax's field remarks for why this exists and why it's
+        /// Clay-only. Runs its OWN wider QueryNear rather than reusing the calling brush's
+        /// candidate list - see RelaxRadiusFactor's remarks.
+        ///
+        /// Deliberately plain managed C#, not a Burst job: even at MaxRelaxIterations this is
+        /// a handful of passes over a footprint-bounded candidate list, a small fraction of
+        /// what Smooth's own up-to-10-pass job exists to make fast.
+        private void ApplySurfaceRelaxLocal(Vector3 localPoint)
+        {
+            if (surfaceRelax <= 0f) return;
+
+            float relaxRadius = brushRadius * RelaxRadiusFactor;
+            List<int> candidates = sculptableMesh.QueryNear(localPoint, relaxRadius);
+            if (candidates.Count == 0) return;
+
+            Vector3[] verts = sculptableMesh.Vertices;
+            Vector3[] normals = sculptableMesh.Normals;
+            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+
+            if (_relaxWeightScratch.Length < candidates.Count) _relaxWeightScratch = new float[candidates.Count];
+            float[] weights = _relaxWeightScratch;
+            bool anyInRange = false;
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                int i = candidates[ci];
+                float dist = Vector3.Distance(verts[i], localPoint);
+                if (dist > relaxRadius) { weights[ci] = 0f; continue; }
+
+                // Shell profile, not a falloff from the dab centre: RelaxInnerFloor inside the
+                // brush's own radius (leave the current dab alone - see its remarks), ramping
+                // up to full strength just past brushRadius and tapering again only at the
+                // outer rim (relaxRadius) - see RelaxRadiusFactor's remarks for why the SHELL,
+                // not the core, is where a seam with a neighboring dab actually needs fixing.
+                float spatialWeight;
+                if (dist <= brushRadius)
+                {
+                    spatialWeight = RelaxInnerFloor;
+                }
+                else
+                {
+                    float shellT = (dist - brushRadius) / Mathf.Max(relaxRadius - brushRadius, 1e-5f);
+                    spatialWeight = ClayFalloff(1f - shellT, RelaxEdgeSoftness);
+                }
+
+                // CurvatureDeviationAt is unclamped (unlike the visual cavity tint) - see
+                // RelaxCurvatureFloor's remarks for why that distinction is what makes this
+                // gate actually separate an ordinary rounded feature from a genuine crease,
+                // rather than applying full strength uniformly across the whole shell
+                // regardless of whether anything there actually needs it.
+                float curvatureDeviation = sculptableMesh.CurvatureDeviationAt(i);
+                float curvatureFactor = Mathf.Lerp(RelaxCurvatureFloor, 1f,
+                    Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(RelaxCurvatureStart, RelaxCurvatureFull, curvatureDeviation)));
+
+                weights[ci] = spatialWeight * curvatureFactor
+                    * (1f - sculptableMesh.Mask[i]) * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
+                if (weights[ci] > 0f) anyInRange = true;
+            }
+            if (!anyInRange) return;
+
+            float passAmount = surfaceRelax * MaxRelaxIterations;
+            int fullPasses = Mathf.FloorToInt(passAmount);
+            float partialFactor = passAmount - fullPasses;
+
+            for (int pass = 0; pass < fullPasses; pass++)
+                RunSurfaceRelaxPass(candidates, weights, 1f);
+            if (partialFactor > 0.001f)
+                RunSurfaceRelaxPass(candidates, weights, partialFactor);
+        }
+
+        private void RunSurfaceRelaxPass(List<int> candidates, float[] weights, float passFactor)
+        {
+            Vector3[] verts = sculptableMesh.Vertices;
+
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                float w = weights[ci];
+                if (w <= 0f) continue;
+                int i = candidates[ci];
+
+                // Full Laplacian delta (same "average of my neighbors" Smooth uses) - NOT
+                // stripped down to its tangential-only component. That was tried first and
+                // measured to do almost nothing to an actual pinch: a hard crease is a fold in
+                // the HEIGHT field (a vertex sitting sharply along its own normal relative to
+                // its neighbors), and moving a vertex purely sideways leaves its position along
+                // its own (unchanged) normal identical by construction - verified live, 20 dabs
+                // of tangential-only relax at max strength reduced a measured pinch's curvature
+                // by under 4%. Letting relax actually ease the along-normal component too is
+                // what closes a fold; it's still much gentler than Smooth itself (weighted by
+                // the same flat-plateau/wide-reach falloff above, and gated by MaxRelaxIterations
+                // rather than Smooth's own up-to-10), which is the tradeoff surfaceRelax's own
+                // slider exists to tune - default keeps it subtle enough not to flatten
+                // deliberate broad shaping.
+                Vector3 p = verts[i];
+                Vector3 toAverage = sculptableMesh.GetNeighborAverage(i) - p;
+
+                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                verts[i] = p + toAverage * Mathf.Clamp01(w * passFactor);
+                _dirtyVertexScratch.Add(i);
+            }
+        }
+
         private void ApplyClayBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt)
         {
             Vector3[] verts = sculptableMesh.Vertices;
@@ -2561,6 +2837,8 @@ namespace Sculpting
                 ApplyClayBrushLocalJob(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals);
             else
                 ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals);
+
+            ApplySurfaceRelaxLocal(localPoint);
         }
 
         private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
@@ -3695,7 +3973,7 @@ namespace Sculpting
             {
                 if (!mouse.leftButton.isPressed)
                 {
-                    EndMoveDrag();
+                    EndActiveDrags();
                     return;
                 }
 
@@ -3765,6 +4043,177 @@ namespace Sculpting
             _isMoveDragging = false;
         }
 
+        // Every "don't leave a drag mid-gesture while X begins" guard scattered through this
+        // file now needs to interrupt BOTH click-drag brushes, not just Move - Pose is the same
+        // shape of gesture (see HandlePoseInput). One wrapper instead of duplicating a second
+        // call at every one of those sites, which is what actually calls each real EndXDrag -
+        // both are cheap no-ops when their own drag isn't active, so calling both unconditionally
+        // costs nothing.
+        private void EndActiveDrags()
+        {
+            EndMoveDrag();
+            EndPoseDrag();
+        }
+
+        // Same click/hold-drag/release shape as HandleMoveDrag above, right down to reusing
+        // RayPlaneIntersect against a camera-facing plane through the grab point. The
+        // difference is entirely in what SelectPose/ApplyPoseDelta do with that drag target -
+        // see SculptableMesh's Pose brush section for the actual chain/falloff logic. Masking
+        // works the same direction here as every other brush (masked = protected): to pose an
+        // arm, mask everything EXCEPT the arm, then drag from inside the unmasked part.
+        private void HandlePoseInput(Mouse mouse, bool overUI, bool altHeld)
+        {
+            if (_isPoseDragging)
+            {
+                if (!mouse.leftButton.isPressed)
+                {
+                    EndActiveDrags();
+                    return;
+                }
+
+                Ray dragRay = cam.ScreenPointToRay(mouse.position.ReadValue());
+                if (RayPlaneIntersect(dragRay, _poseDragPlanePoint, _poseDragPlaneNormal, out Vector3 current))
+                {
+                    // Unlike Move, this reads the CURRENT drag point fresh off the plane rather
+                    // than accumulating a delta - ApplyPoseDelta re-derives every vertex from
+                    // its stroke-start position each frame, so there's nothing to accumulate
+                    // onto (see its remarks for why that's the more robust choice for a
+                    // rotation-based deform).
+                    Vector3 localCurrent = sculptableMesh.transform.InverseTransformPoint(current);
+                    _dirtyVertexScratch.Clear();
+                    foreach (var (selection, sign) in _poseSelections)
+                    {
+                        sculptableMesh.ApplyPoseDelta(selection, Vector3.Scale(localCurrent, sign));
+                        foreach (int i in selection.Indices) _dirtyVertexScratch.Add(i);
+                    }
+                    sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+                }
+
+                _isHovering = true;
+                _hoverPoint = current;
+                _previewPositive = true;
+                return;
+            }
+
+            // Not dragging: still recompute the chain every hover frame from wherever the
+            // cursor currently is, so the guide line tracks the cursor live - Blender does the
+            // same, and it's what actually lets you see what you're about to grab before you
+            // commit to a drag. Only the CLICK below promotes an already-fresh selection into an
+            // active drag; nothing about the selection itself is special-cased for the click.
+            _isHovering = false;
+            if (overUI || altHeld) { _poseSelections = null; return; }
+
+            Ray hoverRay = cam.ScreenPointToRay(mouse.position.ReadValue());
+            bool hasHit = sculptableMesh.RaycastMesh(hoverRay, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            _isHovering = hasHit;
+            if (!_isHovering) { _poseSelections = null; return; }
+
+            _hoverPoint = hitPoint;
+            _hoverNormal = hitNormal;
+            _previewPositive = true;
+
+            Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
+            var selections = new List<(SculptableMesh.PoseSelection, Vector3)>();
+            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            {
+                var selection = sculptableMesh.SelectPose(Vector3.Scale(localHit, sign), brushRadius, poseRigidity, poseSegments);
+                if (selection.IsValid) selections.Add((selection, sign));
+            }
+            _poseSelections = selections.Count > 0 ? selections : null;
+
+            if (!mouse.leftButton.wasPressedThisFrame) return;
+
+            if (_poseSelections == null)
+            {
+                // Clicked outside any unmasked region, or the unmasked island has no masked
+                // neighbor anywhere to anchor against - Pose has nothing sensible to do, same
+                // as Move missing the mesh entirely. The toast is worth it here specifically
+                // because the reason for "nothing happened" (mask setup, not a missed click)
+                // is not otherwise visible.
+                TriggerActionToast("Mask an anchor first");
+                return;
+            }
+
+            _isPoseDragging = true;
+            _poseDragPlanePoint = hitPoint;
+            _poseDragPlaneNormal = -cam.transform.forward;
+
+            if (logRayHits) Debug.Log($"[Sculpt] Pose grab started at {hitPoint}");
+        }
+
+        // Unconditional (no _isPoseDragging guard) - unlike EndMoveDrag, _poseSelections is also
+        // the live hover-preview's own state (see HandlePoseInput), not exclusively an active-
+        // drag flag, so this needs to clear it even when called mid-hover (e.g. switching away
+        // from Pose to another brush - see EndActiveDrags' call sites) rather than only at the
+        // end of an actual drag.
+        private void EndPoseDrag()
+        {
+            _poseSelections = null;
+            _isPoseDragging = false;
+        }
+
+        // Blender-style Pose Brush guide line: live from the moment the cursor hovers a posable
+        // region with Pose selected, through the drag, same as Blender's own - not just while a
+        // drag is underway (see HandlePoseInput, which now keeps _poseSelections fresh on every
+        // hover frame too). Called from Update() every frame the app runs, not just while
+        // hovering/posing - the early-out below is what keeps that free the rest of the time.
+        private void UpdatePoseChainVisual()
+        {
+            if (_poseSelections == null || sculptableMesh == null)
+            {
+                for (int i = 0; i < _poseChainLines.Count; i++)
+                    if (_poseChainLines[i] != null) _poseChainLines[i].gameObject.SetActive(false);
+                return;
+            }
+
+            while (_poseChainLines.Count < _poseSelections.Count) _poseChainLines.Add(CreatePoseChainLine());
+
+            float width = Mathf.Max(brushRadius * PoseChainWidthFactor, 0.0005f);
+            for (int s = 0; s < _poseSelections.Count; s++)
+            {
+                var (selection, sign) = _poseSelections[s];
+                LineRenderer lr = _poseChainLines[s];
+                Vector3[] points = selection.ChainPoints;
+                if (points == null || points.Length < 2) { lr.gameObject.SetActive(false); continue; }
+
+                lr.gameObject.SetActive(true);
+                lr.widthMultiplier = width;
+                lr.positionCount = points.Length;
+                for (int p = 0; p < points.Length; p++)
+                    lr.SetPosition(p, sculptableMesh.transform.TransformPoint(Vector3.Scale(points[p], sign)));
+            }
+            for (int s = _poseSelections.Count; s < _poseChainLines.Count; s++)
+                _poseChainLines[s].gameObject.SetActive(false);
+        }
+
+        private LineRenderer CreatePoseChainLine()
+        {
+            var go = new GameObject("PoseChainLine");
+            go.transform.SetParent(transform, false);
+
+            if (_poseChainMaterial == null)
+            {
+                // Same overlay-shader-with-Sprites/Default-fallback dance as
+                // TransformGizmo.ApplyUnlitColor - see this field's own remarks for why the
+                // overlay shader is what actually matters here.
+                Shader overlayShader = Shader.Find("Custom/BrushPreviewOverlay");
+                _poseChainMaterial = overlayShader != null ? new Material(overlayShader) : new Material(Shader.Find("Sprites/Default"));
+                _poseChainMaterial.name = "Pose Chain Line (Runtime)";
+                if (overlayShader != null) _poseChainMaterial.SetColor(PoseChainColorId, PoseChainColor);
+                else _poseChainMaterial.color = PoseChainColor;
+            }
+
+            var lr = go.AddComponent<LineRenderer>();
+            lr.sharedMaterial = _poseChainMaterial;
+            lr.useWorldSpace = true;
+            lr.numCapVertices = 4;
+            lr.numCornerVertices = 2;
+            lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            lr.receiveShadows = false;
+            go.SetActive(false);
+            return lr;
+        }
+
         // internal (not private) so TransformGizmo can reuse the exact same axis-constrained
         // drag technique Move-brush dragging already uses, for its own Move/Scale handles - no
         // .asmdef boundary in this project (see [[project_scene_graph_epic]] memory), so
@@ -3784,7 +4233,7 @@ namespace Sculpting
         public void ResetMesh()
         {
             if (sculptableMesh == null) return;
-            EndMoveDrag();
+            EndActiveDrags();
             sculptableMesh.SnapshotForUndo();
             sculptableMesh.ResetMesh();
         }
@@ -3807,7 +4256,7 @@ namespace Sculpting
         public string MakeSymmetric(bool sourceIsPositive)
         {
             if (sculptableMesh == null) return "No object selected";
-            EndMoveDrag();
+            EndActiveDrags();
 
             int changed = SymmetryOps.MakeSymmetric(sculptableMesh, symmetryAxis, symmetryToleranceScale,
                                                     sourceIsPositive, out int pairs, out int unmatched,
@@ -3850,7 +4299,7 @@ namespace Sculpting
         public string MirrorAndWeld(bool sourceIsPositive)
         {
             if (sculptableMesh == null) return "No object selected";
-            EndMoveDrag();
+            EndActiveDrags();
 
             string axis = SymmetryOps.AxisName(symmetryAxis);
             string from = sourceIsPositive ? "+" + axis : "-" + axis;
@@ -3875,7 +4324,7 @@ namespace Sculpting
         public string SymmetryCleanup()
         {
             if (sculptableMesh == null) return "No object selected";
-            EndMoveDrag();
+            EndActiveDrags();
 
             if (!SymmetryOps.Cleanup(sculptableMesh, symmetryAxis, symmetryToleranceScale,
                                      out int snapped, out int welded))
@@ -4066,6 +4515,9 @@ namespace Sculpting
             public float accumulateStrength;
             public bool frontFacingOnly;
             public bool buildUpOnHold;
+            public float surfaceRelax;
+            public float poseRigidity;
+            public int poseSegments;
 
             public float clayHeightFactor;
             public float clayTipRoundness;
@@ -4127,6 +4579,9 @@ namespace Sculpting
                 accumulateStrength = accumulateStrength,
                 frontFacingOnly = frontFacingOnly,
                 buildUpOnHold = buildUpOnHold,
+                surfaceRelax = surfaceRelax,
+                poseRigidity = poseRigidity,
+                poseSegments = poseSegments,
 
                 clayHeightFactor = clayHeightFactor,
                 clayTipRoundness = clayTipRoundness,
@@ -4208,6 +4663,13 @@ namespace Sculpting
             AccumulateStrength = s.accumulateStrength;
             FrontFacingOnly = s.frontFacingOnly;
             BuildUpOnHold = s.buildUpOnHold;
+            SurfaceRelax = s.surfaceRelax;
+            PoseRigidity = s.poseRigidity;
+            // A file from before this setting existed has poseSegments == 0 (JsonUtility's
+            // default for an unseen int field) - Clamp below floors that to 1, which reproduces
+            // the pre-segments behavior (root always the true anchor) rather than silently
+            // producing an invalid 0-segment chain.
+            PoseSegments = s.poseSegments > 0 ? s.poseSegments : 4;
 
             IsMaskPaintMode = s.maskPaintMode;
 

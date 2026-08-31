@@ -109,6 +109,12 @@ namespace Sculpting
         private InputField _fallbackField;
         private string _lastDirectory;
 
+        // The file this session's scene currently corresponds to - null until the first
+        // successful Save As or a "Replace scene" Load, matching how Save/Save As are supposed
+        // to differ (see Save/SaveAs below). Deliberately NOT touched by "Add to current scene"
+        // imports, since those don't make the imported file the document Ctrl+S would overwrite.
+        private string _currentSavePath;
+
         // The panel's own Canvas GameObject, watched by Update so the panel can rebuild itself
         // if anything ever destroys it out from under this component. Root-level parenting (see
         // UIFactory.CreatePanelCanvas) is the actual fix for the Editor-undo case that used to
@@ -177,7 +183,8 @@ namespace Sculpting
 
             UIFactory.CreateButton(panel, "Import Object...", ImportObject);
             UIFactory.CreateButton(panel, "Load Scene...", LoadScene);
-            UIFactory.CreateButton(panel, "Save Scene...", SaveScene);
+            UIFactory.CreateButton(panel, "Save", Save);
+            UIFactory.CreateButton(panel, "Save As...", SaveAs);
 
             if (!FileDialog.IsSupported)
             {
@@ -328,6 +335,11 @@ namespace Sculpting
                 {
                     if (SceneSerializer.Load(path, out string error))
                     {
+                        // The loaded file becomes the current document, same as opening a file
+                        // in any other creative app - a Ctrl+S right after Load should overwrite
+                        // THIS file, not ask where to save.
+                        _currentSavePath = path;
+
                         // Only the replacing path needs this: it restores brush/material/
                         // lighting/camera wholesale, so the Studio Lighting/Material/
                         // Presentation sections merged into this panel are showing values that
@@ -345,15 +357,47 @@ namespace Sculpting
                 }));
         }
 
-        private void SaveScene()
+        /// Quick save: overwrites the current document with no prompt. Falls back to Save As
+        /// the first time, when there is no current document yet to overwrite - matching how
+        /// Ctrl+S behaves in most creative software. Also reachable via the Ctrl+S hotkey (see
+        /// SculptController.HandleSaveKeys), which SendMessages this by name.
+        private void Save()
+        {
+            if (string.IsNullOrEmpty(_currentSavePath))
+            {
+                SaveAs();
+                return;
+            }
+
+            if (SceneSerializer.Save(_currentSavePath, out string error))
+            {
+                SetStatus($"Saved {Path.GetFileName(_currentSavePath)} ({FileSizeMb(_currentSavePath)})", OkColor, hold: true);
+                if (_controller != null) _controller.TriggerActionToast("Saved");
+            }
+            else
+            {
+                SetStatus("Save failed: " + error, ErrorColor, hold: false);
+            }
+        }
+
+        /// Always prompts for a location, then makes that the current document for subsequent
+        /// quick Saves. Also reachable via the Ctrl+Shift+S hotkey (see
+        /// SculptController.HandleSaveKeys), which SendMessages this by name.
+        private void SaveAs()
         {
             string path = PickSavePath();
             if (path == null) return;
 
             if (SceneSerializer.Save(path, out string error))
+            {
+                _currentSavePath = path;
                 SetStatus($"Saved {Path.GetFileName(path)} ({FileSizeMb(path)})", OkColor, hold: true);
+                if (_controller != null) _controller.TriggerActionToast("Saved As");
+            }
             else
+            {
                 SetStatus("Save failed: " + error, ErrorColor, hold: false);
+            }
         }
 
         // ----------------------------------------------------------------------- path picking
