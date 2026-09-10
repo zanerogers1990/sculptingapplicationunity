@@ -13,7 +13,7 @@ namespace Sculpting
     ///
     /// Self-installing and self-driving, same idiom as RegionSelectTool: SculptController adds
     /// this component the first time DensityGrid is asked for (no scene wiring reaches it
-    /// through Unity MCP - see [[feedback_unity_mcp_object_refs]]), and this class then reads
+    /// through Unity MCP, which cannot assign object reference fields), and this class then reads
     /// the controller/selection itself every frame rather than being pushed state from outside.
     public class RemeshDensityGrid : MonoBehaviour
     {

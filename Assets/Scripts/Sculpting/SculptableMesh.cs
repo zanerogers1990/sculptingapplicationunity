@@ -18,8 +18,8 @@ namespace Sculpting
         // sculpt, refreshed only on topology changes (Awake/Remesh/RestoreSnapshot), NOT every
         // ApplyVertices() call. Re-cooking it every frame during a held stroke used to be the
         // dominant per-frame cost by a wide margin (measured ~35ms/call at ~144k triangles,
-        // ~95% of a brush-application frame) - see [[project_sculpting_application]] memory for
-        // the profiling that found this.
+        // ~95% of a brush-application frame, by timing each ApplyVertices() sub-step - and the
+        // cost was the same whatever the brush size).
         [SerializeField] private bool useMeshCollider = true;
 
         private MeshFilter _meshFilter;
@@ -311,8 +311,8 @@ namespace Sculpting
         // Cell size targets ~8 triangles per cell on average, sized off the CURRENT mesh's own
         // triangle density (bounds volume / triangle count) rather than any fixed constant -
         // learned from a prior bug in SignedDistanceField's triangle-binning grid, which reused
-        // an unrelated cell size and bloated badly on a coarse source mesh (see
-        // [[project_scene_graph_epic]] memory, remesh perf work).
+        // an unrelated cell size and bloated badly on a coarse source mesh (found during the
+        // remesh performance work).
         /// How many times the triangle grid has been rebuilt from scratch. Diagnostic only - a
         /// rebuild is O(total triangle count) and lands inside whatever frame triggered it, so
         /// this is the number to look at when a stroke is smooth on average but hitches.
@@ -445,7 +445,8 @@ namespace Sculpting
         // Rebuilt whenever the managed topology it was copied from is REPLACED, tracked by
         // identity. This used to compare lengths only, which a topology change that keeps the
         // vertex count passes with every neighbour wrong; and a mid-Play recompile nulls the source
-        // reference, which forces a rebuild too (see [[project_domain_reload_null_fields]]).
+        // reference, which forces a rebuild too - every non-serializable cache here has to
+        // rebuild-if-null, not merely null-check.
         private NativeArray<int> _nativeAdjacencyOffsets;
         private NativeArray<int> _nativeAdjacencyNeighbors;
         private MeshAdjacency _nativeAdjacencySource;
@@ -1196,7 +1197,7 @@ namespace Sculpting
         /// neighbors - a moved vertex changes not just its own cavity value but every
         /// neighbor's too, since their GetNeighborAverage includes it. Measured as the dominant
         /// remaining per-frame cost after the triangle-grid fix (this app's high-poly-brush-lag
-        /// investigation) - see [[project_sculpting_application]] memory.
+        /// investigation): ~5.6ms of an ~8ms small-footprint stroke at ~144k triangles.
         private void RecomputeCavityLocal()
         {
             EnsureCavityBuffers();
@@ -1566,8 +1567,8 @@ namespace Sculpting
         /// copy (SetTriangles, in practice), because ordinary sculpting writes moved vertices
         /// STRAIGHT into the GPU buffer via GpuVertexScatter and deliberately never syncs them
         /// back - so Unity's managed copy still holds the pre-sculpt shape. Letting it drive a
-        /// reupload would silently revert the sculpt on screen (the same class of bug the
-        /// [[feedback_unity_gpu_buffer_verification]] memory records for Remesh). Assigning
+        /// reupload would silently revert the sculpt on screen (the same class of bug that once
+        /// made Remesh rebuild from the stale pre-sculpt shape). Assigning
         /// vertices also recalculates the mesh bounds from the FULL vertex array, which is what
         /// keeps bounds correct while part of the index buffer is hidden.
         private void SyncMeshFromWorkingArrays()

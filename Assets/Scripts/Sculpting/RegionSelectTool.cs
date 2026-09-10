@@ -53,8 +53,8 @@ namespace Sculpting
     ///
     /// Self-resolving and self-installing: SculptController adds this component if the scene
     /// doesn't have one, so no Inspector wiring is needed (see that class's RegionSelect
-    /// property, and the [[feedback_unity_mcp_object_refs]] memory for why this project avoids
-    /// serialized object references).
+    /// property). This project avoids serialized object references because its scenes are
+    /// edited through Unity MCP, which cannot assign them.
     public class RegionSelectTool : MonoBehaviour
     {
         // A drag shorter than this in both axes (or, for a lasso, whose whole path is shorter

@@ -258,7 +258,8 @@ namespace Sculpting
         // Multithreads Inflate/Crease/DamStandard/Clay/Smooth's per-candidate math via Unity
         // Jobs+Burst instead of a plain C# loop - mirrors how Blender/ZBrush get real-time perf
         // at high polycount (CPU spatial acceleration + multithreading), not GPU compute for the
-        // brush math itself - see [[project_perf_overhaul_no_gpu_rewrite]] memory for why. Only
+        // brush math itself - a GPU brush was ruled out because hit-testing the deformed surface
+        // would need an async GPU readback, adding a frame or two of latency to every dab. Only
         // matters for large-radius brushes on dense meshes (thousands+ vertices per footprint);
         // ordinary strokes are already fast enough via the footprint scoping alone. Exposed as a
         // toggle for A/B profiling - each brush keeps its original plain-C# method (suffixed
@@ -772,8 +773,7 @@ namespace Sculpting
         // job, reset back to -1 after, an O(1)-per-candidate operation - and only ALLOCATED/
         // filled with -1 once per topology change, not per call (see EnsureSmoothFullMeshScratch).
         // The position mirror IS refreshed via a full O(total) copy each Smooth call, but that's
-        // a plain memcpy-like array copy, not per-vertex math - a deliberately accepted
-        // tradeoff, see [[project_perf_overhaul_no_gpu_rewrite]] memory.
+        // a plain memcpy-like array copy, not per-vertex math - a deliberately accepted tradeoff.
         private NativeArray<int> _nativeVertexToSlot;
         private NativeArray<Vector3> _nativeFullPositionMirror;
         private int _nativeFullMeshCapacity;
@@ -1455,7 +1455,8 @@ namespace Sculpting
         // analog for exactly this kind of iterative relaxation. Both converge toward the same
         // smoothed result; they differ in the transient path between passes, most visible at
         // high brushStrength (many folded passes) - verified empirically to still converge to a
-        // visually/numerically reasonable result, see [[project_perf_overhaul_no_gpu_rewrite]].
+        // visually/numerically reasonable result: the two paths differed by at most ~1e-4 even at
+        // maximum strength (10 full passes).
         [BurstCompile(CompileSynchronously = true)]
         private struct SmoothRelaxJob : IJobParallelFor
         {
@@ -2138,7 +2139,8 @@ namespace Sculpting
 
         // Box/lasso hide and mask (see RegionSelectTool). Found lazily, and ADDED to this
         // GameObject if the scene has none - the scene file is edited through Unity MCP, which
-        // cannot wire object references (see [[feedback_unity_mcp_object_refs]] memory), so a
+        // cannot wire object references (its property setter fails to deserialize any
+        // GameObject/Component reference field), so a
         // tool that self-installs is the one that reliably exists at runtime. Added rather than
         // required, so an older scene picks the feature up with no scene edit at all.
         private RegionSelectTool _regionSelect;
@@ -2912,8 +2914,13 @@ namespace Sculpting
                 case BrushType.Pose:
                     HandlePoseInput(mouse, overUI, altHeld);
                     break;
-                default:
+                case BrushType.Clay:
                     HandleClayInput(mouse, overUI, altHeld);
+                    break;
+                default:
+                    // Every BrushType needs its own case above. This used to fall through to Clay,
+                    // so a newly added brush silently sculpted as Clay instead of failing.
+                    Debug.LogError($"[Sculpt] Unhandled BrushType {currentBrush} in HandleSculptInput", this);
                     break;
             }
 
@@ -3295,8 +3302,8 @@ namespace Sculpting
         // Calibrated empirically against this app's own live cavity numbers, not guessed - a
         // rounded lobe tip measured ~0.07, the mesh-wide 90th/99th percentiles were ~2.9/~12.5,
         // and an actual reported pinch measured ~21 - a clean 300x separation between ordinary
-        // shaping and a genuine crease, comfortably straddled by Start/Full below. See
-        // [[project_surface_relax]] memory for the full numbers.
+        // shaping and a genuine crease, comfortably straddled by Start/Full below. (Sampled
+        // across a 78k-vertex sculpt, whose median deviation was ~0.6 and maximum ~64.)
         private const float RelaxCurvatureFloor = 0.08f;
         private const float RelaxCurvatureStart = 3f;
         private const float RelaxCurvatureFull = 15f;
@@ -5241,8 +5248,7 @@ namespace Sculpting
 
         // internal (not private) so TransformGizmo can reuse the exact same axis-constrained
         // drag technique Move-brush dragging already uses, for its own Move/Scale handles - no
-        // .asmdef boundary in this project (see [[project_scene_graph_epic]] memory), so
-        // internal is enough without a public API change.
+        // .asmdef boundary in this project, so internal is enough without a public API change.
         internal static bool RayPlaneIntersect(Ray ray, Vector3 planePoint, Vector3 planeNormal, out Vector3 point)
         {
             float denom = Vector3.Dot(ray.direction, planeNormal);
