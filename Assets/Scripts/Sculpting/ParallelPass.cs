@@ -14,11 +14,15 @@ namespace Sculpting
     /// splitting them across cores gives bit-identical output. Measured on a 32-core machine at
     /// that footprint: normals 14.5 ms -> 1.3 ms, cavity 14.5 ms -> 1.8 ms.
     ///
+    /// Also used for the other per-vertex passes on that path that have the same shape: the GPU
+    /// scatter's staging (GpuVertexScatter) and the drift-filter baseline update.
+    ///
     /// NOT Burst jobs, which is what every BRUSH in this project uses. Those want NativeArrays,
-    /// and the data these two passes walk is a pair of jagged managed arrays (per-vertex
-    /// adjacency and per-vertex incident triangles) that would have to be flattened into native
-    /// memory and kept in sync with every topology change - a large, permanent cost for the same
-    /// win Parallel.For gets over the arrays that already exist.
+    /// and the data these passes walk (MeshAdjacency's neighbour and incident-triangle arrays, the
+    /// working positions, normals and cavity buffers) lives in managed arrays that every other
+    /// system reads and writes directly - mirroring all of it into native memory and keeping the
+    /// copies in step with every edit would be a large, permanent cost for the same win
+    /// Parallel.For gets over the arrays that already exist.
     ///
     /// THREAD SAFETY IS THE CALLER'S. Nothing here checks it: `body` must not touch any Unity
     /// API, must not write anything two blocks could both reach, and must not read anything

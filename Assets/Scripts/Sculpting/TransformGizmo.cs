@@ -536,6 +536,12 @@ namespace Sculpting
             Ray ray = _cam.ScreenPointToRay(mouse.position.ReadValue());
             if (!TryPickHandle(ray, out GizmoHandleTag tag, out float handleDistance)) return false;
 
+            // The tool owning the gizmo may keep the press even over a handle. A ZSphere rig does
+            // wherever the cursor is on a sphere's body: the arrow shafts start at the selected
+            // sphere's centre, so otherwise every grab of that sphere became a one-axis drag.
+            if (_externalTargets.Count > 0 && _externalSource is IGizmoPointerClaim claim && claim.ClaimsPointer(ray))
+                return false;
+
             // A handle beats a MESH regardless of depth - they are drawn always-on-top precisely
             // so a gizmo sitting inside the model stays grabbable, and the picker has to agree
             // with what is on screen. It must NOT beat another always-on-top control that is

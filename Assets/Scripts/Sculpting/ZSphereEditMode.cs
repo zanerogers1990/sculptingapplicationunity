@@ -1,25 +1,20 @@
 namespace Sculpting
 {
-    /// What a click/drag on the ZSphere rig does while GizmoMode.ZSphere is active - see
-    /// ZSphereController, which owns the mouse in that mode the same way TransformGizmo owns
-    /// it in Transpose/Scale.
-    ///
-    /// Add is the mode the whole workflow is built around (click a sphere to select it, drag
-    /// off one to grow the next); the other four exist because every one of them would
-    /// otherwise have to overload that same drag with a modifier key, and a blockout session
-    /// spends long stretches doing only one of them.
+    /// What a left-drag on the armature does while GizmoMode.ZSphere is active. The same four
+    /// ZBrush offers, and deliberately no more: every gesture that works in ALL modes (wheel to
+    /// resize, right-click to delete, click to select) lives outside this enum, so switching mode
+    /// only ever changes what a drag does - never what a click does.
     public enum ZSphereEditMode
     {
-        /// Click empty space to place the root; drag off an existing sphere to grow a child.
-        Add,
-        /// Drag a sphere to reposition just that sphere, leaving its children where they are.
+        /// Drag off a sphere to grow a child that follows the cursor; drag a link to insert a
+        /// sphere there and place it in the same motion; click empty space to start a rig.
+        Draw,
+        /// Drag a sphere to move it together with everything below it, so a chain keeps its
+        /// shape. Shift moves just that one sphere.
         Move,
-        /// Drag left/right on a sphere to scrub its radius.
+        /// Drag to resize a sphere. Shift resizes its whole branch together.
         Scale,
-        /// Drag a sphere to swing it (and everything below it) about its parent joint,
-        /// preserving bone length - the spheres-are-bones posing pass.
-        Pose,
-        /// Click a sphere to delete it and everything below it.
-        Delete
+        /// Swing a sphere and everything below it about its parent joint, keeping bone lengths.
+        Rotate
     }
 }

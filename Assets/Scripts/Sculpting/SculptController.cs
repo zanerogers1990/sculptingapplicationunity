@@ -323,6 +323,19 @@ namespace Sculpting
         // mesa with near-vertical walls rather than a brush. 0.6 keeps the flat-strip character
         // while giving the footprint a shoulder to blend on.
         [SerializeField, Range(0.05f, 1f)] private float clayEdgeSoftness = 0.6f;
+        // How far a light vs. a firm pen touch narrows/widens Clay's own footprint, on top of
+        // CurrentPressure already scaling how MUCH clay a dab deposits (EffectiveBrushStrength).
+        // Real clay responds to a lighter touch by contacting less of the surface, not just by
+        // depositing less of it - dragged softly it leaves a narrow smear, pressed harder it
+        // spreads wider and flatter. 0 leaves the footprint at exactly brushRadius regardless of
+        // pressure (which is also what a mouse - no pen, CurrentPressure always 1 - already sees,
+        // so this is opt-in and changes nothing for mouse users). See EffectiveClayRadius.
+        [SerializeField, Range(0f, 1f)] private float clayPressureRadiusInfluence = 0.3f;
+        // Companion to the above: how much a lighter touch also softens the footprint's edge
+        // (raises clayEdgeSoftness) instead of just shrinking it - a light touch feathers off,
+        // a firm one presses a thicker, more solid-edged pad. Same CurrentPressure==1 no-op for
+        // mouse users. See EffectiveClayEdgeSoftness.
+        [SerializeField, Range(0f, 1f)] private float clayPressureSoftnessInfluence = 0.5f;
         // Smooth has no "amount" concept beyond how far it eases toward the neighbor
         // average each frame, so it gets its own speed constant rather than reusing Clay's.
         private const float SmoothSpeed = 4f;
@@ -583,6 +596,13 @@ namespace Sculpting
         // TriangleSpatialGrid for why this matters at higher triangle counts.
         private readonly DirtyVertexSet _dirtyVertexScratch = new DirtyVertexSet();
 
+        // Union of _dirtyVertexScratch across every frame of the CURRENT stroke - cleared once on
+        // mouse-down (see HandleSculptInput) rather than every frame, and unioned into (never
+        // cleared by) FlushDirtyVertices below. HandleStrokeEndCommit reads this on release to run
+        // ApplyPostStrokeUnifyPass over everything the whole stroke touched, across however many
+        // brushes/frames/mirror dabs contributed to it - not just the last frame's footprint.
+        private readonly DirtyVertexSet _strokeDirtyVertexScratch = new DirtyVertexSet();
+
         /// Add-once-if-not-present set of vertex indices, stamp-marked rather than hashed.
         ///
         /// This was a HashSet&lt;int&gt;, and it is written once per moved vertex per dab - which on
@@ -646,7 +666,11 @@ namespace Sculpting
         private void FlushDirtyVertices()
         {
             if (_dirtyVertexScratch.Count == 0) return;
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch.Items);
+            // Folded into the stroke-wide set here, the one place every brush's per-frame flush
+            // already passes through - see _strokeDirtyVertexScratch's remarks.
+            List<int> items = _dirtyVertexScratch.Items;
+            for (int i = 0; i < items.Count; i++) _strokeDirtyVertexScratch.Add(items[i]);
+            sculptableMesh.ApplyVerticesLocal(items);
         }
 
         // Persistent, grow-on-demand NativeArray scratch shared by every Burst job below -
@@ -1132,7 +1156,13 @@ namespace Sculpting
             edgeSoftness = Mathf.Max(edgeSoftness, 0.001f);
             if (t01 >= edgeSoftness) return 1f;
             float e = t01 / edgeSoftness;
-            return e * e * (3f - 2f * e);
+            // Quintic ("smootherstep") rather than the cubic smoothstep this used to be: both
+            // run 0->1 across the same band and agree at the ends and the midpoint, but plain
+            // smoothstep still has a nonzero SECOND derivative at e=0/1, which reads as a faint
+            // crease exactly where the taper meets the flat plateau/the zero rim - most visible
+            // where two dabs' edge bands overlap. Zeroing that too (Perlin's 6e^5-15e^4+10e^3)
+            // is what actually reads as "soft" rather than merely "not a hard line".
+            return e * e * e * (e * (e * 6f - 15f) + 10f);
         }
 
         // Blends Clay's footprint shape between round (plain 3D distance, today's original
@@ -1636,6 +1666,20 @@ namespace Sculpting
             }
         }
 
+        // Clay's own pressure-shaped footprint size - see clayPressureRadiusInfluence's remarks.
+        // At CurrentPressure==1 (a firm press, or no pen at all - mouse users always read 1 here)
+        // this returns exactly brushRadius, so the radius math below is a strict no-op until a
+        // pen actually lifts off full pressure.
+        private float EffectiveClayRadius =>
+            brushRadius * Mathf.Lerp(1f - clayPressureRadiusInfluence, 1f, CurrentPressure);
+
+        // Clay's own pressure-shaped edge softness - see clayPressureSoftnessInfluence's remarks.
+        // Same CurrentPressure==1 no-op as EffectiveClayRadius above. Clamped to clayEdgeSoftness's
+        // own [0.05, 1] range for the same NaN-avoidance reason ClayFalloff's own Max() guards.
+        private float EffectiveClayEdgeSoftness => Mathf.Clamp(
+            clayEdgeSoftness * Mathf.Lerp(1f + clayPressureSoftnessInfluence, 1f, CurrentPressure),
+            0.05f, 1f);
+
         // Real tablet pressure sensors are noisy enough that reading Pen.current.pressure raw
         // every frame produces a visibly jittery, stair-stepped stroke rather than the smooth,
         // evenly-building ridge ZBrush/Blender strokes have - this exponentially chases the raw
@@ -1965,6 +2009,8 @@ namespace Sculpting
         public float ClayTipRoundness { get => clayTipRoundness; set => clayTipRoundness = Mathf.Clamp01(value); }
         // Clamped away from 0 rather than to it - ClayFalloff divides by this.
         public float ClayEdgeSoftness { get => clayEdgeSoftness; set => clayEdgeSoftness = Mathf.Clamp(value, 0.05f, 1f); }
+        public float ClayPressureRadiusInfluence { get => clayPressureRadiusInfluence; set => clayPressureRadiusInfluence = Mathf.Clamp01(value); }
+        public float ClayPressureSoftnessInfluence { get => clayPressureSoftnessInfluence; set => clayPressureSoftnessInfluence = Mathf.Clamp01(value); }
         public float PressureFloor { get => pressureFloor; set => pressureFloor = Mathf.Clamp(value, 0f, 0.5f); }
         public float PressureCurve { get => pressureCurve; set => pressureCurve = Mathf.Clamp(value, 0.5f, 3f); }
         public float CreasePinch { get => creasePinch; set => creasePinch = Mathf.Clamp01(value); }
@@ -2327,9 +2373,98 @@ namespace Sculpting
             if (mouse == null || sculptableMesh == null) return;
             if (mouse.leftButton.wasReleasedThisFrame || mouse.rightButton.wasReleasedThisFrame)
             {
+                // Runs BEFORE EndStrokeUndo, not after: this pass's own vertex moves have to land
+                // inside the SAME accumulated undo delta as the rest of the stroke, so one Undo
+                // reverts the whole thing (the stroke plus its unify pass) rather than needing two.
+                ApplyPostStrokeUnifyPass();
                 sculptableMesh.EndStrokeUndo();
                 _strokeEndFadeTimer = StrokeEndFadeDuration;
             }
+        }
+
+        // How much of the gap toward each vertex's neighbor average ApplyPostStrokeUnifyPass
+        // closes in its one pass. Deliberately small and fixed, not an iteration ramp like
+        // Smooth's own MaxSmoothIterations - this isn't a tool the user reaches for, it's one
+        // quiet pass that runs automatically on every stroke release, so it has to stay far too
+        // gentle to read as "the surface got smoothed" on its own; it only has to blend away the
+        // faint facet where one frame's dab meets the next; see the method's own remarks.
+        private const float PostStrokeUnifyAmount = 0.35f;
+
+        // Candidate-indexed scratch for the pass below - reused across strokes rather than
+        // reallocated, same reasoning as _clayWeightScratch/_smoothWeightScratch.
+        private float[] _postStrokeUnifyWeightScratch = System.Array.Empty<float>();
+
+        /// Runs once, when a stroke ends (see HandleStrokeEndCommit), over every vertex ANY brush
+        /// moved during the whole stroke - not just Clay's own per-frame Surface Relax above,
+        /// which only ever sees one frame's dab footprint and only ever rides along on Clay.
+        /// Consecutive dabs (of any brush, Clay's flat-topped plateau most of all) leave a faint
+        /// facet where one frame's geometry meets the next; one gentle, curvature-gated Laplacian
+        /// pass over the whole stroke's footprint blends those together into one continuous
+        /// surface, "unifying" it the way a real sculptor's hand settles clay after a pass.
+        ///
+        /// Curvature-gated with the exact same shape (and the exact same calibrated constants -
+        /// see their own remarks) as Clay's Surface Relax above: a vertex whose curvature already
+        /// departs sharply from the mesh's own baseline (a genuine seam/pinch) gets real
+        /// correction, while an ordinary rounded feature - which measures close to baseline by
+        /// this same test - is mostly left alone. That is what keeps this "without removing
+        /// detail" rather than sanding the whole stroke smooth.
+        ///
+        /// Deliberately plain managed C#, not a Burst job: unlike Surface Relax, which reruns
+        /// every frame of a held stroke, this runs exactly once, at release - even a wide stroke's
+        /// full touched-vertex set is a one-off cost at that point, not a per-frame one.
+        private void ApplyPostStrokeUnifyPass()
+        {
+            if (sculptableMesh == null) return;
+            List<int> touched = _strokeDirtyVertexScratch.Items;
+            if (touched.Count == 0) return;
+
+            SculptableMesh mesh = sculptableMesh;
+            Vector3[] verts = mesh.Vertices;
+            float[] mask = mesh.Mask;
+
+            if (_postStrokeUnifyWeightScratch.Length < touched.Count)
+                _postStrokeUnifyWeightScratch = new float[touched.Count];
+            float[] weights = _postStrokeUnifyWeightScratch;
+
+            bool anyInRange = false;
+            for (int ci = 0; ci < touched.Count; ci++)
+            {
+                int i = touched[ci];
+                // A Remesh mid-stroke resizes the mesh out from under indices gathered on earlier
+                // frames - see DirtyVertexSet's own remarks on the same hazard.
+                if ((uint)i >= (uint)verts.Length) { weights[ci] = 0f; continue; }
+
+                float curvatureDeviation = mesh.CurvatureDeviationAt(i);
+                float curvatureFactor = Mathf.Lerp(RelaxCurvatureFloor, 1f,
+                    Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(RelaxCurvatureStart, RelaxCurvatureFull, curvatureDeviation)));
+                float w = curvatureFactor * (1f - mask[i]);
+                weights[ci] = w;
+                if (w > 0f) anyInRange = true;
+            }
+            if (!anyInRange) return;
+
+            // Reuses the per-frame scratch set as plain scratch here (not through
+            // BeginDirtyVertices/FlushDirtyVertices - this pass's own results must NOT fold back
+            // into _strokeDirtyVertexScratch, which is about to be cleared by the next stroke's
+            // mouse-down and has no reason to remember this pass's touches beyond that).
+            _dirtyVertexScratch.Clear(verts.Length);
+            bool anyMoved = false;
+            for (int ci = 0; ci < touched.Count; ci++)
+            {
+                float w = weights[ci];
+                if (w <= 0f) continue;
+                int i = touched[ci];
+
+                Vector3 toAverage = mesh.GetNeighborAverage(i) - verts[i];
+                mesh.RecordUndoBeforeIfNeeded(i);
+                verts[i] += toAverage * (w * PostStrokeUnifyAmount);
+                anyMoved = true;
+                _dirtyVertexScratch.Add(i);
+            }
+
+            if (!anyMoved) return;
+            MarkPositionMirrorStale();
+            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch.Items);
         }
 
         // Bare Z (not Ctrl+Z) is deliberate: this app runs inside the Unity Editor during
@@ -2729,11 +2864,12 @@ namespace Sculpting
                 return;
             }
 
-            // Rebuild the vertex spatial index once at the start of every stroke (not every
-            // frame - rebuilding is itself O(vertex count), so doing it per-frame would defeat
-            // the point) so Clay/Smooth/Crease/Dam Standard/Move's per-stroke vertex lookups
-            // don't have to scan the whole mesh. Cell size tracks the current brush radius so
-            // the grid stays well-matched to typical query size. Also begins the stroke's undo
+            // Prepare the vertex spatial index once at the start of every stroke so Clay/Smooth/
+            // Crease/Dam Standard/Move's per-stroke vertex lookups don't have to scan the whole
+            // mesh. Cell size tracks the current brush radius so the grid stays well-matched to
+            // typical query size; the previous stroke's index is reused as-is when it still fits
+            // (see SculptableMesh.PrepareSpatialIndex), since a rebuild is O(vertex count) and
+            // would otherwise land in the first frame of every stroke. Also begins the stroke's undo
             // delta accumulator here, once per stroke rather than per frame for the same reason -
             // a stroke that turns out to be a click on empty space (missing the mesh) never
             // records anything, so HandleStrokeEndCommit's EndStrokeUndo call just no-ops for it
@@ -2741,13 +2877,16 @@ namespace Sculpting
             // the extra complexity of gating this from inside every individual brush handler.
             if (!overUI && !altHeld && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
             {
-                sculptableMesh.RebuildSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
+                sculptableMesh.PrepareSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
                 sculptableMesh.BeginStrokeUndo();
                 // Fresh stroke, fresh speed reading - without this, a new stroke's first frame
                 // would measure "speed" against wherever the cursor last hit the mesh at the END
                 // of a PREVIOUS, unrelated stroke (see UpdateStrokeSpeed's remarks).
                 _lastStrokeHitPointWorld = null;
                 _strokeSpeed = 0f;
+                // Fresh stroke, fresh touched-vertex set - see _strokeDirtyVertexScratch/
+                // ApplyPostStrokeUnifyPass.
+                _strokeDirtyVertexScratch.Clear(sculptableMesh.Vertices.Length);
             }
 
             switch (currentBrush)
@@ -2851,7 +2990,7 @@ namespace Sculpting
             // this rebuild is really about matching cell size to the mask brush's own radius.)
             if (!altHeld && (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame))
             {
-                sculptableMesh.RebuildSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
+                sculptableMesh.PrepareSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
                 // Opens the mask stroke's undo accumulator. Mask mode returns from
                 // HandleSculptInput before its BeginStrokeUndo block, so this is the only place
                 // that can do it; the matching commit needs no new call site, since
@@ -3597,14 +3736,21 @@ namespace Sculpting
             Vector3[] verts = sculptableMesh.Vertices;
             Vector3[] normals = sculptableMesh.Normals;
 
+            // Query radius stays keyed to the UN-shrunk brushRadius even under a light touch -
+            // EffectiveClayRadius only ever shrinks the footprint (see its remarks), so this
+            // always covers it, and re-querying a smaller radius every pressure fluctuation
+            // would just invalidate the spatial grid's result buffer for no benefit.
             float queryRadius = clayTipRoundness < 1f ? brushRadius * Sqrt2 : brushRadius;
             List<int> candidates = sculptableMesh.QueryNear(localPoint, queryRadius);
             if (candidates.Count == 0) return;
 
+            float effectiveRadius = EffectiveClayRadius;
+            float effectiveEdgeSoftness = EffectiveClayEdgeSoftness;
+
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyClayBrushLocalJob(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals);
+                ApplyClayBrushLocalJob(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness);
             else
-                ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals);
+                ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness);
 
             // The relax pass this dab needs runs once for the whole frame, over the union of every
             // dab centre in it - see ApplySurfaceRelaxBatched. Recorded here rather than in
@@ -3617,11 +3763,15 @@ namespace Sculpting
             }
         }
 
-        private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness)
         {
             float sign = positive ? 1f : -1f;
             float effectiveStrength = EffectiveBrushStrength;
             float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
+            // Height stays tied to the UN-shrunk brushRadius - pressure already scales how much
+            // this dab deposits via effectiveStrength, so scaling height too would double-count
+            // it. Only the footprint's WIDTH (effectiveRadius/effectiveEdgeSoftness) responds to
+            // pressure here - see EffectiveClayRadius's remarks.
             float height = brushRadius * clayHeightFactor * sign;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
@@ -3637,11 +3787,11 @@ namespace Sculpting
                 WeightedPosOut = _nativeClayWeightedPos,
                 WeightedNormalOut = _nativeClayWeightedNormal,
                 LocalPoint = localPoint,
-                BrushRadius = brushRadius,
+                BrushRadius = effectiveRadius,
                 Tangent0 = tangent0,
                 Bitangent0 = bitangent0,
                 TipRoundness = clayTipRoundness,
-                EdgeSoftness = clayEdgeSoftness,
+                EdgeSoftness = effectiveEdgeSoftness,
                 FrontFacingOnly = frontFacingOnly,
                 CameraLocalPos = _dabCameraLocal,
             };
@@ -3688,7 +3838,7 @@ namespace Sculpting
                 InvertAlpha = invertAlpha,
                 CosR = Mathf.Cos(rot),
                 SinR = Mathf.Sin(rot),
-                InvStampRadius = 1f / Mathf.Max(0.0001f, brushRadius * alphaScale),
+                InvStampRadius = 1f / Mathf.Max(0.0001f, effectiveRadius * alphaScale),
                 AlphaSize = useAlpha ? _nativeAlphaSize : 0,
                 Accumulate = accumulate,
                 Rate = sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt,
@@ -3699,11 +3849,13 @@ namespace Sculpting
             ScatterJobResults(candidates, verts);
         }
 
-        private void ApplyClayBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyClayBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness)
         {
             float sign = positive ? 1f : -1f;
             float effectiveStrength = EffectiveBrushStrength;
             float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
+            // See ApplyClayBrushLocalJob's matching line - height deliberately stays tied to the
+            // UN-shrunk brushRadius so pressure isn't double-counted between strength and height.
             float height = brushRadius * clayHeightFactor * sign;
 
             if (_clayWeightScratch.Length < candidates.Count) _clayWeightScratch = new float[candidates.Count];
@@ -3721,14 +3873,14 @@ namespace Sculpting
                 int i = candidates[ci];
                 Vector3 p = verts[i];
                 Vector3 toVert = p - localPoint;
-                float t01 = ClayTipShapeT01(toVert, brushRadius, tangent0, bitangent0, clayTipRoundness);
+                float t01 = ClayTipShapeT01(toVert, effectiveRadius, tangent0, bitangent0, clayTipRoundness);
                 if (t01 <= 0f) { weights[ci] = 0f; continue; }
 
                 Vector3 n = normals[i];
                 // Plane weight (no mask) and displacement weight (masked), split for the reason
                 // ClayWeightJob.Execute sets out - the plane measures the surface, the mask only
                 // says which of its vertices may move.
-                float planeW = ClayFalloff(t01, clayEdgeSoftness) // flat plateau, edge-only taper - see clayEdgeSoftness
+                float planeW = ClayFalloff(t01, effectiveEdgeSoftness) // flat plateau, edge-only taper - see clayEdgeSoftness
                     * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 weights[ci] = planeW * (1f - mask[i]);
 
@@ -3747,7 +3899,7 @@ namespace Sculpting
             float rot = alphaRotation * Mathf.Deg2Rad;
             float cosR = Mathf.Cos(rot), sinR = Mathf.Sin(rot);
             BrushAlphaLibrary.AlphaData alpha = useAlpha ? BrushAlphaLibrary.Get(alphaType) : default;
-            float invStampRadius = 1f / Mathf.Max(0.0001f, brushRadius * alphaScale);
+            float invStampRadius = 1f / Mathf.Max(0.0001f, effectiveRadius * alphaScale);
             SculptableMesh mesh = sculptableMesh;
             bool anyMoved = false;
 
@@ -5395,6 +5547,8 @@ namespace Sculpting
             public float clayHeightFactor;
             public float clayTipRoundness;
             public float clayEdgeSoftness;
+            public float clayPressureRadiusInfluence;
+            public float clayPressureSoftnessInfluence;
 
             public bool useAlpha;
             public int alphaType;
@@ -5459,6 +5613,8 @@ namespace Sculpting
                 clayHeightFactor = clayHeightFactor,
                 clayTipRoundness = clayTipRoundness,
                 clayEdgeSoftness = clayEdgeSoftness,
+                clayPressureRadiusInfluence = clayPressureRadiusInfluence,
+                clayPressureSoftnessInfluence = clayPressureSoftnessInfluence,
 
                 useAlpha = useAlpha,
                 alphaType = (int)alphaType,
@@ -5505,6 +5661,8 @@ namespace Sculpting
             ClayHeightFactor = s.clayHeightFactor;
             ClayTipRoundness = s.clayTipRoundness;
             ClayEdgeSoftness = s.clayEdgeSoftness;
+            ClayPressureRadiusInfluence = s.clayPressureRadiusInfluence;
+            ClayPressureSoftnessInfluence = s.clayPressureSoftnessInfluence;
 
             UseAlpha = s.useAlpha;
             AlphaType = (BrushAlphaType)Mathf.Clamp(s.alphaType, 0, System.Enum.GetValues(typeof(BrushAlphaType)).Length - 1);

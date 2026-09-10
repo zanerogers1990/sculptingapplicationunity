@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -8,13 +9,19 @@ namespace Sculpting
     /// buffer via a compute-shader scatter write, instead of Unity's managed Mesh.vertices/
     /// .normals/.colors setters - those always reupload the ENTIRE array regardless of how many
     /// vertices actually changed, which is the real per-frame ceiling at high polycounts. See
-    /// SculptableMesh.ApplyVerticesLocal, the only caller.
+    /// SculptableMesh.ApplyVerticesLocal, the main caller.
     ///
     /// CPU stays fully authoritative for every other system - raycasting, undo, mask, mirror,
     /// and export all keep reading SculptableMesh's own Vector3[]/Color[] arrays exactly as
     /// before. This class only ever WRITES into the mesh's buffer for rendering; nothing reads
     /// it back, so there's no async-readback latency to reason about here (unlike a full GPU
     /// brush rewrite would need).
+    ///
+    /// One packed upload per call. The dirty set used to go up as four separate structured
+    /// buffers (indices, positions, normals, colours): four staging arrays written in lock-step,
+    /// four SetData calls, and string-keyed SetBuffer/SetInt lookups on every dispatch. Each dirty
+    /// vertex is now one 44-byte record in a single raw buffer that the kernel reads by byte offset
+    /// (see DirtyVertex), staged across cores when the set is large.
     ///
     /// Loaded via Resources.Load rather than a serialized field: this project's Unity MCP
     /// tooling can't assign object-reference fields (see feedback_unity_mcp_object_refs memory),
@@ -28,19 +35,44 @@ namespace Sculpting
         private static uint _threadGroupSize = 64;
         private static bool _loadAttempted;
 
+        private static readonly int VertexBufferId = Shader.PropertyToID("_VertexBuffer");
+        private static readonly int DirtyVerticesId = Shader.PropertyToID("_DirtyVertices");
+        private static readonly int StrideId = Shader.PropertyToID("_Stride");
+        private static readonly int PositionOffsetId = Shader.PropertyToID("_PositionOffset");
+        private static readonly int NormalOffsetId = Shader.PropertyToID("_NormalOffset");
+        private static readonly int ColorOffsetId = Shader.PropertyToID("_ColorOffset");
+        private static readonly int DirtyStartId = Shader.PropertyToID("_DirtyStart");
+        private static readonly int DirtyCountId = Shader.PropertyToID("_DirtyCount");
+
+        /// One dirty vertex exactly as VertexScatter.compute reads it: a uint index, then position,
+        /// normal and colour as raw float bits - 44 bytes. Every field is four bytes wide, so there is
+        /// no padding on any platform, and the kernel reads it through a ByteAddressBuffer by offset
+        /// rather than as a structured type, because Metal and Vulkan do not agree with D3D on how a
+        /// float3 inside a structured element is aligned.
+        private struct DirtyVertex
+        {
+            public uint Index;
+            public Vector3 Position;
+            public Vector3 Normal;
+            public Color Color;
+        }
+
+        private const int DirtyVertexStride = 44;
+
         private GraphicsBuffer _vertexBuffer;
         private uint _stride, _positionOffset, _normalOffset, _colorOffset;
 
-        private GraphicsBuffer _indexBuffer;
-        private GraphicsBuffer _positionBuffer;
-        private GraphicsBuffer _normalBuffer;
-        private GraphicsBuffer _colorBuffer;
+        private GraphicsBuffer _dirtyBuffer;
         private int _bufferCapacity;
+        private DirtyVertex[] _staging = Array.Empty<DirtyVertex>();
 
-        private uint[] _indexScratch = System.Array.Empty<uint>();
-        private Vector3[] _positionScratch = System.Array.Empty<Vector3>();
-        private Vector3[] _normalScratch = System.Array.Empty<Vector3>();
-        private Vector4[] _colorScratch = System.Array.Empty<Vector4>();
+        // Inputs of the staging pass in flight, held in fields so ParallelPass can split it without a
+        // closure allocation per call. Cleared as soon as the pass returns.
+        private List<int> _stageIndices;
+        private Vector3[] _stagePositions;
+        private Vector3[] _stageNormals;
+        private Color[] _stageColors;
+        private Action<int, int> _stageRange;
 
         private static void EnsureShaderLoaded()
         {
@@ -72,18 +104,11 @@ namespace Sculpting
 
         private void EnsureCapacity(int count)
         {
-            if (_bufferCapacity >= count) return;
+            if (_bufferCapacity >= count && _dirtyBuffer != null) return;
 
-            _indexBuffer?.Dispose();
-            _positionBuffer?.Dispose();
-            _normalBuffer?.Dispose();
-            _colorBuffer?.Dispose();
-
+            _dirtyBuffer?.Dispose();
             _bufferCapacity = Mathf.Max(Mathf.NextPowerOfTwo(count), 64);
-            _indexBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _bufferCapacity, sizeof(uint));
-            _positionBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _bufferCapacity, sizeof(float) * 3);
-            _normalBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _bufferCapacity, sizeof(float) * 3);
-            _colorBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _bufferCapacity, sizeof(float) * 4);
+            _dirtyBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Raw, _bufferCapacity, DirtyVertexStride);
         }
 
         /// Scatters position/normal/color for exactly the vertices in `indices` (reading from
@@ -97,87 +122,99 @@ namespace Sculpting
         {
             if (!BeginScatter(count)) return;
 
+            DirtyVertex[] staging = _staging;
             int n = 0;
             foreach (int vi in indices)
             {
-                _indexScratch[n] = (uint)vi;
-                _positionScratch[n] = positions[vi];
-                _normalScratch[n] = normals[vi];
-                _colorScratch[n] = colors[vi];
+                staging[n].Index = (uint)vi;
+                staging[n].Position = positions[vi];
+                staging[n].Normal = normals[vi];
+                staging[n].Color = colors[vi];
                 n++;
             }
 
-            Dispatch(n);
+            Upload(n);
         }
 
         /// List overload, used by the brush hot path - see SculptableMesh's _affectedList for why
-        /// that set stopped being a HashSet. Same concrete-type-not-interface reasoning as above:
-        /// List&lt;int&gt;'s enumerator is a struct too, and only stays allocation-free when the
-        /// parameter is the concrete type.
+        /// that set stopped being a HashSet. Staged across cores past ParallelPass's threshold: every
+        /// entry reads shared arrays and writes only its own staging slot.
         public void ScatterDirty(List<int> indices, int count, Vector3[] positions, Vector3[] normals, Color[] colors)
         {
             if (!BeginScatter(count)) return;
 
-            for (int n = 0; n < count; n++)
+            _stageIndices = indices;
+            _stagePositions = positions;
+            _stageNormals = normals;
+            _stageColors = colors;
+            ParallelPass.ForRange(count, _stageRange ?? (_stageRange = StageRange));
+            _stageIndices = null;
+            _stagePositions = null;
+            _stageNormals = null;
+            _stageColors = null;
+
+            Upload(count);
+        }
+
+        private void StageRange(int start, int end)
+        {
+            DirtyVertex[] staging = _staging;
+            List<int> indices = _stageIndices;
+            Vector3[] positions = _stagePositions;
+            Vector3[] normals = _stageNormals;
+            Color[] colors = _stageColors;
+            for (int n = start; n < end; n++)
             {
                 int vi = indices[n];
-                _indexScratch[n] = (uint)vi;
-                _positionScratch[n] = positions[vi];
-                _normalScratch[n] = normals[vi];
-                _colorScratch[n] = colors[vi];
+                staging[n].Index = (uint)vi;
+                staging[n].Position = positions[vi];
+                staging[n].Normal = normals[vi];
+                staging[n].Color = colors[vi];
             }
-
-            Dispatch(count);
         }
 
         /// Shared preamble: returns false when there is nothing to do (or no shader to do it
-        /// with), otherwise leaves the GPU and scratch buffers big enough for `count` entries.
+        /// with), otherwise leaves the GPU and staging buffers big enough for `count` entries.
         private bool BeginScatter(int count)
         {
             EnsureShaderLoaded();
             if (_shader == null || _vertexBuffer == null || count == 0) return false;
 
             EnsureCapacity(count);
-            if (_indexScratch.Length < count)
-            {
-                _indexScratch = new uint[count];
-                _positionScratch = new Vector3[count];
-                _normalScratch = new Vector3[count];
-                _colorScratch = new Vector4[count];
-            }
+            if (_staging.Length < count) _staging = new DirtyVertex[Mathf.Max(Mathf.NextPowerOfTwo(count), 64)];
             return true;
         }
 
-        private void Dispatch(int n)
+        private void Upload(int n)
         {
-            _indexBuffer.SetData(_indexScratch, 0, 0, n);
-            _positionBuffer.SetData(_positionScratch, 0, 0, n);
-            _normalBuffer.SetData(_normalScratch, 0, 0, n);
-            _colorBuffer.SetData(_colorScratch, 0, 0, n);
+            _dirtyBuffer.SetData(_staging, 0, 0, n);
 
-            _shader.SetBuffer(_kernel, "_VertexBuffer", _vertexBuffer);
-            _shader.SetBuffer(_kernel, "_DirtyIndices", _indexBuffer);
-            _shader.SetBuffer(_kernel, "_DirtyPositions", _positionBuffer);
-            _shader.SetBuffer(_kernel, "_DirtyNormals", _normalBuffer);
-            _shader.SetBuffer(_kernel, "_DirtyColors", _colorBuffer);
-            _shader.SetInt("_Stride", (int)_stride);
-            _shader.SetInt("_PositionOffset", (int)_positionOffset);
-            _shader.SetInt("_NormalOffset", (int)_normalOffset);
-            _shader.SetInt("_ColorOffset", (int)_colorOffset);
-            _shader.SetInt("_DirtyCount", n);
+            _shader.SetBuffer(_kernel, VertexBufferId, _vertexBuffer);
+            _shader.SetBuffer(_kernel, DirtyVerticesId, _dirtyBuffer);
+            _shader.SetInt(StrideId, (int)_stride);
+            _shader.SetInt(PositionOffsetId, (int)_positionOffset);
+            _shader.SetInt(NormalOffsetId, (int)_normalOffset);
+            _shader.SetInt(ColorOffsetId, (int)_colorOffset);
 
-            int groups = Mathf.Max(1, Mathf.CeilToInt(n / (float)_threadGroupSize));
-            _shader.Dispatch(_kernel, groups, 1, 1);
+            // A dispatch is capped at 65535 thread groups per axis - at 64 per group that is ~4.2M
+            // vertices, which a whole-mesh edit at the densities the remesher produces can reach -
+            // so a larger set goes out as consecutive windows over the same uploaded buffer.
+            int groupSize = (int)_threadGroupSize;
+            int window = 65535 * groupSize;
+            for (int start = 0; start < n; start += window)
+            {
+                int count = Mathf.Min(window, n - start);
+                _shader.SetInt(DirtyStartId, start);
+                _shader.SetInt(DirtyCountId, count);
+                _shader.Dispatch(_kernel, (count + groupSize - 1) / groupSize, 1, 1);
+            }
         }
 
         public void Dispose()
         {
             _vertexBuffer?.Dispose();
-            _indexBuffer?.Dispose();
-            _positionBuffer?.Dispose();
-            _normalBuffer?.Dispose();
-            _colorBuffer?.Dispose();
-            _vertexBuffer = _indexBuffer = _positionBuffer = _normalBuffer = _colorBuffer = null;
+            _dirtyBuffer?.Dispose();
+            _vertexBuffer = _dirtyBuffer = null;
             _bufferCapacity = 0;
         }
     }

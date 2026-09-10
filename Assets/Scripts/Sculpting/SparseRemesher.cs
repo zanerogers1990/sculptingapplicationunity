@@ -42,6 +42,13 @@ namespace Sculpting
     /// Vertex placement is DualContourSolver's, not the average of the edge crossings - see
     /// there for why the average is what made every remesh round off sharp detail.
     ///
+    /// A cell whose surface is not one clean patch - an ambiguous face where two sculpted forms
+    /// nearly touch, or several sheets through one cell - gets one vertex per PATCH rather than
+    /// one per cell (see SurfaceNetsTopology). With one vertex per cell those cells produced edges
+    /// shared by four triangles, which is not a surface a sculpting brush can work on. Deciding a
+    /// crease reads cells that may sit in other bricks, so creases are gathered once every brick's
+    /// signs exist and decided together (AmbiguityResolver) before vertices are counted.
+    ///
     /// Runs synchronously on the calling thread (its passes are parallel internally), same
     /// contract as the rest of the remesher.
     internal static class SparseRemesher
@@ -63,9 +70,13 @@ namespace Sculpting
         private static readonly int[] CornerY = { 0, 0, 1, 1, 0, 0, 1, 1 };
         private static readonly int[] CornerZ = { 0, 0, 0, 0, 1, 1, 1, 1 };
 
-        /// The 12 cube edges as corner-index pairs - every pair differing in exactly one bit.
-        private static readonly int[] EdgeA = { 0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3 };
-        private static readonly int[] EdgeB = { 1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7 };
+        /// The 12 cube edges as corner-index pairs, in SurfaceNetsTopology's numbering.
+        private static readonly int[] EdgeA = SurfaceNetsTopology.EdgeA;
+        private static readonly int[] EdgeB = SurfaceNetsTopology.EdgeB;
+
+        // Main thread only, like the rest of the remesher's shared state; JoinsFor is read from
+        // the parallel passes only after Resolve has returned.
+        private static readonly AmbiguityResolver _resolver = new AmbiguityResolver();
 
         /// Counts worth surfacing to a caller that wants to report or test them.
         public struct Stats
@@ -78,7 +89,28 @@ namespace Sculpting
             /// vertex. Should be zero; a non-zero value means brick activation missed a cell,
             /// and whatever hole it leaves is closed by MeshRemesher's hole patching.
             public int SkippedQuads;
+            /// Cells that were not a single clean patch, and the ambiguous faces the resolver could
+            /// not settle (expected 0).
+            public int CreaseCells;
+            public int ResidualCollapses;
             public long RetainedBytes;
+        }
+
+        /// A cell holding more than one patch, or an ambiguous face: its patches' vertices are
+        /// numbered consecutively from BaseVertex, and EdgePatches says (two bits per edge) which
+        /// patch each edge's quad uses. Its cellVertex entry is -(index into its brick's list + 2),
+        /// which keeps the common single-patch cell a plain vertex index with no side lookup.
+        private struct PatchedCell
+        {
+            public int BaseVertex;
+            public int EdgePatches;
+        }
+
+        /// A crease cell as gathered for the resolver: where it is, its signs and its corner values.
+        private sealed class CreaseCell
+        {
+            public int X, Y, Z, Mask;
+            public readonly float[] Values = new float[8];
         }
 
         public static void Build(Vector3[] sourceVertices, int[] sourceTriangles,
@@ -127,17 +159,45 @@ namespace Sculpting
             float rayStartX = Mathf.Min(origin.x, field.MinX);
 
             // ---- 2. Signs, per brick, from its own winding-number rays ----
-            var perBrickVertices = new int[slotCount];
             Parallel.For(0, slotCount, () => new Scratch(), (slot, _, scratch) =>
             {
                 int brick = slotBrick[slot];
                 DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
                 ComputeSigns(field, signBits, slot, bx, by, bz, origin, cellSize, rayStartX, scratch);
-                perBrickVertices[slot] = CountActiveCells(signBits, slot, bx, by, bz, nx, ny, nz);
                 return scratch;
             }, _ => { });
 
-            // ---- 3. Exclusive prefix sum: every brick's vertex block, in brick order ----
+            // ---- 3. Creases: every cell that is not one clean patch, decided together ----
+            // Gathered per brick in parallel (rare, so cheap), decided on this thread.
+            var creaseCells = new List<CreaseCell>[slotCount];
+            Parallel.For(0, slotCount, () => new Scratch(), (slot, _, scratch) =>
+            {
+                int brick = slotBrick[slot];
+                DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
+                creaseCells[slot] = CollectCreaseCells(field, signBits, slot, bx, by, bz, nx, ny, nz, origin, cellSize, scratch);
+                return scratch;
+            }, _ => { });
+
+            _resolver.Reset(nx, ny, nz);
+            for (int slot = 0; slot < slotCount; slot++)
+            {
+                List<CreaseCell> list = creaseCells[slot];
+                if (list == null) continue;
+                foreach (CreaseCell cell in list) _resolver.Add(cell.X, cell.Y, cell.Z, cell.Mask, cell.Values);
+            }
+            _resolver.Resolve();
+            stats.CreaseCells = _resolver.CellCount;
+            stats.ResidualCollapses = _resolver.ResidualCollapses;
+
+            // ---- 4. Vertices per brick - one per patch - then an exclusive prefix sum ----
+            var perBrickVertices = new int[slotCount];
+            Parallel.For(0, slotCount, slot =>
+            {
+                int brick = slotBrick[slot];
+                DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
+                perBrickVertices[slot] = CountBrickVertices(signBits, slot, bx, by, bz, nx, ny, nz);
+            });
+
             var vertexBase = new int[slotCount + 1];
             int running = 0;
             for (int i = 0; i < slotCount; i++) { vertexBase[i] = running; running += perBrickVertices[i]; }
@@ -148,24 +208,25 @@ namespace Sculpting
             output.EnsureVertexCapacity(running + 1024); // headroom for hole-patch centroids
             output.VertexCount = running;
 
-            // ---- 4. Distances, dual vertices and normals - the only stage that queries the
+            // ---- 5. Distances, dual vertices and normals - the only stage that queries the
             //         source mesh, and it runs once per ACTIVE CELL rather than per lattice site
+            var patchedCells = new List<PatchedCell>[slotCount];
             Parallel.For(0, slotCount, () => new Scratch(), (slot, _, scratch) =>
             {
                 int brick = slotBrick[slot];
                 DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
-                SolveBrickVertices(field, signBits, cellVertex, slot, bx, by, bz, nx, ny, nz,
-                                   origin, cellSize, vertexBase[slot], output, scratch);
+                SolveBrickVertices(field, signBits, cellVertex, patchedCells, slot, bx, by, bz,
+                                   nx, ny, nz, origin, cellSize, vertexBase[slot], output, scratch);
                 return scratch;
             }, _ => { });
 
-            // ---- 5. Quads. Counted first so the emit pass can write disjoint index ranges ----
+            // ---- 6. Quads. Counted first so the emit pass can write disjoint index ranges ----
             var perBrickIndices = new int[slotCount];
             Parallel.For(0, slotCount, slot =>
             {
                 int brick = slotBrick[slot];
                 DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
-                perBrickIndices[slot] = EmitQuads(signBits, cellVertex, brickSlot, slot, bx, by, bz,
+                perBrickIndices[slot] = EmitQuads(signBits, cellVertex, brickSlot, patchedCells, slot, bx, by, bz,
                                                   nx, ny, nz, bnx, bny, bnz, output, -1, out _);
             });
 
@@ -183,7 +244,7 @@ namespace Sculpting
             {
                 int brick = slotBrick[slot];
                 DecodeBrick(brick, bnx, bny, out int bx, out int by, out int bz);
-                EmitQuads(signBits, cellVertex, brickSlot, slot, bx, by, bz,
+                EmitQuads(signBits, cellVertex, brickSlot, patchedCells, slot, bx, by, bz,
                           nx, ny, nz, bnx, bny, bnz, output, indexBase[slot], out int localSkipped);
                 if (localSkipped != 0) System.Threading.Interlocked.Add(ref skipped, localSkipped);
             });
@@ -347,10 +408,43 @@ namespace Sculpting
             }
         }
 
-        /// How many of this brick's cells straddle the surface - i.e. how many output vertices
-        /// it owns. Pure bit reads; no distance query and no source-mesh access.
-        private static int CountActiveCells(ulong[] signBits, int slot, int bx, int by, int bz,
-                                            int nx, int ny, int nz)
+        /// This brick's crease cells (null when it has none), with their corner values.
+        private static List<CreaseCell> CollectCreaseCells(SignedDistanceField field, ulong[] signBits, int slot,
+                                                           int bx, int by, int bz, int nx, int ny, int nz,
+                                                           Vector3 origin, float cellSize, Scratch scratch)
+        {
+            long wordBase = (long)slot * SignWords;
+            int x0 = bx * BrickSize, y0 = by * BrickSize, z0 = bz * BrickSize;
+            for (int w = 0; w < SignWords; w++) scratch.HasDistance[w] = 0UL;
+
+            Span<bool> cornerInside = stackalloc bool[8];
+            List<CreaseCell> found = null;
+
+            for (int cz = 0; cz < BrickSize; cz++)
+            {
+                if (z0 + cz >= nz) break;
+                for (int cy = 0; cy < BrickSize; cy++)
+                {
+                    if (y0 + cy >= ny) break;
+                    for (int cx = 0; cx < BrickSize; cx++)
+                    {
+                        if (x0 + cx >= nx) break;
+                        int mask = CellMask(signBits, wordBase, cx, cy, cz);
+                        if (mask == 0 || mask == 255 || SurfaceNetsTopology.IsSimple(mask)) continue;
+
+                        var cell = new CreaseCell { X = x0 + cx, Y = y0 + cy, Z = z0 + cz, Mask = mask };
+                        LoadCorners(field, signBits, wordBase, cx, cy, cz, x0, y0, z0, origin, cellSize, scratch,
+                                    cell.Values, cornerInside);
+                        (found ?? (found = new List<CreaseCell>())).Add(cell);
+                    }
+                }
+            }
+            return found;
+        }
+
+        /// How many vertices this brick owns: one per single-patch cell, one per patch for the rest.
+        /// Pure bit reads plus the resolver's already-settled decisions.
+        private static int CountBrickVertices(ulong[] signBits, int slot, int bx, int by, int bz, int nx, int ny, int nz)
         {
             long wordBase = (long)slot * SignWords;
             int x0 = bx * BrickSize, y0 = by * BrickSize, z0 = bz * BrickSize;
@@ -365,7 +459,11 @@ namespace Sculpting
                     for (int cx = 0; cx < BrickSize; cx++)
                     {
                         if (x0 + cx >= nx) break;
-                        if (IsActiveCell(signBits, wordBase, cx, cy, cz)) count++;
+                        int mask = CellMask(signBits, wordBase, cx, cy, cz);
+                        if (mask == 0 || mask == 255) continue;
+                        count += SurfaceNetsTopology.IsSimple(mask)
+                            ? 1
+                            : SurfaceNetsTopology.Components(mask, _resolver.JoinsFor(x0 + cx, y0 + cy, z0 + cz), out _);
                     }
                 }
             }
@@ -381,10 +479,39 @@ namespace Sculpting
             return false;
         }
 
+        private static int CellMask(ulong[] signBits, long wordBase, int cx, int cy, int cz)
+        {
+            int mask = 0;
+            for (int c = 0; c < 8; c++)
+                if (GetBit(signBits, wordBase, SampleIndex(cx + CornerX[c], cy + CornerY[c], cz + CornerZ[c])))
+                    mask |= 1 << c;
+            return mask;
+        }
+
+        /// A cell's eight corner distances (cached per brick, so a corner shared by up to eight
+        /// cells is queried once) and inside flags. Returns the inside mask.
+        private static int LoadCorners(SignedDistanceField field, ulong[] signBits, long wordBase, int cx, int cy, int cz,
+                                       int x0, int y0, int z0, Vector3 origin, float cellSize, Scratch scratch,
+                                       Span<float> corner, Span<bool> cornerInside)
+        {
+            int mask = 0;
+            for (int c = 0; c < 8; c++)
+            {
+                int s = SampleIndex(cx + CornerX[c], cy + CornerY[c], cz + CornerZ[c]);
+                EnsureDistance(field, signBits, wordBase, s, x0, y0, z0, origin, cellSize, scratch);
+                corner[c] = scratch.Distance[s];
+                bool inside = GetBit(signBits, wordBase, s);
+                cornerInside[c] = inside;
+                if (inside) mask |= 1 << c;
+            }
+            return mask;
+        }
+
         /// The stage that actually costs something: for each active cell, the eight corner
-        /// distances (cached per brick, so a corner shared by up to eight cells is queried
-        /// once), the edge crossings, and the feature-preserving vertex solve.
+        /// distances, the edge crossings, and the feature-preserving vertex solve - once per
+        /// patch for a crease cell.
         private static void SolveBrickVertices(SignedDistanceField field, ulong[] signBits, int[] cellVertex,
+                                               List<PatchedCell>[] patchedCells,
                                                int slot, int bx, int by, int bz, int nx, int ny, int nz,
                                                Vector3 origin, float cellSize, int vertexBase,
                                                MeshGeometryBuffer output, Scratch scratch)
@@ -411,72 +538,99 @@ namespace Sculpting
                         if (x0 + cx >= nx) break;
                         if (!IsActiveCell(signBits, wordBase, cx, cy, cz)) continue;
 
-                        for (int c = 0; c < 8; c++)
+                        int mask = LoadCorners(field, signBits, wordBase, cx, cy, cz, x0, y0, z0, origin, cellSize,
+                                               scratch, corner, cornerInside);
+                        var cell = new Vector3(x0 + cx, y0 + cy, z0 + cz);
+
+                        if (SurfaceNetsTopology.IsSimple(mask))
                         {
-                            int s = SampleIndex(cx + CornerX[c], cy + CornerY[c], cz + CornerZ[c]);
-                            EnsureDistance(field, signBits, wordBase, s, x0, y0, z0, origin, cellSize, scratch);
-                            corner[c] = scratch.Distance[s];
-                            cornerInside[c] = GetBit(signBits, wordBase, s);
+                            int crossings = GatherCrossings(field, scratch, corner, cornerInside, cx, cy, cz, -1, 0);
+                            if (crossings == 0) continue; // corners disagree but no edge does: nothing to place
+                            WriteVertex(output, next, scratch, crossings, origin, cellSize, cell);
+                            cellVertex[cellBase + CellIndex(cx, cy, cz)] = next++;
+                            continue;
                         }
 
-                        int crossings = 0;
-                        for (int e = 0; e < 12; e++)
+                        int joins = _resolver.JoinsFor(x0 + cx, y0 + cy, z0 + cz);
+                        int patches = SurfaceNetsTopology.Components(mask, joins, out int edgePatches);
+
+                        List<PatchedCell> list = patchedCells[slot] ?? (patchedCells[slot] = new List<PatchedCell>());
+                        cellVertex[cellBase + CellIndex(cx, cy, cz)] = -(list.Count + 2);
+                        list.Add(new PatchedCell { BaseVertex = next, EdgePatches = edgePatches });
+
+                        for (int p = 0; p < patches; p++)
                         {
-                            int a = EdgeA[e], b = EdgeB[e];
-                            // Which side each corner is on comes from the SIGN BITS, never from
-                            // the sign of the stored distance. They are almost always the same
-                            // thing, and the exception is not exotic: a sample lying exactly ON
-                            // the surface has distance 0, and an inside one then stores -0.0f,
-                            // for which `< 0f` is FALSE. Any mesh with a face flush against a
-                            // sample plane - an unrotated box, a fresh primitive, anything
-                            // snapped to the grid - has thousands of those, and reading the two
-                            // in different ways made this pass disagree with the pass that
-                            // decides which cells are active, which left holes exactly there.
-                            // Measured on an axis-aligned box at resolution 128: 50,022 quads
-                            // dropped and the surface broken into 841 pieces.
-                            bool ia = cornerInside[a], ib = cornerInside[b];
-                            if (ia == ib) continue;
-
-                            float va = corner[a], vb = corner[b];
-                            // Both endpoints sitting exactly on the surface leaves nothing to
-                            // interpolate; the midpoint is the only unbiased answer.
-                            float denom = va - vb;
-                            float t = Mathf.Abs(denom) > 1e-20f ? Mathf.Clamp01(va / denom) : 0.5f;
-                            scratch.Points[crossings] = new Vector3(
-                                CornerX[a] + (CornerX[b] - CornerX[a]) * t,
-                                CornerY[a] + (CornerY[b] - CornerY[a]) * t,
-                                CornerZ[a] + (CornerZ[b] - CornerZ[a]) * t);
-
-                            // The surface normal AT the crossing, taken from the source
-                            // triangle nearest whichever end of the edge is closer to it. That
-                            // triangle fell out of the distance query already made for that
-                            // corner, so the normal is free - and it is a TRUE face normal, not
-                            // a finite difference of the sampled field, which is what lets the
-                            // solver reconstruct a crease instead of a smoothed approximation
-                            // of one.
-                            int nearest = Mathf.Abs(va) <= Mathf.Abs(vb)
-                                ? scratch.Triangle[SampleIndex(cx + CornerX[a], cy + CornerY[a], cz + CornerZ[a])]
-                                : scratch.Triangle[SampleIndex(cx + CornerX[b], cy + CornerY[b], cz + CornerZ[b])];
-                            scratch.Normals[crossings] = nearest >= 0 ? field.TriangleNormal(nearest) : Vector3.zero;
-                            crossings++;
+                            int crossings = GatherCrossings(field, scratch, corner, cornerInside, cx, cy, cz, p, edgePatches);
+                            WriteVertex(output, next++, scratch, crossings, origin, cellSize, cell);
                         }
-
-                        if (crossings == 0) continue; // corners disagree but no edge does: nothing to place
-
-                        Vector3 local = DualContourSolver.Solve(scratch.Points, scratch.Normals, crossings);
-                        Vector3 world = origin + (new Vector3(x0 + cx, y0 + cy, z0 + cz) + local) * cellSize;
-
-                        Vector3 normal = Vector3.zero;
-                        for (int i = 0; i < crossings; i++) normal += scratch.Normals[i];
-                        normal = normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up;
-
-                        output.Vertices[next] = world;
-                        output.Normals[next] = normal;
-                        cellVertex[cellBase + CellIndex(cx, cy, cz)] = next;
-                        next++;
                     }
                 }
             }
+        }
+
+        /// Edge crossings of one cell into scratch.Points/Normals, in cell-local coordinates.
+        /// `patch` < 0 takes every crossing; otherwise only those `edgePatches` assigns to it.
+        private static int GatherCrossings(SignedDistanceField field, Scratch scratch, Span<float> corner, Span<bool> cornerInside,
+                                           int cx, int cy, int cz, int patch, int edgePatches)
+        {
+            int crossings = 0;
+            for (int e = 0; e < 12; e++)
+            {
+                if (patch >= 0 && (edgePatches >> (2 * e) & 3) != patch) continue;
+
+                int a = EdgeA[e], b = EdgeB[e];
+                // Which side each corner is on comes from the SIGN BITS, never from
+                // the sign of the stored distance. They are almost always the same
+                // thing, and the exception is not exotic: a sample lying exactly ON
+                // the surface has distance 0, and an inside one then stores -0.0f,
+                // for which `< 0f` is FALSE. Any mesh with a face flush against a
+                // sample plane - an unrotated box, a fresh primitive, anything snapped
+                // to the grid - has thousands of those, and reading the two in
+                // different ways made this pass disagree with the pass that decides
+                // which cells are active, which left holes exactly there. Measured on
+                // an axis-aligned box at resolution 128: 50,022 quads dropped and the
+                // surface broken into 841 pieces.
+                bool ia = cornerInside[a], ib = cornerInside[b];
+                if (ia == ib) continue;
+
+                float va = corner[a], vb = corner[b];
+                // Both endpoints sitting exactly on the surface leaves nothing to
+                // interpolate; the midpoint is the only unbiased answer.
+                float denom = va - vb;
+                float t = Mathf.Abs(denom) > 1e-20f ? Mathf.Clamp01(va / denom) : 0.5f;
+                scratch.Points[crossings] = new Vector3(
+                    CornerX[a] + (CornerX[b] - CornerX[a]) * t,
+                    CornerY[a] + (CornerY[b] - CornerY[a]) * t,
+                    CornerZ[a] + (CornerZ[b] - CornerZ[a]) * t);
+
+                // The surface normal AT the crossing, taken from the source
+                // triangle nearest whichever end of the edge is closer to it. That
+                // triangle fell out of the distance query already made for that
+                // corner, so the normal is free - and it is a TRUE face normal, not
+                // a finite difference of the sampled field, which is what lets the
+                // solver reconstruct a crease instead of a smoothed approximation
+                // of one.
+                int nearest = Mathf.Abs(va) <= Mathf.Abs(vb)
+                    ? scratch.Triangle[SampleIndex(cx + CornerX[a], cy + CornerY[a], cz + CornerZ[a])]
+                    : scratch.Triangle[SampleIndex(cx + CornerX[b], cy + CornerY[b], cz + CornerZ[b])];
+                scratch.Normals[crossings] = nearest >= 0 ? field.TriangleNormal(nearest) : Vector3.zero;
+                crossings++;
+            }
+            return crossings;
+        }
+
+        private static void WriteVertex(MeshGeometryBuffer output, int index, Scratch scratch, int crossings,
+                                        Vector3 origin, float cellSize, Vector3 cell)
+        {
+            Vector3 local = DualContourSolver.Solve(scratch.Points, scratch.Normals, crossings);
+            Vector3 world = origin + (cell + local) * cellSize;
+
+            Vector3 normal = Vector3.zero;
+            for (int i = 0; i < crossings; i++) normal += scratch.Normals[i];
+            normal = normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up;
+
+            output.Vertices[index] = world;
+            output.Normals[index] = normal;
         }
 
         private static void EnsureDistance(SignedDistanceField field, ulong[] signBits, long wordBase, int s,
@@ -506,10 +660,11 @@ namespace Sculpting
         /// field changes sign across is shared by four cells, and the cell at the maximum end in
         /// both cross-axis directions is its single owner. So walking active cells and testing
         /// each one's three owned edges reaches every quad exactly once - and reaches nothing
-        /// else, which is the point.
+        /// else, which is the point. Each of the four cells contributes the vertex of the patch
+        /// that owns that edge, which is why every stitch names the edge's number in each cell.
         ///
         /// Returns the number of INDICES written (or that would be written).
-        private static int EmitQuads(ulong[] signBits, int[] cellVertex, int[] brickSlot,
+        private static int EmitQuads(ulong[] signBits, int[] cellVertex, int[] brickSlot, List<PatchedCell>[] patchedCells,
                                      int slot, int bx, int by, int bz,
                                      int nx, int ny, int nz, int bnx, int bny, int bnz,
                                      MeshGeometryBuffer output, int indexBase, out int skipped)
@@ -537,23 +692,23 @@ namespace Sculpting
 
                         // Edge along +X. Its four cells step back in Y and Z.
                         if (Y >= 1 && Z >= 1 && GetBit(signBits, wordBase, SampleIndex(cx + 1, cy, cz)) != signA)
-                            Stitch(X, Y - 1, Z - 1, X, Y, Z - 1, X, Y, Z, X, Y - 1, Z);
+                            Stitch(X, Y - 1, Z - 1, 3, X, Y, Z - 1, 2, X, Y, Z, 0, X, Y - 1, Z, 1);
 
                         // Edge along +Y. Its four cells step back in Z and X.
                         if (Z >= 1 && X >= 1 && GetBit(signBits, wordBase, SampleIndex(cx, cy + 1, cz)) != signA)
-                            Stitch(X - 1, Y, Z - 1, X - 1, Y, Z, X, Y, Z, X, Y, Z - 1);
+                            Stitch(X - 1, Y, Z - 1, 7, X - 1, Y, Z, 5, X, Y, Z, 4, X, Y, Z - 1, 6);
 
                         // Edge along +Z. Its four cells step back in X and Y.
                         if (X >= 1 && Y >= 1 && GetBit(signBits, wordBase, SampleIndex(cx, cy, cz + 1)) != signA)
-                            Stitch(X - 1, Y - 1, Z, X, Y - 1, Z, X, Y, Z, X - 1, Y, Z);
+                            Stitch(X - 1, Y - 1, Z, 11, X, Y - 1, Z, 10, X, Y, Z, 8, X - 1, Y, Z, 9);
 
-                        void Stitch(int ax, int ay, int az, int bx2, int by2, int bz2,
-                                    int cx2, int cy2, int cz2, int dx, int dy, int dz)
+                        void Stitch(int ax, int ay, int az, int ae, int bx2, int by2, int bz2, int be,
+                                    int cx2, int cy2, int cz2, int ce, int dx, int dy, int dz, int de)
                         {
-                            int i0 = VertexAt(ax, ay, az);
-                            int i1 = VertexAt(bx2, by2, bz2);
-                            int i2 = VertexAt(cx2, cy2, cz2);
-                            int i3 = VertexAt(dx, dy, dz);
+                            int i0 = VertexAt(ax, ay, az, ae);
+                            int i1 = VertexAt(bx2, by2, bz2, be);
+                            int i2 = VertexAt(cx2, cy2, cz2, ce);
+                            int i3 = VertexAt(dx, dy, dz, de);
                             if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) { missing++; return; }
 
                             written += 6;
@@ -579,14 +734,16 @@ namespace Sculpting
             skipped = missing;
             return written;
 
-            int VertexAt(int X, int Y, int Z)
+            int VertexAt(int X, int Y, int Z, int edge)
             {
                 if ((uint)X >= (uint)nx || (uint)Y >= (uint)ny || (uint)Z >= (uint)nz) return -1;
                 int b = (X / BrickSize) + bnx * ((Y / BrickSize) + bny * (Z / BrickSize));
                 int s = brickSlot[b];
                 if (s < 0) return -1;
-                return cellVertex[(long)s * BrickCells
-                                  + CellIndex(X % BrickSize, Y % BrickSize, Z % BrickSize)];
+                int v = cellVertex[(long)s * BrickCells + CellIndex(X % BrickSize, Y % BrickSize, Z % BrickSize)];
+                if (v >= -1) return v;
+                PatchedCell patched = patchedCells[s][-v - 2];
+                return patched.BaseVertex + (patched.EdgePatches >> (2 * edge) & 3);
             }
         }
     }

@@ -8,25 +8,27 @@
 #pragma kernel ScatterVertexAttributes
 
 RWByteAddressBuffer _VertexBuffer;
-StructuredBuffer<uint> _DirtyIndices;
-StructuredBuffer<float3> _DirtyPositions;
-StructuredBuffer<float3> _DirtyNormals;
-StructuredBuffer<float4> _DirtyColors;
+// The dirty vertices, packed by GpuVertexScatter.DirtyVertex - 44 bytes each: uint index, then
+// float3 position, float3 normal, float4 color. Read and written as raw bits by byte offset, so
+// the layout means the same thing on every graphics API.
+ByteAddressBuffer _DirtyVertices;
 
 uint _Stride;
 uint _PositionOffset;
 uint _NormalOffset;
 uint _ColorOffset;
+// Window into _DirtyVertices this dispatch covers - see GpuVertexScatter.Upload.
+uint _DirtyStart;
 uint _DirtyCount;
 
 [numthreads(64, 1, 1)]
 void ScatterVertexAttributes(uint3 id : SV_DispatchThreadID)
 {
-    uint idx = id.x;
-    if (idx >= _DirtyCount) return;
+    if (id.x >= _DirtyCount) return;
 
-    uint baseAddress = _DirtyIndices[idx] * _Stride;
-    _VertexBuffer.Store3(baseAddress + _PositionOffset, asuint(_DirtyPositions[idx]));
-    _VertexBuffer.Store3(baseAddress + _NormalOffset, asuint(_DirtyNormals[idx]));
-    _VertexBuffer.Store4(baseAddress + _ColorOffset, asuint(_DirtyColors[idx]));
+    uint source = (_DirtyStart + id.x) * 44;
+    uint baseAddress = _DirtyVertices.Load(source) * _Stride;
+    _VertexBuffer.Store3(baseAddress + _PositionOffset, _DirtyVertices.Load3(source + 4));
+    _VertexBuffer.Store3(baseAddress + _NormalOffset, _DirtyVertices.Load3(source + 16));
+    _VertexBuffer.Store4(baseAddress + _ColorOffset, _DirtyVertices.Load4(source + 28));
 }

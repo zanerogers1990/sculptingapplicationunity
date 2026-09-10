@@ -255,35 +255,52 @@ namespace Sculpting
         // Reused across BuildDenseSurface calls for the same reason as the geometry buffer -
         // avoids a fresh multi-million-element allocation on every call. Sized up (never down)
         // on demand.
-        private static bool[] _scratchCellHasVertex = new bool[0];
+        //
+        // Cell state: 0 = no surface; 1 = a single patch, solved in pass 1; 2 = an ambiguous face
+        // or several patches, resolved in pass 2 with one vertex per patch (SurfaceNetsTopology).
+        private static byte[] _scratchCellState = new byte[0];
         private static Vector3[] _scratchCellLocalPos = new Vector3[0];
         private static Vector3[] _scratchCellNormal = new Vector3[0];
         private static int[] _scratchCellVertexIndex = new int[0];
 
+        // State-2 cells only: which patch each of the cell's twelve edges belongs to, two bits per
+        // edge. A map rather than a per-cell array because such cells only occur at creases and
+        // pinches - a few per mesh - while an array would cost four bytes per lattice cell.
+        private static readonly Dictionary<int, int> _scratchCellEdgePatches = new Dictionary<int, int>();
+
+        // Decides every ambiguous face of a dense extraction together - see AmbiguityResolver.
+        private static readonly AmbiguityResolver _denseResolver = new AmbiguityResolver();
+
         // The cells pass 1 found a crossing in, in pass 2's scan order - i.e. exactly the cells
         // that own a vertex, and so the only cells the quad pass has any reason to look at.
         private static readonly List<int> _scratchActiveCells = new List<int>();
+
+        // SurfaceNetsTopology's edge number for each CubeEdges entry. Crossings are still gathered
+        // in CubeEdges order so a single-patch cell's vertex comes out bit-identical to before.
+        private static readonly int[] CubeEdgeTopologyIndex = BuildCubeEdgeTopologyIndex();
 
         private static void BuildDenseSurface(float[] sdf, Vector3Int dims, int sx, int sy, Vector3 origin, float cellSize, MeshGeometryBuffer output)
         {
             int nx = dims.x, ny = dims.y, nz = dims.z;
             int cellCount = nx * ny * nz;
 
-            if (_scratchCellHasVertex.Length < cellCount)
+            if (_scratchCellState.Length < cellCount)
             {
-                _scratchCellHasVertex = new bool[cellCount];
+                _scratchCellState = new byte[cellCount];
                 _scratchCellLocalPos = new Vector3[cellCount];
                 _scratchCellNormal = new Vector3[cellCount];
                 _scratchCellVertexIndex = new int[cellCount];
             }
-            bool[] cellHasVertex = _scratchCellHasVertex;
+            byte[] cellState = _scratchCellState;
             Vector3[] cellLocalPos = _scratchCellLocalPos;
             Vector3[] cellNormal = _scratchCellNormal;
             int[] cellVertexIndex = _scratchCellVertexIndex;
 
             // Pass 1 (parallel): work out whether each cell is active and, if so, where its dual
             // vertex goes. Each cell only reads sdf[] and writes its own slot, so this is
-            // embarrassingly parallel across cores.
+            // embarrassingly parallel across cores. Cells whose surface is not a single clean patch
+            // are only flagged here: resolving them depends on their neighbours, and there are few
+            // enough of them that doing it sequentially in pass 2 costs nothing.
             System.Threading.Tasks.Parallel.For(0, nz, z =>
             {
                 Span<float> corner = stackalloc float[8];
@@ -294,66 +311,133 @@ namespace Sculpting
                 for (int x = 0; x < nx; x++)
                 {
                     int cellIndex = x + nx * (y + ny * z);
-                    int mask = 0;
-                    for (int c = 0; c < 8; c++)
-                    {
-                        Vector3Int co = CubeCorners[c];
-                        float v = sdf[SampleIndex(x + co.x, y + co.y, z + co.z, sx, sy)];
-                        corner[c] = v;
-                        if (v < 0f) mask |= 1 << c;
-                    }
+                    int mask = CornerValues(sdf, x, y, z, sx, sy, corner);
 
-                    if (mask == 0 || mask == 255) { cellHasVertex[cellIndex] = false; continue; } // no crossing
+                    if (mask == 0 || mask == 255) { cellState[cellIndex] = 0; continue; } // no crossing
+                    if (!SurfaceNetsTopology.IsSimple(mask)) { cellState[cellIndex] = 2; continue; }
 
-                    int crossings = 0;
-                    for (int e = 0; e < CubeEdges.Length; e++)
-                    {
-                        int a = CubeEdges[e][0], b = CubeEdges[e][1];
-                        float va = corner[a], vb = corner[b];
-                        if ((va < 0f) == (vb < 0f)) continue;
-
-                        float t = va / (va - vb);
-                        Vector3 p = Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
-                        points[crossings] = p;
-                        // There is no source mesh here to take a true face normal from, so the
-                        // normal comes from the gradient of the trilinear interpolant of this
-                        // cell's OWN eight corners. Staying inside the cell matters: the narrow
-                        // band only guarantees real distances at an active cell's own corners,
-                        // and a central difference would reach into neighbours that may hold
-                        // nothing but the far sentinel.
-                        normals[crossings] = TrilinearGradient(corner, p);
-                        crossings++;
-                    }
-
-                    if (crossings == 0) { cellHasVertex[cellIndex] = false; continue; }
-
+                    int crossings = GatherCrossings(corner, -1, 0, points, normals);
                     cellLocalPos[cellIndex] = DualContourSolver.Solve(points, normals, crossings);
-
-                    Vector3 n = Vector3.zero;
-                    for (int i = 0; i < crossings; i++) n += normals[i];
-                    cellNormal[cellIndex] = n.sqrMagnitude > 1e-12f ? n.normalized : Vector3.up;
-                    cellHasVertex[cellIndex] = true;
+                    cellNormal[cellIndex] = AverageNormal(normals, crossings);
+                    cellState[cellIndex] = 1;
                 }
             });
 
-            // Pass 2 (sequential, but cheap - pure array reads, no per-cell math): compacts
-            // pass 1's per-cell results into the final vertex list and cell->index map.
+            // Pass 2 (sequential, but cheap - pure array reads for all but the rare crease cells):
+            // lists the active cells in scan order, decides every crease together, then compacts
+            // the per-cell results into the final vertex list and cell->index map, giving a
+            // multi-patch cell one vertex per patch, numbered consecutively.
             var activeCells = _scratchActiveCells;
             activeCells.Clear();
+            _scratchCellEdgePatches.Clear();
+            _denseResolver.Reset(nx, ny, nz);
 
+            Span<float> values = stackalloc float[8];
             for (int z = 0; z < nz; z++)
             for (int y = 0; y < ny; y++)
             for (int x = 0; x < nx; x++)
             {
                 int cellIndex = x + nx * (y + ny * z);
-                if (!cellHasVertex[cellIndex]) { cellVertexIndex[cellIndex] = -1; continue; }
-
-                Vector3 worldPos = origin + (new Vector3(x, y, z) + cellLocalPos[cellIndex]) * cellSize;
-                cellVertexIndex[cellIndex] = output.AddVertex(worldPos, cellNormal[cellIndex]);
+                byte state = cellState[cellIndex];
+                if (state == 0) { cellVertexIndex[cellIndex] = -1; continue; }
                 activeCells.Add(cellIndex);
+                if (state == 2) _denseResolver.Add(x, y, z, CornerValues(sdf, x, y, z, sx, sy, values), values);
             }
 
-            EmitDenseQuads(sdf, cellVertexIndex, activeCells, dims, sx, sy, output);
+            _denseResolver.Resolve();
+
+            var patchPoints = new Vector3[12];
+            var patchNormals = new Vector3[12];
+            int slice = nx * ny;
+            for (int i = 0; i < activeCells.Count; i++)
+            {
+                int cellIndex = activeCells[i];
+                int z = cellIndex / slice;
+                int rem = cellIndex - z * slice;
+                int y = rem / nx;
+                int x = rem - y * nx;
+                var cell = new Vector3(x, y, z);
+
+                if (cellState[cellIndex] == 1)
+                {
+                    Vector3 worldPos = origin + (cell + cellLocalPos[cellIndex]) * cellSize;
+                    cellVertexIndex[cellIndex] = output.AddVertex(worldPos, cellNormal[cellIndex]);
+                    continue;
+                }
+
+                int mask = CornerValues(sdf, x, y, z, sx, sy, values);
+                int patches = SurfaceNetsTopology.Components(mask, _denseResolver.JoinsFor(x, y, z), out int edgePatches);
+                _scratchCellEdgePatches[cellIndex] = edgePatches;
+
+                for (int p = 0; p < patches; p++)
+                {
+                    int crossings = GatherCrossings(values, p, edgePatches, patchPoints, patchNormals);
+                    Vector3 local = DualContourSolver.Solve(patchPoints, patchNormals, crossings);
+                    int index = output.AddVertex(origin + (cell + local) * cellSize, AverageNormal(patchNormals, crossings));
+                    if (p == 0) cellVertexIndex[cellIndex] = index;
+                }
+            }
+
+            EmitDenseQuads(sdf, cellVertexIndex, cellState, activeCells, dims, sx, sy, output);
+        }
+
+        /// Reads a cell's eight corner samples into `corner` and returns its inside mask.
+        private static int CornerValues(float[] sdf, int x, int y, int z, int sx, int sy, Span<float> corner)
+        {
+            int mask = 0;
+            for (int c = 0; c < 8; c++)
+            {
+                Vector3Int co = CubeCorners[c];
+                float v = sdf[SampleIndex(x + co.x, y + co.y, z + co.z, sx, sy)];
+                corner[c] = v;
+                if (v < 0f) mask |= 1 << c;
+            }
+            return mask;
+        }
+
+        /// Edge crossings of a cell in cell-local coordinates, with their normals. `patch` < 0 takes
+        /// every crossing; otherwise only those `edgePatches` assigns to that patch.
+        private static int GatherCrossings(Span<float> corner, int patch, int edgePatches, Vector3[] points, Vector3[] normals)
+        {
+            int crossings = 0;
+            for (int e = 0; e < CubeEdges.Length; e++)
+            {
+                if (patch >= 0 && (edgePatches >> (2 * CubeEdgeTopologyIndex[e]) & 3) != patch) continue;
+
+                int a = CubeEdges[e][0], b = CubeEdges[e][1];
+                float va = corner[a], vb = corner[b];
+                if ((va < 0f) == (vb < 0f)) continue;
+
+                float t = va / (va - vb);
+                Vector3 p = Vector3.Lerp(CubeCorners[a], CubeCorners[b], t);
+                points[crossings] = p;
+                // There is no source mesh here to take a true face normal from, so the
+                // normal comes from the gradient of the trilinear interpolant of this
+                // cell's OWN eight corners. Staying inside the cell matters: the narrow
+                // band only guarantees real distances at an active cell's own corners,
+                // and a central difference would reach into neighbours that may hold
+                // nothing but the far sentinel.
+                normals[crossings] = TrilinearGradient(corner, p);
+                crossings++;
+            }
+            return crossings;
+        }
+
+        private static Vector3 AverageNormal(Vector3[] normals, int count)
+        {
+            Vector3 n = Vector3.zero;
+            for (int i = 0; i < count; i++) n += normals[i];
+            return n.sqrMagnitude > 1e-12f ? n.normalized : Vector3.up;
+        }
+
+        private static int[] BuildCubeEdgeTopologyIndex()
+        {
+            var map = new int[CubeEdges.Length];
+            for (int i = 0; i < CubeEdges.Length; i++)
+                for (int e = 0; e < 12; e++)
+                    if (SurfaceNetsTopology.EdgeA[e] == CubeEdges[i][0] && SurfaceNetsTopology.EdgeB[e] == CubeEdges[i][1])
+                        map[i] = e;
+            return map;
         }
 
         /// Gradient of the trilinear interpolant of a cell's eight corner values, at a point in
@@ -396,7 +480,11 @@ namespace Sculpting
         // the maximum end of the edge in both cross-axis directions as that edge's single owner
         // gives exactly one owner per edge, so walking active cells and testing each one's three
         // owned edges reaches every quad exactly once - and reaches nothing else.
-        private static void EmitDenseQuads(float[] sdf, int[] cellVertexIndex, List<int> activeCells, Vector3Int dims, int sx, int sy, MeshGeometryBuffer output)
+        //
+        // Each of the four cells contributes the vertex of the patch that owns THIS edge, which is
+        // why every stitch names the edge's number within each cell (SurfaceNetsTopology order).
+        private static void EmitDenseQuads(float[] sdf, int[] cellVertexIndex, byte[] cellState, List<int> activeCells,
+                                           Vector3Int dims, int sx, int sy, MeshGeometryBuffer output)
         {
             int nx = dims.x, ny = dims.y;
             int slice = nx * ny;
@@ -416,37 +504,48 @@ namespace Sculpting
                 // Edge along +X. Its four cells step back in Y and Z.
                 if (y >= 1 && z >= 1 && (sdf[SampleIndex(x + 1, y, z, sx, sy)] < 0f) != signA)
                 {
-                    StitchDenseQuad(cellVertexIndex, output, signA,
-                        x, y - 1, z - 1, x, y, z - 1, x, y, z, x, y - 1, z, nx, ny);
+                    StitchDenseQuad(output, signA,
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - nx - slice, 3),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - slice, 2),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex, 0),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - nx, 1));
                 }
 
                 // Edge along +Y. Its four cells step back in Z and X.
                 if (z >= 1 && x >= 1 && (sdf[SampleIndex(x, y + 1, z, sx, sy)] < 0f) != signA)
                 {
-                    StitchDenseQuad(cellVertexIndex, output, signA,
-                        x - 1, y, z - 1, x - 1, y, z, x, y, z, x, y, z - 1, nx, ny);
+                    StitchDenseQuad(output, signA,
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - 1 - slice, 7),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - 1, 5),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex, 4),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - slice, 6));
                 }
 
                 // Edge along +Z. Its four cells step back in X and Y.
                 if (x >= 1 && y >= 1 && (sdf[SampleIndex(x, y, z + 1, sx, sy)] < 0f) != signA)
                 {
-                    StitchDenseQuad(cellVertexIndex, output, signA,
-                        x - 1, y - 1, z, x, y - 1, z, x, y, z, x - 1, y, z, nx, ny);
+                    StitchDenseQuad(output, signA,
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - 1 - nx, 11),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - nx, 10),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex, 8),
+                        DenseVertex(cellVertexIndex, cellState, cellIndex - 1, 9));
                 }
             }
         }
 
-        // Turns the four cells around one sign-flipping edge into two triangles, wound so the
-        // face points out of the solid (`insideFirst` is the sign at the edge's start sample).
-        private static void StitchDenseQuad(int[] cellVertexIndex, MeshGeometryBuffer output, bool insideFirst,
-                                            int ax, int ay, int az, int bx, int by, int bz,
-                                            int cx, int cy, int cz, int dx, int dy, int dz, int nx, int ny)
+        /// The vertex a cell contributes to a quad around its edge `edge`: its only vertex, or for a
+        /// multi-patch cell the vertex of the patch that edge belongs to.
+        private static int DenseVertex(int[] cellVertexIndex, byte[] cellState, int cell, int edge)
         {
-            int i0 = cellVertexIndex[ax + nx * (ay + ny * az)];
-            int i1 = cellVertexIndex[bx + nx * (by + ny * bz)];
-            int i2 = cellVertexIndex[cx + nx * (cy + ny * cz)];
-            int i3 = cellVertexIndex[dx + nx * (dy + ny * dz)];
+            int index = cellVertexIndex[cell];
+            if (index < 0 || cellState[cell] != 2) return index;
+            return index + (_scratchCellEdgePatches[cell] >> (2 * edge) & 3);
+        }
 
+        // Turns the four vertices around one sign-flipping edge into two triangles, wound so the
+        // face points out of the solid (`insideFirst` is the sign at the edge's start sample).
+        private static void StitchDenseQuad(MeshGeometryBuffer output, bool insideFirst, int i0, int i1, int i2, int i3)
+        {
             if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0) return; // hole patching closes whatever this leaves
 
             if (insideFirst)
@@ -477,14 +576,15 @@ namespace Sculpting
 
         /// Finds every boundary edge the extraction left open - used by exactly one triangle,
         /// with no matching triangle on the other side - walks each into a closed loop, and
-        /// caps it with a fan of triangles from a new centroid vertex. This is what makes the
-        /// output watertight the way DynaMesh/Blender's Voxel Remesh guarantee, rather than
-        /// leaving a permanent hole: one vertex per active grid cell means a genuinely concave
-        /// pinch where two close sculpted features pass through the SAME cell as two distinct
-        /// surface sheets can't be represented there. That one-vertex-per-cell ambiguity isn't
-        /// fixable at the per-cell level; patching the resulting hole afterward is. A missing
-        /// face has no vertex-position fix, which is why this couldn't be solved by
-        /// smoothing/sculpting after the fact before this pass existed.
+        /// caps it with a fan of triangles from a new centroid vertex, so the output is watertight
+        /// the way DynaMesh/Blender's Voxel Remesh guarantee rather than keeping a permanent hole.
+        ///
+        /// A safety net, not part of the normal path. Both extractors give a cell one vertex per
+        /// surface PATCH (see SurfaceNetsTopology), so a pinch where two sculpted features pass
+        /// through the same cell as separate sheets is represented directly and the extraction is
+        /// already closed and 2-manifold. What is left for this pass is a quad dropped because one
+        /// of its cells has no vertex - a surface running into the edge of the grid, or a brick the
+        /// sparse path's activation missed.
         ///
         /// No-ops (after one cheap O(triangle count) scan) on the overwhelmingly common
         /// watertight case - this only does real work on the rare geometry that actually needs

@@ -371,11 +371,7 @@ namespace Sculpting
         /// leaving the low-frequency shape (and therefore the thickness) essentially where it
         /// was while still removing the high-frequency rim hardness and faceting.
         ///
-        /// Shared with ZSphereSkinner (hence internal, and hence IReadOnlyList rather than the
-        /// List this class happens to hold), which wants the same non-shrinking property for the
-        /// same reason at a different scale: its job is to soften Surface Nets' voxel stair-
-        /// stepping without eating the limb thicknesses the ZSphere radii just specified.
-        internal static void Smooth(Vector3[] verts, IReadOnlyList<int> tris, int iterations)
+        private static void Smooth(Vector3[] verts, IReadOnlyList<int> tris, int iterations)
         {
             BuildAdjacency(verts.Length, tris, out int[] offsets, out int[] neighbours);
             var scratch = new Vector3[verts.Length];

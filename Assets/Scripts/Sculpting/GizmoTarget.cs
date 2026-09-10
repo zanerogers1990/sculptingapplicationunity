@@ -110,8 +110,8 @@ namespace Sculpting
     /// A rig node has no GameObject of its own - the spheres on screen are drawn from the rig each
     /// frame - so this reads and writes through the controller instead, converting between the
     /// gizmo's world space and the rig's own local space on the way. Writes route through
-    /// SetPositionSymmetric rather than the raw setter so dragging a node still carries its mirror
-    /// twin with it, exactly as the free-drag path does.
+    /// MoveNodeFromGizmo, which carries the node's branch exactly as a Move-mode drag does; the
+    /// mirrored side follows by construction, since reflections are derived rather than stored.
     public sealed class ZSphereNodeTarget : GizmoTarget
     {
         private readonly ZSphereController _controller;
@@ -157,5 +157,12 @@ namespace Sculpting
 
         public override bool SameAs(GizmoTarget other) =>
             other is ZSphereNodeTarget z && z._controller == _controller && z._nodeIndex == _nodeIndex;
+    }
+
+    /// Optional for an IGizmoTargetSource: lets the tool that owns the gizmo keep a press that
+    /// lands on a handle, when something of its own under the cursor should win instead.
+    public interface IGizmoPointerClaim
+    {
+        bool ClaimsPointer(Ray ray);
     }
 }

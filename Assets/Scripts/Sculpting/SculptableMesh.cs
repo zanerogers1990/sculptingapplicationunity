@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Unity.Collections;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -50,15 +51,12 @@ namespace Sculpting
         // multi-million-vertex mesh sizes. See VertexSpatialGrid/_workingVertices for the same
         // reasoning applied to positions.
         private Vector3[] _workingNormals;
-        // Direct-edge neighbors per vertex, derived from the current mesh's triangles, used
-        // by the Smooth brush to relax vertices toward their local average. Rebuilt whenever
-        // topology changes (initial load, Remesh) - never touched by ordinary sculpting since
-        // that only moves vertices, it doesn't change which ones are connected.
-        private int[][] _adjacency;
-        // Per-vertex incident-triangle list, built alongside _adjacency (same triangle scan).
-        // Used by ApplyVerticesLocal to translate "these vertices moved" into "these triangles
-        // need re-bucketing in _triangleGrid" without touching the rest of the mesh.
-        private int[][] _vertexTriangles;
+        // Direct-edge neighbours and incident triangles per vertex, derived from the current
+        // mesh's triangles: neighbours drive every Laplacian (Smooth, relax, cavity), incident
+        // triangles drive the normal recompute and the triangle grid's re-bucketing. Rebuilt
+        // whenever topology changes (initial load, Remesh) - never touched by ordinary sculpting,
+        // which only moves vertices. See MeshAdjacency for the flat layout and why it is flat.
+        private MeshAdjacency _topology;
 
         // Per-vertex concavity/convexity, recomputed after every stroke and written into the
         // mesh's vertex colors (.r) for SculptPBR's cavity coloring - see RecomputeCavity.
@@ -108,11 +106,12 @@ namespace Sculpting
         public int MaskVersion { get; private set; }
 
         // Accelerates SelectGrab/QueryNear so a brush stroke doesn't scan every vertex in the
-        // mesh every frame - see VertexSpatialGrid. Rebuilt by SculptController at the start
-        // of each stroke (RebuildSpatialIndex), and invalidated here whenever the vertex
-        // buffer is replaced/reset wholesale so a stale grid can never be queried against the
-        // wrong positions; QueryNear/SelectGrab rebuild lazily with a default cell size if
-        // nothing has rebuilt it yet.
+        // mesh every frame - see VertexSpatialGrid. Prepared by SculptController at the start of
+        // each stroke (PrepareSpatialIndex, which keeps the existing index when it still fits),
+        // kept exact as vertices move (see QueueSpatialIndexUpdates), and invalidated here
+        // whenever the vertex buffer is replaced/reset wholesale so a stale grid can never be
+        // queried against the wrong positions; QueryNear/SelectGrab rebuild lazily with a default
+        // cell size if nothing has built it yet.
         private VertexSpatialGrid _spatialGrid;
 
         // See SculptHistory - snapshot-based undo/redo for brush strokes, Remesh, and Reset
@@ -273,6 +272,7 @@ namespace Sculpting
             _gpuScatter = null;
             if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
             if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
+            _nativeAdjacencySource = null;
         }
 
         // Marks the mesh's vertex buffer as compute-shader-writable (GraphicsBuffer.Target.Raw)
@@ -338,6 +338,8 @@ namespace Sculpting
             b.SetMinMax(b.min - pad, b.max + pad);
 
             _triangleGrid = new TriangleSpatialGrid(_workingVertices, _workingTriangles, b, cellSize);
+            // A fresh build already reflects every position, so nothing queued before it applies.
+            _pendingTriangleGridVertices.Clear();
         }
 
         /// True if every dirty vertex's incident triangles are still fully inside the triangle
@@ -361,11 +363,12 @@ namespace Sculpting
         {
             worldPoint = default;
             worldNormal = default;
-            // _triangleGrid is a plain C# class (not Unity-serializable), so like _adjacency
-            // (see EnsureAdjacency) it comes back null after a script recompile during Play
-            // mode - rebuild lazily rather than leaving raycasts silently returning false
-            // until the next topology change.
-            if (_triangleGrid == null) RebuildTriangleGrid();
+            // Catches the grid up with every vertex moved since the last raycast (see
+            // QueueSpatialIndexUpdates), or builds it outright. _triangleGrid is a plain C# class
+            // (not Unity-serializable), so like _topology (see EnsureAdjacency) it comes back null
+            // after a script recompile during Play mode - rebuilt lazily here rather than leaving
+            // raycasts silently returning false until the next topology change.
+            SyncTriangleGrid();
 
             Transform t = transform;
             Vector3 localOrigin = t.InverseTransformPoint(worldRay.origin);
@@ -414,98 +417,55 @@ namespace Sculpting
             return Mathf.Min(Mathf.Abs(s.x), Mathf.Min(Mathf.Abs(s.y), Mathf.Abs(s.z)));
         }
 
-        /// Rebuilds the per-vertex direct-edge neighbor lists from the current mesh's
-        /// triangles. O(triangle count) - cheap enough to run once per topology change but
-        /// not meant to run every frame.
+        /// Rebuilds the per-vertex neighbour and incident-triangle arrays from the current
+        /// triangles. O(triangle count) - cheap enough to run once per topology change but not
+        /// meant to run every frame. See MeshAdjacency.
         private void BuildAdjacency()
         {
-            int vertCount = _workingVertices.Length;
-            var neighborSets = new HashSet<int>[vertCount];
-            var triangleSets = new List<int>[vertCount];
-            for (int i = 0; i < vertCount; i++)
-            {
-                neighborSets[i] = new HashSet<int>();
-                triangleSets[i] = new List<int>();
-            }
-
-            int[] tris = _workingTriangles;
-            for (int t = 0; t < tris.Length; t += 3)
-            {
-                int a = tris[t], b = tris[t + 1], c = tris[t + 2];
-                neighborSets[a].Add(b); neighborSets[a].Add(c);
-                neighborSets[b].Add(a); neighborSets[b].Add(c);
-                neighborSets[c].Add(a); neighborSets[c].Add(b);
-
-                int ti = t / 3;
-                triangleSets[a].Add(ti);
-                triangleSets[b].Add(ti);
-                triangleSets[c].Add(ti);
-            }
-
-            _adjacency = new int[vertCount][];
-            _vertexTriangles = new int[vertCount][];
-            for (int i = 0; i < vertCount; i++)
-            {
-                var arr = new int[neighborSets[i].Count];
-                neighborSets[i].CopyTo(arr);
-                _adjacency[i] = arr;
-                _vertexTriangles[i] = triangleSets[i].ToArray();
-            }
+            _topology = MeshAdjacency.Build(_workingVertices.Length, _workingTriangles);
         }
 
-        // Unity's domain-reload serializer doesn't support jagged arrays (int[][]) - unlike
-        // _workingVertices/_workingTriangles, _adjacency and _vertexTriangles silently come
-        // back null after a script recompile while Play mode is active ("Recompile And
-        // Continue Playing"). Guards every direct access to either array so a mid-session
-        // recompile rebuilds them instead of NullReferenceException-ing on the next brush
-        // stroke - same lazy-rebuild-if-null pattern QueryNear already uses for _spatialGrid.
-        private void EnsureAdjacency()
+        // _topology is a plain C# class, which Unity's domain-reload serializer does not carry
+        // across a script recompile while Play mode is active ("Recompile And Continue Playing") -
+        // it silently comes back null. Guards every direct access so a mid-session recompile
+        // rebuilds it instead of NullReference-ing on the next brush stroke - same lazy
+        // rebuild-if-null pattern QueryNear uses for _spatialGrid. Returns it for convenience.
+        private MeshAdjacency EnsureAdjacency()
         {
-            if (_adjacency == null || _adjacency.Length != _workingVertices.Length ||
-                _vertexTriangles == null || _vertexTriangles.Length != _workingVertices.Length)
+            if (_topology == null || _topology.VertexCount != _workingVertices.Length)
                 BuildAdjacency();
+            return _topology;
         }
 
-        // CSR (compressed sparse row) flattening of _adjacency for the Smooth brush's Burst job
-        // (SculptController.SmoothRelaxJob) - jagged int[][] arrays can't be used inside a Burst-
-        // compiled job at all, so this is a NativeArray-backed copy of the same data: neighbors
-        // of vertex i live in NeighborsFlat[OffsetsFlat[i] .. OffsetsFlat[i+1]). Rebuilt whenever
-        // the managed _adjacency itself is rebuilt (topology change, or a mid-Play-recompile
-        // domain reload nulling it - see EnsureAdjacency/[[project_domain_reload_null_fields]]) -
-        // a plain length check can't distinguish "still valid" from "silently rebuilt with
-        // identical content" after a same-topology domain reload, but that distinction is
-        // harmless here since BuildAdjacency is deterministic - rebuilding from unchanged source
-        // data just reproduces the same content.
+        // Native copy of _topology's CSR neighbour arrays for the Laplacian Burst jobs
+        // (SculptController's SmoothRelaxJob and SurfaceRelaxJob) - a job cannot touch a managed
+        // array. Neighbours of vertex i live in NeighborsFlat[OffsetsFlat[i] .. OffsetsFlat[i+1]),
+        // the layout MeshAdjacency already holds, so building it is two bulk copies.
+        //
+        // Rebuilt whenever the managed topology it was copied from is REPLACED, tracked by
+        // identity. This used to compare lengths only, which a topology change that keeps the
+        // vertex count passes with every neighbour wrong; and a mid-Play recompile nulls the source
+        // reference, which forces a rebuild too (see [[project_domain_reload_null_fields]]).
         private NativeArray<int> _nativeAdjacencyOffsets;
         private NativeArray<int> _nativeAdjacencyNeighbors;
+        private MeshAdjacency _nativeAdjacencySource;
 
         public NativeArray<int> AdjacencyOffsets { get { EnsureNativeAdjacency(); return _nativeAdjacencyOffsets; } }
         public NativeArray<int> AdjacencyNeighbors { get { EnsureNativeAdjacency(); return _nativeAdjacencyNeighbors; } }
 
         private void EnsureNativeAdjacency()
         {
-            EnsureAdjacency();
-            if (_nativeAdjacencyOffsets.IsCreated && _nativeAdjacencyOffsets.Length == _workingVertices.Length + 1)
+            MeshAdjacency topology = EnsureAdjacency();
+            if (_nativeAdjacencyOffsets.IsCreated && _nativeAdjacencyNeighbors.IsCreated &&
+                ReferenceEquals(_nativeAdjacencySource, topology))
                 return;
 
             if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
             if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
 
-            int vertCount = _workingVertices.Length;
-            int totalNeighbors = 0;
-            for (int i = 0; i < vertCount; i++) totalNeighbors += _adjacency[i].Length;
-
-            _nativeAdjacencyOffsets = new NativeArray<int>(vertCount + 1, Allocator.Persistent);
-            _nativeAdjacencyNeighbors = new NativeArray<int>(totalNeighbors, Allocator.Persistent);
-
-            int cursor = 0;
-            for (int i = 0; i < vertCount; i++)
-            {
-                _nativeAdjacencyOffsets[i] = cursor;
-                int[] neighbors = _adjacency[i];
-                for (int k = 0; k < neighbors.Length; k++) _nativeAdjacencyNeighbors[cursor++] = neighbors[k];
-            }
-            _nativeAdjacencyOffsets[vertCount] = cursor;
+            _nativeAdjacencyOffsets = new NativeArray<int>(topology.NeighborOffsets, Allocator.Persistent);
+            _nativeAdjacencyNeighbors = new NativeArray<int>(topology.NeighborIndices, Allocator.Persistent);
+            _nativeAdjacencySource = topology;
         }
 
         /// The average position of a vertex's directly-connected neighbors (Laplacian
@@ -513,13 +473,14 @@ namespace Sculpting
         /// neighbors (degenerate/isolated vertex).
         public Vector3 GetNeighborAverage(int vertexIndex)
         {
-            EnsureAdjacency();
-            int[] neighbors = _adjacency[vertexIndex];
-            if (neighbors.Length == 0) return _workingVertices[vertexIndex];
+            MeshAdjacency topology = EnsureAdjacency();
+            int from = topology.NeighborOffsets[vertexIndex], to = topology.NeighborOffsets[vertexIndex + 1];
+            if (to == from) return _workingVertices[vertexIndex];
 
+            int[] neighbors = topology.NeighborIndices;
             Vector3 sum = Vector3.zero;
-            for (int i = 0; i < neighbors.Length; i++) sum += _workingVertices[neighbors[i]];
-            return sum / neighbors.Length;
+            for (int i = from; i < to; i++) sum += _workingVertices[neighbors[i]];
+            return sum / (to - from);
         }
 
         /// Pushes the current working vertex buffer into the mesh, recomputes normals/bounds,
@@ -567,6 +528,7 @@ namespace Sculpting
                 // positions - QueryNear/SelectGrab rebuild lazily from null (see their remarks),
                 // whereas a kept-but-stale grid is silently wrong.
                 _spatialGrid = null;
+                _pendingVertexGridVertices.Clear();
                 RebuildTriangleGrid();
                 RecomputeCavity();
             }
@@ -621,7 +583,7 @@ namespace Sculpting
         /// those neighbors.
         private void BuildAffectedSet(List<int> dirtyVertices)
         {
-            EnsureAdjacency();
+            MeshAdjacency topology = EnsureAdjacency();
             BeginAffectedSet();
 
             // AddAffected's body inlined with the stamp array, generation and member list hoisted
@@ -631,15 +593,15 @@ namespace Sculpting
             int[] stamp = _affectedStamp;
             int generation = _affectedGeneration;
             List<int> affected = _affectedList;
-            int[][] adjacency = _adjacency;
+            int[] offsets = topology.NeighborOffsets;
+            int[] neighbors = topology.NeighborIndices;
 
             for (int k = 0; k < dirtyVertices.Count; k++)
             {
                 int vi = dirtyVertices[k];
                 if (stamp[vi] != generation) { stamp[vi] = generation; affected.Add(vi); }
 
-                int[] neighbors = adjacency[vi];
-                for (int i = 0; i < neighbors.Length; i++)
+                for (int i = offsets[vi], end = offsets[vi + 1]; i < end; i++)
                 {
                     int ni = neighbors[i];
                     if (stamp[ni] == generation) continue;
@@ -667,7 +629,7 @@ namespace Sculpting
 
         // Cached so the closure-free delegate is allocated once, not per brush frame. Null after
         // a mid-Play recompile, like every other cache on this class - hence the ?? above rather
-        // than an initializer (see the domain-reload note on _adjacency).
+        // than an initializer (see the domain-reload note on _topology).
         private Action<int, int> _recomputeNormalsRange;
         private Action<int, int> _cavityCurvatureRange;
         private Action<int, int> _cavityEncodeRange;
@@ -680,17 +642,17 @@ namespace Sculpting
             Vector3[] verts = _workingVertices;
             Vector3[] normals = _workingNormals;
             int[] tris = _workingTriangles;
-            int[][] vertexTris = _vertexTriangles;
+            int[] triangleOffsets = _topology.TriangleOffsets;
+            int[] vertexTris = _topology.TriangleIndices;
             List<int> affected = _affectedList;
 
             for (int k = start; k < end; k++)
             {
                 int i = affected[k];
-                int[] incidentTris = vertexTris[i];
                 float sx = 0f, sy = 0f, sz = 0f;
-                for (int t = 0; t < incidentTris.Length; t++)
+                for (int t = triangleOffsets[i], tEnd = triangleOffsets[i + 1]; t < tEnd; t++)
                 {
-                    int baseIndex = incidentTris[t] * 3;
+                    int baseIndex = vertexTris[t] * 3;
                     Vector3 a = verts[tris[baseIndex]];
                     Vector3 b = verts[tris[baseIndex + 1]];
                     Vector3 c = verts[tris[baseIndex + 2]];
@@ -862,85 +824,186 @@ namespace Sculpting
 
         private void ApplyDirtyVertexList()
         {
-            // Everything below is proportional to how much of the mesh is reported dirty, so the
-            // list is first cut down to the vertices that actually went anywhere - see
-            // FilterToDrifted for the measurements that make this the single biggest win on the
-            // brush hot path.
-            EnsureSyncBuffer();
-            FilterToDrifted(_dirtyVertexList);
-            if (_dirtyVertexList.Count == 0) return;
+            using (ApplyMarker.Auto())
+            {
+                // Everything below is proportional to how much of the mesh is reported dirty, so the
+                // list is first cut down to the vertices that actually went anywhere - see
+                // FilterToDrifted for the measurements that make this the single biggest win on the
+                // brush hot path.
+                EnsureSyncBuffer();
+                FilterToDrifted(_dirtyVertexList);
+                if (_dirtyVertexList.Count == 0) return;
 
-            // Past FilterToDrifted, geometry demonstrably moved - which is exactly the timelapse
-            // recorder's definition of "the user is sculpting". Reported here rather than from
-            // the brush handlers because every brush funnels through this one method, and
-            // because the filter above has already thrown out the strokes that touched nothing.
-            // Undo/redo also reach this path and are silenced at the source - see EditHistory.
-            // The centroid rides along so the timelapse camera can lean towards the part of the
-            // model being worked on rather than just its middle.
-            SculptActivity.ReportEdit(this, DirtyCentroidLocal());
+                // Past FilterToDrifted, geometry demonstrably moved - which is exactly the timelapse
+                // recorder's definition of "the user is sculpting". Reported here rather than from
+                // the brush handlers because every brush funnels through this one method, and
+                // because the filter above has already thrown out the strokes that touched nothing.
+                // Undo/redo also reach this path and are silenced at the source - see EditHistory.
+                // The centroid rides along so the timelapse camera can lean towards the part of the
+                // model being worked on rather than just its middle.
+                SculptActivity.ReportEdit(this, DirtyCentroidLocal());
 
-            BuildAffectedSet(_dirtyVertexList);
-            RecomputeNormalsLocal();
-            ExpandBoundsLocal(_dirtyVertexList);
+                BuildAffectedSet(_dirtyVertexList);
+                RecomputeNormalsLocal();
+                ExpandBoundsLocal(_dirtyVertexList);
 
-            // Re-bucket the moved vertices in the vertex index so it stays exact for the rest
-            // of this stroke and for whatever queries it next (mask painting in particular,
-            // which reuses whatever index the last sculpt stroke left behind). Without this
-            // the index only ever tolerated one cell of drift, and anything past that dropped
-            // out of every future candidate list - see VertexSpatialGrid's class remarks for
-            // the artifacts that caused.
-            if (_spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length)
-                _spatialGrid.UpdateVertices(_dirtyVertexList);
+                // Neither spatial index is re-bucketed here: the moved vertices are queued, and each
+                // index catches up the next time something reads it - see QueueSpatialIndexUpdates.
+                QueueSpatialIndexUpdates(_dirtyVertexList);
 
-            // No Count > 0 test: the early-out above already guarantees it.
-            if (_triangleGrid != null)
+                RecomputeCavityLocal();
+
+                // Replaces the full _mesh.vertices=/.colors= reassignment (and the .normals=
+                // assignment removed above) with a compute-shader scatter write scoped to just the
+                // affected vertices - see GpuVertexScatter remarks. _affectedList is exactly
+                // that "dirty ∪ neighbors" set (built once by BuildAffectedSet above and shared with
+                // both the normal and cavity passes) - position is redundant-but-harmless for
+                // neighbor-only entries whose position didn't change, only their normal/cavity
+                // color did.
+                using (ScatterMarker.Auto())
+                {
+                    EnsureGpuScatter();
+                    _gpuScatter.ScatterDirty(_affectedList, _affectedList.Count, _workingVertices, _workingNormals, _cavityColors);
+                }
+
+                // The scatter just made the GPU match the CPU for exactly this set, so this is what
+                // the next call's drift test measures against. The affected set (not just the dirty
+                // list) is right: the scatter uploads a position for every entry in it, including the
+                // neighbours pulled in only for their normal/colour. Split across cores the same way
+                // as the normal and cavity passes - each entry writes only its own slot.
+                ParallelPass.ForRange(_affectedList.Count, _markSyncedRange ?? (_markSyncedRange = MarkSyncedRange));
+            }
+        }
+
+        private Action<int, int> _markSyncedRange;
+
+        private void MarkSyncedRange(int start, int end)
+        {
+            Vector3[] verts = _workingVertices;
+            Vector3[] synced = _syncedVertices;
+            List<int> affected = _affectedList;
+            for (int k = start; k < end; k++)
+            {
+                int vi = affected[k];
+                synced[vi] = verts[vi];
+            }
+        }
+
+        // Profiler markers for the stages of the apply path that are worth seeing separately in the
+        // Unity Profiler. Negligible cost when nothing is recording.
+        private static readonly ProfilerMarker ApplyMarker = new ProfilerMarker("SculptableMesh.ApplyVerticesLocal");
+        private static readonly ProfilerMarker ScatterMarker = new ProfilerMarker("SculptableMesh.GpuScatter");
+        private static readonly ProfilerMarker TriangleGridSyncMarker = new ProfilerMarker("SculptableMesh.SyncTriangleGrid");
+        private static readonly ProfilerMarker VertexGridSyncMarker = new ProfilerMarker("SculptableMesh.SyncVertexGrid");
+
+
+        // ------------------------------------------------------------ lazy spatial index upkeep
+
+        /// Vertices moved since one spatial index last caught up with them, de-duplicated with a
+        /// flag per vertex. One of these per index, because the two catch up at different moments:
+        /// the triangle grid when something raycasts, the vertex grid when something queries.
+        private sealed class PendingVertexSet
+        {
+            private bool[] _queued;
+            public readonly List<int> Items = new List<int>();
+            public int Count => Items.Count;
+
+            public void Add(List<int> vertices, int vertexCount)
+            {
+                // A different vertex count means the topology changed under whatever was queued,
+                // and those indices no longer name the same vertices.
+                if (_queued == null || _queued.Length != vertexCount)
+                {
+                    _queued = new bool[vertexCount];
+                    Items.Clear();
+                }
+
+                bool[] queued = _queued;
+                for (int k = 0; k < vertices.Count; k++)
+                {
+                    int vi = vertices[k];
+                    if (queued[vi]) continue;
+                    queued[vi] = true;
+                    Items.Add(vi);
+                }
+            }
+
+            public void Clear()
+            {
+                if (_queued != null)
+                {
+                    for (int k = 0; k < Items.Count; k++)
+                    {
+                        int vi = Items[k];
+                        if ((uint)vi < (uint)_queued.Length) _queued[vi] = false;
+                    }
+                }
+                Items.Clear();
+            }
+        }
+
+        private readonly PendingVertexSet _pendingTriangleGridVertices = new PendingVertexSet();
+        private readonly PendingVertexSet _pendingVertexGridVertices = new PendingVertexSet();
+
+        /// Records that these vertices moved, for both spatial indices to catch up with the next time
+        /// each is actually READ - SyncTriangleGrid from RaycastMesh, SyncVertexGrid from QueryNear -
+        /// rather than re-bucketing them on every apply.
+        ///
+        /// The two are read at very different rates. A Clay or Smooth stroke raycasts and queries
+        /// every frame, so for those this changes nothing but the moment the work happens. A Move or
+        /// Pose drag does neither - it tracks a plane and drags a selection made on its first frame -
+        /// yet it moves its whole footprint every frame, so every drag frame used to pay to keep two
+        /// indices exact that nothing was going to look at until the mouse came up. Now a drag pays
+        /// for one catch-up over its net movement, on the first hover after release. Queued only for
+        /// an index that exists: one that doesn't is built from current positions when next needed.
+        private void QueueSpatialIndexUpdates(List<int> movedVertices)
+        {
+            int vertexCount = _workingVertices.Length;
+            if (_triangleGrid != null) _pendingTriangleGridVertices.Add(movedVertices, vertexCount);
+            if (_spatialGrid != null) _pendingVertexGridVertices.Add(movedVertices, vertexCount);
+        }
+
+        /// Brings the triangle-raycast grid up to date with every queued move, or builds it if there
+        /// is none (a fresh object, or a mid-Play recompile nulling it).
+        private void SyncTriangleGrid()
+        {
+            if (_triangleGrid == null) { RebuildTriangleGrid(); return; }
+            if (_pendingTriangleGridVertices.Count == 0) return;
+
+            using (TriangleGridSyncMarker.Auto())
             {
                 if (!MeshBoundsFitInsideTriangleGrid())
                 {
                     // A stroke moved geometry outside the region the triangle grid was built
                     // for - its bounds don't grow on their own (see RebuildTriangleGrid remarks),
-                    // so an incremental UpdateTriangles here would re-bucket the moved triangles
-                    // using stale bounds, and every future raycast's ray-vs-bounds clip test
-                    // would clip away the part of the ray that now needs to reach them. This is
-                    // the fix for the "Move brush stops registering on the same spot after
-                    // pushing it once" bug: RaycastMesh would silently return false for that
-                    // area, forever, until whatever else happened to trigger a full rebuild.
+                    // so an incremental update here would re-bucket the moved triangles using
+                    // stale bounds, and every future raycast's ray-vs-bounds clip test would clip
+                    // away the part of the ray that now needs to reach them. This is the fix for
+                    // the "Move brush stops registering on the same spot after pushing it once"
+                    // bug: RaycastMesh would silently return false for that area, forever, until
+                    // whatever else happened to trigger a full rebuild.
                     RebuildTriangleGrid();
                 }
                 else
                 {
-                    // Driven from the moved VERTICES, not from their incident triangles - the
-                    // grid does its own "did this vertex even change cell" test first and in the
-                    // common case never looks at a triangle at all. See
-                    // TriangleSpatialGrid.UpdateFromMovedVertices.
-                    EnsureAdjacency();
-                    _triangleGrid.UpdateFromMovedVertices(_dirtyVertexList, _vertexTriangles,
-                        _workingVertices, _workingTriangles);
+                    MeshAdjacency topology = EnsureAdjacency();
+                    _triangleGrid.UpdateFromMovedVertices(_pendingTriangleGridVertices.Items,
+                        topology.TriangleOffsets, topology.TriangleIndices, _workingVertices, _workingTriangles);
+                    _pendingTriangleGridVertices.Clear();
                 }
             }
+        }
 
-            RecomputeCavityLocal();
+        /// The vertex index's counterpart of SyncTriangleGrid. Callers establish first that the index
+        /// was built for the current positions array (see SpatialIndexIsCurrent).
+        private void SyncVertexGrid()
+        {
+            if (_pendingVertexGridVertices.Count == 0) return;
 
-            // Replaces the full _mesh.vertices=/.colors= reassignment (and the .normals=
-            // assignment removed above) with a compute-shader scatter write scoped to just the
-            // affected vertices - see GpuVertexScatter remarks. _affectedList is exactly
-            // that "dirty ∪ neighbors" set (built once by BuildAffectedSet above and shared with
-            // both the normal and cavity passes) - position is redundant-but-harmless for
-            // neighbor-only entries whose position didn't change, only their normal/cavity
-            // color did.
-            EnsureGpuScatter();
-            _gpuScatter.ScatterDirty(_affectedList, _affectedList.Count, _workingVertices, _workingNormals, _cavityColors);
-
-            // The scatter just made the GPU match the CPU for exactly this set, so this is what
-            // the next call's drift test measures against. The affected set (not just the dirty
-            // list) is right: the scatter uploads a position for every entry in it, including the
-            // neighbours pulled in only for their normal/colour.
-            Vector3[] verts = _workingVertices;
-            Vector3[] synced = _syncedVertices;
-            for (int k = 0; k < _affectedList.Count; k++)
+            using (VertexGridSyncMarker.Auto())
             {
-                int vi = _affectedList[k];
-                synced[vi] = verts[vi];
+                _spatialGrid.UpdateVertices(_pendingVertexGridVertices.Items);
+                _pendingVertexGridVertices.Clear();
             }
         }
 
@@ -1001,7 +1064,7 @@ namespace Sculpting
 
         private float _cavityMean;
 
-        /// Rebuild-if-null, the same treatment _adjacency/_triangleGrid/_gpuScatter get: a
+        /// Rebuild-if-null, the same treatment _topology/_triangleGrid/_gpuScatter get: a
         /// mid-Play script recompile triggers a domain reload that does not preserve these
         /// caches, and a stroke immediately afterward would otherwise NullReference. Also covers
         /// a length mismatch, which would mean the buffers survived a topology change they
@@ -1057,7 +1120,7 @@ namespace Sculpting
         // isn't enough: RestoreSnapshot and the replace paths swap in a whole new positions array
         // that can happen to be the same length as the old one, and a sync buffer carried across
         // that would be describing a shape the mesh no longer has - which the filter would read
-        // as "nothing moved" and skip. Same rebuild-if-stale treatment _adjacency and
+        // as "nothing moved" and skip. Same rebuild-if-stale treatment _topology and
         // _triangleGrid get for the domain-reload case.
         private Vector3[] _syncedFor;
 
@@ -1203,8 +1266,10 @@ namespace Sculpting
         private float CurvatureAt(int i)
         {
             Vector3[] verts = _workingVertices;
-            int[] neighbors = _adjacency[i];
-            if (neighbors.Length == 0) return 0f;
+            MeshAdjacency topology = _topology;
+            int from = topology.NeighborOffsets[i], to = topology.NeighborOffsets[i + 1];
+            if (to == from) return 0f;
+            int[] neighbors = topology.NeighborIndices;
 
             Vector3 p = verts[i];
             Vector3 n = _workingNormals[i];
@@ -1221,7 +1286,7 @@ namespace Sculpting
             float ox = 0f, oy = 0f, oz = 0f;
             float sqrLenSum = 0f;
             int counted = 0;
-            for (int k = 0; k < neighbors.Length; k++)
+            for (int k = from; k < to; k++)
             {
                 Vector3 q = verts[neighbors[k]];
                 float dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
@@ -1301,10 +1366,12 @@ namespace Sculpting
         private void EncodeCavityAt(int i)
         {
             float[] raw = _cavityRaw;
-            int[] neighbors = _adjacency[i];
+            MeshAdjacency topology = _topology;
+            int from = topology.NeighborOffsets[i], to = topology.NeighborOffsets[i + 1];
+            int[] neighbors = topology.NeighborIndices;
             float sum = raw[i];
-            for (int k = 0; k < neighbors.Length; k++) sum += raw[neighbors[k]];
-            float smoothed = sum / (neighbors.Length + 1);
+            for (int k = from; k < to; k++) sum += raw[neighbors[k]];
+            float smoothed = sum / (to - from + 1);
 
             // Subtracting the mesh-wide mean makes this a high-pass of curvature, which is what
             // "cavity" actually means: tint where the surface departs from its own overall
@@ -1829,12 +1896,14 @@ namespace Sculpting
 
         /// Call before Remesh/Reset Mesh (topology-changing edits) so Undo can revert them - a
         /// full clone is unavoidable here since nothing less can describe a topology change.
-        /// _workingVertices is cloned since it's the live array brush strokes mutate in place -
-        /// Mesh.triangles doesn't need cloning too, Unity's getter already returns a fresh copy.
+        /// Both arrays are cloned from the CPU-authoritative copies, never read back from the Mesh:
+        /// while any geometry is hidden (see RefreshVisibility) the Mesh's index buffer holds only
+        /// the VISIBLE triangles, so a snapshot taken through Mesh.triangles silently dropped every
+        /// hidden one - and restoring that snapshot deleted them.
         /// Ordinary brush strokes use BeginStrokeUndo/EndStrokeUndo instead - see their remarks.
         public void SnapshotForUndo()
         {
-            _history.PushFullUndo((Vector3[])_workingVertices.Clone(), _mesh.triangles);
+            _history.PushFullUndo((Vector3[])_workingVertices.Clone(), (int[])_workingTriangles.Clone());
             EditHistory.RecordMeshEdit(this);
         }
 
@@ -2039,7 +2108,8 @@ namespace Sculpting
         private void CaptureFull(out Vector3[] vertices, out int[] triangles)
         {
             vertices = (Vector3[])_workingVertices.Clone();
-            triangles = _mesh.triangles;
+            // Not _mesh.triangles, which omits hidden triangles - see SnapshotForUndo.
+            triangles = (int[])_workingTriangles.Clone();
         }
 
         private void ApplyRestore(SculptHistory.Restore restore)
@@ -2186,17 +2256,54 @@ namespace Sculpting
         }
 
         /// Rebuilds the spatial index used by SelectGrab/QueryNear over the current vertex
-        /// positions. Cheap relative to a full brush stroke (called once per stroke, not per
-        /// frame) but still O(vertex count), so callers should call this at the start of a
-        /// stroke/drag rather than every frame - see SculptController.
+        /// positions, unconditionally. O(vertex count) - a stroke start should call
+        /// PrepareSpatialIndex instead, which only rebuilds when it has to.
         public void RebuildSpatialIndex(float cellSize)
         {
             _spatialGrid = new VertexSpatialGrid(_workingVertices, cellSize);
+            // A fresh build already reflects every position, so nothing queued before it applies.
+            _pendingVertexGridVertices.Clear();
         }
 
-        /// Candidate vertex indices near a local-space point - callers still need to check
-        /// exact distance themselves (see VertexSpatialGrid.Query). Lazily builds the index
-        /// with a radius-derived cell size if nothing has called RebuildSpatialIndex yet.
+        // How far the existing index's cell size may sit from the one asked for, as a ratio either
+        // way, before PrepareSpatialIndex rebuilds instead of reusing. Query cost rises both as cells
+        // shrink relative to the query radius (more cells to visit) and as they grow past it (more
+        // vertices per cell to test); inside 1.5x either way it stays within a small factor of ideal.
+        private const float SpatialIndexReuseRatio = 1.5f;
+
+        /// Readies the vertex index for a stroke whose brush wants cells of about `cellSize`,
+        /// rebuilding it only when it has to.
+        ///
+        /// This used to rebuild unconditionally on every mouse press. There were two reasons: an index
+        /// bucketed against pre-stroke positions went stale as vertices moved, and cell size should
+        /// track the brush. The first no longer holds - the index is kept exact as vertices move (see
+        /// QueueSpatialIndexUpdates) - so an index already built for this positions array at a
+        /// compatible cell size is exactly what a rebuild would produce, and the rebuild was pure cost
+        /// landing in the first frame of every stroke: the frame a user watches most closely to see
+        /// whether the brush responded.
+        public void PrepareSpatialIndex(float cellSize)
+        {
+            if (SpatialIndexIsCurrent())
+            {
+                float ratio = _spatialGrid.CellSize / Mathf.Max(cellSize, 0.0001f);
+                if (ratio <= SpatialIndexReuseRatio && ratio >= 1f / SpatialIndexReuseRatio)
+                {
+                    SyncVertexGrid();
+                    return;
+                }
+            }
+            RebuildSpatialIndex(cellSize);
+        }
+
+        /// True if the vertex index exists and was built over THIS positions array - a same-length
+        /// replacement array describes a different shape, which the index would still answer for.
+        private bool SpatialIndexIsCurrent() =>
+            _spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length &&
+            ReferenceEquals(_spatialGrid.Positions, _workingVertices);
+
+        /// Vertex indices within `radius` of a local-space point - exact, see VertexSpatialGrid.Query.
+        /// Lazily builds the index with a radius-derived cell size if nothing has prepared one, and
+        /// catches it up with any queued vertex moves first (see QueueSpatialIndexUpdates).
         /// Hidden vertices are dropped from the result, which is what makes hidden geometry
         /// un-sculptable: every brush, the mask brush and SelectGrab all reach the mesh through
         /// this one method, so filtering here covers all of them at once and cannot be forgotten
@@ -2204,7 +2311,8 @@ namespace Sculpting
         /// allocating a filtered copy per call.
         public List<int> QueryNear(Vector3 localPoint, float radius)
         {
-            if (_spatialGrid == null) RebuildSpatialIndex(Mathf.Max(radius * 0.5f, 0.01f));
+            if (!SpatialIndexIsCurrent()) RebuildSpatialIndex(Mathf.Max(radius * 0.5f, 0.01f));
+            else SyncVertexGrid();
             List<int> candidates = _spatialGrid.Query(localPoint, radius);
             if (!_anyHidden || _hiddenVertices == null) return candidates;
 
@@ -2354,7 +2462,9 @@ namespace Sculpting
             int clickVertex = NearestVertexIndex(localClickPoint, brushRadius);
             if (clickVertex < 0 || _mask[clickVertex] > PoseMaskThreshold) return default;
 
-            EnsureAdjacency();
+            MeshAdjacency topology = EnsureAdjacency();
+            int[] neighborOffsets = topology.NeighborOffsets;
+            int[] neighborIndices = topology.NeighborIndices;
 
             // Pass 1: flood-fill the connected unmasked island containing the click, collecting
             // every island vertex that touches a masked neighbor as we go - that set becomes the
@@ -2370,11 +2480,10 @@ namespace Sculpting
                 if (island.Count >= PoseMaxIslandVertices) break; // see PoseMaxIslandVertices
                 int v = floodQueue.Dequeue();
                 island.Add(v);
-                int[] neighbors = _adjacency[v];
                 bool touchesMasked = false;
-                for (int k = 0; k < neighbors.Length; k++)
+                for (int k = neighborOffsets[v], kEnd = neighborOffsets[v + 1]; k < kEnd; k++)
                 {
-                    int n = neighbors[k];
+                    int n = neighborIndices[k];
                     if (_mask[n] > PoseMaskThreshold) { touchesMasked = true; continue; }
                     if (visited.Add(n)) floodQueue.Enqueue(n);
                 }
@@ -2430,10 +2539,9 @@ namespace Sculpting
                 if (d > dist[v] + 1e-6f) continue; // stale heap entry from an earlier, worse push
                 processed++;
 
-                int[] neighbors = _adjacency[v];
-                for (int k = 0; k < neighbors.Length; k++)
+                for (int k = neighborOffsets[v], kEnd = neighborOffsets[v + 1]; k < kEnd; k++)
                 {
-                    int n = neighbors[k];
+                    int n = neighborIndices[k];
                     if (!visited.Contains(n)) continue; // outside the island - never cross the mask boundary
                     float nd = d + Vector3.Distance(_workingVertices[v], _workingVertices[n]);
                     if (dist.TryGetValue(n, out float existing) && existing <= nd) continue;
