@@ -48,11 +48,13 @@ namespace Sculpting
 
         /// Builds a standalone Canvas docked to one corner of the screen with a panel inside it
         /// whose content sits behind a scrollbar/viewport instead of growing without limit. The
-        /// panel still auto-sizes to its content below maxHeight (so a short panel isn't left
-        /// with dead space) - it only starts scrolling once content would otherwise run past
-        /// maxHeight. Returns the scrolling CONTENT transform - callers just build into it like
-        /// any other panel transform, the scrolling machinery is invisible to them.
-        public static Transform CreateScrollingPanelCanvas(string name, Vector2 anchor, Vector2 offset, float width, float maxHeight)
+        /// panel still auto-sizes to its content below the window's height (so a short panel
+        /// isn't left with dead space) - it only starts scrolling once content would otherwise
+        /// run past it. `width` is also the panel's floor: see ResponsivePanelWidth for how it
+        /// scales up on a larger screen. Returns the scrolling CONTENT transform - callers just
+        /// build into it like any other panel transform, the scrolling machinery is invisible to
+        /// them.
+        public static Transform CreateScrollingPanelCanvas(string name, Vector2 anchor, Vector2 offset, float width)
         {
             DestroyStaleCanvas(name);
             var canvasGO = new GameObject(name, typeof(RectTransform));
@@ -72,21 +74,23 @@ namespace Sculpting
             rect.anchorMax = anchor;
             rect.pivot = anchor;
             rect.anchoredPosition = offset;
-            rect.sizeDelta = new Vector2(width, 0f); // height is driven by ScrollPanelHeightController below
+            rect.sizeDelta = new Vector2(width, 0f); // size is driven by ScrollPanelHeightController below
 
-            return AddScrollingContent(rect, maxHeight, new RectOffset(12, 12, 12, 12), 8f);
+            return AddScrollingContent(rect, new RectOffset(12, 12, 12, 12), 8f);
         }
 
         /// Wraps an already-positioned, already-sized panel RectTransform (background Image
         /// already attached, as every panel in this project has) with a Viewport/Content/
         /// Scrollbar/ScrollRect, and a ScrollPanelHeightController that keeps the panel's own
-        /// height matched to its content up to maxHeight. Split out from
+        /// size matched to its content and to the window. Split out from
         /// CreateScrollingPanelCanvas so SculptUIBuilder - which builds its own panel by hand -
         /// can add the same scrolling behavior to its existing panel instead of rebuilding it
-        /// through this factory.
-        public static Transform AddScrollingContent(RectTransform panelRect, float maxHeight, RectOffset padding, float spacing)
+        /// through this factory. Whatever width the caller already set on panelRect becomes the
+        /// panel's reference/floor width for ResponsivePanelWidth below.
+        public static Transform AddScrollingContent(RectTransform panelRect, RectOffset padding, float spacing)
         {
             GameObject panelGO = panelRect.gameObject;
+            float referenceWidth = panelRect.sizeDelta.x;
 
             var viewportGO = new GameObject("Viewport", typeof(RectTransform), typeof(RectMask2D));
             viewportGO.transform.SetParent(panelRect, false);
@@ -168,31 +172,55 @@ namespace Sculpting
             var sizer = panelGO.AddComponent<ScrollPanelHeightController>();
             sizer.PanelRect = panelRect;
             sizer.ContentRect = contentRect;
-            sizer.MaxHeight = maxHeight;
+            sizer.ReferenceWidth = referenceWidth;
 
             return contentGO.transform;
         }
 
-        /// Keeps a scrolling panel's outer height matched to its content's natural size, capped
-        /// at MaxHeight - the scrolling equivalent of the plain ContentSizeFitter every other
-        /// panel puts directly on itself, which can't cap. Foldouts opening/closing and lists
-        /// like the scene object list rebuilding change content height continuously after the
-        /// panel is first built, so this re-measures every frame rather than once at
-        /// construction - the same cheap per-frame poll idiom SculptUIBuilder/
-        /// SceneGraphUIBuilder already use for their own refresh checks.
+        /// How wide a docked side panel should be for the CURRENT screen, instead of a fixed
+        /// pixel size that looks tiny on a big/high-res monitor and never adapts if the window
+        /// (now resizable - see the Fullscreen Mode player setting) is dragged to a
+        /// different-sized screen. `referenceWidth` is both the pixel width the panel was
+        /// designed/tested at and its floor, so nothing shrinks below today's look on an
+        /// ordinary desktop window; it only scales UP on a wider one, capped at 1.5x so it can't
+        /// sprawl across a large fraction of a very wide monitor. 1920 as the reference screen
+        /// width is an ordinary desktop baseline - at that width this returns referenceWidth
+        /// unchanged.
+        public static float ResponsivePanelWidth(float referenceWidth)
+        {
+            float width = Screen.width * (referenceWidth / 1920f);
+            return Mathf.Clamp(width, referenceWidth, referenceWidth * 1.5f);
+        }
+
+        /// Keeps a scrolling panel's outer size matched to the window: width via
+        /// ResponsivePanelWidth, height to the content's natural size capped at the window's own
+        /// height (floored at 300 so a near-empty panel, or a very short window, doesn't
+        /// collapse to nothing) - the scrolling equivalent of the plain ContentSizeFitter every
+        /// other panel puts directly on itself, which can't cap. Re-measures every frame rather
+        /// than once at construction: foldouts opening/closing and lists like the scene object
+        /// list rebuilding change content height continuously after the panel is first built,
+        /// and the window itself can now be resized or dragged to another monitor live - the
+        /// same cheap per-frame poll idiom SculptUIBuilder/SceneGraphUIBuilder already use for
+        /// their own refresh checks.
         private sealed class ScrollPanelHeightController : MonoBehaviour
         {
             public RectTransform PanelRect;
             public RectTransform ContentRect;
-            public float MaxHeight;
+            public float ReferenceWidth;
 
             private void LateUpdate()
             {
                 if (PanelRect == null || ContentRect == null) return;
+
+                float width = ResponsivePanelWidth(ReferenceWidth);
+                if (Mathf.Abs(PanelRect.sizeDelta.x - width) > 0.5f)
+                    PanelRect.sizeDelta = new Vector2(width, PanelRect.sizeDelta.y);
+
                 LayoutRebuilder.ForceRebuildLayoutImmediate(ContentRect);
-                float target = Mathf.Min(ContentRect.rect.height, MaxHeight);
-                if (Mathf.Abs(PanelRect.sizeDelta.y - target) > 0.5f)
-                    PanelRect.sizeDelta = new Vector2(PanelRect.sizeDelta.x, target);
+                float heightCap = Mathf.Max(300f, Screen.height);
+                float height = Mathf.Min(ContentRect.rect.height, heightCap);
+                if (Mathf.Abs(PanelRect.sizeDelta.y - height) > 0.5f)
+                    PanelRect.sizeDelta = new Vector2(PanelRect.sizeDelta.x, height);
             }
         }
 
@@ -229,7 +257,7 @@ namespace Sculpting
             return go;
         }
 
-        public static Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange)
+        public static Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange, string tooltip = null)
         {
             var sliderGO = new GameObject("Slider", typeof(RectTransform));
             sliderGO.transform.SetParent(parent, false);
@@ -283,10 +311,11 @@ namespace Sculpting
             slider.value = defaultVal;
             slider.onValueChanged.AddListener(v => onChange(v));
 
+            TooltipSystem.Attach(sliderGO, tooltip);
             return slider;
         }
 
-        public static Button CreateButton(Transform parent, string label, Action onClick)
+        public static Button CreateButton(Transform parent, string label, Action onClick, string tooltip = null)
         {
             var go = new GameObject("Button_" + label, typeof(RectTransform), typeof(Image));
             go.transform.SetParent(parent, false);
@@ -310,10 +339,11 @@ namespace Sculpting
             text.color = Color.white;
             text.text = label;
 
+            TooltipSystem.Attach(go, tooltip);
             return btn;
         }
 
-        public static Toggle CreateToggle(Transform parent, string label, bool defaultVal, Action<bool> onChange, Color? checkColor = null)
+        public static Toggle CreateToggle(Transform parent, string label, bool defaultVal, Action<bool> onChange, Color? checkColor = null, string tooltip = null)
         {
             var go = new GameObject("Toggle_" + label, typeof(RectTransform));
             go.transform.SetParent(parent, false);
@@ -356,6 +386,7 @@ namespace Sculpting
             text.text = label;
 
             toggle.onValueChanged.AddListener(v => onChange(v));
+            TooltipSystem.Attach(go, tooltip);
             return toggle;
         }
 

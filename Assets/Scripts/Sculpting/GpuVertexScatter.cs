@@ -95,17 +95,7 @@ namespace Sculpting
         /// allocating garbage every single call during a held stroke.
         public void ScatterDirty(HashSet<int> indices, int count, Vector3[] positions, Vector3[] normals, Color[] colors)
         {
-            EnsureShaderLoaded();
-            if (_shader == null || _vertexBuffer == null || count == 0) return;
-
-            EnsureCapacity(count);
-            if (_indexScratch.Length < count)
-            {
-                _indexScratch = new uint[count];
-                _positionScratch = new Vector3[count];
-                _normalScratch = new Vector3[count];
-                _colorScratch = new Vector4[count];
-            }
+            if (!BeginScatter(count)) return;
 
             int n = 0;
             foreach (int vi in indices)
@@ -117,6 +107,49 @@ namespace Sculpting
                 n++;
             }
 
+            Dispatch(n);
+        }
+
+        /// List overload, used by the brush hot path - see SculptableMesh's _affectedList for why
+        /// that set stopped being a HashSet. Same concrete-type-not-interface reasoning as above:
+        /// List&lt;int&gt;'s enumerator is a struct too, and only stays allocation-free when the
+        /// parameter is the concrete type.
+        public void ScatterDirty(List<int> indices, int count, Vector3[] positions, Vector3[] normals, Color[] colors)
+        {
+            if (!BeginScatter(count)) return;
+
+            for (int n = 0; n < count; n++)
+            {
+                int vi = indices[n];
+                _indexScratch[n] = (uint)vi;
+                _positionScratch[n] = positions[vi];
+                _normalScratch[n] = normals[vi];
+                _colorScratch[n] = colors[vi];
+            }
+
+            Dispatch(count);
+        }
+
+        /// Shared preamble: returns false when there is nothing to do (or no shader to do it
+        /// with), otherwise leaves the GPU and scratch buffers big enough for `count` entries.
+        private bool BeginScatter(int count)
+        {
+            EnsureShaderLoaded();
+            if (_shader == null || _vertexBuffer == null || count == 0) return false;
+
+            EnsureCapacity(count);
+            if (_indexScratch.Length < count)
+            {
+                _indexScratch = new uint[count];
+                _positionScratch = new Vector3[count];
+                _normalScratch = new Vector3[count];
+                _colorScratch = new Vector4[count];
+            }
+            return true;
+        }
+
+        private void Dispatch(int n)
+        {
             _indexBuffer.SetData(_indexScratch, 0, 0, n);
             _positionBuffer.SetData(_positionScratch, 0, 0, n);
             _normalBuffer.SetData(_normalScratch, 0, 0, n);

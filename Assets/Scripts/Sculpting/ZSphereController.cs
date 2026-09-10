@@ -22,7 +22,7 @@ namespace Sculpting
     /// is the normal end of its life. Convert is therefore the point at which the work becomes
     /// real, savable, undoable geometry - which is also why KeepRigOnConvert exists, for the
     /// blockout you want to keep iterating on after taking one skin off it.
-    public class ZSphereController : MonoBehaviour
+    public class ZSphereController : MonoBehaviour, IGizmoTargetSource
     {
         // ------------------------------------------------------------------------- constants
 
@@ -284,10 +284,23 @@ namespace Sculpting
             {
                 IsHoveringNode = false;
                 UpdatePlacementCursor(false);
+                // Still run once on the way out, so putting the tool away also takes the gizmo
+                // off whatever sphere it was pointed at.
+                SyncGizmoTargets();
                 return;
             }
 
             RefreshHandles();
+            // RefreshHandles just repositioned the sphere colliders PickNode raycasts against, and
+            // the physics scene keeps its own copy of every collider transform that is only
+            // refreshed at the next physics step. Without this, a click on the same frame the rig
+            // changed shape is tested against where the spheres used to be - see the matching call
+            // in TransformGizmo.Update for the full story.
+            Physics.SyncTransforms();
+            // Before HandleInput: the gizmo's own Update may already have run this frame, and this
+            // is what decides whether it is showing at all, so pushing after the click was
+            // processed would cost a frame of latency on every mode/selection switch.
+            SyncGizmoTargets();
             // Before HandleInput, so the ghost shown this frame is the position the click landing
             // this frame will actually use.
             UpdatePlacementCursor(true);
@@ -338,6 +351,20 @@ namespace Sculpting
             bool blocked = overUI || altHeld;
 
             Ray ray = _cam.ScreenPointToRay(mouse.position.ReadValue());
+
+            // The transform gizmo is up on the selected sphere while Move mode is active (see
+            // SyncGizmoTargets), and it processes the SAME click this method does. Without this
+            // guard a click on a move arrow would also register here - as a click on empty space,
+            // which in Add mode places a root, and everywhere else deselects. Standing down while
+            // the cursor is over a handle (or a handle drag is already running) gives the gizmo
+            // first refusal on the click, the same precedence SculptController gives this tool.
+            TransformGizmo gizmo = Gizmo;
+            if (gizmo != null && (gizmo.IsDragging || gizmo.IsPointerOverHandle(ray)))
+            {
+                IsHoveringNode = false;
+                return;
+            }
+
             int hovered = blocked ? ZSphereRig.NoNode : PickNode(ray);
             IsHoveringNode = hovered != ZSphereRig.NoNode && _drag == DragKind.None;
 
@@ -1985,5 +2012,90 @@ namespace Sculpting
 
         private Vector3 RigToWorld(Vector3 rigPoint) => _rigRoot.TransformPoint(rigPoint);
         private Vector3 WorldToRig(Vector3 worldPoint) => _rigRoot.InverseTransformPoint(worldPoint);
+
+        // ------------------------------------------------------------------ transform gizmo
+
+        /// World-space position of a rig-local point, for the transform gizmo (see
+        /// ZSphereNodeTarget). Public wrapper rather than making RigToWorld itself public, so the
+        /// rig root stays this class's business and only the two conversions a gizmo target
+        /// actually needs are exposed.
+        public Vector3 RigPointToWorld(Vector3 rigPoint) => _rigRoot != null ? RigToWorld(rigPoint) : rigPoint;
+
+        /// A node radius in world units - the gizmo sizes its arms from this so the handles clear
+        /// the sphere they are attached to instead of sitting inside it.
+        public float RigRadiusToWorld(float rigRadius)
+        {
+            if (_rigRoot == null) return rigRadius;
+            Vector3 s = _rigRoot.lossyScale;
+            return rigRadius * Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+        }
+
+        /// Moves a node to a world-space point on behalf of the transform gizmo. Goes through
+        /// SetPositionSymmetric, so an axis drag carries the mirror twin exactly as the free drag
+        /// does, and marks the preview stale so the skin follows the handle.
+        public void MoveNodeFromGizmo(int nodeIndex, Vector3 worldPosition)
+        {
+            if (_rigRoot == null || _rig.Get(nodeIndex) == null) return;
+            SetPositionSymmetric(nodeIndex, WorldToRig(worldPosition));
+            InvalidatePreview();
+        }
+
+        // Which node the gizmo is currently pointed at, so the push/clear below happens only on a
+        // real change rather than every frame.
+        private readonly List<GizmoTarget> _gizmoTargets = new List<GizmoTarget>();
+        private int _gizmoTargetNode = ZSphereRig.NoNode;
+
+        /// Points the transform gizmo at the selected sphere while Move mode is up, and takes it
+        /// away again otherwise.
+        ///
+        /// Move mode keeps its original free drag on the sphere body - grabbing the ball itself
+        /// still slides it along a view-facing plane, which is the fastest way to rough a blockout
+        /// in. The gizmo adds the thing that was missing: an axis to constrain to, for the moment
+        /// you want a limb moved straight down X without disturbing the other two.
+        private void SyncGizmoTargets()
+        {
+            TransformGizmo gizmo = Gizmo;
+            if (gizmo == null) return;
+
+            bool wants = _wasActive && EditMode == ZSphereEditMode.Move &&
+                         SelectedNode != ZSphereRig.NoNode && _rig.Get(SelectedNode) != null &&
+                         _drag == DragKind.None;
+
+            if (!wants)
+            {
+                if (_gizmoTargetNode != ZSphereRig.NoNode)
+                {
+                    gizmo.ClearExternalTargets(this);
+                    _gizmoTargetNode = ZSphereRig.NoNode;
+                    _gizmoTargets.Clear();
+                }
+                return;
+            }
+
+            if (_gizmoTargetNode == SelectedNode) return;
+
+            _gizmoTargetNode = SelectedNode;
+            _gizmoTargets.Clear();
+            _gizmoTargets.Add(new ZSphereNodeTarget(this, SelectedNode));
+            // Move only: a sphere is rotationally symmetric, and its radius already has its own
+            // edit mode (and its own scroll-wheel gesture), so rotate/scale handles here would be
+            // three more things to misclick for no reachable effect.
+            gizmo.SetExternalTargets(this, _gizmoTargets, GizmoHandleSet.Move);
+        }
+
+        // The rig keeps its own undo stack (BeginRigEdit/CommitRigEdit), deliberately separate from
+        // the scene's - see this class's remarks on why the rig is a scaffold rather than an object.
+        public bool RecordsOwnUndoStep => true;
+
+        public void OnGizmoDragStarted() => BeginRigEdit("Move Sphere");
+
+        public void OnGizmoDragEnded(bool changed)
+        {
+            // CommitRigEdit throws the snapshot away by itself when the rig version did not move,
+            // so an unchanged drag needs no special case here - but the preview still wants
+            // refreshing after a real one.
+            if (changed) InvalidatePreview();
+            CommitRigEdit();
+        }
     }
 }

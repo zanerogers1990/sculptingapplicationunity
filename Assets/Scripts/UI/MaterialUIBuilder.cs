@@ -56,26 +56,34 @@ namespace Sculpting
             UIFactory.CreateColorPicker(panel, "Base Color", _material.BaseColor, c => _material.BaseColor = c);
 
             UIFactory.CreateLabel(panel, "Metallic", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(panel, 0f, 1f, _material.Metallic, v => _material.Metallic = v);
+            UIFactory.CreateSlider(panel, 0f, 1f, _material.Metallic, v => _material.Metallic = v,
+                "How metallic the surface looks - low keeps it a plain coloured material, high makes it reflect like bare metal.");
 
             UIFactory.CreateLabel(panel, "Smoothness", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(panel, 0f, 1f, _material.Smoothness, v => _material.Smoothness = v);
+            UIFactory.CreateSlider(panel, 0f, 1f, _material.Smoothness, v => _material.Smoothness = v,
+                "Sharpness of reflections/highlights - low is matte, high is glossy.");
 
             UIFactory.CreateLabel(panel, "Normal Detail Strength", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(panel, 0f, 2f, _material.NormalStrength, v => _material.NormalStrength = v);
+            UIFactory.CreateSlider(panel, 0f, 2f, _material.NormalStrength, v => _material.NormalStrength = v,
+                "Fake surface bumpiness in the shading only - doesn't change the actual mesh.");
 
             UIFactory.CreateLabel(panel, "Normal Detail Scale", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(panel, 1f, 300f, _material.NormalNoiseScale, v => _material.NormalNoiseScale = v);
+            UIFactory.CreateSlider(panel, 1f, 300f, _material.NormalNoiseScale, v => _material.NormalNoiseScale = v,
+                "Size of the Normal Detail bumps - low is large and gentle, high is fine grain.");
 
-            UIFactory.CreateToggle(panel, "Flat Shading (Show Facets)", _material.FlatShading, v => _material.FlatShading = v);
+            UIFactory.CreateToggle(panel, "Flat Shading (Show Facets)", _material.FlatShading, v => _material.FlatShading = v,
+                tooltip: "Shows each triangle as a flat facet instead of smoothly blended shading - good for checking mesh density.");
 
             Transform cavity = UIFactory.CreateFoldoutSection(panel, "Cavity", false);
-            UIFactory.CreateToggle(cavity, "Enabled", _material.CavityEnabled, v => _material.CavityEnabled = v);
+            UIFactory.CreateToggle(cavity, "Enabled", _material.CavityEnabled, v => _material.CavityEnabled = v,
+                tooltip: "Darkens creases and recesses based on the mesh's curvature, like dirt collecting in tight spots.");
             UIFactory.CreateColorPicker(cavity, "Recess Color", _material.RecessColor, c => _material.RecessColor = c);
             UIFactory.CreateLabel(cavity, "Cavity Intensity", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityIntensity, v => _material.CavityIntensity = v);
+            UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityIntensity, v => _material.CavityIntensity = v,
+                "How strongly Recess Color blends into recesses - 0 is off, higher is darker.");
             UIFactory.CreateLabel(cavity, "Cavity Range", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(cavity, 0.05f, 2f, _material.CavityRange, v => _material.CavityRange = v);
+            UIFactory.CreateSlider(cavity, 0.05f, 2f, _material.CavityRange, v => _material.CavityRange = v,
+                "How sharp a crease must be to get tinted - low affects broad curves, high confines it to the deepest creases only.");
 
             BuildMatcapSection(UIFactory.CreateFoldoutSection(panel, "Matcap", false));
         }
@@ -86,17 +94,19 @@ namespace Sculpting
             {
                 _material.MatcapEnabled = v;
                 RefreshMatcapUi();
-            });
+            }, tooltip: "Replaces scene lighting with a pre-baked shading image, so the surface looks lit consistently without setting up scene lights.");
 
             _matcapStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
 
             UIFactory.CreateLabel(section, "Intensity", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(section, 0f, 3f, _material.MatcapIntensity, v => _material.MatcapIntensity = v);
+            UIFactory.CreateSlider(section, 0f, 3f, _material.MatcapIntensity, v => _material.MatcapIntensity = v,
+                "Brightness of the matcap shading - 1 is as baked, higher brightens it.");
 
             // Named for what it does rather than "Tint": a matcap already carries a colour, and
             // this is specifically how much of the Base Color above gets multiplied through it.
             UIFactory.CreateLabel(section, "Tint By Base Color", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(section, 0f, 1f, _material.MatcapTintStrength, v => _material.MatcapTintStrength = v);
+            UIFactory.CreateSlider(section, 0f, 1f, _material.MatcapTintStrength, v => _material.MatcapTintStrength = v,
+                "How much Base Color tints the matcap - 0 leaves it untouched, 1 fully tints it.");
 
             // Palette lives in its own container so Rescan can clear and refill just this part
             // of the section without disturbing the controls around it.
@@ -112,8 +122,8 @@ namespace Sculpting
             _paletteRoot = paletteGO.transform;
             BuildPalette();
 
-            UIFactory.CreateButton(section, "Import Matcap...", ImportMatcap);
-            UIFactory.CreateButton(section, "Rescan Folder", RescanMatcaps);
+            UIFactory.CreateButton(section, "Import Matcap...", ImportMatcap, "Add a matcap image file to the palette.");
+            UIFactory.CreateButton(section, "Rescan Folder", RescanMatcaps, "Refresh the palette from the Matcaps folder on disk.");
 
             if (!FileDialog.IsSupported)
                 UIFactory.CreateLabel(section, "No file picker - drop images in the Matcaps folder instead.",

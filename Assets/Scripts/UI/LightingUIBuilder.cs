@@ -1,16 +1,20 @@
+using System.Collections.Generic;
 using Sculpting.IO;
 using UnityEngine;
 using UnityEngine.UI;
 
 namespace Sculpting
 {
-    /// Builds the "Studio Lighting" section: a master enable toggle, 3-point/5-point mode
-    /// buttons, a row to pick which light's sliders are currently shown, and
-    /// intensity/yaw/pitch/distance/color controls for whichever light is selected. Only one
-    /// set of sliders is built (rather than one per light) - switching the selected light
-    /// re-syncs the same sliders to that light's stored values via SetValueWithoutNotify.
+    /// Builds the lighting controls: a "Scene Lights" section for placing and editing lights
+    /// directly in the scene, and an "HDRI Environment" section.
     ///
-    /// Also carries the "HDRI Environment" sub-section: picking an image off disk, rotating it,
+    /// It used to lead with the fixed studio rig - a master enable, 3-point/5-point mode buttons
+    /// and per-slot intensity/yaw/pitch/distance/colour sliders, all wrapped in a "Studio
+    /// Lighting" foldout that these two sections then sat inside. That is gone: lights are added
+    /// and moved in the scene instead, which does everything the rig did and is one less concept.
+    /// LightingRigController survives without a UI - see BuildContent.
+    ///
+    /// The "HDRI Environment" section: picking an image off disk, rotating it,
     /// and how strongly it lights and reflects. Whether that HDRI is also DRAWN behind the
     /// sculpt is also switchable here, next to the lighting switch, since "light with it" and
     /// "show it" are the two halves of the same decision and comparing them means flipping
@@ -23,16 +27,6 @@ namespace Sculpting
     /// BuildContent with that section's foldout content transform once the panel is up.
     public class LightingUIBuilder : MonoBehaviour
     {
-        private static readonly string[] SlotLabels = { "Key", "Fill", "Rim", "Kick1", "Kick2" };
-
-        private LightingRigController _controller;
-        private LightSlot _selectedSlot = LightSlot.Key;
-
-        private readonly Image[] _slotButtonImages = new Image[5];
-        private Toggle _lightOnToggle;
-        private Slider _intensitySlider, _yawSlider, _pitchSlider, _distanceSlider;
-        private UIFactory.ColorPickerHandle _colorPicker;
-
         // Same palette the Scene panel's status line uses, so a failure reads as a failure in
         // both places.
         private static readonly Color HdriOkColor = new Color(0.55f, 0.85f, 0.55f);
@@ -54,45 +48,171 @@ namespace Sculpting
         // could race it.
         public void BuildContent(Transform panel)
         {
-            _controller = FindFirstObjectByType<LightingRigController>();
-            if (_controller == null) return;
+            // The fixed studio rig's own controls (master enable, 3-point/5-point, and the
+            // per-slot intensity/yaw/pitch/distance/colour sliders) are GONE - lights are placed
+            // and moved in the scene now, which is both more direct and one less thing to learn.
+            // LightingRigController itself is deliberately still here: scenes saved before this
+            // change carry its settings (see SculptSaveData), and it is what re-enables the
+            // scene's own directional sun when the rig is off. It just has no UI any more.
+            //
+            // What is left are two things that were only ever nested under "Studio Lighting"
+            // because the rig was their parent. They now make their own top-level foldouts in
+            // whatever panel they are handed.
+            BuildSceneLightsSection(panel);
+            BuildHdriSection(panel);
+        }
 
-            UIFactory.CreateToggle(panel, "Enabled", _controller.StudioLightingEnabled, v => _controller.StudioLightingEnabled = v);
+        // --------------------------------------------------------------------- scene lights
 
-            var modeRow = UIFactory.CreateRow(panel);
-            UIFactory.CreateButton(modeRow.transform, "3-Point", () => { _controller.Mode = LightingMode.ThreePoint; RefreshSlotButtons(); });
-            UIFactory.CreateButton(modeRow.transform, "5-Point", () => { _controller.Mode = LightingMode.FivePoint; RefreshSlotButtons(); });
+        // The free-placement light system, as against the fixed rig above - see
+        // SceneLightManager. Its own foldout rather than a replacement for the rig's controls:
+        // the rig is still what a scene saved before this existed comes back as, and "turn the
+        // rig off, add your own lights" is the migration rather than a hard cutover.
+        private SceneLightManager _sceneLights;
+        private Transform _sceneLightList;
+        private Slider _sceneIntensitySlider, _sceneRangeSlider, _sceneAngleSlider;
+        private Toggle _sceneShadowToggle;
+        private UIFactory.ColorPickerHandle _sceneColorPicker;
+        private Text _sceneLightStatus;
+        private int _shownLightVersion = -1;
 
-            UIFactory.CreateLabel(panel, "Light", 13, FontStyle.Normal);
-            var slotRow = UIFactory.CreateRow(panel);
-            for (int i = 0; i < SlotLabels.Length; i++)
+        private SceneLight SelectedSceneLight =>
+            _sceneLights != null && _sceneLights.Selected.Count > 0 ? _sceneLights.Selected[0] : null;
+
+        private void BuildSceneLightsSection(Transform panel)
+        {
+            Transform section = UIFactory.CreateFoldoutSection(panel, "Scene Lights", false);
+
+            // Reached through the gizmo so both get the SAME self-installed instance - asking the
+            // scene directly would create a second manager in a scene that has none yet.
+            var gizmo = FindFirstObjectByType<TransformGizmo>();
+            _sceneLights = gizmo != null ? gizmo.Lights : FindFirstObjectByType<SceneLightManager>();
+            if (_sceneLights == null) return;
+
+            UIFactory.CreateLabel(section,
+                "Add lights and place them directly. Switch to Transpose to move or aim them; " +
+                "click a light to select, Shift+click for several.", 11, FontStyle.Italic);
+
+            var addRow = UIFactory.CreateRow(section);
+            UIFactory.CreateButton(addRow.transform, "+ Point", () => AddSceneLight(LightType.Point),
+                "Adds a point light - shines equally in every direction.");
+            UIFactory.CreateButton(addRow.transform, "+ Spot", () => AddSceneLight(LightType.Spot),
+                "Adds a spot light - a cone you can aim with the Transpose gizmo's rotate rings.");
+            UIFactory.CreateButton(addRow.transform, "+ Sun", () => AddSceneLight(LightType.Directional),
+                "Adds a directional light - parallel rays, position irrelevant, only the aim matters.");
+
+            _sceneLightStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
+            _sceneLightList = UIFactory.CreateRow(section, 0f).transform;
+
+            UIFactory.CreateLabel(section, "Intensity", 12, FontStyle.Normal);
+            _sceneIntensitySlider = UIFactory.CreateSlider(section, 0f, 20f, 6f,
+                v => ApplyToSelectedLights(l => l.intensity = v), "Brightness of the selected light(s).");
+
+            UIFactory.CreateLabel(section, "Range", 12, FontStyle.Normal);
+            _sceneRangeSlider = UIFactory.CreateSlider(section, 0.5f, 40f, 10f,
+                v => ApplyToSelectedLights(l => l.range = v),
+                "How far a point or spot light reaches. Directional lights ignore this.");
+
+            UIFactory.CreateLabel(section, "Spot Angle", 12, FontStyle.Normal);
+            _sceneAngleSlider = UIFactory.CreateSlider(section, 5f, 170f, 70f,
+                v => ApplyToSelectedLights(l => { l.spotAngle = v; l.innerSpotAngle = v * 0.45f; }),
+                "Width of a spot light's cone. Ignored by the other types.");
+
+            _sceneShadowToggle = UIFactory.CreateToggle(section, "Casts Shadows", false,
+                v => ApplyToSelectedLights(l => l.shadows = v ? LightShadows.Soft : LightShadows.None),
+                tooltip: "Shadows read the form better but cost more - off by default, as on the studio rig.");
+
+            _sceneColorPicker = UIFactory.CreateColorPicker(section, "Light Color", Color.white,
+                c => ApplyToSelectedLights(l => l.color = c));
+
+            UIFactory.CreateButton(section, "Delete Selected", () => { _sceneLights.DeleteSelected(); RefreshSceneLights(true); },
+                "Removes the selected light(s). Delete/Backspace does the same while Transpose is active.");
+
+            RefreshSceneLights(true);
+        }
+
+        private void AddSceneLight(LightType type)
+        {
+            if (_sceneLights == null) return;
+            _sceneLights.AddLight(type);
+
+            // A new light is placed and selected, but nothing can be dragged until a transform
+            // tool is up - switching here saves the user working that out from an inert gizmo.
+            var gizmo = FindFirstObjectByType<TransformGizmo>();
+            if (gizmo != null && gizmo.Mode == GizmoMode.Sculpt) gizmo.SetMode(GizmoMode.Transpose);
+
+            RefreshSceneLights(true);
+        }
+
+        /// Applies an edit to every selected light, so a multi-selection can be dialled in as one.
+        private void ApplyToSelectedLights(System.Action<Light> edit)
+        {
+            if (_sceneLights == null) return;
+            IReadOnlyList<SceneLight> selected = _sceneLights.Selected;
+            for (int i = 0; i < selected.Count; i++)
             {
-                var slot = (LightSlot)i;
-                Button btn = UIFactory.CreateButton(slotRow.transform, SlotLabels[i], () => SelectSlot(slot));
-                _slotButtonImages[i] = btn.GetComponent<Image>();
+                if (selected[i] == null || selected[i].Light == null) continue;
+                edit(selected[i].Light);
+                // The marker draws in the light's own colour, so it has to be told when that
+                // colour changes or it keeps describing the old one.
+                selected[i].RefreshMarker();
+            }
+        }
+
+        private void RefreshSceneLights(bool force)
+        {
+            if (_sceneLights == null || _sceneLightList == null) return;
+            if (!force && _shownLightVersion == _sceneLights.Version) return;
+            _shownLightVersion = _sceneLights.Version;
+
+            for (int i = _sceneLightList.childCount - 1; i >= 0; i--)
+                Destroy(_sceneLightList.GetChild(i).gameObject);
+
+            IReadOnlyList<SceneLight> lights = _sceneLights.Lights;
+            _sceneLightStatus.text = lights.Count == 0
+                ? "No scene lights yet."
+                : lights.Count + (lights.Count == 1 ? " light" : " lights") + ", "
+                  + _sceneLights.Selected.Count + " selected";
+
+            for (int i = 0; i < lights.Count; i++)
+            {
+                SceneLight light = lights[i];
+                if (light == null) continue;
+                bool selected = _sceneLights.IsSelected(light);
+                UIFactory.CreateButton(_sceneLightList, (selected ? "> " : "   ") + light.name,
+                    () => { _sceneLights.Select(light, ShiftHeld()); RefreshSceneLights(true); },
+                    "Selects this light. Shift-click to add it to the selection.");
             }
 
-            _lightOnToggle = UIFactory.CreateToggle(panel, "Light On", true, v => _controller.GetConfig(_selectedSlot).enabled = v);
-
-            UIFactory.CreateLabel(panel, "Intensity", 12, FontStyle.Normal);
-            _intensitySlider = UIFactory.CreateSlider(panel, 0f, 15f, 5f, v => _controller.GetConfig(_selectedSlot).intensity = v);
-
-            UIFactory.CreateLabel(panel, "Yaw", 12, FontStyle.Normal);
-            _yawSlider = UIFactory.CreateSlider(panel, 0f, 360f, 0f, v => _controller.GetConfig(_selectedSlot).yaw = v);
-
-            UIFactory.CreateLabel(panel, "Pitch", 12, FontStyle.Normal);
-            _pitchSlider = UIFactory.CreateSlider(panel, -89f, 89f, 0f, v => _controller.GetConfig(_selectedSlot).pitch = v);
-
-            UIFactory.CreateLabel(panel, "Distance", 12, FontStyle.Normal);
-            _distanceSlider = UIFactory.CreateSlider(panel, 0.5f, 10f, 3f, v => _controller.GetConfig(_selectedSlot).distance = v);
-
-            _colorPicker = UIFactory.CreateColorPicker(panel, "Color", Color.white, c => _controller.GetConfig(_selectedSlot).color = c);
-
-            BuildHdriSection(panel);
-
-            RefreshSlotButtons();
-            RefreshSliders();
+            SyncSceneLightSliders();
         }
+
+        private static bool ShiftHeld()
+        {
+            var kb = UnityEngine.InputSystem.Keyboard.current;
+            return kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed);
+        }
+
+        // SetValueWithoutNotify throughout, for the same reason the rig's own sliders use it:
+        // pushing the selected light's values into the widgets must not fire the change handlers
+        // back at the light and overwrite the other selected lights with them.
+        private void SyncSceneLightSliders()
+        {
+            SceneLight light = SelectedSceneLight;
+            if (light == null || light.Light == null) return;
+            Light l = light.Light;
+
+            _sceneIntensitySlider.SetValueWithoutNotify(l.intensity);
+            _sceneRangeSlider.SetValueWithoutNotify(Mathf.Clamp(l.range, 0.5f, 40f));
+            _sceneAngleSlider.SetValueWithoutNotify(Mathf.Clamp(l.spotAngle, 5f, 170f));
+            _sceneShadowToggle.SetIsOnWithoutNotify(l.shadows != LightShadows.None);
+            _sceneColorPicker?.SetValueWithoutNotify(l.color);
+        }
+
+        // The gizmo and the viewport can both change which light is selected, so the panel polls
+        // the manager's version counter rather than trying to be told - the same cheap-poll idiom
+        // the Scene Graph list already uses for SelectionManager.
+        private void Update() => RefreshSceneLights(false);
 
         // ------------------------------------------------------------------------------ HDRI
 
@@ -106,14 +226,16 @@ namespace Sculpting
             // panel always shows which HDRI is in play without a second widget to keep in sync,
             // and there is no state where the button says "Load HDRI..." over an image that is
             // already lighting the scene.
-            Button fileButton = UIFactory.CreateButton(section, FileButtonLabel(hdri), PickHdri);
+            Button fileButton = UIFactory.CreateButton(section, FileButtonLabel(hdri), PickHdri,
+                "Browse for an HDRI image file to light the scene with.");
             _hdriFileButtonLabel = fileButton.GetComponentInChildren<Text>();
 
             _hdriStatusLabel = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
             RefreshHdriStatus();
 
             _hdriEnabledToggle = UIFactory.CreateToggle(section, "Use HDRI Lighting", hdri.Enabled,
-                v => { HdriEnvironmentController.Instance.Enabled = v; SyncBackgroundUi(); });
+                v => { HdriEnvironmentController.Instance.Enabled = v; SyncBackgroundUi(); },
+                tooltip: "Lights the scene from the loaded HDRI image instead of the studio rig.");
 
             // Sits directly under the lighting switch because it is the other half of the same
             // question, and it is a TOGGLE rather than the one-way "show it" button it replaces:
@@ -122,25 +244,25 @@ namespace Sculpting
             var backgroundController = FindFirstObjectByType<BackgroundController>();
             _hdriBackgroundToggle = UIFactory.CreateToggle(section, "Show HDRI as Background",
                 backgroundController != null && backgroundController.Mode == BackgroundMode.Hdri,
-                SetHdriBackground);
+                SetHdriBackground, tooltip: "Shows the HDRI image itself behind the sculpt, instead of the flat/gradient backdrop.");
 
             UIFactory.CreateLabel(section, "Rotation", 12, FontStyle.Normal);
             _hdriRotationSlider = UIFactory.CreateSlider(section, 0f, 360f, hdri.Rotation,
-                v => HdriEnvironmentController.Instance.Rotation = v);
+                v => HdriEnvironmentController.Instance.Rotation = v, "Spins the HDRI image around the scene.");
 
             UIFactory.CreateLabel(section, "Exposure", 12, FontStyle.Normal);
             _hdriExposureSlider = UIFactory.CreateSlider(section, 0f, 4f, hdri.Exposure,
-                v => HdriEnvironmentController.Instance.Exposure = v);
+                v => HdriEnvironmentController.Instance.Exposure = v, "Overall brightness of the HDRI lighting and backdrop.");
 
             UIFactory.CreateLabel(section, "Ambient Intensity", 12, FontStyle.Normal);
             _hdriAmbientSlider = UIFactory.CreateSlider(section, 0f, 3f, hdri.AmbientIntensity,
-                v => HdriEnvironmentController.Instance.AmbientIntensity = v);
+                v => HdriEnvironmentController.Instance.AmbientIntensity = v, "How much the HDRI fills in soft ambient light.");
 
             UIFactory.CreateLabel(section, "Reflections", 12, FontStyle.Normal);
             _hdriReflectionSlider = UIFactory.CreateSlider(section, 0f, 1f, hdri.ReflectionIntensity,
-                v => HdriEnvironmentController.Instance.ReflectionIntensity = v);
+                v => HdriEnvironmentController.Instance.ReflectionIntensity = v, "How strongly the HDRI shows up in reflective/metallic surfaces.");
 
-            UIFactory.CreateButton(section, "Clear HDRI", ClearHdri);
+            UIFactory.CreateButton(section, "Clear HDRI", ClearHdri, "Removes the loaded HDRI image.");
 
             if (!FileDialog.IsSupported)
                 UIFactory.CreateLabel(section, "No file picker on this platform.", 11, FontStyle.Italic);
@@ -259,34 +381,5 @@ namespace Sculpting
             _hdriStatusLabel.color = color;
         }
 
-        private void SelectSlot(LightSlot slot)
-        {
-            _selectedSlot = slot;
-            RefreshSlotButtons();
-            RefreshSliders();
-        }
-
-        private void RefreshSlotButtons()
-        {
-            for (int i = 0; i < _slotButtonImages.Length; i++)
-            {
-                var slot = (LightSlot)i;
-                bool isSelected = slot == _selectedSlot;
-                bool isAvailable = _controller.IsSlotAvailable(slot);
-                _slotButtonImages[i].color = isSelected ? UIFactory.ActiveColor : UIFactory.InactiveColor;
-                _slotButtonImages[i].canvasRenderer.SetAlpha(isAvailable ? 1f : 0.4f);
-            }
-        }
-
-        private void RefreshSliders()
-        {
-            LightingRigController.RigLight cfg = _controller.GetConfig(_selectedSlot);
-            _lightOnToggle.SetIsOnWithoutNotify(cfg.enabled);
-            _intensitySlider.SetValueWithoutNotify(cfg.intensity);
-            _yawSlider.SetValueWithoutNotify(cfg.yaw);
-            _pitchSlider.SetValueWithoutNotify(cfg.pitch);
-            _distanceSlider.SetValueWithoutNotify(cfg.distance);
-            _colorPicker.SetValueWithoutNotify(cfg.color);
-        }
     }
 }

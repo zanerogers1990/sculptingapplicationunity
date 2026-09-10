@@ -5,18 +5,21 @@ using UnityEngine.InputSystem;
 
 namespace Sculpting
 {
-    /// Which region gesture is armed, or Off for none. Hide and Mask are the same gesture
-    /// pointed at two different pieces of per-vertex state, and Box/Lasso are the same gesture
-    /// with two different shapes - one enum rather than a shape flag plus an action flag
-    /// because they are mutually exclusive by nature (they all want the same drag), and one
-    /// enum is what makes that impossible to get wrong. Mirrors GizmoMode's reasoning.
+    /// Which region gesture is armed, or Off for none. Hide, Mask and Trim are the same gesture
+    /// pointed at three different things - per-triangle visibility, per-vertex mask, and the
+    /// geometry itself - and Box/Lasso are the same gesture with two different shapes. One enum
+    /// rather than a shape flag plus an action flag because they are mutually exclusive by
+    /// nature (they all want the same drag), and one enum is what makes that impossible to get
+    /// wrong. Mirrors GizmoMode's reasoning.
     public enum RegionSelectMode
     {
         Off,
         BoxHide,
         LassoHide,
         BoxMask,
-        LassoMask
+        LassoMask,
+        BoxTrim,
+        LassoTrim
     }
 
     /// Box and lasso region tools for hiding geometry and for masking it - the screen-space
@@ -26,17 +29,22 @@ namespace Sculpting
     /// it covers - front AND back, straight through the model, not just the surface facing you -
     /// is hidden or masked on release.
     ///
-    /// One tool for four jobs rather than two: the gesture, the screen-space test, the symmetry
+    /// One tool for six jobs rather than two: the gesture, the screen-space test, the symmetry
     /// handling and the on-screen overlay are identical in every case, and only the last step
-    /// (flip triangle visibility vs. write mask values) differs.
+    /// (flip triangle visibility, write mask values, or cut the geometry away) differs. TRIM is
+    /// the destructive member of the family - the same shape that would have hidden geometry
+    /// instead deletes it and closes the hole (see MeshTrimmer/TrimTool), which is exactly what
+    /// makes "hide it first to check, then trim" a natural way to work.
     ///
     /// Modifiers follow the conventions the brushes already set, so there is nothing new to
     /// learn: RMB-drag or Ctrl inverts the action (show instead of hide, unmask instead of
-    /// mask), exactly as RMB/Ctrl inverts every brush. Shift acts on everything OUTSIDE the
-    /// shape instead of inside it, which is how "isolate this limb" is expressed. A click
-    /// without a drag is the reset - Show All in a hide mode, Clear Mask in a mask mode -
-    /// matching ZBrush's click-on-empty-canvas-to-reveal reflex. Escape abandons a drag in
-    /// progress.
+    /// mask, and for Trim keep the covered part instead of cutting it away), exactly as RMB/Ctrl
+    /// inverts every brush. Shift acts on everything OUTSIDE the shape instead of inside it,
+    /// which is how "isolate this limb" is expressed - and which for Trim means the same thing
+    /// as inverting, since a cut has only two sides. A click without a drag is the reset - Show
+    /// All in a hide mode, Clear Mask in a mask mode - matching ZBrush's click-on-empty-canvas-
+    /// to-reveal reflex; Trim has no reset, so a click there does nothing. Escape abandons a
+    /// drag in progress.
     ///
     /// Hiding is per-POLYGON and honors symmetry: a triangle is hidden when all three of its
     /// vertices fall in the region (see SculptableMesh's _hiddenTriangles), and with a mirror
@@ -135,7 +143,9 @@ namespace Sculpting
         public bool IsActive => mode != RegionSelectMode.Off;
 
         public bool IsHideMode => mode == RegionSelectMode.BoxHide || mode == RegionSelectMode.LassoHide;
-        public bool IsLassoMode => mode == RegionSelectMode.LassoHide || mode == RegionSelectMode.LassoMask;
+        public bool IsTrimMode => mode == RegionSelectMode.BoxTrim || mode == RegionSelectMode.LassoTrim;
+        public bool IsLassoMode => mode == RegionSelectMode.LassoHide || mode == RegionSelectMode.LassoMask ||
+                                   mode == RegionSelectMode.LassoTrim;
 
         // ------------------------------------------------------------------ overlay readouts
 
@@ -185,10 +195,10 @@ namespace Sculpting
             HandleDrag();
         }
 
-        /// H cycles the hide gestures (Box, Lasso, off again) and N does the same for masking -
-        /// N because it sits next to M, which already toggles mask PAINTING. Any brush hotkey
-        /// leaves region mode, so 1-7 always gets you straight back to sculpting without having
-        /// to remember which region tool is armed.
+        /// H cycles the hide gestures (Box, Lasso, off again), N does the same for masking - N
+        /// because it sits next to M, which already toggles mask PAINTING - and T for trimming.
+        /// Any brush hotkey leaves region mode, so 1-7 always gets you straight back to
+        /// sculpting without having to remember which region tool is armed.
         private void HandleModeKeys()
         {
             Keyboard kb = Keyboard.current;
@@ -202,6 +212,10 @@ namespace Sculpting
                 Mode = mode == RegionSelectMode.BoxMask ? RegionSelectMode.LassoMask
                      : mode == RegionSelectMode.LassoMask ? RegionSelectMode.Off
                      : RegionSelectMode.BoxMask;
+            else if (kb.tKey.wasPressedThisFrame)
+                Mode = mode == RegionSelectMode.BoxTrim ? RegionSelectMode.LassoTrim
+                     : mode == RegionSelectMode.LassoTrim ? RegionSelectMode.Off
+                     : RegionSelectMode.BoxTrim;
             else if (mode != RegionSelectMode.Off && AnyBrushKeyPressed(kb))
                 Mode = RegionSelectMode.Off;
         }
@@ -296,11 +310,19 @@ namespace Sculpting
         /// A click with no drag resets whatever the armed mode edits: reveal everything in a
         /// hide mode, clear the mask in a mask mode. Both are undoable like any other edit, and
         /// both are also plain buttons in the panel - this is the muscle-memory shortcut, not
-        /// the only way to reach them.
+        /// the only way to reach them. Trim has no reset (undo is the only way back from a cut),
+        /// so a stray click there is deliberately inert rather than being given some invented
+        /// meaning.
         private void ApplyClickShortcut()
         {
             SculptableMesh target = Target;
             if (target == null) { _status = "No object selected."; return; }
+
+            if (IsTrimMode)
+            {
+                _status = "Drag a shape out to trim.";
+                return;
+            }
 
             if (IsHideMode)
             {
@@ -328,6 +350,18 @@ namespace Sculpting
                 ? ScreenRegionMask.Lasso(_lassoPoints)
                 : ScreenRegionMask.Box(_dragStart, _dragCurrent);
             if (region == null) { _status = "Region too small."; return; }
+
+            // Trim never builds the per-vertex coverage array the other two share: it has to
+            // find the exact place the boundary crosses each straddling EDGE, not just which
+            // side each vertex fell on, so it re-runs the same test itself (see MeshTrimmer).
+            // Both modifiers mean the same thing here - a cut has only two sides - so either one
+            // keeps the covered part instead of removing it.
+            if (IsTrimMode)
+            {
+                TrimTool.Apply(target, cam, region, removeCovered: !(inverse || actOnOutside), out _status);
+                _lassoPoints.Clear();
+                return;
+            }
 
             bool[] inside = MarkCoveredVertices(target, cam, region, actOnOutside);
             if (inside == null) return;
@@ -375,23 +409,9 @@ namespace Sculpting
             return _insideScratch;
         }
 
-        private static bool ProjectsInside(Matrix4x4 mvp, Vector3 localPos, Rect viewport, ScreenRegionMask region)
-        {
-            Vector4 clip = mvp * new Vector4(localPos.x, localPos.y, localPos.z, 1f);
-            // Behind a PERSPECTIVE camera: w is the view-space depth, so a non-positive w means
-            // the point is at or behind the eye and its projection would be mirrored nonsense.
-            if (clip.w <= 1e-6f) return false;
-
-            float invW = 1f / clip.w;
-            float ndcZ = clip.z * invW;
-            // Behind an ORTHOGRAPHIC camera, where w is always 1 and the test above can never
-            // fire: everything in front of the near plane has ndc z >= -1.
-            if (ndcZ < -1f) return false;
-
-            float x = viewport.x + (clip.x * invW * 0.5f + 0.5f) * viewport.width;
-            float y = viewport.y + (clip.y * invW * 0.5f + 0.5f) * viewport.height;
-            return region.Contains(x, y);
-        }
+        private static bool ProjectsInside(Matrix4x4 mvp, Vector3 localPos, Rect viewport, ScreenRegionMask region) =>
+            ScreenRegionMask.ProjectToScreen(mvp, localPos, viewport, out Vector2 screen) &&
+            region.Contains(screen);
 
         /// Hides (or shows) every triangle whose three vertices are all covered. Per-polygon,
         /// not per-vertex: a triangle straddling the edge of the region keeps its vertices
@@ -450,104 +470,6 @@ namespace Sculpting
 
             target.SetMaskOnVertices(_indexScratch, maskValue);
             _status = (maskValue > 0f ? "Masked " : "Unmasked ") + _indexScratch.Count + " vertices.";
-        }
-
-        // --------------------------------------------------------------------- region shapes
-
-        /// The dragged shape as a screen-space stencil. A box is stored as plain bounds; a lasso
-        /// is scan-converted ONCE into a coverage bitmap over its own bounding box, so testing a
-        /// vertex is an array lookup rather than a walk of every lasso segment. That is the
-        /// difference between O(vertices) and O(vertices x lasso points) - the latter runs into
-        /// hundreds of millions of operations for a detailed lasso on a dense mesh, all of it in
-        /// the frame the user releases the button.
-        private sealed class ScreenRegionMask
-        {
-            private readonly int _minX, _minY, _width, _height;
-            // Null for a box (every cell in bounds is covered); the scan-converted polygon
-            // otherwise, row-major over the bounding box.
-            private readonly bool[] _cells;
-
-            private ScreenRegionMask(int minX, int minY, int width, int height, bool[] cells)
-            {
-                _minX = minX;
-                _minY = minY;
-                _width = width;
-                _height = height;
-                _cells = cells;
-            }
-
-            public static ScreenRegionMask Box(Vector2 a, Vector2 b)
-            {
-                int minX = Mathf.FloorToInt(Mathf.Min(a.x, b.x));
-                int minY = Mathf.FloorToInt(Mathf.Min(a.y, b.y));
-                int maxX = Mathf.CeilToInt(Mathf.Max(a.x, b.x));
-                int maxY = Mathf.CeilToInt(Mathf.Max(a.y, b.y));
-                int width = maxX - minX, height = maxY - minY;
-                if (width <= 0 || height <= 0) return null;
-                return new ScreenRegionMask(minX, minY, width, height, null);
-            }
-
-            public static ScreenRegionMask Lasso(IReadOnlyList<Vector2> points)
-            {
-                // Fewer than three points cannot enclose anything - a stray click that slipped
-                // past the click-slop test, in practice.
-                if (points == null || points.Count < 3) return null;
-
-                float fMinX = float.MaxValue, fMinY = float.MaxValue;
-                float fMaxX = float.MinValue, fMaxY = float.MinValue;
-                for (int i = 0; i < points.Count; i++)
-                {
-                    fMinX = Mathf.Min(fMinX, points[i].x);
-                    fMinY = Mathf.Min(fMinY, points[i].y);
-                    fMaxX = Mathf.Max(fMaxX, points[i].x);
-                    fMaxY = Mathf.Max(fMaxY, points[i].y);
-                }
-
-                int minX = Mathf.FloorToInt(fMinX), minY = Mathf.FloorToInt(fMinY);
-                int width = Mathf.CeilToInt(fMaxX) - minX, height = Mathf.CeilToInt(fMaxY) - minY;
-                if (width <= 0 || height <= 0) return null;
-
-                var cells = new bool[width * height];
-                var crossings = new List<float>();
-
-                // Even-odd scanline fill, with the path implicitly closed from the last point
-                // back to the first - which is exactly what a lasso means by "the bit I drew
-                // around", however open the drawn path was left.
-                for (int row = 0; row < height; row++)
-                {
-                    float y = minY + row + 0.5f;
-                    crossings.Clear();
-                    for (int i = 0, j = points.Count - 1; i < points.Count; j = i++)
-                    {
-                        Vector2 p1 = points[j], p2 = points[i];
-                        // Half-open comparison (<=, not <) counts a vertex sitting exactly on
-                        // the scanline once rather than twice, which is what keeps the parity
-                        // right through a horizontal run of points.
-                        if ((p1.y <= y) == (p2.y <= y)) continue;
-                        float t = (y - p1.y) / (p2.y - p1.y);
-                        crossings.Add(p1.x + t * (p2.x - p1.x));
-                    }
-                    if (crossings.Count < 2) continue;
-
-                    crossings.Sort();
-                    for (int c = 0; c + 1 < crossings.Count; c += 2)
-                    {
-                        int x0 = Mathf.Max(Mathf.CeilToInt(crossings[c] - 0.5f) - minX, 0);
-                        int x1 = Mathf.Min(Mathf.FloorToInt(crossings[c + 1] - 0.5f) - minX, width - 1);
-                        for (int x = x0; x <= x1; x++) cells[row * width + x] = true;
-                    }
-                }
-
-                return new ScreenRegionMask(minX, minY, width, height, cells);
-            }
-
-            public bool Contains(float screenX, float screenY)
-            {
-                int x = Mathf.FloorToInt(screenX) - _minX;
-                int y = Mathf.FloorToInt(screenY) - _minY;
-                if (x < 0 || y < 0 || x >= _width || y >= _height) return false;
-                return _cells == null || _cells[y * _width + x];
-            }
         }
     }
 }

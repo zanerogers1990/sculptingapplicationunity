@@ -90,6 +90,30 @@ namespace Sculpting
             SelectionVersion++;
         }
 
+        /// Shift-click semantics: adds obj to the selection, or drops it if it was already in
+        /// there. Distinct from Select(additive:true), which only ever adds - that one exists for
+        /// Join, where clicking an already-picked object again should not silently remove it from
+        /// the merge. Here the click IS the toggle, which is what every DCC does and what makes a
+        /// multi-object transform selection correctable without starting over.
+        ///
+        /// Removing the primary promotes whatever is left, so the scene graph's highlight and the
+        /// gizmo's pivot never point at something no longer in the set.
+        public void ToggleSelected(SculptableMesh obj)
+        {
+            if (obj == null) return;
+
+            if (_selectedSet.Remove(obj))
+            {
+                if (_primary == obj) _primary = _selectedSet.Count > 0 ? _selectedSet[0] : null;
+                SelectionVersion++;
+                return;
+            }
+
+            _selectedSet.Add(obj);
+            if (_primary == null) _primary = obj;
+            SelectionVersion++;
+        }
+
         public void ClearSelection()
         {
             _selectedSet.Clear();
@@ -98,6 +122,33 @@ namespace Sculpting
         }
 
         public bool IsSelected(SculptableMesh obj) => _selectedSet.Contains(obj);
+
+        /// The visible registered object whose surface `ray` hits first, or null. Hit-tested
+        /// against each object's own live vertex data (SculptableMesh.RaycastMesh), not against a
+        /// MeshCollider - the collider is deliberately not kept in step with the sculpted surface
+        /// (see SculptableMesh's class remarks), so picking through it would miss geometry the
+        /// user can plainly see.
+        ///
+        /// Lives here rather than in either caller because both the brush controller's
+        /// double-click pick and the transform gizmo's click-to-select need exactly this, and a
+        /// second copy would be a second place for the visibility rule to drift.
+        public SculptableMesh Raycast(Ray ray, float maxDistance = 1000f)
+        {
+            SculptableMesh closest = null;
+            float closestSqr = float.MaxValue;
+            for (int i = 0; i < _allObjects.Count; i++)
+            {
+                SculptableMesh obj = _allObjects[i];
+                if (obj == null || !obj.Visible) continue;
+                if (!obj.RaycastMesh(ray, maxDistance, out Vector3 hitPoint, out _)) continue;
+
+                float sqr = (hitPoint - ray.origin).sqrMagnitude;
+                if (sqr >= closestSqr) continue;
+                closestSqr = sqr;
+                closest = obj;
+            }
+            return closest;
+        }
 
         /// Bumps SelectionVersion for a change this class didn't make itself - today, an object
         /// being renamed. The scene-graph list draws object names, so it has to rebuild for a

@@ -576,12 +576,78 @@ namespace Sculpting
         private float[] _relaxWeightScratch = System.Array.Empty<float>();
 
         // Vertex indices actually moved by the current frame's brush application (across every
-        // mirror sign) - cleared at the start of each Apply*Brush wrapper, filled in by the
-        // matching *Local method(s), then handed to SculptableMesh.ApplyVerticesLocal so it only
-        // has to update the triangle-raycast grid for triangles touching these vertices instead
-        // of rescanning the whole mesh. See TriangleSpatialGrid for why this matters at higher
-        // triangle counts.
-        private readonly HashSet<int> _dirtyVertexScratch = new HashSet<int>();
+        // mirror sign AND every sub-dab of the frame) - cleared at the start of each Apply*Brush
+        // wrapper, filled in by the matching *Local method(s), then handed to
+        // SculptableMesh.ApplyVerticesLocal so it only has to update the triangle-raycast grid for
+        // triangles touching these vertices instead of rescanning the whole mesh. See
+        // TriangleSpatialGrid for why this matters at higher triangle counts.
+        private readonly DirtyVertexSet _dirtyVertexScratch = new DirtyVertexSet();
+
+        /// Add-once-if-not-present set of vertex indices, stamp-marked rather than hashed.
+        ///
+        /// This was a HashSet&lt;int&gt;, and it is written once per moved vertex per dab - which on
+        /// a wide stroke over a dense mesh is hundreds of thousands of writes per frame, each
+        /// paying a hash, a bucket probe and (on insert) a possible resize. A per-vertex "which
+        /// build was I last added in" stamp gives identical semantics for one array read, leaves
+        /// the members in a flat List that ApplyVerticesLocal can walk in index order with no
+        /// enumerator at all, and never rehashes. Same scheme (and same reasoning) as
+        /// SculptableMesh's own _affectedList and TriangleSpatialGrid's _movedTriangleStamp.
+        ///
+        /// The generation counter is what avoids clearing the stamp array between frames; it is
+        /// reset alongside the array whenever the vertex count changes under it.
+        private sealed class DirtyVertexSet
+        {
+            private int[] _stamp;
+            private int _generation;
+
+            /// The members of the current build, in insertion order. Handed straight to
+            /// SculptableMesh.ApplyVerticesLocal's List overload - never copied.
+            public readonly List<int> Items = new List<int>();
+
+            public int Count => Items.Count;
+
+            /// Starts a new build. `vertexCount` is the CURRENT mesh's vertex count - a Remesh (or
+            /// an undo across one) resizes the mesh under this set, and a stamp array sized to the
+            /// old topology would either throw or silently mark the wrong vertices.
+            public void Clear(int vertexCount)
+            {
+                if (_stamp == null || _stamp.Length != vertexCount)
+                {
+                    _stamp = new int[vertexCount];
+                    _generation = 0;
+                }
+                _generation++;
+                Items.Clear();
+            }
+
+            public void Add(int vertexIndex)
+            {
+                // Bounds-checked rather than trusting the caller: every brush indexes this with a
+                // spatial-query result, and a query answered from an index built before a topology
+                // change can still name a vertex that no longer exists.
+                if (_stamp == null || (uint)vertexIndex >= (uint)_stamp.Length) return;
+                if (_stamp[vertexIndex] == _generation) return;
+                _stamp[vertexIndex] = _generation;
+                Items.Add(vertexIndex);
+            }
+        }
+
+        /// Starts a fresh per-frame dirty set for whatever brush is about to run. Every brush
+        /// entry point goes through this rather than clearing the set inline, so none of them can
+        /// forget to size the stamp array to the current topology.
+        private void BeginDirtyVertices()
+        {
+            _dirtyVertexScratch.Clear(sculptableMesh.Vertices.Length);
+        }
+
+        /// Pushes whatever the frame's brush application moved into the mesh, in one call. Skips
+        /// entirely when nothing moved - a held-but-stationary stroke places no dabs at all, and
+        /// an empty apply would still walk the sync/filter preamble for no result.
+        private void FlushDirtyVertices()
+        {
+            if (_dirtyVertexScratch.Count == 0) return;
+            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch.Items);
+        }
 
         // Persistent, grow-on-demand NativeArray scratch shared by every Burst job below -
         // sized to the current candidate footprint, never the whole mesh (see EnsureNativeScratch).
@@ -600,6 +666,10 @@ namespace Sculpting
         // share ClayWeightJob for that pass) - grown alongside
         // the arrays above for simplicity; the extra memory is trivial at footprint-bounded sizes.
         private NativeArray<float> _nativeClayWeights;
+        // The same falloff WITHOUT the mask term, which is what the area plane is measured with -
+        // see ClayWeightJob. Kept as its own array rather than derived from _nativeClayWeights,
+        // which cannot be divided back out where the mask is 1.
+        private NativeArray<float> _nativeClayPlaneWeights;
         private NativeArray<Vector3> _nativeClayWeightedPos;
         private NativeArray<Vector3> _nativeClayWeightedNormal;
         // Each candidate's position as of THIS stroke's start (see
@@ -632,6 +702,7 @@ namespace Sculpting
                 _nativePositionsOut = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeAppliedOut = new NativeArray<byte>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeights = new NativeArray<float>(_nativeScratchCapacity, Allocator.Persistent);
+                _nativeClayPlaneWeights = new NativeArray<float>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedPos = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeClayWeightedNormal = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
                 _nativeStrokeStart = new NativeArray<Vector3>(_nativeScratchCapacity, Allocator.Persistent);
@@ -646,6 +717,7 @@ namespace Sculpting
             if (_nativePositionsOut.IsCreated) _nativePositionsOut.Dispose();
             if (_nativeAppliedOut.IsCreated) _nativeAppliedOut.Dispose();
             if (_nativeClayWeights.IsCreated) _nativeClayWeights.Dispose();
+            if (_nativeClayPlaneWeights.IsCreated) _nativeClayPlaneWeights.Dispose();
             if (_nativeClayWeightedPos.IsCreated) _nativeClayWeightedPos.Dispose();
             if (_nativeClayWeightedNormal.IsCreated) _nativeClayWeightedNormal.Dispose();
             if (_nativeStrokeStart.IsCreated) _nativeStrokeStart.Dispose();
@@ -665,8 +737,9 @@ namespace Sculpting
             }
         }
 
-        // Smooth-only, full-MESH-sized scratch (unlike every other brush's footprint-sized
-        // scratch above) - Smooth's relaxation needs a neighbor's position even when that
+        // Full-MESH-sized scratch (unlike every other brush's footprint-sized scratch above),
+        // shared by the two Laplacian jobs - Smooth's own relaxation and Clay's surface-relax
+        // pass. A relaxation needs a neighbor's position even when that
         // neighbor sits outside the current brush footprint, so it needs a way to tell "is this
         // global vertex index also one of this call's candidates" (_nativeVertexToSlot) and a
         // fallback position source for when it isn't (_nativeFullPositionMirror). Both avoid an
@@ -680,7 +753,31 @@ namespace Sculpting
         private NativeArray<int> _nativeVertexToSlot;
         private NativeArray<Vector3> _nativeFullPositionMirror;
         private int _nativeFullMeshCapacity;
-        private NativeArray<int> _nativeSmoothCandidates;
+
+        // Candidate-indexed scratch for whichever Laplacian job is running - Smooth's or Clay's
+        // surface-relax pass. Shared rather than one set each because the two can never be live
+        // at the same time (relax runs inside a Clay dab, Smooth is a different brush entirely),
+        // and sized independently of _nativeScratchCapacity above because relax's candidate list
+        // reaches 2.5x the brush radius, well past the footprint the shared brush scratch is
+        // grown to. _nativeRelaxCurvature is relax-only (Smooth has no curvature gate).
+        private NativeArray<int> _nativeLaplacianCandidates;
+        private NativeArray<float> _nativeRelaxCurvature;
+        private int _nativeLaplacianCapacity;
+
+        private void EnsureLaplacianCandidates(int count)
+        {
+            // The shared brush scratch (positions/normals/mask/weights) is indexed by the same
+            // candidate slots, so it has to reach at least as far.
+            EnsureNativeScratch(count);
+            if (_nativeLaplacianCapacity >= count && _nativeLaplacianCandidates.IsCreated) return;
+
+            if (_nativeLaplacianCandidates.IsCreated) _nativeLaplacianCandidates.Dispose();
+            if (_nativeRelaxCurvature.IsCreated) _nativeRelaxCurvature.Dispose();
+
+            _nativeLaplacianCapacity = Mathf.Max(Mathf.NextPowerOfTwo(count), MinJobVertexCount);
+            _nativeLaplacianCandidates = new NativeArray<int>(_nativeLaplacianCapacity, Allocator.Persistent);
+            _nativeRelaxCurvature = new NativeArray<float>(_nativeLaplacianCapacity, Allocator.Persistent);
+        }
 
         private void EnsureSmoothFullMeshScratch(int totalVertexCount)
         {
@@ -693,6 +790,36 @@ namespace Sculpting
             _nativeVertexToSlot = new NativeArray<int>(totalVertexCount, Allocator.Persistent);
             for (int i = 0; i < totalVertexCount; i++) _nativeVertexToSlot[i] = -1; // one-time O(total) init
             _nativeFullPositionMirror = new NativeArray<Vector3>(totalVertexCount, Allocator.Persistent);
+            _positionMirrorStale = true;
+        }
+
+        // Whether _nativeFullPositionMirror still describes the live vertex array. Set by every
+        // path that writes a vertex (see MarkPositionMirrorStale) and once per frame up front, so
+        // anything outside this component - undo, a gizmo drag, a Remesh - is covered too.
+        //
+        // The refresh is an O(total vertex count) copy and it used to run unconditionally on EVERY
+        // Laplacian call. That is once per Clay dab, and Clay lays down up to ClayMaxDabsPerFrame
+        // of them in a single frame: at a million vertices that is 12MB copied per dab, ~280MB a
+        // frame, for data that had not changed between most of those dabs. Gating on "has anything
+        // actually moved since the last refresh" collapses it to one copy per frame in the common
+        // case while keeping the mirror exactly as fresh as before - a brush write always
+        // invalidates it, so no job ever reads a stale neighbour position.
+        private bool _positionMirrorStale = true;
+        private Vector3[] _positionMirrorSource;
+
+        private void MarkPositionMirrorStale() => _positionMirrorStale = true;
+
+        /// Brings _nativeFullPositionMirror back in step with `verts`, if anything has moved since
+        /// it was last refreshed. Call immediately before scheduling a job that reads it.
+        private void RefreshPositionMirror(Vector3[] verts)
+        {
+            if (!_positionMirrorStale && ReferenceEquals(_positionMirrorSource, verts) &&
+                _nativeFullMeshCapacity == verts.Length)
+                return;
+
+            NativeArray<Vector3>.Copy(verts, _nativeFullPositionMirror, verts.Length);
+            _positionMirrorSource = verts;
+            _positionMirrorStale = false;
         }
 
         private void OnDestroy() => ReleaseNativeResources();
@@ -711,7 +838,13 @@ namespace Sculpting
             if (_nativeVertexToSlot.IsCreated) _nativeVertexToSlot.Dispose();
             if (_nativeFullPositionMirror.IsCreated) _nativeFullPositionMirror.Dispose();
             _nativeFullMeshCapacity = 0;
-            if (_nativeSmoothCandidates.IsCreated) _nativeSmoothCandidates.Dispose();
+            _positionMirrorStale = true;
+            _positionMirrorSource = null;
+            if (_nativeLaplacianCandidates.IsCreated) _nativeLaplacianCandidates.Dispose();
+            if (_nativeRelaxCurvature.IsCreated) _nativeRelaxCurvature.Dispose();
+            _nativeLaplacianCapacity = 0;
+            if (_nativeRelaxCentres.IsCreated) _nativeRelaxCentres.Dispose();
+            if (_nativeRelaxCentreCameras.IsCreated) _nativeRelaxCentreCameras.Dispose();
         }
 
         // Copies the current candidate footprint's position/normal/mask into the shared native
@@ -720,13 +853,20 @@ namespace Sculpting
         // itself and never need to look outside it (unlike Smooth's neighbor lookups).
         private void GatherCandidatesNative(List<int> candidates, Vector3[] verts, Vector3[] normals, float[] mask)
         {
-            EnsureNativeScratch(candidates.Count);
-            for (int ci = 0; ci < candidates.Count; ci++)
+            int count = candidates.Count;
+            EnsureNativeScratch(count);
+            // The three destinations are hoisted out of the loop: a NativeArray field access goes
+            // through a struct copy plus (in the Editor) a safety-handle check, and this loop runs
+            // once per candidate per dab - six figures a frame under a wide brush.
+            NativeArray<Vector3> positionsIn = _nativePositionsIn;
+            NativeArray<Vector3> normalsIn = _nativeNormalsIn;
+            NativeArray<float> maskIn = _nativeMaskIn;
+            for (int ci = 0; ci < count; ci++)
             {
                 int i = candidates[ci];
-                _nativePositionsIn[ci] = verts[i];
-                _nativeNormalsIn[ci] = normals[i];
-                _nativeMaskIn[ci] = mask[i];
+                positionsIn[ci] = verts[i];
+                normalsIn[ci] = normals[i];
+                maskIn[ci] = mask[i];
             }
         }
 
@@ -736,14 +876,20 @@ namespace Sculpting
         // conditions - see each job struct's remarks.
         private void ScatterJobResults(List<int> candidates, Vector3[] verts)
         {
-            for (int ci = 0; ci < candidates.Count; ci++)
+            int count = candidates.Count;
+            NativeArray<byte> applied = _nativeAppliedOut;
+            NativeArray<Vector3> positionsOut = _nativePositionsOut;
+            SculptableMesh mesh = sculptableMesh;
+
+            for (int ci = 0; ci < count; ci++)
             {
-                if (_nativeAppliedOut[ci] == 0) continue;
+                if (applied[ci] == 0) continue;
                 int i = candidates[ci];
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
-                verts[i] = _nativePositionsOut[ci];
+                mesh.RecordUndoBeforeIfNeeded(i);
+                verts[i] = positionsOut[ci];
                 _dirtyVertexScratch.Add(i);
             }
+            MarkPositionMirrorStale();
         }
 
         // Direct Burst port of ApplyInflateBrushLocalManaged's per-candidate body. AppliedOut
@@ -919,10 +1065,57 @@ namespace Sculpting
         // up close, where a sculpt's own scale can be comparable to the camera's distance from
         // it. Plain float/Vector3 math (like ClayFalloff below), so Burst inlines it into a
         // job's Execute exactly the same way.
-        private static float FrontFacingWeight(bool frontFacingOnly, Vector3 normalLocal, Vector3 posLocal, Vector3 cameraLocalPos)
+        /// How wide the accept/reject transition is, as the cosine of the angle between a vertex's
+        /// normal and its own direction to the camera - so ~11.5 degrees either side of edge-on.
+        ///
+        /// The gate used to be a bare `dot > 0`, which is a 0/1 step, and a step is what made this
+        /// option visibly chew up thin, strongly-curved geometry - an ear above all. Adjacent
+        /// vertices on a remeshed surface do not share a normal (Surface Nets places one vertex per
+        /// cell, so the output is genuinely bumpy at the cell scale - see
+        /// SculptableMesh.EncodeCavityAt), so wherever the silhouette runs through a footprint the
+        /// step hands neighbouring vertices full strength and none at all. That is a sawtooth
+        /// written straight into the surface, and it reads exactly as one ear coming out jagged and
+        /// faceted while the other is smooth.
+        ///
+        /// A ramp costs the option nothing it is actually for. A vertex on the FAR wall of a fin
+        /// points away from the camera, lands at cosine <= 0, and is still rejected outright; only
+        /// the sliver of surface within a few degrees of edge-on - where "is this the near wall or
+        /// the far one" genuinely has no sharp answer - gets a partial weight instead of a coin
+        /// flip.
+        private const float SilhouetteBand = 0.2f;
+
+        // Shared by every brush's weight computation, multiplied in alongside the mask term
+        // right next to it (MaskIn / sculptableMesh.Mask) - see frontFacingOnly's remarks for
+        // what this is for. A vertex counts as front-facing when its OWN mesh normal points at
+        // least partly back toward the camera; compared per-vertex against the camera's actual
+        // local-space position rather than one shared view direction, so the test stays correct
+        // up close, where a sculpt's own scale can be comparable to the camera's distance from
+        // it. Plain float/Vector3 math (like ClayFalloff below), so Burst inlines it into a
+        // job's Execute exactly the same way.
+        //
+        // cameraLocalPos is the CURRENT DAB's viewpoint, which for a mirrored dab is the reflected
+        // camera - see SculptController._dabCameraLocal.
+        // internal, not private: SculptableMesh.SelectGrab needs the identical rule (Move picks its
+        // vertex set once on mouse-down instead of running a per-frame weight loop), and a second
+        // copy of a silhouette ramp is exactly the kind of thing that drifts out of step.
+        internal static float FrontFacingWeight(bool frontFacingOnly, Vector3 normalLocal, Vector3 posLocal, Vector3 cameraLocalPos)
         {
             if (!frontFacingOnly) return 1f;
-            return Vector3.Dot(normalLocal, cameraLocalPos - posLocal) > 0f ? 1f : 0f;
+
+            Vector3 toCamera = cameraLocalPos - posLocal;
+            float d = Vector3.Dot(normalLocal, toCamera);
+            if (d <= 0f) return 0f; // facing away - rejected exactly as before
+
+            // Comparing squared keeps the square root off the overwhelming majority of candidates:
+            // anything comfortably front-facing clears this without one, and only the narrow
+            // silhouette band pays for the cosine it actually needs. (Squaring is monotonic here
+            // because d > 0 at this point.)
+            float bandSqr = SilhouetteBand * SilhouetteBand * toCamera.sqrMagnitude;
+            if (d * d >= bandSqr) return 1f;
+
+            float cos = d / Mathf.Sqrt(toCamera.sqrMagnitude);
+            float t = cos / SilhouetteBand;
+            return t * t * (3f - 2f * t); // smoothstep
         }
 
         // Clay's own radial falloff (see clayEdgeSoftness remarks) - full weight through the
@@ -988,6 +1181,9 @@ namespace Sculpting
             public float EdgeSoftness;
             public bool FrontFacingOnly;
             public Vector3 CameraLocalPos;
+            // The displacement weight's mask-free twin, which is what the area-plane reduction sums
+            // - see Execute.
+            public NativeArray<float> PlaneWeightsOut;
 
             public void Execute(int index)
             {
@@ -997,16 +1193,35 @@ namespace Sculpting
                 if (t01 <= 0f)
                 {
                     WeightsOut[index] = 0f;
+                    PlaneWeightsOut[index] = 0f;
                     WeightedPosOut[index] = Vector3.zero;
                     WeightedNormalOut[index] = Vector3.zero;
                     return;
                 }
 
-                float w = ClayFalloff(t01, EdgeSoftness) * (1f - MaskIn[index])
+                // TWO weights, and the difference between them is the whole point of the split.
+                //
+                // The plane weight has NO mask term, because the area plane is a measurement of the
+                // surface the brush is standing on, and the mask says which vertices may MOVE, not
+                // which ones the surface is made of. Folding the mask in fits the plane to whatever
+                // sliver of the footprint happens to be unmasked, which drags its origin out to the
+                // rim and swings its normal round with it: measured on a 145k-triangle sculpt at a
+                // 0.15 radius, a hard mask edge sweeping across the footprint tilted the plane 19
+                // degrees at a third covered, 34 degrees at half, and 58 degrees at five sixths,
+                // with the plane's height under the brush centre dropping 8%, 18% and 44% of a brush
+                // radius respectively. Clay and Flatten then push every unmasked vertex onto THAT
+                // plane, so a stroke run alongside a mask lifts a ridge that follows the mask's
+                // outline - the reported "weird raised surface around the mask area".
+                //
+                // Front Facing Only stays in, and deliberately: unlike the mask it IS a statement
+                // about which surface this stroke is on (the near wall of a fin, not the far one),
+                // so a plane measured across both walls would be the wrong surface.
+                float planeW = ClayFalloff(t01, EdgeSoftness)
                     * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
-                WeightsOut[index] = w;
-                WeightedPosOut[index] = pos * w;
-                WeightedNormalOut[index] = NormalsIn[index] * w;
+                PlaneWeightsOut[index] = planeW;
+                WeightsOut[index] = planeW * (1f - MaskIn[index]);
+                WeightedPosOut[index] = pos * planeW;
+                WeightedNormalOut[index] = NormalsIn[index] * planeW;
             }
         }
 
@@ -1248,6 +1463,118 @@ namespace Sculpting
                 Vector3 toAverage = average - currentPos;
                 float lerp = Mathf.Clamp01(w * PassFactor * LerpFactorScale);
                 PositionsWrite[ci] = currentPos + toAverage * lerp;
+            }
+        }
+
+        /// Clay's surface-relax weights (see ApplySurfaceRelaxBatched for what each term means and
+        /// why it is shaped this way) - the same formula the managed setup loop computes, moved
+        /// into a job because it runs over a candidate list 2.5x the brush radius wide, i.e.
+        /// roughly six times the surface area of the dab it is supporting.
+        ///
+        /// The shell profile is measured from the NEAREST of the frame's dab centres rather than
+        /// from one point, because relax now runs once per frame across every dab that frame
+        /// placed rather than once per dab - see ApplySurfaceRelaxBatched. That is the exact
+        /// generalisation of the single-centre profile: with one centre it reduces to it
+        /// identically, and with several it keeps RelaxInnerFloor over the whole swept path (the
+        /// region the user is actively shaping, which relax deliberately leaves alone) while the
+        /// full-strength shell forms around the outside of the sweep, which is where a seam with
+        /// neighbouring geometry actually is.
+        [BurstCompile(CompileSynchronously = true)]
+        private struct RelaxWeightJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<Vector3> PositionsIn;
+            [ReadOnly] public NativeArray<Vector3> NormalsIn;
+            [ReadOnly] public NativeArray<float> MaskIn;
+            [ReadOnly] public NativeArray<float> CurvatureIn; // CurvatureDeviationAt, candidate-indexed
+            [ReadOnly] public NativeArray<Vector3> Centres; // this frame's dab centres, all mirror signs
+            [ReadOnly] public NativeArray<Vector3> CentreCameras; // one per centre - see _relaxCentreCameras
+            public NativeArray<float> WeightsOut;
+            public int CentreCount;
+            public float BrushRadius;
+            public float RelaxRadius;
+            public float EdgeSoftness;
+            public float InnerFloor;
+            public float CurvatureFloor, CurvatureStart, CurvatureFull;
+            public bool FrontFacingOnly;
+            public Vector3 CameraLocalPos;
+
+            public void Execute(int ci)
+            {
+                Vector3 p = PositionsIn[ci];
+                // Compared squared - the managed loop's Vector3.Distance took a square root for
+                // every candidate purely to throw over half of them away (measured: 53,057 of
+                // 101,771 at a 0.25 radius fall outside the relax radius entirely). With several
+                // centres the square root is now taken at most once per candidate rather than once
+                // per centre, for the same reason.
+                float sqrDist = float.MaxValue;
+                int nearest = 0;
+                for (int c = 0; c < CentreCount; c++)
+                {
+                    float d = (p - Centres[c]).sqrMagnitude;
+                    if (d < sqrDist) { sqrDist = d; nearest = c; }
+                }
+                if (sqrDist > RelaxRadius * RelaxRadius) { WeightsOut[ci] = 0f; return; }
+
+                float dist = Mathf.Sqrt(sqrDist);
+                float spatialWeight;
+                if (dist <= BrushRadius)
+                {
+                    spatialWeight = InnerFloor;
+                }
+                else
+                {
+                    float shellT = (dist - BrushRadius) / Mathf.Max(RelaxRadius - BrushRadius, 1e-5f);
+                    spatialWeight = ClayFalloff(1f - shellT, EdgeSoftness);
+                }
+
+                float curvatureFactor = Mathf.Lerp(CurvatureFloor, 1f,
+                    Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(CurvatureStart, CurvatureFull, CurvatureIn[ci])));
+
+                // Judged from the viewpoint of the dab that placed the nearest centre, not from one
+                // shared camera - see _relaxCentreCameras.
+                WeightsOut[ci] = spatialWeight * curvatureFactor * (1f - MaskIn[ci])
+                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[ci], p, CentreCameras[nearest]);
+            }
+        }
+
+        /// The Laplacian pass itself, structurally identical to SmoothRelaxJob (see its remarks
+        /// on the Jacobi-vs-Gauss-Seidel substitution parallelism requires, which applies here
+        /// for the same reason) - it differs only in the blend factor, which for relax is the
+        /// weight directly rather than a strength-and-dt-scaled lerp.
+        [BurstCompile(CompileSynchronously = true)]
+        private struct SurfaceRelaxJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<int> Candidates;
+            [ReadOnly] public NativeArray<int> AdjacencyOffsets;
+            [ReadOnly] public NativeArray<int> AdjacencyNeighbors;
+            [ReadOnly] public NativeArray<int> VertexToSlot;
+            [ReadOnly] public NativeArray<Vector3> FullPositions;
+            [ReadOnly] public NativeArray<Vector3> PositionsRead;
+            public NativeArray<Vector3> PositionsWrite;
+            [ReadOnly] public NativeArray<float> Weights;
+            public float PassFactor;
+
+            public void Execute(int ci)
+            {
+                Vector3 currentPos = PositionsRead[ci];
+                float w = Weights[ci];
+                if (w <= 0f) { PositionsWrite[ci] = currentPos; return; }
+
+                int globalIdx = Candidates[ci];
+                int start = AdjacencyOffsets[globalIdx];
+                int end = AdjacencyOffsets[globalIdx + 1];
+                if (end == start) { PositionsWrite[ci] = currentPos; return; }
+
+                Vector3 sum = Vector3.zero;
+                for (int n = start; n < end; n++)
+                {
+                    int neighborGlobal = AdjacencyNeighbors[n];
+                    int slot = VertexToSlot[neighborGlobal];
+                    sum += slot >= 0 ? PositionsRead[slot] : FullPositions[neighborGlobal];
+                }
+
+                Vector3 toAverage = sum / (end - start) - currentPos;
+                PositionsWrite[ci] = currentPos + toAverage * Mathf.Clamp01(w * PassFactor);
             }
         }
 
@@ -1560,6 +1887,20 @@ namespace Sculpting
             {
                 if (currentBrush != value)
                 {
+                    // Picking a brush is a statement about what the next click should do, and while
+                    // mask paint mode is armed the answer is "paint mask" no matter which brush is
+                    // highlighted. Leaving it on meant selecting Move and then dragging painted a
+                    // mask instead of moving anything, with the panel showing Move the whole time -
+                    // there is nothing in the UI that says the click is going somewhere else.
+                    // Mask painting is a MODE, so the way out of it is to pick a tool, exactly as
+                    // the box/lasso region gestures already disarm each other (see
+                    // IsMaskPaintMode's setter and RegionSelectTool.Mode's).
+                    //
+                    // Deliberately not reached by the Shift-to-Smooth override, which is a held
+                    // modifier rather than a choice of tool - see HandleShiftSmoothOverride, which
+                    // skips itself entirely while masking.
+                    IsMaskPaintMode = false;
+
                     EndActiveDrags();
                     _lastCarveStrokeLocal = null;
                     _lastClayStrokeLocal = null;
@@ -1835,6 +2176,56 @@ namespace Sculpting
             }
         }
 
+        /// The mirror sign list for the CURRENT target, off the reference SyncSelectionTarget
+        /// already resolved once this frame.
+        ///
+        /// Every brush apply site used to reach this through the Mirror property, which resolves
+        /// Target (a scene-manager lookup) and does a GetComponent - once per DAB, and Clay/Crease
+        /// place up to ClayMaxDabsPerFrame/CreaseMaxDabsPerFrame of those in a single frame. The
+        /// property's self-healing AddComponent path is still the fallback for a target that
+        /// genuinely has no MirrorController, and the result is written back to the cached field so
+        /// that only ever happens once per such target rather than once per dab.
+        private List<Vector3> MirrorSigns()
+        {
+            if (mirrorController == null) mirrorController = Mirror;
+            return mirrorController != null ? mirrorController.GetMirrorSigns() : IdentityMirrorSigns;
+        }
+
+        // Stand-in for a target with no MirrorController at all (Mirror returns null only when
+        // there is no target). One unmirrored stroke, which is what "no mirroring" means.
+        private static readonly List<Vector3> IdentityMirrorSigns = new List<Vector3> { Vector3.one };
+
+        /// The camera's local-space position, reflected through the same mirror plane(s) as the dab
+        /// currently being applied. Every brush's mirror loop sets it once per sign (see
+        /// BeginMirroredDab) and every Front Facing Only test downstream reads it instead of
+        /// re-deriving the raw camera position, so a mirrored dab is judged from the mirrored
+        /// viewpoint. Identity sign leaves it as the real camera, which is what an unmirrored
+        /// session sees.
+        ///
+        /// Front Facing Only asks "is this vertex facing the viewer", and a MIRRORED dab is not
+        /// being viewed from where the real camera is - it is the same stroke seen from the mirrored
+        /// viewpoint. Testing it against the unmirrored camera throws away roughly half of every
+        /// mirrored footprint the moment the model is turned off dead-centre. Measured on a
+        /// 145k-triangle sculpt with Mirror X on and the camera swept around it: at 0 degrees the
+        /// two footprints match (639 of 1280 against 635 of 1281), but at 30 degrees the near side
+        /// keeps 649 of 1166 while the far side keeps 350 of 1161, and the deficit holds at roughly
+        /// 2:1 across the whole orbit, closing again only at a dead-on 180. That is one half of a
+        /// symmetric model quietly receiving twice the material of the other for a whole session -
+        /// the reported "one ear was taking detail and the other was not" - and because the test is
+        /// a hard 0/1 cut rather than a ramp, the surviving part of the far footprint is stamped in
+        /// with a sharp edge straight through it, which is an artifact appearing on the side you are
+        /// NOT working on. Reflecting the camera with the dab restores parity (measured 776 against
+        /// the near side's 780 at 60 degrees) and costs the option nothing: each dab still rejects
+        /// everything facing away from its OWN viewpoint, which is the whole point of the setting.
+        private Vector3 _dabCameraLocal;
+
+        /// Points the per-dab frame at one mirror sign. Call once per sign, before applying that
+        /// sign's dab - the mirror loops below all do, including the identity sign, so no apply path
+        /// can read a viewpoint left behind by the previous dab.
+        private void BeginMirroredDab(Vector3 sign) =>
+            _dabCameraLocal = Vector3.Scale(
+                sculptableMesh.transform.InverseTransformPoint(cam.transform.position), sign);
+
         // Detects a selection change once per Update() (see SyncSelectionTarget) rather than
         // re-resolving Target on every one of the ~60 sculptableMesh/mirrorController call
         // sites below - cheap and correct, since every one of those call sites only ever runs
@@ -2055,6 +2446,14 @@ namespace Sculpting
             // was already running when the mode was armed still gets unwound.
             if (shiftHeld && !_isShiftSmoothActive && RegionSelectActive) return;
 
+            // Same shape of guard for mask painting, and needed twice over: the brush is not used
+            // at all while masking (the click paints mask - see HandleMaskPaintInput), so swapping
+            // it under Shift only mislabels the panel; and selecting a brush now leaves mask paint
+            // mode (see CurrentBrush's setter), so without this a stray Shift would silently drop
+            // the user out of masking mid-selection. As above, the release branch stays reachable so
+            // an override already running when masking was entered still unwinds.
+            if (shiftHeld && !_isShiftSmoothActive && _isMaskPaintMode) return;
+
             if (shiftHeld && !_isShiftSmoothActive)
             {
                 _preShiftBrush = currentBrush;
@@ -2064,7 +2463,14 @@ namespace Sculpting
             else if (!shiftHeld && _isShiftSmoothActive)
             {
                 _isShiftSmoothActive = false;
+                // Unwinding a held modifier is not the user choosing a tool, so it must not carry
+                // that choice's side effect of leaving mask paint mode (see CurrentBrush's setter).
+                // The guard above keeps the override from starting while masking, but the Mask
+                // BUTTON is still clickable mid-hold, and dropping the mode on the next Shift
+                // release would look like the button simply failed.
+                bool maskWasOn = _isMaskPaintMode;
                 CurrentBrush = _preShiftBrush;
+                IsMaskPaintMode = maskWasOn;
             }
         }
 
@@ -2237,18 +2643,9 @@ namespace Sculpting
         {
             if (Selection == null || cam == null) return;
 
-            Ray ray = cam.ScreenPointToRay(screenPos);
-            SculptableMesh closest = null;
-            float closestDist = float.MaxValue;
-            foreach (SculptableMesh obj in Selection.AllObjects)
-            {
-                if (obj == null || !obj.Visible) continue;
-                if (obj.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out _))
-                {
-                    float dist = Vector3.Distance(ray.origin, hitPoint);
-                    if (dist < closestDist) { closestDist = dist; closest = obj; }
-                }
-            }
+            // Shares SelectionManager.Raycast with TransformGizmo's own click-to-select rather
+            // than keeping a second copy of the same visible-objects-only hit test.
+            SculptableMesh closest = Selection.Raycast(cam.ScreenPointToRay(screenPos));
 
             // Only flash on an actual switch - double-clicking the object that's already
             // primary shouldn't flash, since nothing about the sculpt target changed.
@@ -2263,6 +2660,13 @@ namespace Sculpting
         {
             var mouse = Mouse.current;
             if (mouse == null || cam == null || sculptableMesh == null) return;
+
+            // Anything OUTSIDE this component can have moved geometry since the last frame - an
+            // undo (HandleUndoRedoKeys, a few lines earlier in Update), a gizmo drag, a Remesh, a
+            // symmetry op. None of those go through the brush write paths that invalidate the
+            // position mirror, so the frame starts by assuming they did. Within the frame the
+            // brushes' own invalidation keeps it exact - see RefreshPositionMirror.
+            MarkPositionMirrorStale();
 
             // A non-Sculpt gizmo tool (Transpose/Scale) is active - it owns mouse input for
             // dragging the selected object's transform instead, see TransformGizmo/GizmoMode.
@@ -2484,7 +2888,7 @@ namespace Sculpting
             float speed = Mathf.Lerp(MaskPaintSpeedSoft, MaskPaintSpeedHard, maskHardness);
             float amount = (applying ? 1f : -1f) * EffectiveBrushStrength * speed * Time.deltaTime;
 
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            foreach (Vector3 sign in MirrorSigns())
                 sculptableMesh.PaintMask(Vector3.Scale(localPoint, sign), brushRadius, amount, maskHardness);
         }
 
@@ -2594,11 +2998,15 @@ namespace Sculpting
             // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
             Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
-            float dt = Time.deltaTime;
 
             float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
             // One dab = one fixed quantum of material, NOT a slice of this frame's time.
             float dabDt = spacing / ClayReferenceStrokeSpeed;
+
+            // One dirty set and one relax batch for the WHOLE frame, however many dabs it turns
+            // out to place - see FlushClayFrame.
+            BeginDirtyVertices();
+            BeginRelaxBatch();
 
             if (_lastClayStrokeLocal.HasValue)
             {
@@ -2640,15 +3048,34 @@ namespace Sculpting
                 ApplyClayBrushAtLocal(localPoint, localNormal, positive, dabDt);
             }
 
+            FlushClayFrame();
+
             _lastClayStrokeLocal = localPoint;
             _lastClayStrokeNormalLocal = localNormal;
         }
 
+        /// Closes out a frame's worth of Clay dabs: one relaxation pass across everything they
+        /// touched, then one push into the mesh.
+        ///
+        /// Both of those used to run per DAB, and a single frame of a moving stroke places several
+        /// (up to ClayMaxDabsPerFrame). Every one of them paid a full ApplyVerticesLocal - a
+        /// normal recompute, a cavity recompute, a triangle re-bucket and four GPU buffer uploads
+        /// plus a compute dispatch - over footprints that overlap each other by around 90%, so
+        /// almost all of that work was being redone on the same vertices within one frame. Folding
+        /// it into the frame's union does each vertex once, which is where most of the "the surface
+        /// lags behind the cursor on a wide stroke" latency was going.
+        private void FlushClayFrame()
+        {
+            ApplySurfaceRelaxBatched();
+            FlushDirtyVertices();
+        }
+
         private void ApplyClayBrushAtLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt)
         {
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            int centresBefore = _relaxCentres.Count;
+            foreach (Vector3 sign in MirrorSigns())
             {
+                BeginMirroredDab(sign);
                 Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
                 Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
                 // Mirror the frozen stroke tangent frame the same way the point/normal are
@@ -2659,7 +3086,10 @@ namespace Sculpting
                 ApplyClayBrushLocal(mirroredPoint, mirroredNormal, mirroredTangent0, mirroredBitangent0, positive, dt);
             }
 
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+            // Counted only if the dab actually landed on geometry (ApplyClayBrushLocal records a
+            // centre exactly then), so a stroke that runs off the edge of the mesh doesn't inflate
+            // the frame's relaxation budget with dabs that deposited nothing.
+            if (_relaxCentres.Count > centresBefore) _relaxDabCount++;
         }
 
         // Eases each vertex toward a point on the brush's tangent PLANE rather than toward
@@ -2737,29 +3167,350 @@ namespace Sculpting
         /// Clay-only. Runs its OWN wider QueryNear rather than reusing the calling brush's
         /// candidate list - see RelaxRadiusFactor's remarks.
         ///
-        /// Deliberately plain managed C#, not a Burst job: even at MaxRelaxIterations this is
-        /// a handful of passes over a footprint-bounded candidate list, a small fraction of
-        /// what Smooth's own up-to-10-pass job exists to make fast.
-        private void ApplySurfaceRelaxLocal(Vector3 localPoint)
-        {
-            if (surfaceRelax <= 0f) return;
+        /// This used to be deliberately plain managed C#, on the reasoning that a few passes over
+        /// a footprint-bounded candidate list was a small fraction of what Smooth's own job
+        /// exists to make fast. Measurement said otherwise, and by a wide margin: "footprint-
+        /// bounded" is 2.5x the brush radius here, about six times the dab's own surface area, so
+        /// on a 270k-triangle sphere at a 0.25 brush radius this pass alone accounted for 52.8ms
+        /// of a 61.1ms Clay dab - 86% of it. It now takes the same Burst path Smooth does.
+        // The centres of every dab this frame placed, across every mirror sign - the input to the
+        // one batched relax pass that runs after them (see ApplySurfaceRelaxBatched). Reused
+        // between frames rather than reallocated; ClayMaxDabsPerFrame x 8 mirror signs bounds it.
+        private readonly List<Vector3> _relaxCentres = new List<Vector3>();
+        // How many dabs the frame placed (NOT counting mirror signs - a mirrored dab is the same
+        // dab, applied twice). Sets how much relaxation the batched pass has to make up for.
+        private int _relaxDabCount;
+        // Union of the per-centre candidate queries, deduped by generation stamp - same scheme as
+        // DirtyVertexSet, and needed for the same reason: consecutive dab centres are a fifth of a
+        // brush radius apart while relax reaches two and a half radii, so their candidate lists
+        // overlap by well over 90% and the union is barely larger than one of them.
+        private readonly List<int> _relaxCandidateUnion = new List<int>();
+        private int[] _relaxUnionStamp;
+        private int _relaxUnionGeneration;
+        private NativeArray<Vector3> _nativeRelaxCentres;
 
+        // One viewpoint per entry of _relaxCentres, kept in lockstep with it: the camera position
+        // the dab that placed that centre was applied from (see _dabCameraLocal). The relax pass is
+        // batched across every sign in the frame, so unlike a dab it cannot have a single viewpoint
+        // of its own - a candidate is weighted against its NEAREST centre, and the same centre is
+        // what says which side of the mirror that candidate is being relaxed for. Without this the
+        // batched pass would reintroduce, for the relaxation, exactly the asymmetry _dabCameraLocal
+        // removes from the dabs themselves.
+        private readonly List<Vector3> _relaxCentreCameras = new List<Vector3>();
+        private NativeArray<Vector3> _nativeRelaxCentreCameras;
+
+        private void BeginRelaxBatch()
+        {
+            _relaxCentres.Clear();
+            _relaxCentreCameras.Clear();
+            _relaxDabCount = 0;
+        }
+
+        /// Runs Clay's relaxation ONCE for the whole frame, over the union of every dab centre it
+        /// placed, instead of once per dab.
+        ///
+        /// A dab's own displacement is cheap next to this pass - relax reaches RelaxRadiusFactor
+        /// (2.5) brush radii, about six times the dab's own surface area - and consecutive dabs
+        /// are only ClayDabSpacingFraction (0.2) of a radius apart, so running it per dab redid
+        /// almost exactly the same work several times over within a single frame: the same spatial
+        /// query, the same gather, the same full-mesh position mirror copy, the same weight job and
+        /// the same scatter, over a candidate set that had barely moved. On a wide stroke over a
+        /// dense mesh that is the single dominant cost of a brush frame, and it is the reason a
+        /// zoomed-out stroke lagged the cursor while a zoomed-in one felt instant.
+        ///
+        /// The total amount of relaxation is preserved, not reduced: each dab still contributes its
+        /// own surfaceRelax * MaxRelaxIterations worth of passes, they are just accumulated and run
+        /// back-to-back over one candidate set. What changes is that the passes now interleave with
+        /// the frame's dabs rather than each dab's own - a distinction the pass is already
+        /// deliberately insensitive to, since RelaxInnerFloor exists precisely to keep it out of
+        /// whatever the brush is actively shaping.
+        private void ApplySurfaceRelaxBatched()
+        {
+            if (surfaceRelax <= 0f || _relaxDabCount == 0 || _relaxCentres.Count == 0) return;
+
+            // Thinned first, and the candidate query widened by however much that cost, so the
+            // union covers exactly what the unthinned centres would have - see CompactRelaxCentres.
+            float centreSeparation = CompactRelaxCentres();
             float relaxRadius = brushRadius * RelaxRadiusFactor;
-            List<int> candidates = sculptableMesh.QueryNear(localPoint, relaxRadius);
+            List<int> candidates = GatherRelaxCandidates(relaxRadius + centreSeparation);
             if (candidates.Count == 0) return;
 
+            // Total pass budget for the frame. Capped so a frame in which the cursor jumped a long
+            // way (many banked dabs) cannot turn into a burst of relaxation passes over a large
+            // union - the same "a hitching frame must not also become the most expensive one"
+            // reasoning ClayMaxDabsPerFrame itself encodes.
+            float passAmount = Mathf.Min(surfaceRelax * MaxRelaxIterations * _relaxDabCount,
+                                         MaxRelaxIterations * MaxRelaxFrameBudget);
+
+            if (useBurstJobs && candidates.Count >= MinJobVertexCount)
+            {
+                ApplySurfaceRelaxLocalJob(relaxRadius, candidates, passAmount);
+                return;
+            }
+            ApplySurfaceRelaxLocalManaged(relaxRadius, candidates, passAmount);
+        }
+
+        // How many whole MaxRelaxIterations-worth of passes one frame may fold in, however many
+        // dabs it placed. At the default surfaceRelax this is only reached past ~18 dabs in a
+        // single frame, i.e. only on a frame that was already dropping material at
+        // ClayMaxDabsPerFrame.
+        private const int MaxRelaxFrameBudget = 4;
+
+        // Ceiling on how many centres the weight pass measures each candidate against. The pass is
+        // O(candidates x centres), and a frame that banked a long cursor jump with all three mirror
+        // axes enabled could otherwise reach ClayMaxDabsPerFrame x 8 of them.
+        private const int MaxRelaxCentres = 48;
+
+        /// Drops centres that add nothing, and returns how far a dropped centre can be from the
+        /// one that replaced it (0 when nothing meaningful was dropped) so the caller can widen its
+        /// candidate query by the same amount and keep coverage identical.
+        ///
+        /// The first pass removes only near-exact duplicates - a mirrored dab landing on its own
+        /// mirror plane produces the same point twice, and each duplicate costs a whole extra
+        /// spatial query plus a distance test per candidate for no change in the result. The second
+        /// only runs on a frame that would otherwise blow past MaxRelaxCentres, and trades a small
+        /// shift in where the shell profile sits for a bounded cost on exactly the frames that are
+        /// already the most expensive ones.
+        private float CompactRelaxCentres()
+        {
+            ThinRelaxCentres(brushRadius * 1e-3f);
+            if (_relaxCentres.Count <= MaxRelaxCentres) return 0f;
+
+            float separation = Mathf.Max(brushRadius * ClayDabSpacingFraction, 1e-6f);
+            float applied = 0f;
+            while (_relaxCentres.Count > MaxRelaxCentres)
+            {
+                ThinRelaxCentres(separation);
+                applied = separation;
+                separation *= 2f; // always terminates: doubling eventually leaves a single centre
+            }
+            return applied;
+        }
+
+        /// Greedy in-place thin: keeps a centre only if it is at least `separation` from every
+        /// centre kept before it. O(kept x total), which at these list lengths (tens) is nothing.
+        private void ThinRelaxCentres(float separation)
+        {
+            if (separation <= 0f) return;
+            float sqrSeparation = separation * separation;
+
+            int w = 0;
+            for (int i = 0; i < _relaxCentres.Count; i++)
+            {
+                Vector3 c = _relaxCentres[i];
+                bool covered = false;
+                for (int k = 0; k < w; k++)
+                {
+                    if ((_relaxCentres[k] - c).sqrMagnitude >= sqrSeparation) continue;
+                    covered = true;
+                    break;
+                }
+                if (covered) continue;
+                // The viewpoint list is compacted in lockstep, never separately - a centre and the
+                // viewpoint its dab was applied from have to stay the same entry (see
+                // _relaxCentreCameras).
+                _relaxCentreCameras[w] = _relaxCentreCameras[i];
+                _relaxCentres[w++] = c;
+            }
+            _relaxCentres.RemoveRange(w, _relaxCentres.Count - w);
+            _relaxCentreCameras.RemoveRange(w, _relaxCentreCameras.Count - w);
+        }
+
+        /// Every vertex within queryRadius of ANY of this frame's dab centres, deduped. One query
+        /// per centre: the query itself is a cell walk plus a bulk list copy, which is a couple of
+        /// operations per returned index against the dozens each candidate costs downstream, so
+        /// paying it per centre to keep the expensive part paid once per vertex is the right trade.
+        private List<int> GatherRelaxCandidates(float queryRadius)
+        {
+            int vertexCount = sculptableMesh.Vertices.Length;
+            if (_relaxUnionStamp == null || _relaxUnionStamp.Length != vertexCount)
+            {
+                _relaxUnionStamp = new int[vertexCount];
+                _relaxUnionGeneration = 0;
+            }
+            _relaxUnionGeneration++;
+            _relaxCandidateUnion.Clear();
+
+            int[] stamp = _relaxUnionStamp;
+            int generation = _relaxUnionGeneration;
+            for (int c = 0; c < _relaxCentres.Count; c++)
+            {
+                // QueryNear hands back the spatial grid's own reused buffer, so this has to consume
+                // it fully before the next centre's query overwrites it.
+                List<int> near = sculptableMesh.QueryNear(_relaxCentres[c], queryRadius);
+                for (int k = 0; k < near.Count; k++)
+                {
+                    int vi = near[k];
+                    if ((uint)vi >= (uint)stamp.Length || stamp[vi] == generation) continue;
+                    stamp[vi] = generation;
+                    _relaxCandidateUnion.Add(vi);
+                }
+            }
+            return _relaxCandidateUnion;
+        }
+
+        private void EnsureRelaxCentresNative()
+        {
+            if (_nativeRelaxCentres.IsCreated && _nativeRelaxCentres.Length >= _relaxCentres.Count) return;
+            if (_nativeRelaxCentres.IsCreated) _nativeRelaxCentres.Dispose();
+            if (_nativeRelaxCentreCameras.IsCreated) _nativeRelaxCentreCameras.Dispose();
+            int capacity = Mathf.Max(Mathf.NextPowerOfTwo(_relaxCentres.Count), 32);
+            _nativeRelaxCentres = new NativeArray<Vector3>(capacity, Allocator.Persistent);
+            // Grown together so the two can never disagree on length - see _relaxCentreCameras.
+            _nativeRelaxCentreCameras = new NativeArray<Vector3>(capacity, Allocator.Persistent);
+        }
+
+        private void ApplySurfaceRelaxLocalJob(float relaxRadius, List<int> candidates, float passAmount)
+        {
             Vector3[] verts = sculptableMesh.Vertices;
-            Vector3[] normals = sculptableMesh.Normals;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            int totalVerts = verts.Length;
+
+            // Same neighbour-lookup scaffolding Smooth's job uses - a relax pass reads the
+            // positions of neighbours that can sit outside its own candidate list, so it needs
+            // both the slot map and the full-mesh position mirror. See EnsureSmoothFullMeshScratch.
+            EnsureSmoothFullMeshScratch(totalVerts);
+            RefreshPositionMirror(verts);
+
+            // Grown BEFORE the gather, not after: EnsureNativeScratch reallocates rather than
+            // resizes, so growing the shared scratch after filling it would throw the gathered
+            // footprint away.
+            EnsureLaplacianCandidates(candidates.Count);
+            GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
+
+            EnsureRelaxCentresNative();
+            for (int c = 0; c < _relaxCentres.Count; c++)
+            {
+                _nativeRelaxCentres[c] = _relaxCentres[c];
+                _nativeRelaxCentreCameras[c] = _relaxCentreCameras[c];
+            }
+
+            SculptableMesh mesh = sculptableMesh;
+            NativeArray<int> laplacianCandidates = _nativeLaplacianCandidates;
+            NativeArray<int> vertexToSlot = _nativeVertexToSlot;
+            NativeArray<float> curvature = _nativeRelaxCurvature;
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                int globalIdx = candidates[ci];
+                laplacianCandidates[ci] = globalIdx;
+                vertexToSlot[globalIdx] = ci;
+                curvature[ci] = mesh.CurvatureDeviationAt(globalIdx);
+            }
+
+            var weightJob = new RelaxWeightJob
+            {
+                PositionsIn = _nativePositionsIn,
+                NormalsIn = _nativeNormalsIn,
+                MaskIn = _nativeMaskIn,
+                CurvatureIn = _nativeRelaxCurvature,
+                Centres = _nativeRelaxCentres,
+                CentreCameras = _nativeRelaxCentreCameras,
+                CentreCount = _relaxCentres.Count,
+                WeightsOut = _nativeClayWeights,
+                BrushRadius = brushRadius,
+                RelaxRadius = relaxRadius,
+                EdgeSoftness = RelaxEdgeSoftness,
+                InnerFloor = RelaxInnerFloor,
+                CurvatureFloor = RelaxCurvatureFloor,
+                CurvatureStart = RelaxCurvatureStart,
+                CurvatureFull = RelaxCurvatureFull,
+                FrontFacingOnly = frontFacingOnly,
+                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+            };
+
+            int fullPasses = Mathf.FloorToInt(passAmount);
+            float partialFactor = passAmount - fullPasses;
+
+            NativeArray<int> adjOffsets = sculptableMesh.AdjacencyOffsets;
+            NativeArray<int> adjNeighbors = sculptableMesh.AdjacencyNeighbors;
+            NativeArray<Vector3> readBuf = _nativePositionsIn;
+            NativeArray<Vector3> writeBuf = _nativePositionsOut;
+
+            // One dependency chain, waited on once - same reasoning as Smooth's (see
+            // ApplySmoothBrushLocalJob): the passes are inherently sequential, but nothing needs
+            // to look at the intermediate results on the main thread.
+            JobHandle chain = weightJob.Schedule(candidates.Count, 64);
+            for (int pass = 0; pass < fullPasses; pass++)
+            {
+                chain = ScheduleSurfaceRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, 1f, chain);
+                (readBuf, writeBuf) = (writeBuf, readBuf);
+            }
+            if (partialFactor > 0.001f)
+            {
+                chain = ScheduleSurfaceRelaxJob(candidates.Count, readBuf, writeBuf, adjOffsets, adjNeighbors, partialFactor, chain);
+                (readBuf, writeBuf) = (writeBuf, readBuf);
+            }
+            chain.Complete();
+
+            bool anyPassRan = fullPasses > 0 || partialFactor > 0.001f;
+            NativeArray<float> weights = _nativeClayWeights;
+            for (int ci = 0; ci < candidates.Count; ci++)
+            {
+                int globalIdx = candidates[ci];
+                vertexToSlot[globalIdx] = -1; // targeted reset, see field remarks
+                if (!anyPassRan || weights[ci] <= 0f) continue;
+
+                mesh.RecordUndoBeforeIfNeeded(globalIdx);
+                verts[globalIdx] = readBuf[ci];
+                // The relax shell moves the overwhelming majority of its candidates by an amount
+                // no one can see (see SculptableMesh.FilterToDrifted for the measurement), and
+                // reporting those dirty costs a normal recompute, a cavity recompute, a triangle
+                // re-bucket and a GPU upload each. Asking first keeps them out of the dirty set
+                // entirely rather than relying on the filter downstream to take them back out.
+                if (mesh.HasVisiblyDrifted(globalIdx)) _dirtyVertexScratch.Add(globalIdx);
+            }
+            if (anyPassRan) MarkPositionMirrorStale();
+        }
+
+        private JobHandle ScheduleSurfaceRelaxJob(int candidateCount, NativeArray<Vector3> readBuf, NativeArray<Vector3> writeBuf,
+            NativeArray<int> adjOffsets, NativeArray<int> adjNeighbors, float passFactor, JobHandle dependency)
+        {
+            var job = new SurfaceRelaxJob
+            {
+                Candidates = _nativeLaplacianCandidates,
+                AdjacencyOffsets = adjOffsets,
+                AdjacencyNeighbors = adjNeighbors,
+                VertexToSlot = _nativeVertexToSlot,
+                FullPositions = _nativeFullPositionMirror,
+                PositionsRead = readBuf,
+                PositionsWrite = writeBuf,
+                Weights = _nativeClayWeights,
+                PassFactor = passFactor,
+            };
+            return job.Schedule(candidateCount, 64, dependency);
+        }
+
+        private void ApplySurfaceRelaxLocalManaged(float relaxRadius, List<int> candidates, float passAmount)
+        {
+            SculptableMesh mesh = sculptableMesh;
+            Vector3[] verts = mesh.Vertices;
+            Vector3[] normals = mesh.Normals;
+            float[] mask = mesh.Mask;
 
             if (_relaxWeightScratch.Length < candidates.Count) _relaxWeightScratch = new float[candidates.Count];
             float[] weights = _relaxWeightScratch;
+            float relaxRadiusSqr = relaxRadius * relaxRadius;
+            float invShellSpan = 1f / Mathf.Max(relaxRadius - brushRadius, 1e-5f);
             bool anyInRange = false;
+
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                float dist = Vector3.Distance(verts[i], localPoint);
-                if (dist > relaxRadius) { weights[ci] = 0f; continue; }
+                Vector3 p = verts[i];
+
+                // Distance to the NEAREST of this frame's dab centres - see RelaxWeightJob, whose
+                // Burst counterpart this must stay identical to (which one runs depends only on
+                // footprint size). Compared squared so the square root is paid at most once per
+                // candidate rather than once per centre, and not at all for a candidate the whole
+                // sweep misses.
+                float sqrDist = float.MaxValue;
+                int nearest = 0;
+                for (int c = 0; c < _relaxCentres.Count; c++)
+                {
+                    float d = (p - _relaxCentres[c]).sqrMagnitude;
+                    if (d < sqrDist) { sqrDist = d; nearest = c; }
+                }
+                if (sqrDist > relaxRadiusSqr) { weights[ci] = 0f; continue; }
+                float dist = Mathf.Sqrt(sqrDist);
 
                 // Shell profile, not a falloff from the dab centre: RelaxInnerFloor inside the
                 // brush's own radius (leave the current dab alone - see its remarks), ramping
@@ -2773,7 +3524,7 @@ namespace Sculpting
                 }
                 else
                 {
-                    float shellT = (dist - brushRadius) / Mathf.Max(relaxRadius - brushRadius, 1e-5f);
+                    float shellT = (dist - brushRadius) * invShellSpan;
                     spatialWeight = ClayFalloff(1f - shellT, RelaxEdgeSoftness);
                 }
 
@@ -2782,17 +3533,18 @@ namespace Sculpting
                 // gate actually separate an ordinary rounded feature from a genuine crease,
                 // rather than applying full strength uniformly across the whole shell
                 // regardless of whether anything there actually needs it.
-                float curvatureDeviation = sculptableMesh.CurvatureDeviationAt(i);
+                float curvatureDeviation = mesh.CurvatureDeviationAt(i);
                 float curvatureFactor = Mathf.Lerp(RelaxCurvatureFloor, 1f,
                     Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(RelaxCurvatureStart, RelaxCurvatureFull, curvatureDeviation)));
 
-                weights[ci] = spatialWeight * curvatureFactor
-                    * (1f - sculptableMesh.Mask[i]) * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
-                if (weights[ci] > 0f) anyInRange = true;
+                // Nearest centre's own viewpoint, matching RelaxWeightJob - see _relaxCentreCameras.
+                float w = spatialWeight * curvatureFactor * (1f - mask[i])
+                    * FrontFacingWeight(frontFacingOnly, normals[i], p, _relaxCentreCameras[nearest]);
+                weights[ci] = w;
+                if (w > 0f) anyInRange = true;
             }
             if (!anyInRange) return;
 
-            float passAmount = surfaceRelax * MaxRelaxIterations;
             int fullPasses = Mathf.FloorToInt(passAmount);
             float partialFactor = passAmount - fullPasses;
 
@@ -2804,7 +3556,9 @@ namespace Sculpting
 
         private void RunSurfaceRelaxPass(List<int> candidates, float[] weights, float passFactor)
         {
-            Vector3[] verts = sculptableMesh.Vertices;
+            SculptableMesh mesh = sculptableMesh;
+            Vector3[] verts = mesh.Vertices;
+            bool anyMoved = false;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2826,12 +3580,16 @@ namespace Sculpting
                 // slider exists to tune - default keeps it subtle enough not to flatten
                 // deliberate broad shaping.
                 Vector3 p = verts[i];
-                Vector3 toAverage = sculptableMesh.GetNeighborAverage(i) - p;
+                Vector3 toAverage = mesh.GetNeighborAverage(i) - p;
 
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                mesh.RecordUndoBeforeIfNeeded(i);
                 verts[i] = p + toAverage * Mathf.Clamp01(w * passFactor);
-                _dirtyVertexScratch.Add(i);
+                anyMoved = true;
+                // Same invisible-movement gate the job path applies - see its remarks.
+                if (mesh.HasVisiblyDrifted(i)) _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         private void ApplyClayBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt)
@@ -2848,7 +3606,15 @@ namespace Sculpting
             else
                 ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals);
 
-            ApplySurfaceRelaxLocal(localPoint);
+            // The relax pass this dab needs runs once for the whole frame, over the union of every
+            // dab centre in it - see ApplySurfaceRelaxBatched. Recorded here rather than in
+            // ApplyClayBrushAtLocal so a mirrored dab contributes its own (mirrored) centre, and
+            // only for dabs that actually landed on geometry.
+            if (surfaceRelax > 0f)
+            {
+                _relaxCentres.Add(localPoint);
+                _relaxCentreCameras.Add(_dabCameraLocal); // lockstep - see _relaxCentreCameras
+            }
         }
 
         private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
@@ -2859,8 +3625,7 @@ namespace Sculpting
             float height = brushRadius * clayHeightFactor * sign;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
-            for (int ci = 0; ci < candidates.Count; ci++)
-                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+            sculptableMesh.CopyStrokeStartPositions(candidates, _nativeStrokeStart);
 
             var weightJob = new ClayWeightJob
             {
@@ -2868,6 +3633,7 @@ namespace Sculpting
                 NormalsIn = _nativeNormalsIn,
                 MaskIn = _nativeMaskIn,
                 WeightsOut = _nativeClayWeights,
+                PlaneWeightsOut = _nativeClayPlaneWeights,
                 WeightedPosOut = _nativeClayWeightedPos,
                 WeightedNormalOut = _nativeClayWeightedNormal,
                 LocalPoint = localPoint,
@@ -2877,19 +3643,21 @@ namespace Sculpting
                 TipRoundness = clayTipRoundness,
                 EdgeSoftness = clayEdgeSoftness,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = _dabCameraLocal,
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
             // Sequential reduction across the (footprint-bounded) candidate list - see
             // ClayWeightJob's remarks on why this stays on the main thread.
+            // Mask-free weights throughout - the plane describes the surface, not what may move.
+            // See ClayWeightJob.Execute.
             Vector3 planeOriginSum = Vector3.zero, planeNormalSum = Vector3.zero;
             float planeWeightSum = 0f;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 planeOriginSum += _nativeClayWeightedPos[ci];
                 planeNormalSum += _nativeClayWeightedNormal[ci];
-                planeWeightSum += _nativeClayWeights[ci];
+                planeWeightSum += _nativeClayPlaneWeights[ci];
             }
             if (planeWeightSum <= 1e-6f) return;
 
@@ -2944,22 +3712,29 @@ namespace Sculpting
             Vector3 planeOriginSum = Vector3.zero;
             Vector3 planeNormalSum = Vector3.zero;
             float planeWeightSum = 0f;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            // This dab's own viewpoint, not the raw camera - see _dabCameraLocal.
+            Vector3 cameraLocalPos = _dabCameraLocal;
+            float[] mask = sculptableMesh.Mask;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                Vector3 toVert = verts[i] - localPoint;
+                Vector3 p = verts[i];
+                Vector3 toVert = p - localPoint;
                 float t01 = ClayTipShapeT01(toVert, brushRadius, tangent0, bitangent0, clayTipRoundness);
                 if (t01 <= 0f) { weights[ci] = 0f; continue; }
 
-                float w = ClayFalloff(t01, clayEdgeSoftness) * (1f - sculptableMesh.Mask[i]) // flat plateau, edge-only taper - see clayEdgeSoftness
-                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
-                weights[ci] = w;
+                Vector3 n = normals[i];
+                // Plane weight (no mask) and displacement weight (masked), split for the reason
+                // ClayWeightJob.Execute sets out - the plane measures the surface, the mask only
+                // says which of its vertices may move.
+                float planeW = ClayFalloff(t01, clayEdgeSoftness) // flat plateau, edge-only taper - see clayEdgeSoftness
+                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
+                weights[ci] = planeW * (1f - mask[i]);
 
-                planeOriginSum += verts[i] * w;
-                planeNormalSum += normals[i] * w;
-                planeWeightSum += w;
+                planeOriginSum += p * planeW;
+                planeNormalSum += n * planeW;
+                planeWeightSum += planeW;
             }
 
             if (planeWeightSum <= 1e-6f) return;
@@ -2973,6 +3748,8 @@ namespace Sculpting
             float cosR = Mathf.Cos(rot), sinR = Mathf.Sin(rot);
             BrushAlphaLibrary.AlphaData alpha = useAlpha ? BrushAlphaLibrary.Get(alphaType) : default;
             float invStampRadius = 1f / Mathf.Max(0.0001f, brushRadius * alphaScale);
+            SculptableMesh mesh = sculptableMesh;
+            bool anyMoved = false;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
@@ -2997,7 +3774,8 @@ namespace Sculpting
                     if (weight <= 0f) continue;
                 }
 
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                mesh.RecordUndoBeforeIfNeeded(i);
+                anyMoved = true;
 
                 if (accumulate)
                 {
@@ -3024,7 +3802,7 @@ namespace Sculpting
                     Vector3 flattenDelta = (flattenTarget - verts[i]) * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt);
 
                     verts[i] = ClampStrokeDepth(verts[i] + buildDelta + flattenDelta,
-                        sculptableMesh.StrokeStartPosition(i), planeNormal,
+                        mesh.StrokeStartPosition(i), planeNormal,
                         height * ClayStrokeDepthLimitAccumulate, height);
                 }
                 else
@@ -3046,12 +3824,14 @@ namespace Sculpting
                     // large-dt stroke sent a vertex from radius 0.5 to over 3.0 in 90 frames
                     // before this clamp existed).
                     verts[i] = ClampStrokeDepth(verts[i] + toTarget * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt),
-                        sculptableMesh.StrokeStartPosition(i), planeNormal,
+                        mesh.StrokeStartPosition(i), planeNormal,
                         height * ClayStrokeDepthLimit, height);
                 }
 
                 _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         /// Caps how far THIS stroke has displaced one vertex, measured from where the stroke
@@ -3159,6 +3939,15 @@ namespace Sculpting
             Vector3 sampledNormal = AverageFootprintNormal(localPoint, localNormal);
             float spacing = Mathf.Max(brushRadius * CreaseDabSpacingFraction, 0.0005f);
 
+            // One dirty set for the whole frame's dabs, pushed once at the end. A carve frame can
+            // place up to CreaseMaxDabsPerFrame dabs at half Clay's spacing, and each used to pay
+            // its own full ApplyVerticesLocal over a footprint that overlapped its neighbour's by
+            // ~90% - see FlushClayFrame for the same fix on Clay. Carve is the easier case of the
+            // two: its stroke frame (_carveStrokeNormal/_carveStrokeDir) is already sampled once
+            // per frame before any dab runs, so nothing within the frame was reading the
+            // per-dab-refreshed normals anyway.
+            BeginDirtyVertices();
+
             if (!_lastCarveStrokeLocal.HasValue)
             {
                 // Fresh stroke: no travel direction yet, so this first dab pinches radially (a
@@ -3170,6 +3959,7 @@ namespace Sculpting
                 _carveDabCarry = 0f;
                 _lastCarveStrokeLocal = localPoint;
                 ApplyCarveDab(localPoint, positive, lipFactor);
+                FlushDirtyVertices();
                 return;
             }
 
@@ -3219,6 +4009,7 @@ namespace Sculpting
             // struggling to keep up.
             if (placed >= CreaseMaxDabsPerFrame) _carveDabCarry = 0f;
 
+            FlushDirtyVertices();
             _lastCarveStrokeLocal = localPoint;
         }
 
@@ -3248,9 +4039,9 @@ namespace Sculpting
 
         private void ApplyCarveDab(Vector3 localPoint, bool positive, float lipFactor)
         {
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            foreach (Vector3 sign in MirrorSigns())
             {
+                BeginMirroredDab(sign);
                 Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
                 Vector3 mirroredNormal = Vector3.Scale(_carveStrokeNormal, sign).normalized;
                 // Mirror the stroke frame the same way Clay mirrors its frozen tip axes, rather
@@ -3260,8 +4051,6 @@ namespace Sculpting
                 Vector3 mirroredDir = Vector3.Scale(_carveStrokeDir, sign);
                 ApplyCarveDabLocal(mirroredPoint, mirroredNormal, mirroredDir, positive, lipFactor);
             }
-
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
         }
 
         // Carves along the stroke's normal while pinching the footprint ACROSS the stroke line,
@@ -3309,8 +4098,7 @@ namespace Sculpting
 
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
             // The dab's whole target is measured from here - see ApplyCarveDabLocal's remarks.
-            for (int ci = 0; ci < candidates.Count; ci++)
-                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+            sculptableMesh.CopyStrokeStartPositions(candidates, _nativeStrokeStart);
 
             var job = new CreaseJob
             {
@@ -3334,7 +4122,7 @@ namespace Sculpting
                 LipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
                 PinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = _dabCameraLocal,
             };
             job.Schedule(candidates.Count, 32).Complete();
 
@@ -3353,25 +4141,36 @@ namespace Sculpting
             float depthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
             float lipRate = sign * lipFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
             float pinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
+            SculptableMesh mesh = sculptableMesh;
+            float[] mask = mesh.Mask;
+            Vector3[] normals = mesh.Normals;
+            float radiusSqr = brushRadius * brushRadius;
+            float invRadius = 1f / brushRadius;
+            bool anyMoved = false;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                Vector3 toVert = verts[i] - localPoint;
-                float dist = toVert.magnitude;
-                if (dist > brushRadius) continue;
+                Vector3 p = verts[i];
+                Vector3 toVert = p - localPoint;
+                // Squared first - see ApplySmoothBrushLocalManaged. This loop also used to reach
+                // sculptableMesh.Normals per candidate, which is a property call re-reading the
+                // whole array reference on every iteration.
+                float sqrDist = toVert.sqrMagnitude;
+                if (sqrDist > radiusSqr) continue;
 
-                float weight = CarveFalloff(1f - dist / brushRadius) * (1f - sculptableMesh.Mask[i])
-                    * FrontFacingWeight(frontFacingOnly, sculptableMesh.Normals[i], verts[i], cameraLocalPos);
+                float weight = CarveFalloff(1f - Mathf.Sqrt(sqrDist) * invRadius) * (1f - mask[i])
+                    * FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
 
-                Vector3 start = sculptableMesh.StrokeStartPosition(i);
+                Vector3 start = mesh.StrokeStartPosition(i);
                 SplitCarveFrame(start - localPoint, localNormal, dirLocal,
                     out float startNormal, out float startAlong, out Vector3 startAcross);
                 SplitCarveFrame(toVert, localNormal, dirLocal, out _, out _, out Vector3 across);
                 bool hasLip = startAlong > 0f;
 
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                mesh.RecordUndoBeforeIfNeeded(i);
+                anyMoved = true;
 
                 if (accumulate)
                 {
@@ -3383,15 +4182,15 @@ namespace Sculpting
                     // past the centreline and oscillate instead of cutting deeper.
                     float normalRate = depthRate;
                     if (hasLip) normalRate += lipRate;
-                    verts[i] += localNormal * (normalRate * weight);
-                    verts[i] += -across * Mathf.Clamp01(weight * pinchRateScale);
+                    verts[i] = p + localNormal * (normalRate * weight)
+                                 - across * Mathf.Clamp01(weight * pinchRateScale);
                 }
                 else
                 {
                     float carve = depth * weight;
                     if (hasLip) carve += lip * weight;
                     // Deepest dab wins - see ApplyCarveDabLocal's remarks.
-                    float achieved = Vector3.Dot(verts[i] - start, localNormal);
+                    float achieved = Vector3.Dot(p - start, localNormal);
                     if (sign * achieved > sign * carve) carve = achieved;
 
                     Vector3 pinched = startAcross * (1f - creasePinch * weight);
@@ -3402,11 +4201,13 @@ namespace Sculpting
                         + dirLocal * startAlong + pinched;
                     // Clamp01: a lerp fraction toward a target, not a velocity - see the
                     // matching note on Clay for what an unclamped factor does on a frame hitch.
-                    verts[i] += (target - verts[i]) * Mathf.Clamp01(weight * lerpScale);
+                    verts[i] = p + (target - p) * Mathf.Clamp01(weight * lerpScale);
                 }
 
                 _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         private void HandleInflateInput(Mouse mouse, bool overUI, bool altHeld)
@@ -3444,14 +4245,15 @@ namespace Sculpting
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
             Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            BeginDirtyVertices();
+            foreach (Vector3 sign in MirrorSigns())
             {
+                BeginMirroredDab(sign);
                 Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
                 ApplyInflateBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
             }
 
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+            FlushDirtyVertices();
         }
 
         // Pushes each vertex outward along its OWN normal (the mesh's per-vertex normals,
@@ -3499,7 +4301,7 @@ namespace Sculpting
                 CapAmount = brushRadius * InflateOffCapFactor * sign,
                 LerpFactorScale = effectiveStrength * InflateSpeed * dt,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = _dabCameraLocal,
             };
             job.Schedule(candidates.Count, 32).Complete();
 
@@ -3513,33 +4315,46 @@ namespace Sculpting
             float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             Vector3 target = localPoint + localNormal * (brushRadius * InflateOffCapFactor * sign);
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
+            SculptableMesh mesh = sculptableMesh;
+            float[] mask = mesh.Mask;
+            float radiusSqr = brushRadius * brushRadius;
+            float invRadius = 1f / brushRadius;
+            float accumulateRate = sign * effectiveStrengthAccumulate * InflateSpeed * dt;
+            float lerpScale = effectiveStrength * InflateSpeed * dt;
+            bool anyMoved = false;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                float dist = Vector3.Distance(verts[i], localPoint);
-                if (dist > brushRadius) continue;
+                Vector3 p = verts[i];
+                // Squared first - see ApplySmoothBrushLocalManaged for why the square root moved
+                // below the range test rather than above it.
+                float sqrDist = (p - localPoint).sqrMagnitude;
+                if (sqrDist > radiusSqr) continue;
 
-                float t01 = 1f - dist / brushRadius;
-                float weight = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
-                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
+                Vector3 n = normals[i];
+                float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
+                float weight = t01 * t01 * (3f - 2f * t01) * (1f - mask[i]) // smoothstep, masked-out
+                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 if (weight <= 0f) continue;
 
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                mesh.RecordUndoBeforeIfNeeded(i);
+                anyMoved = true;
 
                 if (accumulate)
                 {
-                    verts[i] += normals[i] * (weight * sign * effectiveStrengthAccumulate * InflateSpeed * dt);
+                    verts[i] = p + n * (weight * accumulateRate);
                 }
                 else
                 {
-                    Vector3 toTarget = target - verts[i];
-                    verts[i] += toTarget * Mathf.Clamp01(weight * effectiveStrength * InflateSpeed * dt); // see Clamp01 note on Clay
+                    verts[i] = p + (target - p) * Mathf.Clamp01(weight * lerpScale); // see Clamp01 note on Clay
                 }
 
                 _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         private void HandleFlattenInput(Mouse mouse, bool overUI, bool altHeld)
@@ -3577,14 +4392,15 @@ namespace Sculpting
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
             Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            BeginDirtyVertices();
+            foreach (Vector3 sign in MirrorSigns())
             {
+                BeginMirroredDab(sign);
                 Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
                 ApplyFlattenBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
             }
 
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+            FlushDirtyVertices();
         }
 
         // Projects every vertex in the footprint onto one shared plane - the classic
@@ -3637,8 +4453,7 @@ namespace Sculpting
             float dt = Time.deltaTime;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
-            for (int ci = 0; ci < candidates.Count; ci++)
-                _nativeStrokeStart[ci] = sculptableMesh.StrokeStartPosition(candidates[ci]);
+            sculptableMesh.CopyStrokeStartPositions(candidates, _nativeStrokeStart);
 
             // Clay's pass-1 job, reused with the round tip (TipRoundness 1) and a full-radius
             // taper (EdgeSoftness 1) - which reduces ClayTipShapeT01/ClayFalloff to exactly the
@@ -3653,6 +4468,7 @@ namespace Sculpting
                 NormalsIn = _nativeNormalsIn,
                 MaskIn = _nativeMaskIn,
                 WeightsOut = _nativeClayWeights,
+                PlaneWeightsOut = _nativeClayPlaneWeights,
                 WeightedPosOut = _nativeClayWeightedPos,
                 WeightedNormalOut = _nativeClayWeightedNormal,
                 LocalPoint = localPoint,
@@ -3662,7 +4478,7 @@ namespace Sculpting
                 TipRoundness = 1f,
                 EdgeSoftness = 1f,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = _dabCameraLocal,
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
@@ -3677,7 +4493,11 @@ namespace Sculpting
             float planeWeightSum = 0f;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
-                float w = _nativeClayWeights[ci];
+                // The mask-free weight, for the same reason Clay's reduction uses it - see
+                // ClayWeightJob.Execute. Flatten is if anything the more sensitive of the two: it
+                // projects the footprint ONTO this plane, so a plane tilted by a nearby mask does
+                // not merely deposit unevenly, it shears the surface toward the wrong flat.
+                float w = _nativeClayPlaneWeights[ci];
                 planeOriginSum += _nativeStrokeStart[ci] * w;
                 planeNormalSum += _nativeNormalsIn[ci] * w;
                 planeWeightSum += w;
@@ -3717,24 +4537,34 @@ namespace Sculpting
             Vector3 planeOriginSum = Vector3.zero;
             Vector3 planeNormalSum = Vector3.zero;
             float planeWeightSum = 0f;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
+            SculptableMesh mesh = sculptableMesh;
+            float[] mask = mesh.Mask;
+            float radiusSqr = brushRadius * brushRadius;
+            float invRadius = 1f / brushRadius;
 
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                float dist = Vector3.Distance(verts[i], localPoint);
-                if (dist > brushRadius) { weights[ci] = 0f; continue; }
+                Vector3 p = verts[i];
+                // Squared first - see ApplySmoothBrushLocalManaged.
+                float sqrDist = (p - localPoint).sqrMagnitude;
+                if (sqrDist > radiusSqr) { weights[ci] = 0f; continue; }
 
-                float t01 = 1f - dist / brushRadius;
-                float w = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
-                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
-                weights[ci] = w;
+                Vector3 n = normals[i];
+                float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
+                // Plane weight (no mask) and displacement weight (masked) - see
+                // ClayWeightJob.Execute, and ApplyFlattenBrushLocalJob's reduction for why Flatten
+                // in particular cannot afford a mask-tilted plane.
+                float planeW = t01 * t01 * (3f - 2f * t01) // smoothstep
+                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
+                weights[ci] = planeW * (1f - mask[i]); // masked-out vertices hold still
 
                 // StrokeStartPosition, not verts[i] - see ApplyFlattenBrushLocal on why the
                 // plane is anchored to the surface this stroke began with.
-                planeOriginSum += sculptableMesh.StrokeStartPosition(i) * w;
-                planeNormalSum += normals[i] * w;
-                planeWeightSum += w;
+                planeOriginSum += mesh.StrokeStartPosition(i) * planeW;
+                planeNormalSum += n * planeW;
+                planeWeightSum += planeW;
             }
 
             if (planeWeightSum <= 1e-6f) return;
@@ -3745,32 +4575,38 @@ namespace Sculpting
             // Plane Offset control - see flattenPlaneOffset for what the two directions mean.
             Vector3 planeOrigin = planeOriginSum / planeWeightSum + planeNormal * (brushRadius * flattenPlaneOffset);
 
+            bool anyMoved = false;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 float weight = weights[ci];
                 if (weight <= 0f) continue;
                 int i = candidates[ci];
 
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
+                mesh.RecordUndoBeforeIfNeeded(i);
+                anyMoved = true;
 
                 // Signed height above the plane. Flatten cancels it; contrast doubles down on it.
-                float along = Vector3.Dot(verts[i] - planeOrigin, planeNormal);
+                Vector3 moved = verts[i];
+                float along = Vector3.Dot(moved - planeOrigin, planeNormal);
                 // Clamp01 for the same reason Clay's does - this is a lerp fraction toward the
                 // plane, and a frame hitch with a large dt would otherwise overshoot past it.
                 float lerp = Mathf.Clamp01(weight * lerpFactorScale);
-                verts[i] += planeNormal * ((positive ? -along : along) * lerp);
+                moved += planeNormal * ((positive ? -along : along) * lerp);
 
                 if (!positive)
                 {
                     // Contrast only - see FlattenContrastLimit for why this direction alone
                     // needs bounding, and why the bound is symmetric.
-                    float fromStart = Vector3.Dot(verts[i] - sculptableMesh.StrokeStartPosition(i), planeNormal);
-                    if (fromStart > maxOffStart) verts[i] -= planeNormal * (fromStart - maxOffStart);
-                    else if (fromStart < -maxOffStart) verts[i] -= planeNormal * (fromStart + maxOffStart);
+                    float fromStart = Vector3.Dot(moved - mesh.StrokeStartPosition(i), planeNormal);
+                    if (fromStart > maxOffStart) moved -= planeNormal * (fromStart - maxOffStart);
+                    else if (fromStart < -maxOffStart) moved -= planeNormal * (fromStart + maxOffStart);
                 }
 
+                verts[i] = moved;
                 _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         private void HandleSmoothInput(Mouse mouse, bool overUI, bool altHeld)
@@ -3801,11 +4637,14 @@ namespace Sculpting
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
 
-            _dirtyVertexScratch.Clear();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            BeginDirtyVertices();
+            foreach (Vector3 sign in MirrorSigns())
+            {
+                BeginMirroredDab(sign);
                 ApplySmoothBrushLocal(Vector3.Scale(localPoint, sign));
+            }
 
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+            FlushDirtyVertices();
         }
 
         private void ApplySmoothBrushLocal(Vector3 localPoint)
@@ -3827,20 +4666,19 @@ namespace Sculpting
         {
             int totalVerts = verts.Length;
             EnsureSmoothFullMeshScratch(totalVerts);
-            NativeArray<Vector3>.Copy(verts, _nativeFullPositionMirror, totalVerts); // full-mesh mirror, refreshed once per call - see field remarks
+            RefreshPositionMirror(verts); // full-mesh mirror, refreshed only if anything moved - see its remarks
 
+            // Grown before the gather - see ApplySurfaceRelaxLocalJob for why the order matters.
+            EnsureLaplacianCandidates(candidates.Count);
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
 
-            if (!_nativeSmoothCandidates.IsCreated || _nativeSmoothCandidates.Length < candidates.Count)
-            {
-                if (_nativeSmoothCandidates.IsCreated) _nativeSmoothCandidates.Dispose();
-                _nativeSmoothCandidates = new NativeArray<int>(Mathf.Max(Mathf.NextPowerOfTwo(candidates.Count), MinJobVertexCount), Allocator.Persistent);
-            }
+            NativeArray<int> laplacianCandidates = _nativeLaplacianCandidates;
+            NativeArray<int> vertexToSlot = _nativeVertexToSlot;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int globalIdx = candidates[ci];
-                _nativeSmoothCandidates[ci] = globalIdx;
-                _nativeVertexToSlot[globalIdx] = ci;
+                laplacianCandidates[ci] = globalIdx;
+                vertexToSlot[globalIdx] = ci;
             }
 
             var weightJob = new SmoothWeightJob
@@ -3852,7 +4690,7 @@ namespace Sculpting
                 LocalPoint = localPoint,
                 BrushRadius = brushRadius,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = _dabCameraLocal,
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
@@ -3895,15 +4733,18 @@ namespace Sculpting
             // pass actually ran - matches the managed method's own no-op-when-iterAmount-too-
             // small edge case (theoretical given BrushStrength's enforced 0.01 minimum, kept
             // correct anyway rather than assuming the UI clamp is the only caller).
+            SculptableMesh mesh = sculptableMesh;
+            NativeArray<float> weights = _nativeClayWeights;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int globalIdx = candidates[ci];
-                _nativeVertexToSlot[globalIdx] = -1; // targeted reset, not a full-array clear - see field remarks
-                if (!anyPassRan || _nativeClayWeights[ci] <= 0f) continue;
-                sculptableMesh.RecordUndoBeforeIfNeeded(globalIdx);
+                vertexToSlot[globalIdx] = -1; // targeted reset, not a full-array clear - see field remarks
+                if (!anyPassRan || weights[ci] <= 0f) continue;
+                mesh.RecordUndoBeforeIfNeeded(globalIdx);
                 verts[globalIdx] = readBuf[ci];
                 _dirtyVertexScratch.Add(globalIdx);
             }
+            if (anyPassRan) MarkPositionMirrorStale();
         }
 
         private JobHandle ScheduleSmoothRelaxJob(int candidateCount, NativeArray<Vector3> readBuf, NativeArray<Vector3> writeBuf,
@@ -3911,7 +4752,7 @@ namespace Sculpting
         {
             var job = new SmoothRelaxJob
             {
-                Candidates = _nativeSmoothCandidates,
+                Candidates = _nativeLaplacianCandidates,
                 AdjacencyOffsets = adjOffsets,
                 AdjacencyNeighbors = adjNeighbors,
                 VertexToSlot = _nativeVertexToSlot,
@@ -3931,17 +4772,24 @@ namespace Sculpting
             float[] weights = _smoothWeightScratch;
             bool anyInRange = false;
             Vector3[] normals = sculptableMesh.Normals;
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
+            Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
 
+            float[] mask = sculptableMesh.Mask;
+            float radiusSqr = brushRadius * brushRadius;
+            float invRadius = 1f / brushRadius;
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 int i = candidates[ci];
-                float dist = Vector3.Distance(verts[i], localPoint);
-                if (dist > brushRadius) { weights[ci] = 0f; continue; }
+                Vector3 p = verts[i];
+                // Squared first: over half a query's candidates fall outside the radius entirely
+                // (see RelaxWeightJob's measurement), and taking a square root just to discard
+                // them was the single most-executed operation in this loop.
+                float sqrDist = (p - localPoint).sqrMagnitude;
+                if (sqrDist > radiusSqr) { weights[ci] = 0f; continue; }
 
-                float t01 = 1f - dist / brushRadius;
-                weights[ci] = t01 * t01 * (3f - 2f * t01) * (1f - sculptableMesh.Mask[i]) // smoothstep, masked-out
-                    * FrontFacingWeight(frontFacingOnly, normals[i], verts[i], cameraLocalPos);
+                float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
+                weights[ci] = t01 * t01 * (3f - 2f * t01) * (1f - mask[i]) // smoothstep, masked-out
+                    * FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
                 anyInRange = true;
             }
             if (!anyInRange) return;
@@ -3959,17 +4807,24 @@ namespace Sculpting
 
         private void RunSmoothRelaxationPass(Vector3[] verts, List<int> candidates, float[] weights, float passFactor, float dt)
         {
+            SculptableMesh mesh = sculptableMesh;
+            float lerpScale = passFactor * SmoothSpeed * dt;
+            bool anyMoved = false;
+
             for (int ci = 0; ci < candidates.Count; ci++)
             {
                 float w = weights[ci];
                 if (w <= 0f) continue;
                 int i = candidates[ci];
 
-                Vector3 toAverage = sculptableMesh.GetNeighborAverage(i) - verts[i];
-                sculptableMesh.RecordUndoBeforeIfNeeded(i);
-                verts[i] += toAverage * Mathf.Clamp01(w * passFactor * SmoothSpeed * dt); // see Clamp01 note on Clay
+                Vector3 toAverage = mesh.GetNeighborAverage(i) - verts[i];
+                mesh.RecordUndoBeforeIfNeeded(i);
+                verts[i] += toAverage * Mathf.Clamp01(w * lerpScale); // see Clamp01 note on Clay
+                anyMoved = true;
                 _dirtyVertexScratch.Add(i);
             }
+
+            if (anyMoved) MarkPositionMirrorStale();
         }
 
         // Grabs whatever's under the cursor on mouse-down and drags it with the cursor's
@@ -3994,13 +4849,15 @@ namespace Sculpting
                     if (worldDelta.sqrMagnitude > 1e-12f)
                     {
                         Vector3 localDelta = sculptableMesh.transform.InverseTransformVector(worldDelta);
-                        _dirtyVertexScratch.Clear();
+                        BeginDirtyVertices();
                         foreach (var (selection, sign) in _grabSelections)
                         {
                             sculptableMesh.ApplyGrabDelta(selection, Vector3.Scale(localDelta, sign));
-                            foreach (int i in selection.Indices) _dirtyVertexScratch.Add(i);
+                            int[] indices = selection.Indices;
+                            for (int k = 0; k < indices.Length; k++) _dirtyVertexScratch.Add(indices[k]);
                         }
-                        sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+                        MarkPositionMirrorStale();
+                        FlushDirtyVertices();
                     }
                     _lastDragPoint = current;
                 }
@@ -4028,11 +4885,15 @@ namespace Sculpting
             if (!_isHovering || !mouse.leftButton.wasPressedThisFrame) return;
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
-            Vector3 cameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position);
             var selections = new List<(SculptableMesh.GrabSelection, Vector3)>();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            foreach (Vector3 sign in MirrorSigns())
             {
-                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, cameraLocalPos);
+                // Each mirrored selection is judged from its OWN mirrored viewpoint - see
+                // _dabCameraLocal. A grab is picked once and then dragged for the whole gesture, so
+                // getting this wrong here strands half of the far side's vertices behind for the
+                // entire drag rather than merely weakening one frame of it.
+                BeginMirroredDab(sign);
+                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, _dabCameraLocal);
                 if (selection.IsValid) selections.Add((selection, sign));
             }
             if (selections.Count == 0) return;
@@ -4090,13 +4951,15 @@ namespace Sculpting
                     // onto (see its remarks for why that's the more robust choice for a
                     // rotation-based deform).
                     Vector3 localCurrent = sculptableMesh.transform.InverseTransformPoint(current);
-                    _dirtyVertexScratch.Clear();
+                    BeginDirtyVertices();
                     foreach (var (selection, sign) in _poseSelections)
                     {
                         sculptableMesh.ApplyPoseDelta(selection, Vector3.Scale(localCurrent, sign));
-                        foreach (int i in selection.Indices) _dirtyVertexScratch.Add(i);
+                        int[] indices = selection.Indices;
+                        for (int k = 0; k < indices.Length; k++) _dirtyVertexScratch.Add(indices[k]);
                     }
-                    sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch);
+                    MarkPositionMirrorStale();
+                    FlushDirtyVertices();
                 }
 
                 _isHovering = true;
@@ -4124,7 +4987,7 @@ namespace Sculpting
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
             var selections = new List<(SculptableMesh.PoseSelection, Vector3)>();
-            foreach (Vector3 sign in Mirror.GetMirrorSigns())
+            foreach (Vector3 sign in MirrorSigns())
             {
                 var selection = sculptableMesh.SelectPose(Vector3.Scale(localHit, sign), brushRadius, poseRigidity, poseSegments);
                 if (selection.IsValid) selections.Add((selection, sign));

@@ -26,13 +26,29 @@ namespace Sculpting
             [System.NonSerialized] public Light light;
         }
 
-        [SerializeField] private bool studioLightingEnabled = true;
+        // Off by default since the rig lost its UI (see LightingUIBuilder.BuildContent) - lights
+        // are placed in the scene now. The rig is kept, not deleted: scenes saved before that
+        // change still carry its settings through SculptSaveData and can turn it back on, and it
+        // is what hands control of the scene's own directional sun back over (see ApplyAll's
+        // _sceneSun line) when it is off. Leaving it ON with no way to reach it would be the
+        // worst of both worlds.
+        //
+        // The scene file carries its own serialized copy of this, which overrides the default
+        // here - Assets/Scenes/SampleScene.unity was edited to match.
+        [SerializeField] private bool studioLightingEnabled;
         [SerializeField] private LightingMode mode = LightingMode.ThreePoint;
+
+        // Bounding-sphere radius of the app's default 1x1x1 sculpting primitive - the size the
+        // MakeDefault() distance/range numbers below were tuned against. A loaded or imported
+        // mesh is rarely that size, so every placement scales distance by the target's actual
+        // radius relative to this constant instead of using it as a literal world distance.
+        private const float CalibrationRadius = 0.8660254f;
 
         private RigLight[] _rig;
         private Transform _rigRoot;
         private Light _sceneSun;
         private SculptableMesh _target;
+        private SelectionManager _selectionManager;
 
         public bool StudioLightingEnabled { get => studioLightingEnabled; set => studioLightingEnabled = value; }
         public LightingMode Mode { get => mode; set => mode = value; }
@@ -96,19 +112,46 @@ namespace Sculpting
             light.type = LightType.Spot;
             light.spotAngle = 110f;
             light.innerSpotAngle = 40f;
-            light.range = 30f;
+            // range is set every frame in Update, scaled to the target's current size.
             // Only the Key light casts shadows by default - shadows from every light at once
             // muddy the read of the form and cost more to render than this tool needs.
             light.shadows = slot == LightSlot.Key ? LightShadows.Soft : LightShadows.None;
             return light;
         }
 
-        private Vector3 GetPivot()
+        // Which SculptableMesh the rig lights right now: the scene's primary selection - the
+        // same target SculptController and TransformGizmo already sculpt/move - re-resolved
+        // every frame so switching objects in the Scene Graph panel moves the lights with it
+        // instead of leaving them parked on whichever mesh a one-time FindFirstObjectByType
+        // happened to return first. Falls back to a bare find for scenes with no
+        // SelectionManager at all (a minimal single-object scene predating the scene graph).
+        private SculptableMesh ResolveTarget()
         {
+            if (_selectionManager == null) _selectionManager = FindFirstObjectByType<SelectionManager>();
+            SculptableMesh primary = _selectionManager != null ? _selectionManager.PrimarySelection : null;
+            if (primary != null) return primary;
             if (_target == null) _target = FindFirstObjectByType<SculptableMesh>();
-            if (_target == null) return Vector3.zero;
-            Mesh mesh = _target.Mesh;
-            return mesh != null ? _target.transform.TransformPoint(mesh.bounds.center) : _target.transform.position;
+            return _target;
+        }
+
+        private static Vector3 GetPivot(SculptableMesh target)
+        {
+            if (target == null) return Vector3.zero;
+            Mesh mesh = target.Mesh;
+            return mesh != null ? target.transform.TransformPoint(mesh.bounds.center) : target.transform.position;
+        }
+
+        // How much bigger (or smaller) the current target is than the calibration primitive,
+        // so a light's configured "distance" places it proportionally the same number of
+        // subject-radii away regardless of the target's actual scale - a sculpt loaded in at
+        // several units tall no longer parks every light inside its own surface.
+        private static float GetSizeFactor(SculptableMesh target)
+        {
+            Mesh mesh = target != null ? target.Mesh : null;
+            if (mesh == null) return 1f;
+            Vector3 worldExtents = Vector3.Scale(mesh.bounds.extents, target.transform.lossyScale);
+            float radius = worldExtents.magnitude;
+            return radius > 1e-4f ? Mathf.Max(0.05f, radius / CalibrationRadius) : 1f;
         }
 
         private void Update()
@@ -124,7 +167,9 @@ namespace Sculpting
             // for exactly this reload hazard.
             if (_rig == null || _rigRoot == null) BuildRig();
 
-            Vector3 pivot = GetPivot();
+            SculptableMesh target = ResolveTarget();
+            Vector3 pivot = GetPivot(target);
+            float sizeFactor = GetSizeFactor(target);
             for (int i = 0; i < _rig.Length; i++)
             {
                 var slot = (LightSlot)i;
@@ -139,12 +184,13 @@ namespace Sculpting
                 // it out. Placing first costs a transform write on two lights that may not be
                 // drawn, and removes that window entirely.
                 Quaternion rot = Quaternion.Euler(cfg.pitch, cfg.yaw, 0f);
-                Vector3 pos = pivot + rot * (Vector3.back * cfg.distance);
+                Vector3 pos = pivot + rot * (Vector3.back * (cfg.distance * sizeFactor));
                 Vector3 aim = pivot - pos;
                 Quaternion look = aim.sqrMagnitude > 1e-6f ? Quaternion.LookRotation(aim) : cfg.light.transform.rotation;
                 cfg.light.transform.SetPositionAndRotation(pos, look);
                 cfg.light.intensity = cfg.intensity;
                 cfg.light.color = cfg.color;
+                cfg.light.range = 30f * sizeFactor;
 
                 bool wantActive = studioLightingEnabled && cfg.enabled && IsSlotAvailable(slot);
                 if (cfg.light.gameObject.activeSelf != wantActive) cfg.light.gameObject.SetActive(wantActive);

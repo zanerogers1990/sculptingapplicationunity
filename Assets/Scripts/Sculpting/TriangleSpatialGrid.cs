@@ -26,7 +26,16 @@ namespace Sculpting
     internal class TriangleSpatialGrid
     {
         private readonly float _cellSize;
+        // 1/_cellSize, kept alongside it because the per-triangle cell lookup is the hottest
+        // arithmetic in this class and a float divide is several times the cost of a multiply.
+        // UpdateTriangles does six of these per dirty triangle for a test that, measured on a
+        // 270k-triangle sphere, said "unchanged" for 100% of them - so the divides were the
+        // entire cost of the step.
+        private readonly float _invCellSize;
         private readonly Bounds _bounds;
+        // _bounds.min, cached: Bounds.min is a computed property (centre minus extents), and
+        // ClampedCellOf reads it for every corner of every triangle it buckets.
+        private readonly Vector3 _boundsMin;
         private readonly Vector3Int _dims;
         private readonly List<int>[] _cellContents;
         // Per triangle, where it's currently registered - needed so UpdateTriangles knows
@@ -37,6 +46,12 @@ namespace Sculpting
         // The cell RANGE each triangle currently spans, packed so it can be compared in one
         // integer test - see UpdateTriangles, which skips a triangle whose range is unchanged.
         private readonly long[] _triangleCellRange;
+        // Which cell each VERTEX currently sits in, packed the same way. A triangle's cell range
+        // is the bounding box of its three vertices' cells, so it cannot have changed unless at
+        // least one of those vertices changed cell - which makes this the cheap early test that
+        // UpdateFromMovedVertices runs before it looks at a single triangle. See that method for
+        // why the per-triangle test alone was not enough.
+        private readonly int[] _vertexCell;
 
         /// One registration of a triangle: which cell's list it sits in, and at which index
         /// within that list. The index is what makes RemoveTriangle O(1): the previous version
@@ -67,7 +82,9 @@ namespace Sculpting
         public TriangleSpatialGrid(Vector3[] vertices, int[] triangles, Bounds bounds, float cellSize)
         {
             _bounds = bounds;
+            _boundsMin = bounds.min;
             _cellSize = Mathf.Max(cellSize, 0.0001f);
+            _invCellSize = 1f / _cellSize;
 
             Vector3 size = bounds.size;
             _dims = new Vector3Int(
@@ -80,13 +97,19 @@ namespace Sculpting
             _cellContents = new List<int>[cellCount];
             _triangleCells = new List<CellSlot>[triCount];
             _triangleCellRange = new long[triCount];
+            _movedTriangleStamp = new int[triCount];
 
             for (int ti = 0; ti < triCount; ti++)
             {
                 CellRangeOf(ti, vertices, triangles, out Vector3Int cmin, out Vector3Int cmax);
                 InsertTriangle(ti, cmin, cmax);
             }
+
+            _vertexCell = new int[vertices.Length];
+            for (int i = 0; i < vertices.Length; i++) _vertexCell[i] = PackCell(ClampedCellOf(vertices[i]));
         }
+
+        private static int PackCell(Vector3Int c) => (c.x << 16) | (c.y << 8) | c.z;
 
         /// The inclusive cell range the triangle's bounding box covers. Split out from
         /// InsertTriangle so UpdateTriangles can compute it once and use it both to decide
@@ -178,10 +201,11 @@ namespace Sculpting
         /// cell size is chosen so a cell holds several triangles, while one frame of a stroke
         /// moves a vertex by a small fraction of a cell, so a dirty triangle usually sits
         /// exactly where it already was and only the ones near a cell boundary really move.
-        public void UpdateTriangles(HashSet<int> dirtyTriangles, Vector3[] vertices, int[] triangles)
+        public void UpdateTriangles(List<int> dirtyTriangles, Vector3[] vertices, int[] triangles)
         {
-            foreach (int ti in dirtyTriangles)
+            for (int k = 0; k < dirtyTriangles.Count; k++)
             {
+                int ti = dirtyTriangles[k];
                 CellRangeOf(ti, vertices, triangles, out Vector3Int cmin, out Vector3Int cmax);
                 if (_triangleCells[ti] != null && _triangleCellRange[ti] == PackRange(cmin, cmax)) continue;
 
@@ -190,14 +214,64 @@ namespace Sculpting
             }
         }
 
-        private Vector3Int ClampedCellOf(Vector3 worldLocalPoint)
+        /// The same job as UpdateTriangles, driven from the vertices that moved rather than from
+        /// their incident triangles - which is both less work and a cheaper kind of work.
+        ///
+        /// UpdateTriangles has to visit every triangle touching a moved vertex (roughly twice as
+        /// many triangles as there are vertices) and, for each, load three indices and three
+        /// positions and dereference its membership list, just to conclude that nothing changed.
+        /// It nearly always does conclude that: cell size here targets ~8 triangles per cell,
+        /// while one frame of a stroke moves a vertex a small fraction of a cell, so on a
+        /// 270k-triangle sphere this measured 0% of dirty triangles actually re-bucketed and
+        /// 3.3ms per dab spent proving it - half the entire cost of applying a brush frame. The
+        /// scattered loads are what make it expensive rather than the arithmetic.
+        ///
+        /// A triangle's cell range is the bounding box of its three vertices' cells, so it can
+        /// only change if one of those vertices changed cell. Testing that first costs one
+        /// position load and one integer compare per moved VERTEX, and in the common case where
+        /// no vertex crossed a boundary no triangle is looked at at all.
+        public void UpdateFromMovedVertices(List<int> movedVertices, int[][] vertexTriangles,
+            Vector3[] vertices, int[] triangles)
         {
-            Vector3 rel = worldLocalPoint - _bounds.min;
-            return new Vector3Int(
-                Mathf.Clamp(Mathf.FloorToInt(rel.x / _cellSize), 0, _dims.x - 1),
-                Mathf.Clamp(Mathf.FloorToInt(rel.y / _cellSize), 0, _dims.y - 1),
-                Mathf.Clamp(Mathf.FloorToInt(rel.z / _cellSize), 0, _dims.z - 1));
+            _movedTriangleScratch.Clear();
+            _movedTriangleGeneration++;
+
+            for (int k = 0; k < movedVertices.Count; k++)
+            {
+                int vi = movedVertices[k];
+                int now = PackCell(ClampedCellOf(vertices[vi]));
+                if (now == _vertexCell[vi]) continue;
+                _vertexCell[vi] = now;
+
+                int[] incident = vertexTriangles[vi];
+                for (int i = 0; i < incident.Length; i++)
+                {
+                    int ti = incident[i];
+                    if (_movedTriangleStamp[ti] == _movedTriangleGeneration) continue;
+                    _movedTriangleStamp[ti] = _movedTriangleGeneration;
+                    _movedTriangleScratch.Add(ti);
+                }
+            }
+
+            if (_movedTriangleScratch.Count > 0)
+                UpdateTriangles(_movedTriangleScratch, vertices, triangles);
         }
+
+        // Triangles whose cell range might have changed this call, deduped by generation stamp -
+        // same scheme SculptableMesh uses for its own dirty sets, and for the same reason.
+        private readonly List<int> _movedTriangleScratch = new List<int>();
+        private readonly int[] _movedTriangleStamp;
+        private int _movedTriangleGeneration;
+
+        private Vector3Int ClampedCellOf(Vector3 p)
+        {
+            return new Vector3Int(
+                ClampAxis((int)Mathf.Floor((p.x - _boundsMin.x) * _invCellSize), _dims.x),
+                ClampAxis((int)Mathf.Floor((p.y - _boundsMin.y) * _invCellSize), _dims.y),
+                ClampAxis((int)Mathf.Floor((p.z - _boundsMin.z) * _invCellSize), _dims.z));
+        }
+
+        private static int ClampAxis(int v, int dim) => v < 0 ? 0 : (v >= dim ? dim - 1 : v);
 
         private int FlatIndex(int x, int y, int z) => x + _dims.x * (y + _dims.y * z);
 

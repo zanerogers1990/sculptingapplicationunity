@@ -26,6 +26,10 @@ namespace Sculpting
         // box expecting one and get the other. The mask gestures DO share MaskActiveColor,
         // since they edit exactly what the Mask button edits.
         private static readonly Color RegionHideActiveColor = new Color(0.3f, 0.75f, 0.8f);
+        // Trim gets a third colour again, and a warning-coloured one: hiding and masking are both
+        // reversible with a click, and trimming DELETES geometry. An armed tool that can take a
+        // chunk out of the model on the next drag should not look like the two that cannot.
+        private static readonly Color RegionTrimActiveColor = new Color(0.95f, 0.35f, 0.3f);
         // The marquee's tint while the drag would REMOVE (show/unmask) - the same red the
         // brushes already use for their negative/erase polarity.
         private static readonly Color RegionRemoveColor = new Color(1f, 0.3f, 0.3f);
@@ -64,6 +68,7 @@ namespace Sculpting
         // are the controls whose highlight, enabled-ness and status text have to follow it.
         private RegionSelectTool _regionSelect;
         private Image _boxHideButtonImage, _lassoHideButtonImage, _boxMaskButtonImage, _lassoMaskButtonImage;
+        private Image _boxTrimButtonImage, _lassoTrimButtonImage;
         private Button _showAllButton, _invertVisibleButton;
         private Text _regionStatusLabel;
         private RegionSelectMode _lastShownRegionMode = (RegionSelectMode)(-1);
@@ -216,6 +221,7 @@ namespace Sculpting
 
             EnsureEventSystem();
             BuildUI();
+            TooltipSystem.EnsureToggleBuilt();
         }
 
         // Inner strength-circle color - deliberately the same red as SculptController's own
@@ -466,10 +472,12 @@ namespace Sculpting
             // for why a runtime-created child of a scene object doesn't survive an Editor undo.
             var canvas = canvasGO.AddComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-            // Constant pixel size keeps the panel a fixed, predictable size in the top-left
-            // corner regardless of the Game view's resolution/aspect - "Scale With Screen
-            // Size" could blow the panel up or shrink/shift it unpredictably in an
-            // unconventional or narrow docked Game view.
+            // Constant pixel size, not Unity's own "Scale With Screen Size" - that scales every
+            // element uniformly (fonts, buttons, spacing) and could blow the panel up or shrink/
+            // shift it unpredictably in an unconventional or narrow docked Game view. The panel
+            // still adapts to the window's own size, just via UIFactory.ResponsivePanelWidth /
+            // ScrollPanelHeightController instead - only the panel's own width and height track
+            // the screen, not the size of everything inside it.
             var scaler = canvasGO.AddComponent<CanvasScaler>();
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ConstantPixelSize;
             scaler.scaleFactor = 1f;
@@ -490,42 +498,43 @@ namespace Sculpting
             // shaping foldout, mirror, export, remesh...). Capped at the full window height so
             // it never grows past the bottom of the screen; UIFactory.AddScrollingContent still
             // shrinks it back down to fit shorter content, same as the old ContentSizeFitter did.
-            float maxHeight = Mathf.Max(300f, Screen.height);
-            Transform content = UIFactory.AddScrollingContent(panelRect, maxHeight, new RectOffset(12, 12, 12, 12), 10f);
+            Transform content = UIFactory.AddScrollingContent(panelRect, new RectOffset(12, 12, 12, 12), 10f);
             var panel = content.gameObject;
 
             CreateLabel(panel.transform, "Sculpting Tools", 20, FontStyle.Bold);
             _polyCountLabel = CreateLabel(panel.transform, "Tris: - | Verts: -", 12, FontStyle.Normal);
 
             CreateLabel(panel.transform, "Brush Strength", 14, FontStyle.Normal);
-            _brushStrengthSlider = CreateSlider(panel.transform, 0.01f, 1f, controller.BrushStrength, v => controller.BrushStrength = v);
+            _brushStrengthSlider = CreateSlider(panel.transform, 0.01f, 1f, controller.BrushStrength, v => controller.BrushStrength = v,
+                "How much effect each pass of the brush has. Also adjustable by holding F and dragging.");
 
             CreateLabel(panel.transform, "Brush Size", 14, FontStyle.Normal);
             _brushSizeSlider = CreateSlider(panel.transform, SculptController.MinBrushRadius, SculptController.MaxBrushRadius,
-                controller.BrushRadius, v => controller.BrushRadius = v);
+                controller.BrushRadius, v => controller.BrushRadius = v,
+                "Radius of the brush in world units. Also adjustable by holding S and dragging, or scrolling over the model.");
 
             _positiveToggle = CreateToggle(panel.transform, "Positive (Add)", controller.IsPositive, v =>
             {
                 controller.IsPositive = v;
                 _positiveToggleLabel.text = v ? "Positive (Add)" : "Negative (Subtract)";
-            }, out _positiveToggleLabel);
+            }, out _positiveToggleLabel, tooltip: "Whether the brush adds or removes material. Hold Ctrl (or use the right mouse button) to invert for one stroke.");
 
             _accumulateToggle = CreateToggle(panel.transform, "Accumulate", controller.Accumulate, v =>
             {
                 controller.Accumulate = v;
                 _accumulateToggleLabel.text = v ? "Accumulate" : "Accumulate (Off)";
-            }, out _accumulateToggleLabel);
+            }, out _accumulateToggleLabel, tooltip: "Lets repeated passes over the same spot keep building up effect, instead of capping out after the first pass.");
 
             // Applies to both build-up paths, not just Accumulate-on - see
             // SculptController.accumulateStrength for why the label no longer says "Accumulate".
             CreateLabel(panel.transform, "Build-Up Strength", 14, FontStyle.Normal);
             _accumulateStrengthSlider = CreateSlider(panel.transform, 0.1f, 3f, controller.AccumulateStrength,
-                v => controller.AccumulateStrength = v);
+                v => controller.AccumulateStrength = v, "How fast repeated passes build up effect.");
 
             // Shared across every brush (like Lazy Mouse, not per-brush like Accumulate above),
             // so it needs no resync in the brush-changed handler.
             CreateToggle(panel.transform, "Build Up on Hold", controller.BuildUpOnHold,
-                v => controller.BuildUpOnHold = v, out _);
+                v => controller.BuildUpOnHold = v, out _, tooltip: "Keeps applying the brush while the mouse button is held still, not just while it's moving.");
 
             // Clay-only (see SculptController.surfaceRelax remarks) - fixes hard creases/
             // pinching where two Clay lobes/strokes meet, without a full remesh. Labeled
@@ -533,18 +542,19 @@ namespace Sculpting
             // per-brush like Accumulate), so it stays visible and just does nothing on the
             // other brushes - the label is there so that isn't a silent surprise.
             CreateLabel(panel.transform, "Surface Relax (Clay)", 14, FontStyle.Normal);
-            CreateSlider(panel.transform, 0f, 1f, controller.SurfaceRelax, v => controller.SurfaceRelax = v);
+            CreateSlider(panel.transform, 0f, 1f, controller.SurfaceRelax, v => controller.SurfaceRelax = v,
+                "Smooths out hard creases and pinching where Clay strokes meet. Only affects the Clay brush.");
 
             _frontFacingOnlyToggle = CreateToggle(panel.transform, "Front Facing Only", controller.FrontFacingOnly, v =>
             {
                 controller.FrontFacingOnly = v;
                 _frontFacingOnlyToggleLabel.text = v ? "Front Facing Only" : "Front Facing Only (Off)";
-            }, out _frontFacingOnlyToggleLabel);
+            }, out _frontFacingOnlyToggleLabel, tooltip: "Only affects surface facing the camera - stops a brush from also sculpting the far side of thin geometry.");
 
             var brushRow = CreateRow(panel.transform);
-            var moveButton = CreateButton(brushRow.transform, "Move", () => SetBrushType(BrushType.Move));
-            var clayButton = CreateButton(brushRow.transform, "Clay", () => SetBrushType(BrushType.Clay));
-            var smoothButton = CreateButton(brushRow.transform, "Smooth", () => SetBrushType(BrushType.Smooth));
+            var moveButton = CreateButton(brushRow.transform, "Move", () => SetBrushType(BrushType.Move), "Drags the surface around under the brush, like pushing clay.");
+            var clayButton = CreateButton(brushRow.transform, "Clay", () => SetBrushType(BrushType.Clay), "Builds up rounded volume, like adding a lump of clay.");
+            var smoothButton = CreateButton(brushRow.transform, "Smooth", () => SetBrushType(BrushType.Smooth), "Averages the surface to remove bumps and noise.");
             _moveButtonImage = moveButton.GetComponent<Image>();
             _clayButtonImage = clayButton.GetComponent<Image>();
             _smoothButtonImage = smoothButton.GetComponent<Image>();
@@ -552,9 +562,10 @@ namespace Sculpting
             // Second row - the panel is sized for 3 buttons per row (see CreateRow/panel
             // width), so Crease/Dam Standard get their own row rather than squeezing 5 in.
             var brushRow2 = CreateRow(panel.transform);
-            var creaseButton = CreateButton(brushRow2.transform, "Crease", () => SetBrushType(BrushType.Crease));
-            var damButton = CreateButton(brushRow2.transform, "Dam Std", () => SetBrushType(BrushType.DamStandard));
-            var maskButton = CreateButton(brushRow2.transform, "Mask", () => controller.IsMaskPaintMode = !controller.IsMaskPaintMode);
+            var creaseButton = CreateButton(brushRow2.transform, "Crease", () => SetBrushType(BrushType.Crease), "Pinches in a sharp groove, like a fingernail crease.");
+            var damButton = CreateButton(brushRow2.transform, "Dam Std", () => SetBrushType(BrushType.DamStandard), "Raises a standing lip along the stroke, like a levee.");
+            var maskButton = CreateButton(brushRow2.transform, "Mask", () => controller.IsMaskPaintMode = !controller.IsMaskPaintMode,
+                "Paints a mask that protects or isolates areas from later brush strokes.");
             _creaseButtonImage = creaseButton.GetComponent<Image>();
             _damButtonImage = damButton.GetComponent<Image>();
             _maskButtonImage = maskButton.GetComponent<Image>();
@@ -563,9 +574,9 @@ namespace Sculpting
             // first three" brushes, same reasoning as brushRow2 above for why it doesn't
             // squeeze into an existing row.
             var brushRow3 = CreateRow(panel.transform);
-            var inflateButton = CreateButton(brushRow3.transform, "Inflate", () => SetBrushType(BrushType.Inflate));
-            var flattenButton = CreateButton(brushRow3.transform, "Flatten", () => SetBrushType(BrushType.Flatten));
-            var poseButton = CreateButton(brushRow3.transform, "Pose", () => SetBrushType(BrushType.Pose));
+            var inflateButton = CreateButton(brushRow3.transform, "Inflate", () => SetBrushType(BrushType.Inflate), "Pushes the surface outward along its normal, like inflating a balloon.");
+            var flattenButton = CreateButton(brushRow3.transform, "Flatten", () => SetBrushType(BrushType.Flatten), "Flattens the surface to a plane - see Plane Offset below for Fill vs Scrape.");
+            var poseButton = CreateButton(brushRow3.transform, "Pose", () => SetBrushType(BrushType.Pose), "Bends a limb-like region about a joint, keeping its volume.");
             _inflateButtonImage = inflateButton.GetComponent<Image>();
             _flattenButtonImage = flattenButton.GetComponent<Image>();
             _poseButtonImage = poseButton.GetComponent<Image>();
@@ -574,14 +585,15 @@ namespace Sculpting
             // Collapsed by default, same reasoning as the other shaping foldouts below.
             Transform maskFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Masking", false);
             CreateLabel(maskFoldout, "Hardness (Soft <-> Hard)", 12, FontStyle.Normal);
-            CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v);
+            CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v,
+                "Sharpness of the mask edge - low fades gradually, high cuts off sharply.");
             var maskActionRow = CreateRow(maskFoldout);
-            CreateButton(maskActionRow.transform, "Invert Mask", () => controller.InvertMask());
+            CreateButton(maskActionRow.transform, "Invert Mask", () => controller.InvertMask(), "Swaps masked and unmasked areas.");
             CreateButton(maskActionRow.transform, "Clear Mask", () =>
             {
                 SculptableMesh target = SelectedMesh();
                 if (target != null) target.ClearMask();
-            });
+            }, "Removes the mask from the selected object entirely.");
 
             BuildRegionSection(panel.transform);
 
@@ -589,11 +601,14 @@ namespace Sculpting
             // is needed elsewhere in this file - nothing but this panel ever changes it, same as
             // MaskHardness above.
             Transform lazyMouseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Lazy Mouse", false);
-            CreateToggle(lazyMouseFoldout, "Lazy Mouse", controller.LazyMouseEnabled, v => controller.LazyMouseEnabled = v, out _);
+            CreateToggle(lazyMouseFoldout, "Lazy Mouse", controller.LazyMouseEnabled, v => controller.LazyMouseEnabled = v, out _,
+                tooltip: "Smooths the brush's path with a trailing tether instead of following the raw cursor - steadies shaky strokes.");
             CreateLabel(lazyMouseFoldout, "Radius (px)", 12, FontStyle.Normal);
-            CreateSlider(lazyMouseFoldout, 1f, 150f, controller.LazyMouseRadius, v => controller.LazyMouseRadius = v);
+            CreateSlider(lazyMouseFoldout, 1f, 150f, controller.LazyMouseRadius, v => controller.LazyMouseRadius = v,
+                "How far the cursor must pull ahead of the brush before the tether starts dragging it along.");
             CreateLabel(lazyMouseFoldout, "Smoothing (Springy <-> Taut)", 12, FontStyle.Normal);
-            CreateSlider(lazyMouseFoldout, 0.05f, 1f, controller.LazyMouseStrength, v => controller.LazyMouseStrength = v);
+            CreateSlider(lazyMouseFoldout, 0.05f, 1f, controller.LazyMouseStrength, v => controller.LazyMouseStrength = v,
+                "How tightly the brush follows the tether - low is loose and springy, high is taut and direct.");
 
             BuildExtractSection(panel.transform);
 
@@ -602,17 +617,21 @@ namespace Sculpting
             // Material panel anchored at the bottom-left corner.
             Transform clayFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Clay Shaping", false);
             CreateLabel(clayFoldout, "Clay Depth", 12, FontStyle.Normal);
-            CreateSlider(clayFoldout, 0.1f, 1.5f, controller.ClayHeightFactor, v => controller.ClayHeightFactor = v);
+            CreateSlider(clayFoldout, 0.1f, 1.5f, controller.ClayHeightFactor, v => controller.ClayHeightFactor = v,
+                "How much volume the Clay brush builds up per pass.");
 
             CreateLabel(clayFoldout, "Tip Shape (Square <-> Round)", 12, FontStyle.Normal);
-            CreateSlider(clayFoldout, 0f, 1f, controller.ClayTipRoundness, v => controller.ClayTipRoundness = v);
+            CreateSlider(clayFoldout, 0f, 1f, controller.ClayTipRoundness, v => controller.ClayTipRoundness = v,
+                "Shape of the Clay brush's footprint - low is a square stamp, high is a round one.");
 
             // Low = flat-topped strip with a hard rim; high = soft-shouldered pad. See
             // SculptController.clayEdgeSoftness.
             CreateLabel(clayFoldout, "Tip Softness (Flat <-> Domed)", 12, FontStyle.Normal);
-            CreateSlider(clayFoldout, 0.05f, 1f, controller.ClayEdgeSoftness, v => controller.ClayEdgeSoftness = v);
+            CreateSlider(clayFoldout, 0.05f, 1f, controller.ClayEdgeSoftness, v => controller.ClayEdgeSoftness = v,
+                "Edge profile of the Clay brush - low is a flat-topped pad with a hard rim, high is a soft dome.");
 
-            CreateToggle(clayFoldout, "Use Alpha", controller.UseAlpha, v => controller.UseAlpha = v, out _);
+            CreateToggle(clayFoldout, "Use Alpha", controller.UseAlpha, v => controller.UseAlpha = v, out _,
+                tooltip: "Stamps the selected alpha texture's shape into the Clay brush instead of a plain round tip.");
 
             var alphaRow = CreateRow(clayFoldout);
             for (int i = 0; i < AlphaTypes.Length; i++)
@@ -624,23 +643,30 @@ namespace Sculpting
                     RefreshAlphaButtons();
                 });
                 _alphaButtonImages[i] = alphaButton;
+                TooltipSystem.Attach(alphaButton.gameObject, "Selects this alpha shape for the Clay brush.");
             }
             RefreshAlphaButtons();
 
             CreateLabel(clayFoldout, "Alpha Rotation", 12, FontStyle.Normal);
-            CreateSlider(clayFoldout, 0f, 360f, controller.AlphaRotation, v => controller.AlphaRotation = v);
+            CreateSlider(clayFoldout, 0f, 360f, controller.AlphaRotation, v => controller.AlphaRotation = v,
+                "Rotates the alpha shape.");
             CreateLabel(clayFoldout, "Alpha Scale", 12, FontStyle.Normal);
-            CreateSlider(clayFoldout, 0.3f, 3f, controller.AlphaScale, v => controller.AlphaScale = v);
-            CreateToggle(clayFoldout, "Invert Alpha", controller.InvertAlpha, v => controller.InvertAlpha = v, out _);
+            CreateSlider(clayFoldout, 0.3f, 3f, controller.AlphaScale, v => controller.AlphaScale = v,
+                "Resizes the alpha shape relative to the brush.");
+            CreateToggle(clayFoldout, "Invert Alpha", controller.InvertAlpha, v => controller.InvertAlpha = v, out _,
+                tooltip: "Flips the alpha's light/dark areas, inverting where it stamps strongest.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above.
             Transform creaseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Crease Shaping", false);
             CreateLabel(creaseFoldout, "Pinch", 12, FontStyle.Normal);
-            CreateSlider(creaseFoldout, 0f, 1f, controller.CreasePinch, v => controller.CreasePinch = v);
+            CreateSlider(creaseFoldout, 0f, 1f, controller.CreasePinch, v => controller.CreasePinch = v,
+                "How sharply the Crease brush pulls geometry together into the groove.");
             CreateLabel(creaseFoldout, "Depth", 12, FontStyle.Normal);
-            CreateSlider(creaseFoldout, 0.05f, 1f, controller.CreaseDepthFactor, v => controller.CreaseDepthFactor = v);
+            CreateSlider(creaseFoldout, 0.05f, 1f, controller.CreaseDepthFactor, v => controller.CreaseDepthFactor = v,
+                "How deep the Crease brush's groove cuts.");
             CreateLabel(creaseFoldout, "Dam Standard Lip Height", 12, FontStyle.Normal);
-            CreateSlider(creaseFoldout, 0f, 1f, controller.DamLipHeight, v => controller.DamLipHeight = v);
+            CreateSlider(creaseFoldout, 0f, 1f, controller.DamLipHeight, v => controller.DamLipHeight = v,
+                "How tall a standing lip the Dam Standard brush raises along its stroke.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above. One slider, because
             // Plane Offset is the only thing that distinguishes Flatten from its Fill/Scrape
@@ -649,16 +675,19 @@ namespace Sculpting
             Transform flattenFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Flatten Shaping", false);
             CreateLabel(flattenFoldout, "Plane Offset (Scrape <-> Fill)", 12, FontStyle.Normal);
             CreateSlider(flattenFoldout, -0.5f, 0.5f, controller.FlattenPlaneOffset,
-                v => controller.FlattenPlaneOffset = v);
+                v => controller.FlattenPlaneOffset = v,
+                "Where the flatten plane sits relative to the surface - negative scrapes material away, positive fills up to the plane.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above.
             Transform poseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Pose Shaping", false);
             CreateLabel(poseFoldout, "Rigidity (Soft <-> Rigid)", 12, FontStyle.Normal);
-            CreateSlider(poseFoldout, 0f, 1f, controller.PoseRigidity, v => controller.PoseRigidity = v);
+            CreateSlider(poseFoldout, 0f, 1f, controller.PoseRigidity, v => controller.PoseRigidity = v,
+                "How stiffly the bent region holds its shape - low is soft and droopy, high is rigid.");
             // Blender calls this same idea "Segments" - how many separate places along the limb
             // you can pivot from, instead of every click bending from the same single anchor.
             CreateLabel(poseFoldout, "Segments (Joints along the limb)", 12, FontStyle.Normal);
-            CreateSlider(poseFoldout, 1f, 8f, controller.PoseSegments, v => controller.PoseSegments = Mathf.RoundToInt(v));
+            CreateSlider(poseFoldout, 1f, 8f, controller.PoseSegments, v => controller.PoseSegments = Mathf.RoundToInt(v),
+                "Number of separate joints along the limb you can pivot from, instead of one single anchor.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above. Both controls are
             // inert without a stylus - CurrentPressure short-circuits to 1 when Pen.current is
@@ -666,9 +695,11 @@ namespace Sculpting
             // tablet can be plugged in after the UI is constructed.
             Transform pressureFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Stylus Pressure", false);
             CreateLabel(pressureFoldout, "Light-Touch Floor", 12, FontStyle.Normal);
-            CreateSlider(pressureFoldout, 0f, 0.5f, controller.PressureFloor, v => controller.PressureFloor = v);
+            CreateSlider(pressureFoldout, 0f, 0.5f, controller.PressureFloor, v => controller.PressureFloor = v,
+                "Minimum effect a stylus stroke has, even at the very lightest touch.");
             CreateLabel(pressureFoldout, "Curve (Sensitive <-> Gradual)", 12, FontStyle.Normal);
-            CreateSlider(pressureFoldout, 0.5f, 3f, controller.PressureCurve, v => controller.PressureCurve = v);
+            CreateSlider(pressureFoldout, 0.5f, 3f, controller.PressureCurve, v => controller.PressureCurve = v,
+                "How quickly effect ramps up with pressure - low is sensitive to a light touch, high needs more pressure before it responds.");
 
             // Read through a local that tolerates null rather than dereferencing
             // controller.Mirror three times: an exception thrown from anywhere in BuildUI
@@ -679,27 +710,27 @@ namespace Sculpting
             MirrorController mirror = controller.Mirror;
             CreateLabel(panel.transform, "Mirror (Selected Object)", 14, FontStyle.Normal);
             _mirrorXToggle = CreateToggle(panel.transform, "Mirror X", mirror != null && mirror.MirrorX,
-                v => SetMirrorAxis(0, v), out _, MirrorXColor);
+                v => SetMirrorAxis(0, v), out _, MirrorXColor, "Sculpts both sides of the X axis at once.");
             _mirrorYToggle = CreateToggle(panel.transform, "Mirror Y", mirror != null && mirror.MirrorY,
-                v => SetMirrorAxis(1, v), out _, MirrorYColor);
+                v => SetMirrorAxis(1, v), out _, MirrorYColor, "Sculpts both sides of the Y axis at once.");
             _mirrorZToggle = CreateToggle(panel.transform, "Mirror Z", mirror != null && mirror.MirrorZ,
-                v => SetMirrorAxis(2, v), out _, MirrorZColor);
+                v => SetMirrorAxis(2, v), out _, MirrorZColor, "Sculpts both sides of the Z axis at once.");
             // Applied scene-wide, not to the selection alone - see
             // MirrorController.SetShowPlanesForAll for why a per-object visibility toggle
             // reads as broken.
             _showPlanesToggle = CreateToggle(panel.transform, "Show Mirror Planes", mirror == null || mirror.ShowPlanes,
-                MirrorController.SetShowPlanesForAll, out _);
+                MirrorController.SetShowPlanesForAll, out _, tooltip: "Draws the active mirror plane(s) in the viewport.");
 
             BuildSymmetrySection(panel.transform);
 
             CreateToggle(panel.transform, "Wireframe (Scene View)", controller.ShowWireframeGizmo,
-                v => controller.ShowWireframeGizmo = v, out _);
+                v => controller.ShowWireframeGizmo = v, out _, tooltip: "Draws the mesh's wireframe in the Editor's Scene view (not the Game view).");
             CreateToggle(panel.transform, "Log Ray Hits", controller.LogRayHits,
-                v => controller.LogRayHits = v, out _);
+                v => controller.LogRayHits = v, out _, tooltip: "Prints brush raycast hits to the console - a debugging aid.");
 
             var undoRedoRow = CreateRow(panel.transform);
-            _undoButton = CreateButton(undoRedoRow.transform, "Undo (Z)", () => controller.Undo());
-            _redoButton = CreateButton(undoRedoRow.transform, "Redo (Shift+Z)", () => controller.Redo());
+            _undoButton = CreateButton(undoRedoRow.transform, "Undo (Z)", () => controller.Undo(), "Undoes the last sculpting action.");
+            _redoButton = CreateButton(undoRedoRow.transform, "Redo (Shift+Z)", () => controller.Redo(), "Redoes the last undone action.");
 
             // Undo depth is a setting rather than a constant because its cost is entirely
             // workload-dependent: brush strokes store only the vertices they touched, so hundreds
@@ -709,14 +740,15 @@ namespace Sculpting
             // megabytes there is no way to tell which of the two limits you are actually against.
             CreateLabel(panel.transform, "Undo Steps", 14, FontStyle.Normal);
             CreateSlider(panel.transform, EditHistory.MinSteps, EditHistory.HardMaxSteps,
-                controller.UndoSteps, v => controller.UndoSteps = Mathf.RoundToInt(v));
+                controller.UndoSteps, v => controller.UndoSteps = Mathf.RoundToInt(v),
+                "How many past actions the undo history keeps, up to a hard memory ceiling regardless of this number.");
             // Populated here rather than left for the first Update: RefreshHistoryLabel is
             // throttled, and the panel gets rebuilt from scratch on a scene load, so an empty
             // initial string would leave the readout blank for up to half a second every time.
             _historyLabel = CreateLabel(panel.transform, SculptController.HistorySummary, 11, FontStyle.Italic);
             _nextHistoryRefresh = 0f;
 
-            CreateButton(panel.transform, "Reset Mesh", () => controller.ResetMesh());
+            CreateButton(panel.transform, "Reset Mesh", () => controller.ResetMesh(), "Resets the selected object back to its original unsculpted shape.");
 
             CreateLabel(panel.transform, "Export", 14, FontStyle.Normal);
             CreateButton(panel.transform, "Export OBJ", () =>
@@ -725,16 +757,18 @@ namespace Sculpting
                 _exportStatusLabel.text = path != null
                     ? "Saved to Desktop/SculptExports/" + System.IO.Path.GetFileName(path)
                     : "Export failed - no mesh yet";
-            });
+            }, "Saves the selected mesh as an OBJ file to Desktop/SculptExports.");
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
             _remeshResolutionSlider = CreateSlider(panel.transform, 4f, SculptController.MaxRemeshResolution, controller.RemeshResolution,
-                v => controller.RemeshResolution = Mathf.RoundToInt(v));
-            CreateButton(panel.transform, "Remesh", () => controller.Remesh());
+                v => controller.RemeshResolution = Mathf.RoundToInt(v),
+                "Voxel density used by Remesh - higher captures finer detail but is slower. Also adjustable by holding R and dragging.");
+            CreateButton(panel.transform, "Remesh", () => controller.Remesh(),
+                "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R.");
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  8 Pose  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask (Esc cancels)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  8 Pose  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
@@ -833,35 +867,43 @@ namespace Sculpting
             // no other entry point in the panel at all - collapsed, the feature is invisible
             // unless you already know it exists. The panel scrolls, so the extra height costs
             // nothing but a little scrolling.
-            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Hide / Region Select", true);
+            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Hide / Trim / Region Select", true);
 
             CreateLabel(foldout,
-                "Drag a shape out from the cursor to hide or mask\nwhat it covers, front and back. RMB or Ctrl reverses\n(show/unmask), Shift acts OUTSIDE the shape, a click\nwith no drag resets, Esc cancels.",
+                "Drag a shape out from the cursor to hide, mask or trim\nwhat it covers, front and back. RMB or Ctrl reverses\n(show/unmask, or keep the covered part when trimming),\nShift acts OUTSIDE the shape, a click with no drag\nresets, Esc cancels.",
                 11, FontStyle.Italic);
 
             var hideRow = CreateRow(foldout);
             _boxHideButtonImage = CreateButton(hideRow.transform, "Box Hide (H)",
-                () => ToggleRegionMode(RegionSelectMode.BoxHide)).GetComponent<Image>();
+                () => ToggleRegionMode(RegionSelectMode.BoxHide), "Drag a box to hide the geometry it covers.").GetComponent<Image>();
             _lassoHideButtonImage = CreateButton(hideRow.transform, "Lasso Hide",
-                () => ToggleRegionMode(RegionSelectMode.LassoHide)).GetComponent<Image>();
+                () => ToggleRegionMode(RegionSelectMode.LassoHide), "Draw a freeform outline to hide the geometry it covers.").GetComponent<Image>();
 
             var maskRow = CreateRow(foldout);
             _boxMaskButtonImage = CreateButton(maskRow.transform, "Box Mask (N)",
-                () => ToggleRegionMode(RegionSelectMode.BoxMask)).GetComponent<Image>();
+                () => ToggleRegionMode(RegionSelectMode.BoxMask), "Drag a box to mask the geometry it covers.").GetComponent<Image>();
             _lassoMaskButtonImage = CreateButton(maskRow.transform, "Lasso Mask",
-                () => ToggleRegionMode(RegionSelectMode.LassoMask)).GetComponent<Image>();
+                () => ToggleRegionMode(RegionSelectMode.LassoMask), "Draw a freeform outline to mask the geometry it covers.").GetComponent<Image>();
+
+            var trimRow = CreateRow(foldout);
+            _boxTrimButtonImage = CreateButton(trimRow.transform, "Box Trim (T)",
+                () => ToggleRegionMode(RegionSelectMode.BoxTrim),
+                "Drag a box to CUT AWAY the geometry it covers, closing the hole behind it. RMB or Ctrl keeps the covered part instead. Undoable.").GetComponent<Image>();
+            _lassoTrimButtonImage = CreateButton(trimRow.transform, "Lasso Trim",
+                () => ToggleRegionMode(RegionSelectMode.LassoTrim),
+                "Draw a freeform outline to CUT AWAY the geometry it covers, closing the hole behind it. RMB or Ctrl keeps the covered part instead. Undoable.").GetComponent<Image>();
 
             var actionRow = CreateRow(foldout);
             _showAllButton = CreateButton(actionRow.transform, "Show All", () =>
             {
                 SculptableMesh target = SelectedMesh();
                 if (target != null) target.ShowAllGeometry();
-            });
+            }, "Un-hides all geometry on the selected object.");
             _invertVisibleButton = CreateButton(actionRow.transform, "Invert Visible", () =>
             {
                 SculptableMesh target = SelectedMesh();
                 if (target != null) target.InvertVisibleGeometry();
-            });
+            }, "Swaps hidden and visible geometry on the selected object.");
 
             _regionStatusLabel = CreateLabel(foldout, "", 11, FontStyle.Italic);
             RefreshRegionButtons();
@@ -882,6 +924,8 @@ namespace Sculpting
             _lassoHideButtonImage.color = m == RegionSelectMode.LassoHide ? RegionHideActiveColor : UIFactory.InactiveColor;
             _boxMaskButtonImage.color = m == RegionSelectMode.BoxMask ? MaskActiveColor : UIFactory.InactiveColor;
             _lassoMaskButtonImage.color = m == RegionSelectMode.LassoMask ? MaskActiveColor : UIFactory.InactiveColor;
+            _boxTrimButtonImage.color = m == RegionSelectMode.BoxTrim ? RegionTrimActiveColor : UIFactory.InactiveColor;
+            _lassoTrimButtonImage.color = m == RegionSelectMode.LassoTrim ? RegionTrimActiveColor : UIFactory.InactiveColor;
         }
 
         /// Follows the tool once per frame: the mode can change from a hotkey (H/N, or any
@@ -915,9 +959,10 @@ namespace Sculpting
         }
 
         /// The armed-mode pointer. Tinted like the mode it belongs to (teal for hide, orange for
-        /// mask) so the crosshair says WHICH gesture is armed, not merely that one is - the
-        /// panel's highlighted button is the other half of that, and it can be scrolled out of
-        /// sight or collapsed inside its foldout.
+        /// mask, red for trim) so the crosshair says WHICH gesture is armed, not merely that one
+        /// is - the panel's highlighted button is the other half of that, and it can be scrolled
+        /// out of sight or collapsed inside its foldout. It matters most for trim, where the
+        /// crosshair is the only thing on screen saying the next drag deletes geometry.
         private void UpdateRegionCrosshair()
         {
             if (_regionCrosshairGO == null) return;
@@ -927,7 +972,10 @@ namespace Sculpting
             if (!show) return;
 
             _regionCrosshairRect.position = controller.RegionCrosshairScreenPosition;
-            Color tint = _regionSelect != null && _regionSelect.IsHideMode ? RegionHideActiveColor : MaskActiveColor;
+            Color tint = _regionSelect == null ? MaskActiveColor
+                       : _regionSelect.IsTrimMode ? RegionTrimActiveColor
+                       : _regionSelect.IsHideMode ? RegionHideActiveColor
+                       : MaskActiveColor;
             for (int i = 0; i < _regionCrosshairArms.Length; i++)
                 if (_regionCrosshairArms[i] != null) _regionCrosshairArms[i].color = tint;
         }
@@ -979,7 +1027,11 @@ namespace Sculpting
             if (_regionMarqueeGO.activeSelf != show) _regionMarqueeGO.SetActive(show);
             if (!show) return;
 
-            Color tint = _regionSelect.DragRemoves ? RegionRemoveColor
+            // Trim keeps its own red whichever way the modifiers point: for hide and mask, red
+            // means "this drag takes something away", and for trim that is true of BOTH
+            // directions - only which side goes changes.
+            Color tint = _regionSelect.IsTrimMode ? RegionTrimActiveColor
+                : _regionSelect.DragRemoves ? RegionRemoveColor
                 : _regionSelect.IsHideMode ? RegionHideActiveColor
                 : MaskActiveColor;
             if (_regionSelect.DragActsOnOutside) tint = Color.Lerp(tint, Color.white, 0.4f);
@@ -1023,7 +1075,7 @@ namespace Sculpting
             {
                 int axis = i; // captured per iteration, not shared across the three callbacks
                 Button b = CreateButton(axisRow.transform, SymmetryOps.AxisName(axis),
-                    () => controller.SymmetryAxis = axis);
+                    () => controller.SymmetryAxis = axis, "Selects this axis as the symmetry plane for the operations below.");
                 _symmetryAxisImages[i] = b.GetComponent<Image>();
             }
 
@@ -1035,9 +1087,11 @@ namespace Sculpting
             // is safe to let the user push.
             CreateLabel(foldout, "Match Tolerance (tight <-> loose)", 12, FontStyle.Normal);
             CreateSlider(foldout, SymmetryOps.MinToleranceScale, SymmetryOps.MaxToleranceScale,
-                controller.SymmetryToleranceScale, v => controller.SymmetryToleranceScale = v);
+                controller.SymmetryToleranceScale, v => controller.SymmetryToleranceScale = v,
+                "How far apart two vertices can be and still count as a mirrored pair - widen this if halves built separately aren't matching up.");
 
-            CreateButton(foldout, "Check Symmetry", () => SetSymmetryStatus(controller.SymmetryStatus(), Color.white));
+            CreateButton(foldout, "Check Symmetry", () => SetSymmetryStatus(controller.SymmetryStatus(), Color.white),
+                "Reports how many vertices pair up across the symmetry plane, without changing anything.");
 
             // Two rows, two different operations, and the split is the point. "Match Up" nudges
             // vertices onto their counterparts and needs the two halves to already correspond;
@@ -1048,23 +1102,28 @@ namespace Sculpting
             CreateLabel(foldout, "Match Up (keeps topology, needs matching halves)", 12, FontStyle.Normal);
             var mirrorRow = CreateRow(foldout);
             Button posToNeg = CreateButton(mirrorRow.transform, "+X to -X",
-                () => SetSymmetryStatus(controller.MakeSymmetric(true), SymmetryOkColor));
+                () => SetSymmetryStatus(controller.MakeSymmetric(true), SymmetryOkColor),
+                "Nudges the + side's paired vertices to match the - side, keeping topology and mask.");
             Button negToPos = CreateButton(mirrorRow.transform, "-X to +X",
-                () => SetSymmetryStatus(controller.MakeSymmetric(false), SymmetryOkColor));
+                () => SetSymmetryStatus(controller.MakeSymmetric(false), SymmetryOkColor),
+                "Nudges the - side's paired vertices to match the + side, keeping topology and mask.");
             _symPosToNegLabel = posToNeg.GetComponentInChildren<Text>();
             _symNegToPosLabel = negToPos.GetComponentInChildren<Text>();
 
             CreateLabel(foldout, "Cut & Mirror (rebuilds the far side, always works)", 12, FontStyle.Normal);
             var cutRow = CreateRow(foldout);
             Button cutPosToNeg = CreateButton(cutRow.transform, "+X to -X",
-                () => SetSymmetryStatus(controller.MirrorAndWeld(true), SymmetryOkColor));
+                () => SetSymmetryStatus(controller.MirrorAndWeld(true), SymmetryOkColor),
+                "Deletes the - side and rebuilds it as an exact mirror of the + side.");
             Button cutNegToPos = CreateButton(cutRow.transform, "-X to +X",
-                () => SetSymmetryStatus(controller.MirrorAndWeld(false), SymmetryOkColor));
+                () => SetSymmetryStatus(controller.MirrorAndWeld(false), SymmetryOkColor),
+                "Deletes the + side and rebuilds it as an exact mirror of the - side.");
             _symCutPosToNegLabel = cutPosToNeg.GetComponentInChildren<Text>();
             _symCutNegToPosLabel = cutNegToPos.GetComponentInChildren<Text>();
 
             CreateButton(foldout, "Symmetry Cleanup (Snap + Weld)",
-                () => SetSymmetryStatus(controller.SymmetryCleanup(), SymmetryOkColor));
+                () => SetSymmetryStatus(controller.SymmetryCleanup(), SymmetryOkColor),
+                "Snaps near-matching vertices onto the plane and welds seams along it, without moving either side wholesale.");
 
             _symmetryStatusLabel = CreateLabel(foldout,
                 "Check Symmetry reports how many vertices pair across the plane. If most of them " +
@@ -1119,33 +1178,40 @@ namespace Sculpting
             }
 
             CreateLabel(foldout, "Thickness", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0.002f, 0.5f, _extract.ThicknessFraction, v => _extract.ThicknessFraction = v);
+            CreateSlider(foldout, 0.002f, 0.5f, _extract.ThicknessFraction, v => _extract.ThicknessFraction = v,
+                "How thick the extracted shell is, as a fraction of the object's size.");
 
             CreateLabel(foldout, "Offset (sink <-> float)", 12, FontStyle.Normal);
-            CreateSlider(foldout, -0.25f, 0.25f, _extract.OffsetFraction, v => _extract.OffsetFraction = v);
+            CreateSlider(foldout, -0.25f, 0.25f, _extract.OffsetFraction, v => _extract.OffsetFraction = v,
+                "Moves the extracted shell in or out relative to the masked surface.");
 
             CreateLabel(foldout, "Edge Falloff (slab <-> feathered)", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0f, 1f, _extract.FalloffAmount, v => _extract.FalloffAmount = v);
+            CreateSlider(foldout, 0f, 1f, _extract.FalloffAmount, v => _extract.FalloffAmount = v,
+                "How the shell thins toward its border - 0 is a flat slab edge, higher feathers it thinner.");
 
             CreateLabel(foldout, "Border Smoothing", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0f, 20f, _extract.BorderSmoothing, v => _extract.BorderSmoothing = Mathf.RoundToInt(v));
+            CreateSlider(foldout, 0f, 20f, _extract.BorderSmoothing, v => _extract.BorderSmoothing = Mathf.RoundToInt(v),
+                "Smoothing passes applied to the extracted shell's border.");
 
             CreateLabel(foldout, "Surface Smoothing", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0f, 20f, _extract.SurfaceSmoothing, v => _extract.SurfaceSmoothing = Mathf.RoundToInt(v));
+            CreateSlider(foldout, 0f, 20f, _extract.SurfaceSmoothing, v => _extract.SurfaceSmoothing = Mathf.RoundToInt(v),
+                "Smoothing passes applied across the whole extracted surface.");
 
             CreateLabel(foldout, "Shrinkwrap (inner face to body)", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0f, 1f, _extract.Shrinkwrap, v => _extract.Shrinkwrap = v);
+            CreateSlider(foldout, 0f, 1f, _extract.Shrinkwrap, v => _extract.Shrinkwrap = v,
+                "Pulls the shell's inner face back onto the original body's surface.");
 
             CreateLabel(foldout, "Mask Threshold", 12, FontStyle.Normal);
-            CreateSlider(foldout, 0.05f, 0.95f, _extract.MaskThreshold, v => _extract.MaskThreshold = v);
+            CreateSlider(foldout, 0.05f, 0.95f, _extract.MaskThreshold, v => _extract.MaskThreshold = v,
+                "How strongly a vertex must be masked to be included in the extraction.");
 
             CreateToggle(foldout, "Extract Unmasked Instead", _extract.InvertRegion,
-                v => _extract.InvertRegion = v, out _);
+                v => _extract.InvertRegion = v, out _, tooltip: "Extracts the UNmasked area instead of the masked one.");
 
-            CreateButton(foldout, "Preview Extract", () => _extract.BeginPreview());
+            CreateButton(foldout, "Preview Extract", () => _extract.BeginPreview(), "Shows a live preview of the extracted shell using the settings above.");
             var acceptCancelRow = CreateRow(foldout);
-            _extractAcceptButton = CreateButton(acceptCancelRow.transform, "Accept", () => _extract.Accept());
-            _extractCancelButton = CreateButton(acceptCancelRow.transform, "Cancel", () => _extract.Cancel());
+            _extractAcceptButton = CreateButton(acceptCancelRow.transform, "Accept", () => _extract.Accept(), "Turns the preview into a real, separate object.");
+            _extractCancelButton = CreateButton(acceptCancelRow.transform, "Cancel", () => _extract.Cancel(), "Discards the preview without creating anything.");
 
             _extractStatusLabel = CreateLabel(foldout, "", 11, FontStyle.Italic);
             RefreshExtractStatus();
@@ -1264,7 +1330,7 @@ namespace Sculpting
             return t;
         }
 
-        private Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange)
+        private Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange, string tooltip = null)
         {
             var sliderGO = new GameObject("Slider", typeof(RectTransform));
             sliderGO.transform.SetParent(parent, false);
@@ -1318,10 +1384,11 @@ namespace Sculpting
             slider.value = defaultVal;
             slider.onValueChanged.AddListener(v => onChange(v));
 
+            TooltipSystem.Attach(sliderGO, tooltip);
             return slider;
         }
 
-        private Button CreateButton(Transform parent, string label, Action onClick)
+        private Button CreateButton(Transform parent, string label, Action onClick, string tooltip = null)
         {
             var go = new GameObject("Button_" + label, typeof(RectTransform), typeof(Image));
             go.transform.SetParent(parent, false);
@@ -1345,11 +1412,12 @@ namespace Sculpting
             text.color = Color.white;
             text.text = label;
 
+            TooltipSystem.Attach(go, tooltip);
             return btn;
         }
 
         private Toggle CreateToggle(Transform parent, string label, bool defaultVal, Action<bool> onChange,
-            out Text labelText, Color? checkColor = null)
+            out Text labelText, Color? checkColor = null, string tooltip = null)
         {
             var go = new GameObject("Toggle_" + label, typeof(RectTransform));
             go.transform.SetParent(parent, false);
@@ -1394,6 +1462,7 @@ namespace Sculpting
 
             toggle.onValueChanged.AddListener(v => onChange(v));
 
+            TooltipSystem.Attach(go, tooltip);
             return toggle;
         }
 

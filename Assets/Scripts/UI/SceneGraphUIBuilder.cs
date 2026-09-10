@@ -45,6 +45,14 @@ namespace Sculpting
         private Button _subtractButton, _unionButton, _intersectButton;
         private GameObject _confirmModalGO;
 
+        // Timelapse transport - see BuildTimelapseSection. The button's own label is retargeted
+        // between Start and Stop rather than swapping two buttons, so the control never moves
+        // under the cursor mid-session.
+        private Text _timelapseButtonLabel, _timelapseStatus;
+        private bool _timelapseWasRecording;
+
+        private static readonly Color RecordingColor = new Color(0.95f, 0.45f, 0.4f);
+
         // ZSphere blockout section - see BuildZSphereSection. Held as fields only for the parts
         // Update has to keep current: the edit-mode toolbar's highlight, the radius slider (which
         // follows whichever sphere is selected in the viewport), and the status line.
@@ -123,6 +131,11 @@ namespace Sculpting
         // work - there is no other route to Save Scene.
         private GameObject _canvasRoot;
 
+        // Set right before actually closing the app, so OnWantsToQuit's re-entry (Quit() itself
+        // raises wantsToQuit again) lets the second pass through instead of popping the exit
+        // prompt a second time over its own shutdown.
+        private bool _quitConfirmed;
+
         // Start(), not Awake() - reads/uses SelectionManager.AllObjects (via RefreshList),
         // which needs every SculptableMesh's OnEnable to have already registered - see
         // SculptUIBuilder's own Start() remarks for the full reasoning.
@@ -137,7 +150,30 @@ namespace Sculpting
             RefreshList();
             RefreshMultiObjectButtons();
             RefreshToolButtons();
+
+            // Now that the build runs in a real OS window (see the Fullscreen Mode player
+            // setting), it has a native title-bar close button too - without this, that button
+            // would bypass the Exit prompt entirely and close over unsaved work. Skipped in the
+            // Editor: Play Mode has no OS window of its own, and this would instead fire every
+            // time Play is stopped.
+#if !UNITY_EDITOR
+            Application.wantsToQuit += OnWantsToQuit;
+#endif
         }
+
+#if !UNITY_EDITOR
+        private void OnDestroy()
+        {
+            Application.wantsToQuit -= OnWantsToQuit;
+        }
+
+        private bool OnWantsToQuit()
+        {
+            if (_quitConfirmed) return true;
+            ShowExitConfirm();
+            return false;
+        }
+#endif
 
         private void Update()
         {
@@ -156,6 +192,7 @@ namespace Sculpting
             if (_statusClearAt > 0f && Time.unscaledTime >= _statusClearAt) ShowHint();
 
             RefreshZSphereSection();
+            RefreshTimelapseSection(false);
 
             if (_selection == null) return;
             // Cheap once-per-frame poll, same idiom SculptUIBuilder already uses for brush
@@ -174,17 +211,17 @@ namespace Sculpting
             // Docked flush to the top-right corner, full window height, fixed there - no
             // longer draggable (see UIFactory's now-removed DraggablePanel). Sits opposite
             // SculptUIBuilder's Sculpting Tools panel, which docks the same way on the left.
-            float maxHeight = Mathf.Max(300f, Screen.height);
             Transform panel = UIFactory.CreateScrollingPanelCanvas(
-                "SceneGraphCanvas", new Vector2(1f, 1f), Vector2.zero, 260f, maxHeight);
+                "SceneGraphCanvas", new Vector2(1f, 1f), Vector2.zero, 260f);
             _canvasRoot = panel.root.gameObject;
 
             UIFactory.CreateLabel(panel, "Scene", 18, FontStyle.Bold);
 
-            UIFactory.CreateButton(panel, "Import Object...", ImportObject);
-            UIFactory.CreateButton(panel, "Load Scene...", LoadScene);
-            UIFactory.CreateButton(panel, "Save", Save);
-            UIFactory.CreateButton(panel, "Save As...", SaveAs);
+            UIFactory.CreateButton(panel, "Import Object...", ImportObject, "Brings in a mesh file (OBJ/FBX/etc.) from disk as a new sculptable object.");
+            UIFactory.CreateButton(panel, "Load Scene...", LoadScene, "Opens a saved .sculpt scene file, replacing everything currently in the scene.");
+            UIFactory.CreateButton(panel, "Save", Save, "Saves over the current scene file. Prompts for a location the first time.");
+            UIFactory.CreateButton(panel, "Save As...", SaveAs, "Saves the current scene to a new file.");
+            UIFactory.CreateButton(panel, "Exit", ShowExitConfirm, "Closes the app. Offers to save first.");
 
             if (!FileDialog.IsSupported)
             {
@@ -197,11 +234,11 @@ namespace Sculpting
 
             UIFactory.CreateLabel(panel, "Add Primitive", 13, FontStyle.Normal);
             GameObject addRow1 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow1.transform, "Cube", () => Spawn(PrimitiveShapeType.Cube));
-            UIFactory.CreateButton(addRow1.transform, "Sphere", () => Spawn(PrimitiveShapeType.Sphere));
+            UIFactory.CreateButton(addRow1.transform, "Cube", () => Spawn(PrimitiveShapeType.Cube), "Spawns a new sculptable cube.");
+            UIFactory.CreateButton(addRow1.transform, "Sphere", () => Spawn(PrimitiveShapeType.Sphere), "Spawns a new sculptable sphere.");
             GameObject addRow2 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow2.transform, "Cylinder", () => Spawn(PrimitiveShapeType.Cylinder));
-            UIFactory.CreateButton(addRow2.transform, "Capsule", () => Spawn(PrimitiveShapeType.Capsule));
+            UIFactory.CreateButton(addRow2.transform, "Cylinder", () => Spawn(PrimitiveShapeType.Cylinder), "Spawns a new sculptable cylinder.");
+            UIFactory.CreateButton(addRow2.transform, "Capsule", () => Spawn(PrimitiveShapeType.Capsule), "Spawns a new sculptable capsule.");
 
             // A ZSphere rig belongs among the primitives even though it is not one: this is the
             // "start a model from nothing" row, and a blockout is a perfectly ordinary way to
@@ -209,7 +246,8 @@ namespace Sculpting
             // Without an entry here the tool could only be reached by first spawning a primitive
             // to click near, which is exactly backwards for building a figure out of ZSpheres.
             GameObject addRow3 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow3.transform, "ZSphere Rig", StartZSphereRig);
+            UIFactory.CreateButton(addRow3.transform, "ZSphere Rig", StartZSphereRig,
+                "Starts a jointed skeleton of spheres you can pose and grow, then convert into a sculptable mesh - good for blocking out a figure from scratch.");
 
             UIFactory.CreateLabel(panel, "Objects (click=select, Ctrl+click=multi)", 12, FontStyle.Normal);
             var listGO = new GameObject("ObjectList", typeof(RectTransform));
@@ -225,48 +263,110 @@ namespace Sculpting
 
             UIFactory.CreateLabel(panel, "Selected Object", 13, FontStyle.Normal);
             _renameField = UIFactory.CreateInputField(panel, string.Empty, RenameSelected);
-            _cloneButton = UIFactory.CreateButton(panel, "Clone Selected", CloneSelected);
+            _cloneButton = UIFactory.CreateButton(panel, "Clone Selected", CloneSelected, "Duplicates the selected object as a new, independent copy.");
 
             UIFactory.CreateLabel(panel, "Tool", 13, FontStyle.Normal);
             GameObject toolRow = UIFactory.CreateRow(panel, 26f);
-            _sculptModeImg = UIFactory.CreateButton(toolRow.transform, "Sculpt", () => SetGizmoMode(GizmoMode.Sculpt)).GetComponent<Image>();
-            _transposeModeImg = UIFactory.CreateButton(toolRow.transform, "Transpose", () => SetGizmoMode(GizmoMode.Transpose)).GetComponent<Image>();
+            _sculptModeImg = UIFactory.CreateButton(toolRow.transform, "Sculpt", () => SetGizmoMode(GizmoMode.Sculpt),
+                "Brush sculpting on the selected object.").GetComponent<Image>();
+            _transposeModeImg = UIFactory.CreateButton(toolRow.transform, "Transpose", () => SetGizmoMode(GizmoMode.Transpose),
+                "Move/rotate gizmo for repositioning the selected object.").GetComponent<Image>();
             GameObject toolRow2 = UIFactory.CreateRow(panel, 26f);
-            _scaleModeImg = UIFactory.CreateButton(toolRow2.transform, "Scale", () => SetGizmoMode(GizmoMode.Scale)).GetComponent<Image>();
-            _zsphereModeImg = UIFactory.CreateButton(toolRow2.transform, "ZSpheres", () => SetGizmoMode(GizmoMode.ZSphere)).GetComponent<Image>();
+            _scaleModeImg = UIFactory.CreateButton(toolRow2.transform, "Scale", () => SetGizmoMode(GizmoMode.Scale),
+                "Scale gizmo for resizing the selected object.").GetComponent<Image>();
+            _zsphereModeImg = UIFactory.CreateButton(toolRow2.transform, "ZSpheres", () => SetGizmoMode(GizmoMode.ZSphere),
+                "Edits the selected object's ZSphere rig, if it has one.").GetComponent<Image>();
 
             BuildZSphereSection(panel);
 
             UIFactory.CreateLabel(panel, "Mirror Selected Across Sphere", 13, FontStyle.Normal);
             GameObject mirrorRow = UIFactory.CreateRow(panel, 22f);
-            UIFactory.CreateToggle(mirrorRow.transform, "X", _mirrorX, v => _mirrorX = v);
-            UIFactory.CreateToggle(mirrorRow.transform, "Y", _mirrorY, v => _mirrorY = v);
-            UIFactory.CreateToggle(mirrorRow.transform, "Z", _mirrorZ, v => _mirrorZ = v);
-            UIFactory.CreateButton(panel, "Mirror Selected", DoMirror);
+            UIFactory.CreateToggle(mirrorRow.transform, "X", _mirrorX, v => _mirrorX = v, tooltip: "Mirror across the X axis.");
+            UIFactory.CreateToggle(mirrorRow.transform, "Y", _mirrorY, v => _mirrorY = v, tooltip: "Mirror across the Y axis.");
+            UIFactory.CreateToggle(mirrorRow.transform, "Z", _mirrorZ, v => _mirrorZ = v, tooltip: "Mirror across the Z axis.");
+            UIFactory.CreateButton(panel, "Mirror Selected", DoMirror, "Creates a mirrored copy of the selected object across the checked axes.");
 
             UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
-            _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm);
+            _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm,
+                "Merges every selected object into one mesh, deleting the originals.");
 
             // One row of three rather than a button each: they are the same gesture with the
             // same prompt, and the panel already spends a lot of vertical space above this.
             UIFactory.CreateLabel(panel, "Boolean (watertight)", 13, FontStyle.Normal);
             GameObject booleanRow = UIFactory.CreateRow(panel, 26f);
-            _subtractButton = UIFactory.CreateButton(booleanRow.transform, "Subtract", () => ShowBooleanConfirm(BooleanOp.Subtract));
-            _unionButton = UIFactory.CreateButton(booleanRow.transform, "Union", () => ShowBooleanConfirm(BooleanOp.Union));
-            _intersectButton = UIFactory.CreateButton(booleanRow.transform, "Intersect", () => ShowBooleanConfirm(BooleanOp.Intersect));
+            _subtractButton = UIFactory.CreateButton(booleanRow.transform, "Subtract", () => ShowBooleanConfirm(BooleanOp.Subtract),
+                "Cuts the other selected object(s) out of the first.");
+            _unionButton = UIFactory.CreateButton(booleanRow.transform, "Union", () => ShowBooleanConfirm(BooleanOp.Union),
+                "Merges the selected objects into one solid shape.");
+            _intersectButton = UIFactory.CreateButton(booleanRow.transform, "Intersect", () => ShowBooleanConfirm(BooleanOp.Intersect),
+                "Keeps only the volume where the selected objects overlap.");
 
-            // Studio Lighting / Material / Presentation used to be three separate always-open
-            // panels (top-right, bottom-center, bottom-right). Merged into this panel as three
-            // collapsible sections - one panel to dock instead of four, and each section starts
-            // collapsed so the panel stays small until the user opens the one they want. These
-            // builders no longer build their own canvas - they just fill whatever content
-            // transform they're handed (see LightingUIBuilder.BuildContent's remarks).
+            BuildTimelapseSection(panel);
+
+            // Material / Presentation used to be separate always-open panels (bottom-center,
+            // bottom-right). Merged into this panel as collapsible sections - one panel to dock
+            // instead of several, and each section starts collapsed so the panel stays small
+            // until the user opens the one they want. These builders no longer build their own
+            // canvas - they just fill whatever content transform they're handed (see
+            // LightingUIBuilder.BuildContent's remarks).
+            //
+            // Lighting is handed the panel ITSELF rather than a section of its own: the fixed
+            // studio rig it used to wrap is gone, and what is left - Scene Lights and HDRI
+            // Environment - are two unrelated things that were only ever siblings because the rig
+            // was their parent. They make their own top-level foldouts.
             var lighting = FindFirstObjectByType<LightingUIBuilder>();
             var material = FindFirstObjectByType<MaterialUIBuilder>();
             var presentation = FindFirstObjectByType<PostProcessingUIBuilder>();
-            if (lighting != null) lighting.BuildContent(UIFactory.CreateFoldoutSection(panel, "Studio Lighting", false));
+            if (lighting != null) lighting.BuildContent(panel);
             if (material != null) material.BuildContent(UIFactory.CreateFoldoutSection(panel, "Material", false));
             if (presentation != null) presentation.BuildContent(UIFactory.CreateFoldoutSection(panel, "Presentation", false));
+        }
+
+        /// Start/Stop for the sculpting timelapse, so a recording can be driven without leaving
+        /// the app for an editor window.
+        ///
+        /// Editor-only, and hidden rather than disabled in a build: Unity Recorder ships no
+        /// runtime recording API at all (see TimelapseControl), so in a player this button could
+        /// never do anything, and a permanently dead control is worse than no control.
+        private void BuildTimelapseSection(Transform panel)
+        {
+            if (!Application.isEditor) return;
+
+            UIFactory.CreateLabel(panel, "Timelapse", 13, FontStyle.Normal);
+
+            Button button = UIFactory.CreateButton(panel, "Start Timelapse", TimelapseControl.RequestToggle,
+                "Records a timelapse that follows your viewing angle and the part you are " +
+                "sculpting, capturing only while the model is actually changing. Settings live " +
+                "in Window > Sculpting > Timelapse Recorder.");
+            _timelapseButtonLabel = button.GetComponentInChildren<Text>();
+
+            _timelapseStatus = UIFactory.CreateLabel(panel, string.Empty, 11, FontStyle.Italic);
+            _timelapseStatus.color = HintColor;
+
+            RefreshTimelapseSection(true);
+        }
+
+        /// Reflects what the recorder is ACTUALLY doing rather than what was last asked of it -
+        /// the editor window can start and stop the same recording, and the button has to follow
+        /// that rather than track its own presses.
+        private void RefreshTimelapseSection(bool force)
+        {
+            if (_timelapseButtonLabel == null) return;
+
+            bool recording = TimelapseControl.IsRecording;
+            if (force || recording != _timelapseWasRecording)
+            {
+                _timelapseWasRecording = recording;
+                _timelapseButtonLabel.text = recording ? "Stop Timelapse" : "Start Timelapse";
+                _timelapseButtonLabel.color = recording ? RecordingColor : Color.white;
+            }
+
+            // Not gated on the flag above: the frame count inside it changes every frame while
+            // recording, which is exactly the reassurance the line exists to give.
+            string status = recording
+                ? TimelapseControl.Status
+                : (Application.isPlaying ? string.Empty : "Enter Play mode to record.");
+            if (_timelapseStatus.text != status) _timelapseStatus.text = status;
         }
 
         private void Spawn(PrimitiveShapeType type) => _spawner?.SpawnPrimitive(type);
@@ -400,6 +500,51 @@ namespace Sculpting
             }
         }
 
+        /// The Exit button's prompt - also what the OS window's own close button triggers (see
+        /// OnWantsToQuit). Cancel is added automatically by ShowModal, so closing the app always
+        /// has a way back.
+        private void ShowExitConfirm()
+        {
+            UIFactory.ShowModal(
+                "Exit the app?\n\nSave your work first?",
+                null,
+                new UIFactory.ModalChoice("Save and Exit", ExitSaveAndQuit),
+                new UIFactory.ModalChoice("Exit Without Saving", QuitNow));
+        }
+
+        /// Same fallback-to-Save-As as the Save button, except it only actually closes the app
+        /// once the file has been written - a failed save or a cancelled Save As leaves the app
+        /// open rather than quitting over work that was never written to disk.
+        private void ExitSaveAndQuit()
+        {
+            string path = _currentSavePath;
+            if (string.IsNullOrEmpty(path))
+            {
+                path = PickSavePath();
+                if (path == null) return; // cancelled - stay open
+            }
+
+            if (SceneSerializer.Save(path, out string error))
+            {
+                _currentSavePath = path;
+                QuitNow();
+            }
+            else
+            {
+                SetStatus("Save failed: " + error, ErrorColor, hold: false);
+            }
+        }
+
+        private void QuitNow()
+        {
+            _quitConfirmed = true;
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.isPlaying = false;
+#else
+            Application.Quit();
+#endif
+        }
+
         // ----------------------------------------------------------------------- path picking
 
         /// The OS picker where there is one, the fallback field otherwise. Returns null when the
@@ -502,14 +647,16 @@ namespace Sculpting
                 }
                 else
                 {
-                    Button nameBtn = UIFactory.CreateButton(row.transform, obj.name, () => OnRowClicked(obj));
+                    Button nameBtn = UIFactory.CreateButton(row.transform, obj.name, () => OnRowClicked(obj),
+                        "Click to select, Ctrl+click to add to selection, double-click to rename.");
                     nameBtn.GetComponent<Image>().color = _selection.PrimarySelection == obj ? UIFactory.ActiveColor
                         : _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
                     AddDoubleClickHandler(nameBtn.gameObject, () => BeginInlineRename(obj));
                 }
 
-                UIFactory.CreateToggle(row.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v));
-                UIFactory.CreateButton(row.transform, "X", () => _selection.DeleteObject(obj));
+                UIFactory.CreateToggle(row.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v),
+                    tooltip: "Shows or hides this object in the viewport.");
+                UIFactory.CreateButton(row.transform, "X", () => _selection.DeleteObject(obj), "Deletes this object.");
             }
 
             RefreshSelectedObjectControls();
@@ -667,12 +814,17 @@ namespace Sculpting
 
             UIFactory.CreateLabel(foldout, "Edit Mode", 12, FontStyle.Normal);
             GameObject modeRow1 = UIFactory.CreateRow(foldout, 24f);
-            _zsphereModeImages[0] = UIFactory.CreateButton(modeRow1.transform, "Add", () => SetZSphereMode(ZSphereEditMode.Add)).GetComponent<Image>();
-            _zsphereModeImages[1] = UIFactory.CreateButton(modeRow1.transform, "Move", () => SetZSphereMode(ZSphereEditMode.Move)).GetComponent<Image>();
-            _zsphereModeImages[2] = UIFactory.CreateButton(modeRow1.transform, "Scale", () => SetZSphereMode(ZSphereEditMode.Scale)).GetComponent<Image>();
+            _zsphereModeImages[0] = UIFactory.CreateButton(modeRow1.transform, "Add", () => SetZSphereMode(ZSphereEditMode.Add),
+                "Click empty space for a first sphere, then drag off a sphere to grow the next.").GetComponent<Image>();
+            _zsphereModeImages[1] = UIFactory.CreateButton(modeRow1.transform, "Move", () => SetZSphereMode(ZSphereEditMode.Move),
+                "Drag a sphere to reposition it.").GetComponent<Image>();
+            _zsphereModeImages[2] = UIFactory.CreateButton(modeRow1.transform, "Scale", () => SetZSphereMode(ZSphereEditMode.Scale),
+                "Drag a sphere to resize it.").GetComponent<Image>();
             GameObject modeRow2 = UIFactory.CreateRow(foldout, 24f);
-            _zsphereModeImages[3] = UIFactory.CreateButton(modeRow2.transform, "Pose", () => SetZSphereMode(ZSphereEditMode.Pose)).GetComponent<Image>();
-            _zsphereModeImages[4] = UIFactory.CreateButton(modeRow2.transform, "Delete", () => SetZSphereMode(ZSphereEditMode.Delete)).GetComponent<Image>();
+            _zsphereModeImages[3] = UIFactory.CreateButton(modeRow2.transform, "Pose", () => SetZSphereMode(ZSphereEditMode.Pose),
+                "Swing a branch about its parent joint, keeping bone lengths.").GetComponent<Image>();
+            _zsphereModeImages[4] = UIFactory.CreateButton(modeRow2.transform, "Delete", () => SetZSphereMode(ZSphereEditMode.Delete),
+                "Click a sphere to delete it and everything branching from it.").GetComponent<Image>();
 
             // History and Clear sit right under the mode buttons, above everything else: they are
             // what makes the modes safe to experiment with, and a Clear buried at the bottom of a
@@ -680,27 +832,31 @@ namespace Sculpting
             // afraid of pressing.
             GameObject historyRow = UIFactory.CreateRow(foldout, 24f);
             UIFactory.CreateButton(historyRow.transform, "Undo", () =>
-                SetZSphereStatus(_zsphere.UndoRig() ? "Undid the last ZSphere edit." : "Nothing left to undo."));
+                SetZSphereStatus(_zsphere.UndoRig() ? "Undid the last ZSphere edit." : "Nothing left to undo."),
+                "Undoes the last rig edit (also bound to the Z key).");
             UIFactory.CreateButton(historyRow.transform, "Redo", () =>
-                SetZSphereStatus(_zsphere.RedoRig() ? "Redid the last ZSphere edit." : "Nothing to redo."));
+                SetZSphereStatus(_zsphere.RedoRig() ? "Redid the last ZSphere edit." : "Nothing to redo."),
+                "Redoes the last undone rig edit (also bound to Shift+Z).");
             UIFactory.CreateButton(historyRow.transform, "Clear", () =>
             {
                 int had = _zsphere.SphereCount;
                 _zsphere.ClearRig();
                 SetZSphereStatus(had == 0 ? "The rig is already empty." : $"Cleared {had} spheres. Undo (Z) brings them back.");
-            });
+            }, "Removes every sphere in the rig. Undoable.");
             _zsphereUndoLabel = UIFactory.CreateLabel(foldout, string.Empty, 10, FontStyle.Italic);
 
-            UIFactory.CreateToggle(foldout, "Symmetry (X)", _zsphere.SymmetryX, v => _zsphere.SymmetryX = v);
+            UIFactory.CreateToggle(foldout, "Symmetry (X)", _zsphere.SymmetryX, v => _zsphere.SymmetryX = v,
+                tooltip: "Mirrors new spheres across the rig's symmetry plane as you add them.");
 
             // The fix for "extruding down a torso split my spine into two spheres" - see
             // ZSphereController.CentreSnap. Exposed rather than hard-coded because the right band
             // depends on how the user drags: a steady hand wants it small so limbs split readily,
             // a tablet-and-wrist one wants it wide.
             UIFactory.CreateLabel(foldout, "Centre Snap (of radius)", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(foldout, 0f, 1f, _zsphere.CentreSnap, v => _zsphere.CentreSnap = v);
+            UIFactory.CreateSlider(foldout, 0f, 1f, _zsphere.CentreSnap, v => _zsphere.CentreSnap = v,
+                "How close to the symmetry plane a sphere must be dragged before it pins to the centre line instead of splitting into a mirrored pair.");
             UIFactory.CreateButton(foldout, "Snap Selected to Centre",
-                () => SetZSphereStatus(_zsphere.CentreSelected()));
+                () => SetZSphereStatus(_zsphere.CentreSelected()), "Pins the selected sphere onto the symmetry plane.");
 
             // Symmetry only twins spheres AS THEY ARE CREATED, so a rig built with it off - or
             // built before the mirror plane was anchored to the root sphere - stays one-sided
@@ -711,7 +867,7 @@ namespace Sculpting
                 SetZSphereStatus(made == 0
                     ? "Nothing to mirror - every off-centre sphere already has a twin."
                     : $"Mirrored {made} spheres across the X plane.");
-            });
+            }, "Gives every off-centre sphere a mirrored twin, for a rig that was built without Symmetry on.");
 
             // A rig started before there was an object to anchor to - or started when a different
             // object was selected - keeps whatever plane it was given. This re-seats it on the
@@ -720,7 +876,7 @@ namespace Sculpting
             UIFactory.CreateButton(foldout, "Centre Plane on Sculpt Object", () =>
                 SetZSphereStatus(_zsphere.ReanchorSymmetryPlane()
                     ? "Symmetry plane moved onto the sculpt object. Spheres unchanged."
-                    : "No sculpt object to centre on."));
+                    : "No sculpt object to centre on."), "Re-centres the mirror plane on the attached object without moving any spheres.");
 
             // Attach - see ZSphereController.AttachToObject. Placed after the symmetry controls
             // because attaching re-seats the mirror plane onto the object it binds to, so the two
@@ -734,42 +890,46 @@ namespace Sculpting
                 SetZSphereStatus(_zsphere.AttachToObject(target)
                     ? $"Attached to {target.name}. Click its surface to place spheres on it."
                     : "Could not attach to that object.");
-            });
+            }, "Binds the rig to the selected object, so clicks land on its surface and it re-centres the symmetry plane.");
             UIFactory.CreateButton(attachRow.transform, "Detach", () =>
             {
                 bool had = _zsphere.AttachTarget != null;
                 _zsphere.DetachFromObject();
                 SetZSphereStatus(had ? "Detached. Spheres left where they are." : "Nothing was attached.");
-            });
+            }, "Unbinds the rig from its attached object. Spheres are left where they are.");
             UIFactory.CreateToggle(foldout, "Snap Spheres to Surface", _zsphere.SnapToSurface,
-                v => _zsphere.SnapToSurface = v);
+                v => _zsphere.SnapToSurface = v, tooltip: "Keeps placed spheres pinned to the attached object's surface.");
             _zsphereAttachLabel = UIFactory.CreateLabel(foldout, string.Empty, 10, FontStyle.Italic);
 
             UIFactory.CreateLabel(foldout, "Child Size (of parent)", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(foldout, 0.2f, 1.5f, _zsphere.ChildTaper, v => _zsphere.ChildTaper = v);
+            UIFactory.CreateSlider(foldout, 0.2f, 1.5f, _zsphere.ChildTaper, v => _zsphere.ChildTaper = v,
+                "Default radius of a newly grown sphere, relative to its parent's.");
 
             UIFactory.CreateLabel(foldout, "Selected Sphere Radius", 12, FontStyle.Normal);
             _zsphereRadiusSlider = UIFactory.CreateSlider(foldout, ZSphereController.MinNodeRadius, 2f,
-                _zsphere.SelectedRadius, v => _zsphere.SelectedRadius = v);
+                _zsphere.SelectedRadius, v => _zsphere.SelectedRadius = v, "Radius of the currently selected sphere.");
 
             UIFactory.CreateLabel(foldout, "Skin Resolution", 12, FontStyle.Normal);
             UIFactory.CreateSlider(foldout, ZSphereSkinner.MinResolution, ZSphereSkinner.MaxResolution,
-                _zsphere.Resolution, v => _zsphere.Resolution = Mathf.RoundToInt(v));
+                _zsphere.Resolution, v => _zsphere.Resolution = Mathf.RoundToInt(v), "Voxel density of the mesh generated from the rig - higher is more detailed but slower.");
             UIFactory.CreateToggle(foldout, "Adaptive Resolution", _zsphere.AdaptiveResolution,
-                v => _zsphere.AdaptiveResolution = v);
+                v => _zsphere.AdaptiveResolution = v, tooltip: "Automatically scales resolution to the rig's size instead of using a fixed value.");
 
             UIFactory.CreateLabel(foldout, "Joint Blend", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(foldout, 0f, 1f, _zsphere.Blend, v => _zsphere.Blend = v);
+            UIFactory.CreateSlider(foldout, 0f, 1f, _zsphere.Blend, v => _zsphere.Blend = v,
+                "How smoothly the skin blends where two spheres meet at a joint.");
 
             UIFactory.CreateLabel(foldout, "Skin Smoothing", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(foldout, 0f, 12f, _zsphere.Smoothing, v => _zsphere.Smoothing = Mathf.RoundToInt(v));
+            UIFactory.CreateSlider(foldout, 0f, 12f, _zsphere.Smoothing, v => _zsphere.Smoothing = Mathf.RoundToInt(v),
+                "Extra smoothing passes applied to the generated skin surface.");
 
-            UIFactory.CreateToggle(foldout, "Live Skin Preview", _zsphere.LivePreview, v => _zsphere.LivePreview = v);
-            UIFactory.CreateButton(foldout, "Update Skin", () => _zsphere.RebuildSkinNow());
+            UIFactory.CreateToggle(foldout, "Live Skin Preview", _zsphere.LivePreview, v => _zsphere.LivePreview = v,
+                tooltip: "Rebuilds the skin mesh automatically as you edit the rig, instead of only on Update Skin.");
+            UIFactory.CreateButton(foldout, "Update Skin", () => _zsphere.RebuildSkinNow(), "Rebuilds the skin mesh from the current rig once.");
 
             UIFactory.CreateToggle(foldout, "Keep Rig After Convert", _zsphere.KeepRigOnConvert,
-                v => _zsphere.KeepRigOnConvert = v);
-            UIFactory.CreateButton(foldout, "Convert to Sculpt Mesh", ConvertZSpheres);
+                v => _zsphere.KeepRigOnConvert = v, tooltip: "Leaves the sphere rig in the scene after converting, instead of removing it.");
+            UIFactory.CreateButton(foldout, "Convert to Sculpt Mesh", ConvertZSpheres, "Bakes the rig into a real sculptable mesh object.");
 
             _zsphereStatusLabel = UIFactory.CreateLabel(foldout, string.Empty, 11, FontStyle.Italic);
 
@@ -995,9 +1155,11 @@ namespace Sculpting
             ShowConfirm($"Join {count} objects into \"{survivorName}\"? It keeps that object's " +
                         "center and symmetry plane. This cannot be undone.", extraContent =>
             {
-                UIFactory.CreateToggle(extraContent, "Remesh after Join", remeshAfter, v => remeshAfter = v);
+                UIFactory.CreateToggle(extraContent, "Remesh after Join", remeshAfter, v => remeshAfter = v,
+                    tooltip: "Rebuilds the joined result on a clean voxel grid, welding away the seams where the objects met.");
                 UIFactory.CreateLabel(extraContent, "Remesh Resolution", 12, FontStyle.Normal);
-                UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v));
+                UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v),
+                    "Voxel density of the post-join remesh - higher is more detailed but slower.");
             }, () => DoJoin(remeshAfter, resolution));
         }
 
@@ -1053,8 +1215,10 @@ namespace Sculpting
                         "above. Undo (Z) restores the shape.", extraContent =>
             {
                 UIFactory.CreateLabel(extraContent, "Voxel Resolution (across the target)", 12, FontStyle.Normal);
-                UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v));
-                UIFactory.CreateToggle(extraContent, "Delete the other objects instead of hiding", deleteOthers, v => deleteOthers = v);
+                UIFactory.CreateSlider(extraContent, 4f, 500f, resolution, v => resolution = Mathf.RoundToInt(v),
+                    "Voxel density the boolean is computed at - higher captures finer cutter detail but is slower.");
+                UIFactory.CreateToggle(extraContent, "Delete the other objects instead of hiding", deleteOthers, v => deleteOthers = v,
+                    tooltip: "Permanently deletes the other selected objects instead of just hiding them (hidden ones can be re-shown from the list).");
             }, () => DoBoolean(op, resolution, deleteOthers));
         }
 

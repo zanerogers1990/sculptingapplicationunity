@@ -715,7 +715,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 60eb6efb953c7dd4c9b4d2f08bc3ef2f, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.LightingRigController
-  studioLightingEnabled: 1
+  studioLightingEnabled: 0
   mode: 0
 --- !u!4 &803899614
 Transform:

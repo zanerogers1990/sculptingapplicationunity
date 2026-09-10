@@ -24,8 +24,12 @@ namespace Sculpting
         private const string CanvasName = "ViewGizmoCanvas";
 
         // Inset far enough from the right edge to clear SceneGraphUIBuilder's panel, which is
-        // docked flush to that edge at 260px wide. Top-right is where this gizmo belongs (it is
-        // where every DCC puts one) and the panel is the only thing already there.
+        // docked flush to that edge at this reference width (see UIFactory.ResponsivePanelWidth
+        // for how it actually scales with the screen - RightPanelWidth is the same floor value
+        // SceneGraphUIBuilder passes in, so running it through the same formula in Refresh()
+        // below tracks the panel's live width instead of assuming it always stays this narrow).
+        // Top-right is where this gizmo belongs (it is where every DCC puts one) and the panel
+        // is the only thing already there.
         private const float RightPanelWidth = 260f;
         private const float ScreenMargin = 14f;
         private const float GizmoBox = 104f;
@@ -81,6 +85,7 @@ namespace Sculpting
 
         private CameraOrbitController _orbit;
         private GameObject _canvasRoot;
+        private RectTransform _gizmoRect;
 
         private readonly RectTransform[] _handleRects = new RectTransform[6];
         private readonly Image[] _cones = new Image[6];
@@ -135,7 +140,9 @@ namespace Sculpting
             var gizmoRect = gizmoGO.GetComponent<RectTransform>();
             gizmoRect.anchorMin = gizmoRect.anchorMax = gizmoRect.pivot = new Vector2(1f, 1f);
             gizmoRect.sizeDelta = new Vector2(GizmoBox, GizmoBox);
-            gizmoRect.anchoredPosition = new Vector2(-(RightPanelWidth + ScreenMargin), -ScreenMargin);
+            _gizmoRect = gizmoRect;
+            // Positioned below by Refresh() (called at the end of this method, then every
+            // LateUpdate after) - see RepositionForPanel's remarks.
 
             // Everything else in here is depth-sorted every frame; the axis lines are not, they
             // just live behind the lot in their own container at sibling index 0. A line to a
@@ -255,7 +262,8 @@ namespace Sculpting
 
         private void BuildProjectionButton(RectTransform gizmoRect)
         {
-            Button btn = UIFactory.CreateButton(gizmoRect, "Persp", ToggleProjection);
+            Button btn = UIFactory.CreateButton(gizmoRect, "Persp", ToggleProjection,
+                "Switches between perspective and orthographic projection.");
             var rect = btn.GetComponent<RectTransform>();
             // Hung off the gizmo's own rect rather than the canvas, so the pair moves together
             // if the gizmo is ever repositioned - and directly under it, where Unity puts the
@@ -268,8 +276,20 @@ namespace Sculpting
             _projText = btn.GetComponentInChildren<Text>();
         }
 
+        /// Keeps the gizmo clear of SceneGraphUIBuilder's panel as it scales with the window -
+        /// see RightPanelWidth's remarks. Run every frame from Refresh() rather than once at
+        /// build time, since the window can now be resized live.
+        private void RepositionForPanel()
+        {
+            if (_gizmoRect == null) return;
+            float panelWidth = UIFactory.ResponsivePanelWidth(RightPanelWidth);
+            _gizmoRect.anchoredPosition = new Vector2(-(panelWidth + ScreenMargin), -ScreenMargin);
+        }
+
         private void Refresh()
         {
+            RepositionForPanel();
+
             Camera cam = Camera.main;
             if (cam == null || _handleRects[0] == null) return;
 

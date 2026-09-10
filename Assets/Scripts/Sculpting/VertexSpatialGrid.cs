@@ -90,10 +90,23 @@ namespace Sculpting
             Mathf.FloorToInt(p.y / _cellSize),
             Mathf.FloorToInt(p.z / _cellSize));
 
-        /// Candidate vertex indices within (approximately) radius of center - callers must
-        /// still check exact distance themselves, same as before this class existed. The
-        /// returned list is reused across calls (cleared each time), so consume it before
-        /// querying again.
+        /// Vertex indices whose CURRENT position is within radius of center. The returned list is
+        /// reused across calls (cleared each time), so consume it before querying again.
+        ///
+        /// The result is exact, not approximate: it used to hand back every vertex in every cell
+        /// the padded query box touched and leave the distance test to the caller, which meant the
+        /// list was several times larger than the footprint actually in range - the cell pad below
+        /// is a whole cell wide, cells are sized at half a brush radius, and the vertices of a
+        /// mesh sit on a SURFACE, so the overshoot goes as the square of the radius ratio: about
+        /// 3.6x for an ordinary brush footprint and 1.9x for Clay's much wider relax reach. Every
+        /// one of those surplus indices was then copied into the result, gathered into native
+        /// scratch, given a job slot and re-tested. Testing here instead moves one distance
+        /// computation the callers were already doing anyway and drops everything downstream of it.
+        ///
+        /// Filtering on the vertex's CURRENT position (not on which cell it is bucketed in) is what
+        /// keeps the drift tolerance the pad exists for: a vertex that has moved since it was
+        /// bucketed is found by the padded cell scan and then kept or dropped on where it actually
+        /// is now, which is exactly the right answer.
         public List<int> Query(Vector3 center, float radius)
         {
             _resultBuffer.Clear();
@@ -101,18 +114,72 @@ namespace Sculpting
             // +1 cell of margin tolerates a vertex having drifted out of its original bucket
             // since this grid was built (see class remarks).
             float padded = radius + _cellSize;
+            float paddedSqr = padded * padded;
+            float radiusSqr = radius * radius;
             Vector3Int cmin = CellOf(center - Vector3.one * padded);
             Vector3Int cmax = CellOf(center + Vector3.one * padded);
 
             for (int z = cmin.z; z <= cmax.z; z++)
-            for (int y = cmin.y; y <= cmax.y; y++)
-            for (int x = cmin.x; x <= cmax.x; x++)
             {
-                if (_cells.TryGetValue(new Vector3Int(x, y, z), out List<int> list))
-                    _resultBuffer.AddRange(list);
+                AxisSpans(center.z, z, out float nearZ, out float farZ);
+                float nearZSqr = nearZ * nearZ, farZSqr = farZ * farZ;
+                if (nearZSqr > paddedSqr) continue;
+
+                for (int y = cmin.y; y <= cmax.y; y++)
+                {
+                    AxisSpans(center.y, y, out float nearY, out float farY);
+                    float nearZYSqr = nearZSqr + nearY * nearY;
+                    if (nearZYSqr > paddedSqr) continue;
+                    float farZYSqr = farZSqr + farY * farY;
+
+                    for (int x = cmin.x; x <= cmax.x; x++)
+                    {
+                        // Reject whole cells that lie outside the query SPHERE but inside the
+                        // enclosing box the loop bounds describe - there is a lot of box outside
+                        // the sphere, and this is an exact rejection: a cell whose nearest point is
+                        // further than the padded radius cannot hold an in-range vertex.
+                        AxisSpans(center.x, x, out float nearX, out float farX);
+                        if (nearZYSqr + nearX * nearX > paddedSqr) continue;
+
+                        if (!_cells.TryGetValue(new Vector3Int(x, y, z), out List<int> list)) continue;
+
+                        // A cell whose FARTHEST corner is still inside the radius cannot hold an
+                        // out-of-range vertex, so the interior of a footprint - which is most of
+                        // it - is copied in bulk with no per-vertex test at all. Only the rim
+                        // cells, the ones the sphere actually cuts through, pay for one.
+                        if (farZYSqr + farX * farX <= radiusSqr)
+                        {
+                            _resultBuffer.AddRange(list);
+                            continue;
+                        }
+
+                        for (int k = 0; k < list.Count; k++)
+                        {
+                            int vi = list[k];
+                            Vector3 p = _vertices[vi];
+                            float dx = p.x - center.x, dy = p.y - center.y, dz = p.z - center.z;
+                            if (dx * dx + dy * dy + dz * dz > radiusSqr) continue;
+                            _resultBuffer.Add(vi);
+                        }
+                    }
+                }
             }
 
             return _resultBuffer;
+        }
+
+        /// Distances from `coord` to the nearest and farthest points of cell `cell` along one
+        /// axis. `near` is 0 when the coordinate lies inside the cell's own span.
+        private void AxisSpans(float coord, int cell, out float near, out float far)
+        {
+            float lo = cell * _cellSize;
+            float hi = lo + _cellSize;
+            float toLo = coord - lo, toHi = coord - hi;
+            float absLo = toLo < 0f ? -toLo : toLo;
+            float absHi = toHi < 0f ? -toHi : toHi;
+
+            near = coord < lo ? lo - coord : (coord > hi ? coord - hi : 0f);
+            far = absLo > absHi ? absLo : absHi;
         }
     }
 }

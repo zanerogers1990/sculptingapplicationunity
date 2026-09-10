@@ -313,8 +313,14 @@ namespace Sculpting
         // learned from a prior bug in SignedDistanceField's triangle-binning grid, which reused
         // an unrelated cell size and bloated badly on a coarse source mesh (see
         // [[project_scene_graph_epic]] memory, remesh perf work).
+        /// How many times the triangle grid has been rebuilt from scratch. Diagnostic only - a
+        /// rebuild is O(total triangle count) and lands inside whatever frame triggered it, so
+        /// this is the number to look at when a stroke is smooth on average but hitches.
+        public int TriangleGridRebuilds { get; private set; }
+
         private void RebuildTriangleGrid()
         {
+            TriangleGridRebuilds++;
             const float TargetTrianglesPerCell = 8f;
             Bounds b = _mesh.bounds;
             float volume = Mathf.Max(b.size.x * b.size.y * b.size.z, 1e-9f);
@@ -533,6 +539,11 @@ namespace Sculpting
         /// EndMaskedTransform, the only user today.
         public void ApplyVertices(bool fullRebuild)
         {
+            // The whole-mesh counterpart of the report in ApplyDirtyVertexList - this is the path
+            // Remesh, Trim, boolean subtract, mirror and the masked transforms take, and the
+            // timelapse would otherwise sit paused through all of them.
+            SculptActivity.ReportEdit(this);
+
             _mesh.vertices = _workingVertices;
             if (_anyHidden)
             {
@@ -564,6 +575,13 @@ namespace Sculpting
             // straight into the GPU buffer (see GpuVertexScatter/_cavityColors remarks), so
             // skipping this would revert the mask/cavity tint to whatever Unity last knew.
             _mesh.colors = _cavityColors;
+
+            // This path uploaded the WHOLE vertex buffer, so every vertex is now in sync - the
+            // drift baseline ApplyVerticesLocal measures against has to say so, or the first
+            // stroke afterwards would skip vertices it wrongly believed were still stale.
+            EnsureSyncBuffer();
+            Array.Copy(_workingVertices, _syncedVertices, _workingVertices.Length);
+            _syncFilterSuspended = false;
         }
 
         // The dirty vertices plus their direct one-ring neighbors - the set of vertices whose
@@ -572,9 +590,30 @@ namespace Sculpting
         // the normal pass, the cavity pass and the scatter; normals and cavity each used to
         // build their own private copy of this identical set, which meant walking every dirty
         // vertex's adjacency twice for no difference in the result.
-        private readonly HashSet<int> _dirtyNormalScratch = new HashSet<int>();
+        // Stamp-marking rather than a HashSet: this set is built once and then walked three times
+        // (normals, cavity, GPU scatter), and at brush-footprint sizes on a dense mesh the hash
+        // was costing real time on both ends - measured 2.0ms to BUILD a 35,696-entry set on a
+        // 270k-triangle mesh, before any of the three walks over its scattered buckets. A
+        // per-vertex "which build was I last added in" stamp gives the same
+        // add-once-if-not-present semantics with an array write, and leaves the members in a
+        // flat List that the three consumers walk in order. The generation counter avoids having
+        // to clear the stamp array between calls.
+        private readonly List<int> _affectedList = new List<int>();
+        private int[] _affectedStamp;
+        private int _affectedGeneration;
 
-        /// Fills _dirtyNormalScratch with the dirty vertices and their direct neighbors. That
+        private void BeginAffectedSet()
+        {
+            if (_affectedStamp == null || _affectedStamp.Length != _workingVertices.Length)
+            {
+                _affectedStamp = new int[_workingVertices.Length];
+                _affectedGeneration = 0;
+            }
+            _affectedGeneration++;
+            _affectedList.Clear();
+        }
+
+        /// Fills _affectedList with the dirty vertices and their direct neighbors. That
         /// scope is already exactly right for both consumers, no wider walk needed: a vertex's
         /// normal only changes when one of its incident triangles changes shape, and two
         /// vertices share a triangle iff they're adjacent; a vertex's cavity value only changes
@@ -583,13 +622,30 @@ namespace Sculpting
         private void BuildAffectedSet(List<int> dirtyVertices)
         {
             EnsureAdjacency();
-            _dirtyNormalScratch.Clear();
+            BeginAffectedSet();
+
+            // AddAffected's body inlined with the stamp array, generation and member list hoisted
+            // into locals. This runs (1 + valence) times per dirty vertex - roughly seven calls
+            // each, so under a wide stroke it is the single most-executed statement in the apply
+            // path, and every call was reloading three fields to do two array touches.
+            int[] stamp = _affectedStamp;
+            int generation = _affectedGeneration;
+            List<int> affected = _affectedList;
+            int[][] adjacency = _adjacency;
+
             for (int k = 0; k < dirtyVertices.Count; k++)
             {
                 int vi = dirtyVertices[k];
-                _dirtyNormalScratch.Add(vi);
-                int[] neighbors = _adjacency[vi];
-                for (int i = 0; i < neighbors.Length; i++) _dirtyNormalScratch.Add(neighbors[i]);
+                if (stamp[vi] != generation) { stamp[vi] = generation; affected.Add(vi); }
+
+                int[] neighbors = adjacency[vi];
+                for (int i = 0; i < neighbors.Length; i++)
+                {
+                    int ni = neighbors[i];
+                    if (stamp[ni] == generation) continue;
+                    stamp[ni] = generation;
+                    affected.Add(ni);
+                }
             }
         }
 
@@ -601,18 +657,78 @@ namespace Sculpting
         /// whole mesh. Reads the set BuildAffectedSet just filled. See ApplyVerticesLocal.
         private void RecomputeNormalsLocal()
         {
-            foreach (int i in _dirtyNormalScratch)
-                RecomputeNormalAt(i);
+            // Split across cores above a footprint of a thousand or so vertices. Each entry writes
+            // only its OWN normal and reads nothing any other entry writes, so the result is
+            // identical either way - see ParallelPass, which also holds the measurements. The
+            // delegate is cached rather than rebuilt per frame: this runs on every brush frame.
+            ParallelPass.ForRange(_affectedList.Count,
+                _recomputeNormalsRange ?? (_recomputeNormalsRange = RecomputeNormalsRange));
+        }
+
+        // Cached so the closure-free delegate is allocated once, not per brush frame. Null after
+        // a mid-Play recompile, like every other cache on this class - hence the ?? above rather
+        // than an initializer (see the domain-reload note on _adjacency).
+        private Action<int, int> _recomputeNormalsRange;
+        private Action<int, int> _cavityCurvatureRange;
+        private Action<int, int> _cavityEncodeRange;
+
+        private void RecomputeNormalsRange(int start, int end)
+        {
+            // Every array this needs is loaded once and the per-vertex body is inlined, rather
+            // than calling RecomputeNormalAt per entry: the affected set runs to six figures under
+            // a wide brush, and each call was re-loading four fields before it did any work.
+            Vector3[] verts = _workingVertices;
+            Vector3[] normals = _workingNormals;
+            int[] tris = _workingTriangles;
+            int[][] vertexTris = _vertexTriangles;
+            List<int> affected = _affectedList;
+
+            for (int k = start; k < end; k++)
+            {
+                int i = affected[k];
+                int[] incidentTris = vertexTris[i];
+                float sx = 0f, sy = 0f, sz = 0f;
+                for (int t = 0; t < incidentTris.Length; t++)
+                {
+                    int baseIndex = incidentTris[t] * 3;
+                    Vector3 a = verts[tris[baseIndex]];
+                    Vector3 b = verts[tris[baseIndex + 1]];
+                    Vector3 c = verts[tris[baseIndex + 2]];
+                    float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
+                    float e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+                    sx += e1y * e2z - e1z * e2y;
+                    sy += e1z * e2x - e1x * e2z;
+                    sz += e1x * e2y - e1y * e2x;
+                }
+
+                // Degenerate (zero-area) triangles can null out the sum for an isolated vertex -
+                // keep the previous normal rather than collapsing it to zero, the same "leave it
+                // alone" behavior GetNeighborAverage uses for a neighborless vertex.
+                //
+                // Normalized by hand rather than via Vector3.normalized, which has its OWN epsilon
+                // (magnitude < 1e-5, i.e. sqrMagnitude < 1e-10) and silently returns the ZERO
+                // vector below it. That threshold is a hundred times looser than this guard, so any
+                // sum landing in the gap between them passed the guard and then got assigned zero -
+                // exactly the collapse the guard exists to prevent, and a black-shaded vertex on
+                // screen. It takes genuinely sliver-thin triangles to reach, but a dense mesh's
+                // triangles are small enough in absolute terms to get there (measured: 1124
+                // vertices zeroed around a 157k-vertex sphere's pole, where the triangles
+                // degenerate).
+                float sqrMag = sx * sx + sy * sy + sz * sz;
+                if (sqrMag <= 1e-12f) continue;
+                float inv = 1f / Mathf.Sqrt(sqrMag);
+                normals[i] = new Vector3(sx * inv, sy * inv, sz * inv);
+            }
         }
 
         // Face-normal accumulator for RecomputeAllNormalsFromTopology. Its own array rather than
         // summing into _workingNormals directly, so a vertex whose faces cancel out to nothing
-        // (a degenerate sliver - see RecomputeNormalAt) can keep its PREVIOUS normal instead of
+        // (a degenerate sliver - see RecomputeNormalsLocal) can keep its PREVIOUS normal instead of
         // being handed an arbitrary one. Allocated only if that path is ever taken, i.e. only on
         // a whole-mesh reapply while part of the mesh is hidden.
         private Vector3[] _normalAccumScratch;
 
-        /// Whole-mesh version of RecomputeNormalAt. Matches Mesh.RecalculateNormals' own
+        /// Whole-mesh version of RecomputeNormalsLocal. Matches Mesh.RecalculateNormals' own
         /// area-weighted average (a face's raw cross product has magnitude proportional to its
         /// area), but reads the FULL triangle list rather than the mesh's current index buffer -
         /// see ApplyVertices for why that distinction matters while geometry is hidden.
@@ -637,40 +753,13 @@ namespace Sculpting
             for (int i = 0; i < _workingNormals.Length; i++)
             {
                 // Same hand-rolled normalize, epsilon and keep-the-old-value fallback
-                // RecomputeNormalAt uses - see its remarks for why Vector3.normalized's own
+                // RecomputeNormalsLocal uses - see its remarks for why Vector3.normalized's own
                 // epsilon is a hundred times too loose to be safe here.
                 float sqrMag = _normalAccumScratch[i].sqrMagnitude;
                 if (sqrMag > 1e-12f) _workingNormals[i] = _normalAccumScratch[i] / Mathf.Sqrt(sqrMag);
             }
         }
 
-        private void RecomputeNormalAt(int i)
-        {
-            int[] incidentTris = _vertexTriangles[i];
-            Vector3 sum = Vector3.zero;
-            for (int t = 0; t < incidentTris.Length; t++)
-            {
-                int baseIndex = incidentTris[t] * 3;
-                Vector3 a = _workingVertices[_workingTriangles[baseIndex]];
-                Vector3 b = _workingVertices[_workingTriangles[baseIndex + 1]];
-                Vector3 c = _workingVertices[_workingTriangles[baseIndex + 2]];
-                sum += Vector3.Cross(b - a, c - a);
-            }
-            // Degenerate (zero-area) triangles can null out the sum for an isolated vertex -
-            // keep the previous normal rather than collapsing it to zero, same "leave it alone"
-            // behavior GetNeighborAverage uses for a neighborless vertex.
-            //
-            // Normalized by hand rather than via Vector3.normalized, which has its OWN epsilon
-            // (magnitude < 1e-5, i.e. sqrMagnitude < 1e-10) and silently returns the ZERO vector
-            // below it. That threshold is a hundred times looser than this guard, so any sum
-            // landing in the gap between them passed the guard and then got assigned zero -
-            // exactly the collapse the guard exists to prevent, and a black-shaded vertex on
-            // screen. It takes genuinely sliver-thin triangles to reach, but a dense mesh's
-            // triangles are small enough in absolute terms to get there (measured: 1124 vertices
-            // zeroed around a 157k-vertex sphere's pole, where the triangles degenerate).
-            float sqrMag = sum.sqrMagnitude;
-            if (sqrMag > 1e-12f) _workingNormals[i] = sum / Mathf.Sqrt(sqrMag);
-        }
 
         /// Grows the mesh's bounds to include the given vertices' current positions - O(dirty
         /// count) instead of Mesh.RecalculateBounds()'s O(total vertex count) full scan. Bounds
@@ -682,19 +771,33 @@ namespace Sculpting
         private void ExpandBoundsLocal(List<int> dirtyVertices)
         {
             if (dirtyVertices.Count == 0) return;
+
+            // Accumulated into plain locals and compared ONCE at the end, rather than calling
+            // Bounds.Encapsulate per vertex. Encapsulate recomputes the box's centre and extents
+            // from min/max on every call (and this loop read a fresh Bounds struct back out of
+            // the property each time), which is a surprising amount of arithmetic for what is
+            // really six min/max comparisons - measured at 2.6ms of a 30ms apply on a 270k-
+            // triangle mesh, for a step that in the common case changes nothing at all.
             Bounds b = _mesh.bounds;
+            Vector3 min = b.min, max = b.max;
+            Vector3 newMin = min, newMax = max;
+
             for (int k = 0; k < dirtyVertices.Count; k++)
-                b.Encapsulate(_workingVertices[dirtyVertices[k]]);
+            {
+                Vector3 p = _workingVertices[dirtyVertices[k]];
+                if (p.x < newMin.x) newMin.x = p.x; else if (p.x > newMax.x) newMax.x = p.x;
+                if (p.y < newMin.y) newMin.y = p.y; else if (p.y > newMax.y) newMax.y = p.y;
+                if (p.z < newMin.z) newMin.z = p.z; else if (p.z > newMax.z) newMax.z = p.z;
+            }
+
+            if (newMin == min && newMax == max) return;
+            b.SetMinMax(newMin, newMax);
             _mesh.bounds = b;
         }
 
-        // Reused across ApplyVerticesLocal calls so a brush stroke doesn't allocate a fresh
-        // HashSet every frame - cleared and refilled each call, same "grow, don't reallocate"
-        // pattern as the scratch buffers in SculptController.
-        private readonly HashSet<int> _dirtyTriangleScratch = new HashSet<int>();
 
         // Reused across PaintMask calls so a held mask-paint drag doesn't allocate a fresh
-        // HashSet every frame - same pattern as _dirtyTriangleScratch. Holds exactly the
+        // HashSet every frame - same "grow, don't reallocate" pattern. Holds exactly the
         // candidates that passed PaintMask's own dist &lt;= radius check, i.e. the vertices
         // actually touched this call (QueryNear's candidate list is a superset - see its
         // remarks).
@@ -708,13 +811,73 @@ namespace Sculpting
         /// Remesh - see their call sites).
         public void ApplyVerticesLocal(IReadOnlyCollection<int> dirtyVertices)
         {
-            // Copied into a concrete List once, and every step below iterates THAT. Callers pass
-            // a HashSet (the brushes' per-frame dirty set) or an int[] (undo's RestoreDelta), so
-            // walking the parameter directly means an interface-dispatched enumerator per step -
-            // and for the HashSet case a boxed one, i.e. a fresh heap allocation per step per
-            // frame of a held stroke. Five such walks became one.
+            // Copied into a concrete List once, and every step below iterates THAT. Callers on
+            // this overload pass an int[] (undo's RestoreDelta), so walking the parameter directly
+            // means an interface-dispatched enumerator per step. Five such walks became one.
             _dirtyVertexList.Clear();
             foreach (int vi in dirtyVertices) _dirtyVertexList.Add(vi);
+            ApplyDirtyVertexList();
+        }
+
+        /// List overload, taken by every brush (see SculptController's dirty set, which is a flat
+        /// List behind a stamp array for exactly this reason). Copies with one Array.Copy instead
+        /// of walking an interface-dispatched enumerator element by element - at wide-brush
+        /// footprints the dirty set runs to six figures, where the difference is real.
+        public void ApplyVerticesLocal(List<int> dirtyVertices)
+        {
+            if (!ReferenceEquals(dirtyVertices, _dirtyVertexList))
+            {
+                _dirtyVertexList.Clear();
+                _dirtyVertexList.AddRange(dirtyVertices);
+            }
+            ApplyDirtyVertexList();
+        }
+
+        /// Roughly the middle of what just moved, in local space - see the SculptActivity report
+        /// in ApplyDirtyVertexList.
+        ///
+        /// SAMPLED, not summed. The dirty set runs to six figures at wide brush footprints and
+        /// this sits on the brush hot path, while the only consumer is a camera that wants to
+        /// know which end of the model the work is at. A fixed sample cap makes this O(1) whatever
+        /// the footprint, and a stride rather than a prefix so a long stroke's centroid doesn't
+        /// stick to whichever end of the list the dirty set happened to be built from.
+        private Vector3 DirtyCentroidLocal()
+        {
+            const int MaxSamples = 64;
+
+            int count = _dirtyVertexList.Count;
+            int stride = Mathf.Max(1, count / MaxSamples);
+
+            Vector3 sum = Vector3.zero;
+            int taken = 0;
+            for (int i = 0; i < count; i += stride)
+            {
+                sum += _workingVertices[_dirtyVertexList[i]];
+                taken++;
+            }
+
+            // count is guaranteed non-zero by the caller's early-out, so taken is at least 1.
+            return sum / taken;
+        }
+
+        private void ApplyDirtyVertexList()
+        {
+            // Everything below is proportional to how much of the mesh is reported dirty, so the
+            // list is first cut down to the vertices that actually went anywhere - see
+            // FilterToDrifted for the measurements that make this the single biggest win on the
+            // brush hot path.
+            EnsureSyncBuffer();
+            FilterToDrifted(_dirtyVertexList);
+            if (_dirtyVertexList.Count == 0) return;
+
+            // Past FilterToDrifted, geometry demonstrably moved - which is exactly the timelapse
+            // recorder's definition of "the user is sculpting". Reported here rather than from
+            // the brush handlers because every brush funnels through this one method, and
+            // because the filter above has already thrown out the strokes that touched nothing.
+            // Undo/redo also reach this path and are silenced at the source - see EditHistory.
+            // The centroid rides along so the timelapse camera can lean towards the part of the
+            // model being worked on rather than just its middle.
+            SculptActivity.ReportEdit(this, DirtyCentroidLocal());
 
             BuildAffectedSet(_dirtyVertexList);
             RecomputeNormalsLocal();
@@ -729,7 +892,8 @@ namespace Sculpting
             if (_spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length)
                 _spatialGrid.UpdateVertices(_dirtyVertexList);
 
-            if (_triangleGrid != null && _dirtyVertexList.Count > 0)
+            // No Count > 0 test: the early-out above already guarantees it.
+            if (_triangleGrid != null)
             {
                 if (!MeshBoundsFitInsideTriangleGrid())
                 {
@@ -745,14 +909,13 @@ namespace Sculpting
                 }
                 else
                 {
+                    // Driven from the moved VERTICES, not from their incident triangles - the
+                    // grid does its own "did this vertex even change cell" test first and in the
+                    // common case never looks at a triangle at all. See
+                    // TriangleSpatialGrid.UpdateFromMovedVertices.
                     EnsureAdjacency();
-                    _dirtyTriangleScratch.Clear();
-                    for (int k = 0; k < _dirtyVertexList.Count; k++)
-                    {
-                        int[] incident = _vertexTriangles[_dirtyVertexList[k]];
-                        for (int i = 0; i < incident.Length; i++) _dirtyTriangleScratch.Add(incident[i]);
-                    }
-                    _triangleGrid.UpdateTriangles(_dirtyTriangleScratch, _workingVertices, _workingTriangles);
+                    _triangleGrid.UpdateFromMovedVertices(_dirtyVertexList, _vertexTriangles,
+                        _workingVertices, _workingTriangles);
                 }
             }
 
@@ -760,13 +923,25 @@ namespace Sculpting
 
             // Replaces the full _mesh.vertices=/.colors= reassignment (and the .normals=
             // assignment removed above) with a compute-shader scatter write scoped to just the
-            // affected vertices - see GpuVertexScatter remarks. _dirtyNormalScratch is exactly
+            // affected vertices - see GpuVertexScatter remarks. _affectedList is exactly
             // that "dirty ∪ neighbors" set (built once by BuildAffectedSet above and shared with
             // both the normal and cavity passes) - position is redundant-but-harmless for
             // neighbor-only entries whose position didn't change, only their normal/cavity
             // color did.
             EnsureGpuScatter();
-            _gpuScatter.ScatterDirty(_dirtyNormalScratch, _dirtyNormalScratch.Count, _workingVertices, _workingNormals, _cavityColors);
+            _gpuScatter.ScatterDirty(_affectedList, _affectedList.Count, _workingVertices, _workingNormals, _cavityColors);
+
+            // The scatter just made the GPU match the CPU for exactly this set, so this is what
+            // the next call's drift test measures against. The affected set (not just the dirty
+            // list) is right: the scatter uploads a position for every entry in it, including the
+            // neighbours pulled in only for their normal/colour.
+            Vector3[] verts = _workingVertices;
+            Vector3[] synced = _syncedVertices;
+            for (int k = 0; k < _affectedList.Count; k++)
+            {
+                int vi = _affectedList[k];
+                synced[vi] = verts[vi];
+            }
         }
 
         /// Approximates per-vertex concavity/convexity from how far a vertex sits from its
@@ -786,20 +961,42 @@ namespace Sculpting
             EnsureAdjacency();
             EnsureCavityBuffers();
             // Two passes, because the encode step blurs across neighbours: every raw value has
-            // to exist before any of them is read.
+            // to exist before any of them is read. Both are split across cores the same way the
+            // per-stroke version is (see RecomputeCavityLocal) - this one walks the WHOLE mesh,
+            // so it is the single largest cost in Remesh, Trim, Join and a scene load.
+            int vertexCount = _workingVertices.Length;
+            ParallelPass.ForRange(vertexCount,
+                _cavityFullCurvatureRange ?? (_cavityFullCurvatureRange = CavityFullCurvatureRange));
+
+            // Summed on one thread afterwards rather than folded into the pass above: it is a
+            // reduction over the array the pass just filled, and at a few nanoseconds per entry
+            // it is nowhere near worth the partial-sum machinery to split.
             double sum = 0.0; // double, not float - this accumulates millions of terms
-            for (int i = 0; i < _workingVertices.Length; i++)
-            {
-                _cavityRaw[i] = CurvatureAt(i);
-                sum += _cavityRaw[i];
-            }
+            for (int i = 0; i < vertexCount; i++) sum += _cavityRaw[i];
             // The DC term EncodeCavityAt subtracts. Computed only on a full recompute, so a
             // stroke never shifts the whole mesh's tint out from under itself - a brush changes
             // the average curvature of a whole object negligibly, and a mean that drifted every
             // frame would make untouched geometry flicker.
-            _cavityMean = _workingVertices.Length > 0 ? (float)(sum / _workingVertices.Length) : 0f;
+            _cavityMean = vertexCount > 0 ? (float)(sum / vertexCount) : 0f;
 
-            for (int i = 0; i < _workingVertices.Length; i++) EncodeCavityAt(i);
+            ParallelPass.ForRange(vertexCount,
+                _cavityFullEncodeRange ?? (_cavityFullEncodeRange = CavityFullEncodeRange));
+        }
+
+        private Action<int, int> _cavityFullCurvatureRange;
+        private Action<int, int> _cavityFullEncodeRange;
+
+        // The whole-mesh forms of the two cavity passes: index IS the vertex here, where the
+        // per-stroke pair above indexes through _affectedList.
+        private void CavityFullCurvatureRange(int start, int end)
+        {
+            float[] raw = _cavityRaw;
+            for (int i = start; i < end; i++) raw[i] = CurvatureAt(i);
+        }
+
+        private void CavityFullEncodeRange(int start, int end)
+        {
+            for (int i = start; i < end; i++) EncodeCavityAt(i);
         }
 
         private float _cavityMean;
@@ -820,6 +1017,118 @@ namespace Sculpting
         // flattened into a concrete List before anything walks it.
         private readonly List<int> _dirtyVertexList = new List<int>();
 
+        // Where each vertex was the last time ApplyVerticesLocal actually pushed it - i.e. what
+        // the GPU vertex buffer, _workingNormals and _cavityColors currently describe. Every
+        // downstream step in ApplyVerticesLocal (normals, cavity, triangle re-bucketing, GPU
+        // upload) costs the same whether a vertex moved a millimetre or a millionth of one, so
+        // the dirty set is filtered against this before any of them run - see FilterToDrifted.
+        private Vector3[] _syncedVertices;
+        // A freshly allocated sync buffer describes positions from BEFORE this call's movement
+        // for vertices this call is about to touch, so the first call after a topology change or
+        // a mid-Play domain reload skips the filter entirely rather than mistaking "no record
+        // yet" for "hasn't moved".
+        private bool _syncFilterSuspended;
+
+        /// How far a vertex has to drift from its last-pushed position before pushing it again is
+        /// worth doing, as a fraction of the object's own half-extent. Scaled to object size
+        /// rather than to edge length: what decides whether anyone can see the difference is how
+        /// big the error is relative to the object on screen, and that ratio is set by the
+        /// object's extent regardless of how finely it happens to be tessellated.
+        ///
+        /// 1/4000 is off a measured sweep, not picked. On a 270k-triangle sphere under a 30-dab
+        /// Clay stroke, measured against a control run with the filter disabled entirely, it
+        /// leaves the rendered surface at most 0.025% of the object's extent behind the real one
+        /// (comfortably under a pixel at any framing) and the rendered NORMALS at most 0.91
+        /// degrees off, with not one vertex of 139,814 past a full degree - while taking the mean
+        /// dab from 32.1ms to 15.8ms. 1/20000 gave back 10ms of that for error nobody could see
+        /// either way; 1/2000 bought only 3ms more and started putting vertices past a degree of
+        /// normal error, which is where a matcap would begin to show it.
+        private const float ResyncDivisor = 4000f;
+
+        // Derived from _cavityLengthScale, cached rather than recomputed per read: HasVisiblyDrifted
+        // is called once per candidate per dab (hundreds of thousands of times a frame under a wide
+        // brush), and the scale it depends on only moves on a full recompute - see
+        // UpdateCavityLengthScale, which is the one place that writes both.
+        private float _resyncSqrThreshold = (1f / ResyncDivisor) * (1f / ResyncDivisor);
+
+        private float ResyncSqrThreshold => _resyncSqrThreshold;
+
+        // Which _workingVertices INSTANCE the sync buffer was built against. A length check alone
+        // isn't enough: RestoreSnapshot and the replace paths swap in a whole new positions array
+        // that can happen to be the same length as the old one, and a sync buffer carried across
+        // that would be describing a shape the mesh no longer has - which the filter would read
+        // as "nothing moved" and skip. Same rebuild-if-stale treatment _adjacency and
+        // _triangleGrid get for the domain-reload case.
+        private Vector3[] _syncedFor;
+
+        private void EnsureSyncBuffer()
+        {
+            if (_syncedVertices != null && _syncedVertices.Length == _workingVertices.Length &&
+                ReferenceEquals(_syncedFor, _workingVertices)) return;
+
+            _syncedVertices = (Vector3[])_workingVertices.Clone();
+            _syncedFor = _workingVertices;
+            _syncFilterSuspended = true;
+        }
+
+        /// The drift test for one vertex, exposed so a brush that already knows it moves most of
+        /// its footprint imperceptibly can decline to report those vertices dirty at all - which
+        /// skips the HashSet insert as well as everything downstream of it. Clay's surface-relax
+        /// shell is the case this exists for; every other brush is covered by FilterToDrifted
+        /// below, which applies the identical rule to whatever it is handed.
+        public bool HasVisiblyDrifted(int index)
+        {
+            // EnsureSyncBuffer's test inlined rather than called: this runs once per candidate per
+            // dab, and in the ordinary "buffer is already current" case the whole method is now
+            // three compares and a squared distance with no call at all.
+            if (_syncedVertices == null || _syncedVertices.Length != _workingVertices.Length ||
+                !ReferenceEquals(_syncedFor, _workingVertices))
+            {
+                EnsureSyncBuffer();
+                return true;
+            }
+            if (_syncFilterSuspended) return true;
+
+            Vector3 now = _workingVertices[index], last = _syncedVertices[index];
+            float dx = now.x - last.x, dy = now.y - last.y, dz = now.z - last.z;
+            return dx * dx + dy * dy + dz * dz >= _resyncSqrThreshold;
+        }
+
+        /// Drops from the dirty list every vertex whose position still matches what was last
+        /// pushed for it, to within a threshold far below what can be seen - see
+        /// ResyncSqrThreshold. Compares against the last PUSHED position rather than against
+        /// this frame's movement, so error can never accumulate: a vertex nudged a hundredth of
+        /// a threshold per dab still crosses it (and gets fully resynced) after a hundred dabs,
+        /// and the rendered surface is never further than one threshold from the real one.
+        ///
+        /// This exists because of what a Clay dab actually reports as dirty. Clay's surface-relax
+        /// pass (see SculptController.ApplySurfaceRelaxLocal) deliberately reaches 2.5x the brush
+        /// radius to close seams between neighbouring dabs, and by design applies a small residual
+        /// everywhere in that shell. Measured on a 270k-triangle sphere at a 0.25 brush radius: of
+        /// the 101,771 vertices the relax pass touches, 160 move as much as 1% of an edge length
+        /// and the other 99.8% move less than that - yet every one of them was entering the dirty
+        /// set and paying for a normal recompute, a cavity recompute, a triangle re-bucket and a
+        /// GPU upload. Filtering here rather than in the relax pass covers every brush's footprint
+        /// rim with one rule.
+        private void FilterToDrifted(List<int> dirty)
+        {
+            if (_syncFilterSuspended) { _syncFilterSuspended = false; return; }
+
+            float sqrThreshold = _resyncSqrThreshold;
+            Vector3[] verts = _workingVertices;
+            Vector3[] synced = _syncedVertices;
+            int w = 0;
+            for (int k = 0; k < dirty.Count; k++)
+            {
+                int vi = dirty[k];
+                Vector3 now = verts[vi], last = synced[vi];
+                float dx = now.x - last.x, dy = now.y - last.y, dz = now.z - last.z;
+                if (dx * dx + dy * dy + dz * dz < sqrThreshold) continue;
+                dirty[w++] = vi;
+            }
+            dirty.RemoveRange(w, dirty.Count - w);
+        }
+
         /// Same effect as RecomputeCavity(), but only for the given vertices plus their direct
         /// neighbors - a moved vertex changes not just its own cavity value but every
         /// neighbor's too, since their GetNeighborAverage includes it. Measured as the dominant
@@ -834,8 +1143,37 @@ namespace Sculpting
             // slightly stale - that only softens the blur at the footprint's rim by a fraction
             // of a vertex, and widening the recompute by another ring every frame would cost
             // far more than it could possibly be worth.
-            foreach (int i in _dirtyNormalScratch) _cavityRaw[i] = CurvatureAt(i);
-            foreach (int i in _dirtyNormalScratch) EncodeCavityAt(i);
+            //
+            // EnsureAdjacency once for the whole pass rather than per vertex: CurvatureAt used to
+            // call it on every entry, which is two array-length compares per affected vertex for a
+            // condition that cannot change inside a loop that never touches topology.
+            EnsureAdjacency();
+
+            // Two separate splits, never one fused pass: the encode step reads its NEIGHBOURS'
+            // raw curvature, so every raw value has to exist before any of them is read. The
+            // barrier is exactly ParallelPass.ForRange returning.
+            int count = _affectedList.Count;
+            ParallelPass.ForRange(count,
+                _cavityCurvatureRange ?? (_cavityCurvatureRange = CavityCurvatureRange));
+            ParallelPass.ForRange(count,
+                _cavityEncodeRange ?? (_cavityEncodeRange = CavityEncodeRange));
+        }
+
+        private void CavityCurvatureRange(int start, int end)
+        {
+            List<int> affected = _affectedList;
+            float[] raw = _cavityRaw;
+            for (int k = start; k < end; k++)
+            {
+                int i = affected[k];
+                raw[i] = CurvatureAt(i);
+            }
+        }
+
+        private void CavityEncodeRange(int start, int end)
+        {
+            List<int> affected = _affectedList;
+            for (int k = start; k < end; k++) EncodeCavityAt(affected[k]);
         }
 
         /// Discrete mean curvature at a vertex, expressed relative to the object's own size:
@@ -859,13 +1197,16 @@ namespace Sculpting
         /// measure: the same sphere reads the same at any tessellation and any scale, while a
         /// crease far sharper than the object is large saturates and pops, which is what cavity
         /// shading is for.
+        // Callers (RecomputeCavity / RecomputeCavityLocal) call EnsureAdjacency once for the whole
+        // pass - this deliberately does NOT repeat it per vertex; nothing inside a cavity pass can
+        // change topology out from under it.
         private float CurvatureAt(int i)
         {
-            EnsureAdjacency();
+            Vector3[] verts = _workingVertices;
             int[] neighbors = _adjacency[i];
             if (neighbors.Length == 0) return 0f;
 
-            Vector3 p = _workingVertices[i];
+            Vector3 p = verts[i];
             Vector3 n = _workingNormals[i];
 
             // Accumulate first, divide ONCE - not dot(d,n)/|d|^2 per neighbour. Both give the
@@ -877,17 +1218,18 @@ namespace Sculpting
             // values pinned at both 0 and 1. Averaging the offsets and the squared lengths
             // separately keeps the same curvature estimate while letting a stray short edge
             // barely move it.
-            Vector3 offsetSum = Vector3.zero;
+            float ox = 0f, oy = 0f, oz = 0f;
             float sqrLenSum = 0f;
             int counted = 0;
             for (int k = 0; k < neighbors.Length; k++)
             {
-                Vector3 d = _workingVertices[neighbors[k]] - p;
-                float sqrLen = d.sqrMagnitude;
+                Vector3 q = verts[neighbors[k]];
+                float dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+                float sqrLen = dx * dx + dy * dy + dz * dz;
                 // Skip coincident vertices - welded/degenerate geometry does occur, and a NaN
                 // here would propagate into the vertex colours and the rendered mesh.
                 if (sqrLen < 1e-18f) continue;
-                offsetSum += d;
+                ox += dx; oy += dy; oz += dz;
                 sqrLenSum += sqrLen;
                 counted++;
             }
@@ -896,9 +1238,11 @@ namespace Sculpting
             // dot(meanOffset, normal) has units of length; dividing by the mean SQUARED edge
             // length gives 1/length (true curvature); multiplying by the object's extent makes
             // it dimensionless. No square roots anywhere on this path, which matters because it
-            // runs per touched vertex on every stroke.
-            float meanSqrLen = sqrLenSum / counted;
-            return Vector3.Dot(offsetSum / counted, n) / meanSqrLen * _cavityLengthScale;
+            // runs per touched vertex on every stroke. The two per-vertex divides the original
+            // form did (offsetSum/counted, then /meanSqrLen) collapse into one reciprocal: the
+            // 1/counted in the mean offset and the counted in meanSqrLen cancel exactly.
+            float dot = ox * n.x + oy * n.y + oz * n.z;
+            return dot / sqrLenSum * _cavityLengthScale;
         }
 
         /// Characteristic size of the object in LOCAL space, used to make CurvatureAt's true
@@ -910,17 +1254,37 @@ namespace Sculpting
 
         private void UpdateCavityLengthScale()
         {
-            if (_workingVertices == null || _workingVertices.Length == 0) { _cavityLengthScale = 1f; return; }
+            if (_workingVertices == null || _workingVertices.Length == 0)
+            {
+                _cavityLengthScale = 1f;
+                RefreshResyncThreshold();
+                return;
+            }
 
-            Vector3 min = _workingVertices[0], max = _workingVertices[0];
+            // Component-wise min/max in plain floats rather than Vector3.Min/Max: those are method
+            // calls returning a new struct per component pair, and this walks every vertex of the
+            // mesh (millions, on the models this app is meant to handle) on every full recompute.
+            Vector3 first = _workingVertices[0];
+            float minX = first.x, minY = first.y, minZ = first.z;
+            float maxX = minX, maxY = minY, maxZ = minZ;
             for (int i = 1; i < _workingVertices.Length; i++)
             {
-                min = Vector3.Min(min, _workingVertices[i]);
-                max = Vector3.Max(max, _workingVertices[i]);
+                Vector3 p = _workingVertices[i];
+                if (p.x < minX) minX = p.x; else if (p.x > maxX) maxX = p.x;
+                if (p.y < minY) minY = p.y; else if (p.y > maxY) maxY = p.y;
+                if (p.z < minZ) minZ = p.z; else if (p.z > maxZ) maxZ = p.z;
             }
-            Vector3 extents = (max - min) * 0.5f;
-            _cavityLengthScale = Mathf.Max(extents.x, Mathf.Max(extents.y, extents.z));
+
+            _cavityLengthScale = Mathf.Max((maxX - minX) * 0.5f,
+                Mathf.Max((maxY - minY) * 0.5f, (maxZ - minZ) * 0.5f));
             if (_cavityLengthScale < 1e-6f) _cavityLengthScale = 1f;
+            RefreshResyncThreshold();
+        }
+
+        private void RefreshResyncThreshold()
+        {
+            float t = _cavityLengthScale / ResyncDivisor;
+            _resyncSqrThreshold = t * t;
         }
 
         /// Turns raw curvature into the encoded 0..1 vertex-colour value, blurring across the
@@ -936,9 +1300,10 @@ namespace Sculpting
         /// essentially untouched.
         private void EncodeCavityAt(int i)
         {
+            float[] raw = _cavityRaw;
             int[] neighbors = _adjacency[i];
-            float sum = _cavityRaw[i];
-            for (int k = 0; k < neighbors.Length; k++) sum += _cavityRaw[neighbors[k]];
+            float sum = raw[i];
+            for (int k = 0; k < neighbors.Length; k++) sum += raw[neighbors[k]];
             float smoothed = sum / (neighbors.Length + 1);
 
             // Subtracting the mesh-wide mean makes this a high-pass of curvature, which is what
@@ -1000,6 +1365,12 @@ namespace Sculpting
             }
             MaskVersion++;
 
+            // Masking changes what the model looks like and is a deliberate step in the work, so
+            // the timelapse records it - but only when the brush actually touched something, so a
+            // paint drag out over empty space doesn't hold the recording open. Mask painting
+            // never goes near the vertex apply paths that report for the sculpting brushes.
+            if (_paintMaskScratch.Count > 0) SculptActivity.ReportEdit(this, localPoint);
+
             // Held mask-paint drags call this every frame (see SculptController.ApplyMaskPaint),
             // so at high polycounts this needs the same footprint-scoped GPU write
             // ApplyVerticesLocal uses instead of a full _mesh.colors= reassignment - see
@@ -1021,6 +1392,7 @@ namespace Sculpting
             // while dialling a selection in.
             _history.PushMaskInvert();
             EditHistory.RecordMeshEdit(this);
+            SculptActivity.ReportEdit(this);
             InvertMaskWithoutUndo();
         }
 
@@ -1079,6 +1451,9 @@ namespace Sculpting
             if (_paintMaskScratch.Count == 0) return;
 
             MaskVersion++;
+            // Box/lasso masking and Clear Mask, same reasoning as PaintMask's report above. Past
+            // the early-out, so a drag that changed nothing stays out of the timelapse.
+            SculptActivity.ReportEdit(this);
             UploadMaskColors();
             EndStrokeUndo();
         }
@@ -1473,17 +1848,15 @@ namespace Sculpting
         // entries per stroke.
         private readonly List<int> _strokeDeltaIndices = new List<int>();
         private readonly List<Vector3> _strokeDeltaBefore = new List<Vector3>();
-        // Which indices are already recorded THIS stroke - separate from _dirtyVertexScratch-
-        // style per-frame scratch since this has to persist across every frame of a held stroke,
-        // not just one.
-        private readonly HashSet<int> _strokeRecordedIndices = new HashSet<int>();
 
-        // Slot into _strokeDeltaBefore per vertex, or -1 for "not touched this stroke". Turns
-        // the undo accumulator above into an O(1)-readable record of where the surface was when
-        // this stroke began, which is what StrokeStartPosition serves - see its remarks for why
-        // a brush needs that. _strokeRecordedIndices already answers "was it touched", but not
-        // "where was it", and a HashSet lookup plus a linear scan of the parallel lists would be
-        // far too slow for something read once per candidate per dab.
+        // Slot into _strokeDeltaBefore per vertex, or -1 for "not touched this stroke". Serves
+        // two jobs at once: it is the O(1)-readable record of where the surface was when this
+        // stroke began (StrokeStartPosition - see its remarks for why a brush needs that), AND it
+        // is the "have I already recorded this vertex" membership test RecordUndoBeforeIfNeeded
+        // needs. It used to be only the first, with a parallel HashSet<int> answering the second -
+        // which meant a hash probe per touched vertex per dab, and a wide stroke reports hundreds
+        // of thousands of those per frame. A slot of -1 already means exactly "not recorded yet",
+        // so the set was pure duplicated state on the hottest write path in the app.
         private int[] _strokeRecordSlot;
 
         /// Where a vertex was when the CURRENT stroke started, or its live position if this
@@ -1497,6 +1870,31 @@ namespace Sculpting
                 return _workingVertices[index];
             int slot = _strokeRecordSlot[index];
             return slot >= 0 ? _strokeDeltaBefore[slot] : _workingVertices[index];
+        }
+
+        /// Bulk StrokeStartPosition over a whole candidate list. Hoists the null/length guard and
+        /// the two field loads out of a loop that runs once per candidate per dab - at wide-brush
+        /// footprints that loop is hundreds of thousands of iterations a frame, and the guard was
+        /// re-testing the same two unchanged conditions on every one of them.
+        public void CopyStrokeStartPositions(List<int> indices, NativeArray<Vector3> destination)
+        {
+            Vector3[] verts = _workingVertices;
+            int[] slots = _strokeRecordSlot != null && _strokeRecordSlot.Length == verts.Length
+                ? _strokeRecordSlot : null;
+
+            if (slots == null)
+            {
+                for (int k = 0; k < indices.Count; k++) destination[k] = verts[indices[k]];
+                return;
+            }
+
+            List<Vector3> before = _strokeDeltaBefore;
+            for (int k = 0; k < indices.Count; k++)
+            {
+                int i = indices[k];
+                int slot = slots[i];
+                destination[k] = slot >= 0 ? before[slot] : verts[i];
+            }
         }
 
         // The mask equivalent of the three lists above, filled by RecordMaskBeforeIfNeeded and
@@ -1513,7 +1911,6 @@ namespace Sculpting
             ReleaseStrokeSlots();
             _strokeDeltaIndices.Clear();
             _strokeDeltaBefore.Clear();
-            _strokeRecordedIndices.Clear();
         }
 
         /// The mask-paint equivalent, called on mouse-press in mask mode. Separate from
@@ -1557,21 +1954,28 @@ namespace Sculpting
         /// only records once (its value from before the very first touch, not the most recent).
         public void RecordUndoBeforeIfNeeded(int index)
         {
-            if (_strokeRecordedIndices.Add(index))
-            {
-                // Reallocated (and reset) whenever topology changed under us - a Remesh
-                // mid-session leaves the old array sized to the old vertex count, and indexing
-                // it would either throw or, worse, silently return another vertex's slot.
-                if (_strokeRecordSlot == null || _strokeRecordSlot.Length != _workingVertices.Length)
-                {
-                    _strokeRecordSlot = new int[_workingVertices.Length];
-                    for (int i = 0; i < _strokeRecordSlot.Length; i++) _strokeRecordSlot[i] = -1;
-                }
+            EnsureStrokeSlots();
+            if (_strokeRecordSlot[index] >= 0) return;
 
-                _strokeRecordSlot[index] = _strokeDeltaIndices.Count;
-                _strokeDeltaIndices.Add(index);
-                _strokeDeltaBefore.Add(_workingVertices[index]);
-            }
+            _strokeRecordSlot[index] = _strokeDeltaIndices.Count;
+            _strokeDeltaIndices.Add(index);
+            _strokeDeltaBefore.Add(_workingVertices[index]);
+        }
+
+        // Reallocated (and reset) whenever topology changed under us - a Remesh mid-session
+        // leaves the old array sized to the old vertex count, and indexing it would either throw
+        // or, worse, silently return another vertex's slot. Whatever the accumulator held at that
+        // point describes the OLD vertex set, so it is dropped rather than carried across:
+        // restoring those indices into the new topology would corrupt geometry rather than undo
+        // it, and the topology change pushed its own full-mesh entry anyway (SnapshotForUndo).
+        private void EnsureStrokeSlots()
+        {
+            if (_strokeRecordSlot != null && _strokeRecordSlot.Length == _workingVertices.Length) return;
+
+            _strokeDeltaIndices.Clear();
+            _strokeDeltaBefore.Clear();
+            _strokeRecordSlot = new int[_workingVertices.Length];
+            for (int i = 0; i < _strokeRecordSlot.Length; i++) _strokeRecordSlot[i] = -1;
         }
 
         /// Call once when a stroke ends (mouse-up) to commit whatever was recorded as one undo
@@ -1594,7 +1998,6 @@ namespace Sculpting
                 ReleaseStrokeSlots();
                 _strokeDeltaIndices.Clear();
                 _strokeDeltaBefore.Clear();
-                _strokeRecordedIndices.Clear();
             }
 
             if (_maskStrokeIndices.Count > 0)
@@ -1839,7 +2242,13 @@ namespace Sculpting
                 float t01 = 1f - dist / radius;
                 float smooth = t01 * t01 * (3f - 2f * t01) * (1f - _mask[i]); // smoothstep, masked-out
                 if (smooth <= 0f) continue;
-                if (frontFacingOnly && Vector3.Dot(_workingNormals[i], cameraLocalPos - _workingVertices[i]) <= 0f) continue;
+                // Multiplied into the weight rather than used to reject outright, and through the
+                // SAME helper every other brush uses: the old hard test gave the grabbed region a
+                // sawtooth edge wherever the silhouette crossed it, so a drag tore at exactly the
+                // thin, strongly-curved geometry this option exists to protect.
+                smooth *= SculptController.FrontFacingWeight(
+                    frontFacingOnly, _workingNormals[i], _workingVertices[i], cameraLocalPos);
+                if (smooth <= 0f) continue;
                 indices.Add(i);
                 weights.Add(smooth);
             }

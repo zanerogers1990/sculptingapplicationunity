@@ -89,12 +89,31 @@ namespace Sculpting
             DiscardRedo();
             _undo.Add(new Step { Label = label, Undo = undo, Redo = redo, Discard = discard, SceneBytes = approxBytes });
             TrimToLimits();
+
+            // The timelapse recorder's "something really changed" signal. Mesh edits report from
+            // the vertex apply paths themselves (see SculptableMesh.ApplyVertices), which a scene
+            // action - creating an object, skinning a rig - never goes through.
+            SculptActivity.ReportEdit();
         }
 
         // ------------------------------------------------------------------- undo and redo
 
-        public static bool Undo() => TakeStep(_undo, _redo, undoing: true);
-        public static bool Redo() => TakeStep(_redo, _undo, undoing: false);
+        // Both wrap their step so the vertex writes it performs report NO activity to
+        // SculptActivity: undoing is the one kind of geometry change a timelapse should never
+        // show. See SculptActivity's class remarks.
+        public static bool Undo()
+        {
+            SculptActivity.BeginSuppress();
+            try { return TakeStep(_undo, _redo, undoing: true); }
+            finally { SculptActivity.EndSuppress(); }
+        }
+
+        public static bool Redo()
+        {
+            SculptActivity.BeginSuppress();
+            try { return TakeStep(_redo, _undo, undoing: false); }
+            finally { SculptActivity.EndSuppress(); }
+        }
 
         /// Pops steps off `from` until one of them actually applies, moving it to `to`.
         ///

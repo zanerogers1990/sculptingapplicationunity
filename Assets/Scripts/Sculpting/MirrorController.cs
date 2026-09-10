@@ -153,29 +153,60 @@ namespace Sculpting
             return t;
         }
 
+        // The signs for the CURRENT axis flags, rebuilt only when those flags change. This used to
+        // build a fresh List (plus one more per enabled axis, via Expand) on every call - and
+        // every one of the eight brush apply sites calls it once per DAB, with Clay alone laying
+        // up to ClayMaxDabsPerFrame dabs in a single frame. That is pure per-frame garbage on the
+        // sculpting hot path, and GC pressure during a stroke is felt as exactly the intermittent
+        // hitching between cursor and surface that a brush is judged on.
+        //
+        // Handing out the cached list rather than a copy is safe because every caller only ever
+        // foreach-es it, and List<T>'s own struct enumerator keeps that allocation-free too.
+        private readonly List<Vector3> _signs = new List<Vector3>(8);
+        private bool _signsBuilt;
+        private bool _signsX, _signsY, _signsZ;
+
         /// Local-space mirror sign combinations for every currently-enabled axis, always
         /// including the identity (1,1,1) so the original, unmirrored stroke is included.
         /// Scaling a local point/delta/normal by one of these reflects it through whichever
         /// axes are active - e.g. with X and Y both enabled this returns four signs
         /// covering all quadrants.
+        ///
+        /// The returned list is REUSED between calls - read it, do not keep or mutate it.
         public List<Vector3> GetMirrorSigns()
         {
-            var signs = new List<Vector3> { Vector3.one };
-            if (mirrorX) signs = Expand(signs, true, false, false);
-            if (mirrorY) signs = Expand(signs, false, true, false);
-            if (mirrorZ) signs = Expand(signs, false, false, true);
-            return signs;
+            if (_signsBuilt && _signsX == mirrorX && _signsY == mirrorY && _signsZ == mirrorZ)
+                return _signs;
+
+            _signs.Clear();
+            _signs.Add(Vector3.one);
+            if (mirrorX) ExpandInPlace(_signs, true, false, false);
+            if (mirrorY) ExpandInPlace(_signs, false, true, false);
+            if (mirrorZ) ExpandInPlace(_signs, false, false, true);
+
+            _signsBuilt = true;
+            _signsX = mirrorX; _signsY = mirrorY; _signsZ = mirrorZ;
+            return _signs;
         }
 
-        private static List<Vector3> Expand(List<Vector3> input, bool x, bool y, bool z)
+        /// Doubles the list in place, each existing sign followed immediately by its reflection.
+        ///
+        /// Filled BACKWARDS, which is what makes an in-place expansion safe: entry i moves to 2i,
+        /// and 2i >= i for every i, so no slot is written before it has been read. The
+        /// interleaved order is deliberate rather than incidental - it is the order the previous
+        /// allocating version produced, and the brushes apply these signs in sequence against the
+        /// live vertex array, so reordering them would quietly change what a mirrored stroke does
+        /// where two footprints overlap near the plane.
+        private static void ExpandInPlace(List<Vector3> signs, bool x, bool y, bool z)
         {
-            var result = new List<Vector3>(input.Count * 2);
-            foreach (Vector3 s in input)
+            int count = signs.Count;
+            for (int i = 0; i < count; i++) signs.Add(Vector3.zero);
+            for (int i = count - 1; i >= 0; i--)
             {
-                result.Add(s);
-                result.Add(new Vector3(x ? -s.x : s.x, y ? -s.y : s.y, z ? -s.z : s.z));
+                Vector3 s = signs[i];
+                signs[i * 2] = s;
+                signs[i * 2 + 1] = new Vector3(x ? -s.x : s.x, y ? -s.y : s.y, z ? -s.z : s.z);
             }
-            return result;
         }
     }
 }

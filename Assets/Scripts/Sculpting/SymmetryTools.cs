@@ -175,6 +175,88 @@ namespace Sculpting
             return carried;
         }
 
+        /// How much of the way to its neighbours' average an unmatched vertex is moved per pass,
+        /// and how many passes. Deliberately gentle and few: this is seating a scatter of isolated
+        /// points back into a surface, not smoothing the surface.
+        private const float ReseatRate = 0.5f;
+        private const int ReseatPasses = 3;
+
+        /// Seats the vertices that had no counterpart back into the repaired surface.
+        ///
+        /// CarryUnmatched moves them by their neighbours' average SHIFT, which is the right rule
+        /// while the repair is happening - it is the only statement that can be made about such a
+        /// vertex without inventing geometry, and it keeps a cluster of them from tearing. But it
+        /// preserves whatever offset each vertex had from the surface it used to sit in, and after
+        /// a repair that surface is a mirror of the other half rather than the one those offsets
+        /// were measured against. Measured on a 134k-triangle repair: the destination half came
+        /// back at 0.216 mean roughness against the 0.064 of the source half it was copied from,
+        /// with spikes to 1.7 vertex spacings - a scatter of a few hundred points standing proud
+        /// of an otherwise exactly mirrored surface, which is what reads as the repaired side
+        /// being jagged.
+        ///
+        /// An unmatched vertex has no correct position by definition - the two halves are not
+        /// tessellated alike there, so there is nothing to copy. "Sit smoothly among the vertices
+        /// that DO have correct positions" is the best answer available, and unlike its previous
+        /// offset it is at least a statement about the surface that now exists.
+        ///
+        /// Only unmatched, non-source, off-plane vertices move. Every paired vertex is left
+        /// exactly where MakeSymmetric put it, so this cannot degrade the mirror itself, and the
+        /// source half is never touched - the same rule CarryUnmatched follows. Needs a map built
+        /// WITH triangles. Returns how many vertices moved.
+        public static int ReseatUnmatched(Vector3[] vertices, Vector3[] before, SymmetryMap map,
+                                          bool sourceIsPositive)
+        {
+            if (vertices == null || before == null || map == null) return 0;
+            if (map.VertexCount != vertices.Length || before.Length != vertices.Length) return 0;
+            if (!map.HasTopology) return 0;
+
+            int n = vertices.Length;
+            int axis = map.Axis;
+
+            // Sides are read from `before`, matching CarryUnmatched: `vertices` has already been
+            // rewritten by the repair, and a vertex's ROLE in that repair is a fact about where it
+            // started, not about where it ended up.
+            var loose = new List<int>();
+            for (int i = 0; i < n; i++)
+            {
+                if (map.IsOnPlane(i) || map.PartnerOf(i) != SymmetryMap.NoPartner) continue;
+                float side = SymmetryMap.Coord(before[i], axis);
+                bool isSource = sourceIsPositive ? side > 0f : side < 0f;
+                if (isSource) continue;
+                loose.Add(i);
+            }
+            if (loose.Count == 0) return 0;
+
+            // Jacobi, not Gauss-Seidel: every vertex in a pass reads the previous pass's positions,
+            // so the result cannot depend on the order the loose vertices happen to be listed in -
+            // the same reason SymmetryMap batches its propagation rounds.
+            var next = new Vector3[loose.Count];
+            for (int pass = 0; pass < ReseatPasses; pass++)
+            {
+                for (int k = 0; k < loose.Count; k++)
+                {
+                    int i = loose[k];
+                    Vector3 sum = Vector3.zero;
+                    int count = 0;
+                    int neighbours = map.NeighbourCount(i);
+                    for (int q = 0; q < neighbours; q++)
+                    {
+                        int nb = map.Neighbour(i, q);
+                        sum += vertices[nb];
+                        count++;
+                    }
+                    next[k] = count == 0 ? vertices[i]
+                                         : Vector3.Lerp(vertices[i], sum / count, ReseatRate);
+                }
+                for (int k = 0; k < loose.Count; k++) vertices[loose[k]] = next[k];
+            }
+
+            int moved = 0;
+            for (int k = 0; k < loose.Count; k++)
+                if ((vertices[loose[k]] - before[loose[k]]).sqrMagnitude > 0f) moved++;
+            return moved;
+        }
+
         /// Replaces one whole side of the model with a reflection of the other, cutting the mesh
         /// at the plane and rebuilding the discarded half from scratch. Topology-changing, which
         /// is the point: unlike MakeSymmetric it needs NO vertex correspondence, so it works on
@@ -245,20 +327,46 @@ namespace Sculpting
             }
             if (keptTriangleCount == 0) return false;
 
-            // Pass 2: pin the kept triangles' crossed-over corners onto the plane. Only vertices
-            // a KEPT triangle actually uses - one belonging solely to discarded triangles is
-            // about to disappear, and moving it would be pointless work.
+            // Pass 2: flatten the cut edge onto the plane. Only vertices a KEPT triangle actually
+            // uses - one belonging solely to discarded triangles is about to disappear, and moving
+            // it would be pointless work.
+            //
+            // TWO kinds of vertex need this, and getting only the first is what left the result
+            // torn open. The obvious one is a corner that reaches across the plane. The one that
+            // was missed is the RIM itself: a vertex shared by a kept and a discarded triangle,
+            // sitting on the correct side and so pinned by nothing. Whether the rim happened to
+            // land inside the seam band was pure luck of the tessellation, and where it did not,
+            // pass 3 gave it a reflected TWIN instead of sharing it - so the two halves came out as
+            // two shells with a gap between them rather than one closed surface. Measured on a
+            // watertight 145k-triangle sculpt at the default tolerance: 1560 boundary edges over
+            // 1188 rim vertices, only 408 of which were on the plane, the rest standing up to 0.7
+            // vertex spacings off it. That is an open gash down the centreline, which is what
+            // reads as Cut & Mirror "artifacting". It disappeared at a 4x Match Tolerance purely
+            // because the wider band happened to swallow the rim - i.e. the tool worked by
+            // accident, on a setting the user has no reason to reach for.
+            //
+            // Pinning the rim makes the cut planar BY CONSTRUCTION at any tolerance: every rim
+            // vertex ends up at exactly zero, so pass 3 shares it between the halves instead of
+            // duplicating it, and the seam comes out as one edge loop with two triangles on every
+            // edge. The rim is at most one triangle from the plane to begin with (the cut is
+            // decided by centroid), so this moves nothing further than the cut itself already did.
             var used = new bool[work.Length];
+            var onRim = new bool[work.Length];
             for (int t = 0; t < triCount; t++)
             {
-                if (!keep[t]) continue;
                 int b = t * 3;
-                used[triangles[b]] = true;
-                used[triangles[b + 1]] = true;
-                used[triangles[b + 2]] = true;
+                bool[] flags = keep[t] ? used : onRim;
+                flags[triangles[b]] = true;
+                flags[triangles[b + 1]] = true;
+                flags[triangles[b + 2]] = true;
             }
             for (int i = 0; i < work.Length; i++)
-                if (used[i] && SymmetryMap.Coord(work[i], axis) * sign < 0f) work[i] = Pin(work[i], axis);
+            {
+                if (!used[i]) continue;
+                // onRim is "touched by a discarded triangle" until combined with used here, which
+                // is what makes it mean "on the boundary between the two".
+                if (onRim[i] || SymmetryMap.Coord(work[i], axis) * sign < 0f) work[i] = Pin(work[i], axis);
+            }
 
             // Pass 3: compact the kept vertices, giving each off-plane one a reflected twin.
             // On-plane vertices get no twin - they ARE the join, and duplicating them is exactly
@@ -297,6 +405,14 @@ namespace Sculpting
                 // and both halves would carry one.
                 int a0 = sourceIndex[i0], a1 = sourceIndex[i1], a2 = sourceIndex[i2];
                 if (Degenerate(outVerts, a0, a1, a2)) continue;
+
+                // A triangle now lying wholly IN the plane is its own mirror - every corner is
+                // shared, so emitting the pair below would put two coincident faces on the same
+                // three vertices, wound opposite ways. The keep test above rules this out for the
+                // geometry as it stood then (a triangle already in the plane has centroid zero and
+                // is discarded), but pinning the rim can flatten a thin protrusion into the plane
+                // afterwards, which is a case that could not arise before rim pinning existed.
+                if (mirrorIndex[i0] == a0 && mirrorIndex[i1] == a1 && mirrorIndex[i2] == a2) continue;
 
                 outTris.Add(a0);
                 outTris.Add(a1);
@@ -420,34 +536,53 @@ namespace Sculpting
             var buckets = new Dictionary<Vector3Int, List<int>>();
             int merged = 0;
 
+            float seamSqr = seam * seam;
+            float coincidentSqr = coincident * coincident;
+
             for (int i = 0; i < n; i++)
             {
-                // On the seam a vertex may merge with anything in the snapped band; off it, only
-                // with something at its own position.
                 bool onSeam = Mathf.Abs(SymmetryMap.Coord(vertices[i], axis)) <= seam;
-                float radius = onSeam ? seam : coincident;
-                float radiusSqr = radius * radius;
 
                 Vector3Int home = CellOf(vertices[i], seam);
                 int found = -1;
+                float foundSqr = float.MaxValue;
 
-                for (int z = -1; z <= 1 && found < 0; z++)
-                for (int y = -1; y <= 1 && found < 0; y++)
-                for (int x = -1; x <= 1 && found < 0; x++)
+                for (int z = -1; z <= 1; z++)
+                for (int y = -1; y <= 1; y++)
+                for (int x = -1; x <= 1; x++)
                 {
                     if (!buckets.TryGetValue(new Vector3Int(home.x + x, home.y + y, home.z + z),
                                              out List<int> list)) continue;
 
                     for (int k = 0; k < list.Count; k++)
                     {
-                        if ((vertices[list[k]] - vertices[i]).sqrMagnitude > radiusSqr) continue;
-                        found = list[k];
-                        break;
+                        int candidate = list[k];
+
+                        // The generous seam radius applies only when BOTH ends are on the seam.
+                        // Deciding it from vertex i alone let an on-seam vertex swallow an
+                        // off-seam one up to a whole seam width away - and the seam width is the
+                        // Match Tolerance slider, which reaches 8x the base tolerance. That drags
+                        // the centreline sideways into whatever geometry happens to sit near it,
+                        // which is precisely the zig-zag seam SnapToPlane exists to prevent. It
+                        // was also order-dependent: whether A swallowed B or B swallowed A - and
+                        // so where the survivor ended up - depended on which came first.
+                        bool candidateOnSeam =
+                            Mathf.Abs(SymmetryMap.Coord(vertices[candidate], axis)) <= seam;
+                        float radiusSqr = (onSeam && candidateOnSeam) ? seamSqr : coincidentSqr;
+
+                        float d = (vertices[candidate] - vertices[i]).sqrMagnitude;
+                        if (d > radiusSqr || d >= foundSqr) continue;
+                        found = candidate;
+                        foundSqr = d;
                     }
                 }
 
                 if (found >= 0)
                 {
+                    // Nearest rather than first-encountered. Taking the first match made the
+                    // result depend on bucket iteration order, so two vertices that should have
+                    // merged into their common nearest neighbour could instead be pulled to
+                    // opposite ends of the tolerance band.
                     remap[i] = found;
                     merged++;
                     continue;

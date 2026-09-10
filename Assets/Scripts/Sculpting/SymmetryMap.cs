@@ -35,22 +35,63 @@ namespace Sculpting
         /// question to ask about instead.
         public const int NoPartner = -1;
 
-        /// How far a topological propagation step may reach, as a multiple of Tolerance.
+        /// How far a topological propagation step may reach, as a multiple of the mesh's VERTEX
+        /// SPACING (MeanSpacing), falling back to Tolerance only when there are no triangles to
+        /// measure spacing from.
         ///
         /// Propagation (see Propagate) grows the pairing along the mesh's own edges out of pairs
         /// already found, so the distance test is no longer being asked "are these two the same
         /// vertex" on its own - the topology has already said they are the corresponding
         /// neighbours of a known pair, and this only has to be wide enough to cover how far the
-        /// two sides have DRIFTED. That is a different, much looser question than the seeding
-        /// pass answers, which is why it gets its own, wider radius: the drift this tool exists
-        /// to repair is routinely a whole vertex spacing, and Tolerance is deliberately sized
-        /// below that.
-        public const float PropagationReach = 4f;
+        /// two sides have DRIFTED. That is a different, much looser question than the seeding pass
+        /// answers, which is why it gets its own, wider radius.
+        ///
+        /// Decoupled from Tolerance because those two must be free to move in opposite directions,
+        /// and coupling them broke this outright. Tolerance has to stay BELOW the vertex spacing or
+        /// it pairs a vertex with its reflection's neighbour; drift has to be allowed to reach WELL
+        /// PAST it, because a single sculpt stroke moves a surface much further than one spacing.
+        /// As a multiple of Tolerance the reach collapsed along with it the moment Tolerance was
+        /// correctly tightened - measured: pairs fell from 31,905 to 16,697 and MakeSymmetric began
+        /// refusing the repair outright as too asymmetric.
+        ///
+        /// Generous on purpose. This is only a coarse "not somewhere else entirely" bound; the
+        /// discrimination is done by the structural residual in Propagate, which does not care how
+        /// far the halves have drifted, only whether a candidate sits where the LOCAL shape says it
+        /// should.
+        public const float PropagationReach = 8f;
+
+        /// The other half of that bound, as a fraction of the bounding-box diagonal, and the one
+        /// that governs on a dense mesh.
+        ///
+        /// Drift between two halves is a WORLD-SPACE quantity - it is how far a stroke pushed the
+        /// surface, which does not change when the mesh is re-tessellated more finely. Vertex
+        /// spacing does. So a reach expressed only in spacings silently tightens as density rises,
+        /// which is the identical unit error that made Tolerance too loose, running the other way:
+        /// measured across the same one-sided sculpt, a spacings-only reach paired 33,207 vertices
+        /// at 134k triangles but only 106,121 of 496,178 at 992k, and MakeSymmetric refused the
+        /// repair at both 357k and 992k. Taking whichever of the two bounds is LARGER keeps a
+        /// coarse mesh's few-spacings reach while letting a dense one span the same world distance
+        /// it always could.
+        public const float PropagationDriftFraction = 0.10f;
 
         /// Propagation is a fixed point - each round can only pair vertices adjacent to a pair
         /// found in an earlier one - so it stops on its own. The cap is a guard against a
-        /// pathological mesh, not a tuning knob; meshes here settle in two or three rounds.
-        private const int MaxPropagationRounds = 64;
+        /// pathological mesh, not a tuning knob.
+        ///
+        /// One round advances the pairing by one ring of vertices, so the number of rounds a mesh
+        /// needs scales with how many rings wide its unpaired regions are - which is a WORLD
+        /// distance divided by the vertex spacing, and therefore grows as a mesh gets denser. At 64
+        /// this bound silently bit: the region left unpaired by a stroke of a given brush radius is
+        /// about radius/spacing rings across, which measured ~26 rings at 134k triangles (settles
+        /// well inside the cap) and ~75 at 1.08M (stalls against it). The visible result was that
+        /// the identical repair succeeded on a coarse mesh and was refused as "too asymmetric" on a
+        /// dense one - 107,897 vertices left unpaired at 1.08M purely because propagation ran out
+        /// of rounds with work still to do.
+        ///
+        /// Affordable at this size only because a round now costs O(frontier), not O(vertex count)
+        /// - see Propagate. The loop still exits the moment a round accepts nothing, so a mesh that
+        /// settles in three rounds pays for three.
+        private const int MaxPropagationRounds = 4096;
 
         /// Which local axis the mirror plane is perpendicular to (AxisX = the YZ plane, etc).
         public int Axis { get; private set; }
@@ -72,6 +113,26 @@ namespace Sculpting
         private int[] _adjStart;
         private int[] _adjCount;
         private int[] _adjNeighbours;
+
+        /// The mesh's own vertex spacing, measured when Build is given triangles. Propagation
+        /// judges candidates against this rather than against Tolerance alone - see Propagate.
+        public float MeanSpacing { get; private set; }
+
+        /// The model's bounding-box diagonal - the scale drift is measured in, as against
+        /// MeanSpacing, the scale a vertex's identity is measured in. See PropagationDriftFraction.
+        public float Diagonal { get; private set; }
+
+        /// How far a propagated pair's LOCAL offset may disagree, as a fraction of MeanSpacing. A
+        /// correct pair disagrees only by the remesher's own placement noise (see SpacingFraction)
+        /// whatever global drift there is between the halves, because the anchor's drift is
+        /// subtracted first; a vertex paired with its reflection's NEIGHBOUR disagrees by about a
+        /// full spacing. 0.75 clears the measured noise ceiling of ~0.73 while staying under that.
+        ///
+        /// This can afford to sit above SpacingFraction precisely because it is a different, much
+        /// sharper measurement: the seeding pass compares absolute positions, so it eats the full
+        /// placement noise of both vertices, while this compares each candidate against what the
+        /// LOCAL shape predicts, and neighbouring cells' noise is correlated and largely cancels.
+        private const float StructuralFraction = 0.75f;
 
         public int VertexCount => _partner.Length;
 
@@ -135,17 +196,55 @@ namespace Sculpting
         public static float Coord(Vector3 p, int axis) =>
             axis == AxisX ? p.x : (axis == AxisY ? p.y : p.z);
 
+        /// The property that actually matters, and the one every consumer of Tolerance relies on:
+        /// the tolerance must stay comfortably BELOW the mesh's vertex spacing. A tolerance
+        /// approaching the spacing starts pairing each vertex with its reflection's NEIGHBOUR
+        /// rather than with its reflection, and it makes the "on the plane" band (which is this
+        /// same value, used as a half-thickness) wide enough to swallow a strip of genuine
+        /// geometry either side of the centreline.
+        ///
+        /// Half the vertex spacing. The two things this has to separate are a correct pair and an
+        /// off-by-one-neighbour pair, and those sit at ~0 and ~1 spacing apart, so half a spacing
+        /// is the natural divide - and the greedy closest-first matching in Build widens the
+        /// margin further, since a true reflection is claimed long before any looser candidate
+        /// gets a chance at either end.
+        ///
+        /// Not tighter than half, because the remesher does not place mirrored vertices at exactly
+        /// mirrored positions and the discrepancy GROWS with resolution: Surface Nets puts one
+        /// vertex per cell at the average of that cell's edge crossings, so a roughly constant
+        /// absolute error in the distance field becomes a larger fraction of a cell as cells
+        /// shrink. Measured on a remeshed sphere, the distance from a vertex to the nearest vertex
+        /// to its reflection ran mean 0.025 / max 0.47 spacings at 134k triangles and mean 0.061 /
+        /// max 0.73 at 1.08M. A tolerance of 0.35 sat below that noise floor and refused to pair
+        /// most of a perfectly symmetric model - measured 45.9% of a 992k-triangle sphere left
+        /// unmatched, which made MakeSymmetric decline the repair outright.
+        private const float SpacingFraction = 0.5f;
+
+        /// Half a percent of the bounding-box diagonal - the original rule, kept as a CEILING for
+        /// the coarse meshes it was calibrated on, where it is genuinely below the spacing.
+        private const float DiagonalFraction = 0.005f;
+
         /// A tolerance proportional to the model rather than an absolute number, because this is
         /// used on everything from a default unit sphere to an imported multi-metre scan, and a
         /// fixed epsilon would pair everything on one and nothing on the other.
         ///
-        /// Half a percent of the bounding-box diagonal is comfortably below the vertex spacing of
-        /// any mesh this app produces (a 500-vertex sphere spaces vertices ~4% of its diagonal
-        /// apart), which is the property that matters: a tolerance approaching the spacing starts
-        /// pairing each vertex with its reflection's NEIGHBOUR, and the mutual-agreement rule in
-        /// Build then throws those away rather than pairing them wrongly - so an over-large
-        /// tolerance shows up as a low pair count, not as silently corrupt output.
-        public static float DefaultTolerance(Vector3[] vertices)
+        /// Prefer the overload that takes triangles wherever they are to hand. Bounding-box
+        /// diagonal alone was the original rule, justified by "half a percent is comfortably below
+        /// the vertex spacing of any mesh this app produces (a 500-vertex sphere spaces vertices
+        /// ~4% of its diagonal apart)". That holds at 500 vertices and fails as the mesh gets
+        /// denser, because spacing shrinks with density while the fraction does not: measured on a
+        /// 67,234-vertex remesh of that same sphere, spacing had fallen to 0.502% of the diagonal
+        /// and the tolerance came out at 1.00 vertex spacings - exactly the ratio the rule exists
+        /// to stay under, and worse still on anything denser. That is the root cause of a repaired
+        /// half coming back jagged: at that ratio the pairing can and does pick the reflection's
+        /// neighbour, and SnapToPlane flattens a band two spacings wide onto the centreline.
+        public static float DefaultTolerance(Vector3[] vertices) => DefaultTolerance(vertices, null);
+
+        /// Tolerance bounded by BOTH the model's overall size and its actual vertex spacing.
+        /// Identical to the diagonal-only rule on the coarse meshes that rule was calibrated
+        /// against (there the spacing bound is the looser of the two and never binds); on a dense
+        /// mesh the spacing bound takes over, which is exactly where the diagonal rule broke down.
+        public static float DefaultTolerance(Vector3[] vertices, int[] triangles)
         {
             if (vertices == null || vertices.Length == 0) return 0.001f;
 
@@ -155,8 +254,32 @@ namespace Sculpting
                 min = Vector3.Min(min, vertices[i]);
                 max = Vector3.Max(max, vertices[i]);
             }
-            float diagonal = (max - min).magnitude;
-            return Mathf.Max(diagonal * 0.005f, 1e-6f);
+            float tolerance = (max - min).magnitude * DiagonalFraction;
+
+            float spacing = MeanEdgeLength(vertices, triangles);
+            if (spacing > 0f) tolerance = Mathf.Min(tolerance, spacing * SpacingFraction);
+
+            return Mathf.Max(tolerance, 1e-6f);
+        }
+
+        /// Mean length of one edge per triangle - a cheap, robust stand-in for vertex spacing.
+        /// One edge rather than all three because this only needs a scale, not a census, and the
+        /// three edges of a triangle are the same length to within the mesh's own regularity.
+        /// Returns 0 when there are no triangles to measure.
+        public static float MeanEdgeLength(Vector3[] vertices, int[] triangles)
+        {
+            if (vertices == null || triangles == null || triangles.Length < 3) return 0f;
+
+            double sum = 0;
+            int counted = 0;
+            for (int t = 0; t + 1 < triangles.Length; t += 3)
+            {
+                int a = triangles[t], b = triangles[t + 1];
+                if (a < 0 || a >= vertices.Length || b < 0 || b >= vertices.Length) continue;
+                sum += (vertices[b] - vertices[a]).magnitude;
+                counted++;
+            }
+            return counted > 0 ? (float)(sum / counted) : 0f;
         }
 
         /// Builds the pairing. O(vertex count) with a uniform spatial hash - the same bucketing
@@ -281,6 +404,16 @@ namespace Sculpting
             // that did not need it.
             if (triangles != null && triangles.Length >= 3)
             {
+                map.MeanSpacing = MeanEdgeLength(vertices, triangles);
+
+                Vector3 bmin = vertices[0], bmax = vertices[0];
+                for (int i = 1; i < n; i++)
+                {
+                    bmin = Vector3.Min(bmin, vertices[i]);
+                    bmax = Vector3.Max(bmax, vertices[i]);
+                }
+                map.Diagonal = (bmax - bmin).magnitude;
+
                 map.BuildAdjacency(triangles);
                 map.Propagate(vertices);
             }
@@ -359,27 +492,74 @@ namespace Sculpting
         /// (SymmetryTools.CarryUnmatched is what those need instead).
         ///
         /// Rounds are batched rather than run vertex-by-vertex, and each round's candidates are
-        /// accepted closest-first, for the same reason the seeding pass is greedy: the order
-        /// vertices happen to be visited in must not decide which of two near-equal candidates
-        /// wins, or the map stops being a property of the geometry.
+        /// accepted best-first, for the same reason the seeding pass is greedy: the order vertices
+        /// happen to be visited in must not decide which of two near-equal candidates wins, or the
+        /// map stops being a property of the geometry.
+        ///
+        /// "Best" is measured STRUCTURALLY - how well b sits relative to its anchor j compared to
+        /// where a sits relative to its anchor i - rather than by raw distance from a's reflected
+        /// position. The two agree when the halves have not drifted and diverge exactly when they
+        /// have, which is the case this pass exists for. Raw distance has to be given a wide
+        /// radius to tolerate drift at all (PropagationReach is four Tolerances), and a radius
+        /// that wide is several vertex spacings across on a dense mesh - wide enough for the
+        /// closest candidate to be the reflection's NEIGHBOUR rather than the reflection. Those
+        /// wrong pairs are what MakeSymmetric then writes mismatched positions through, which
+        /// shows up as a jagged repaired half and, where a wrong pair inverts a triangle, as
+        /// flipped normals. The structural residual cancels whatever drift i and j already carry,
+        /// so it stays small for a correct pair however far the halves have moved apart, while an
+        /// off-by-one-neighbour candidate scores about a full vertex spacing.
         private void Propagate(Vector3[] vertices)
         {
-            float limitSqr = Tolerance * PropagationReach;
-            limitSqr *= limitSqr;
+            // Whichever bound is larger: a few vertex spacings, or a fixed fraction of the model.
+            // The first governs a coarse mesh, the second a dense one - see PropagationReach and
+            // PropagationDriftFraction for why neither works alone. Tolerance is the fallback only
+            // for a map built without measurable topology.
+            float spacingReach = (MeanSpacing > 0f ? MeanSpacing : Tolerance) * PropagationReach;
+            float driftReach = Diagonal * PropagationDriftFraction;
+            float limit = Mathf.Max(spacingReach, driftReach);
+            float limitSqr = limit * limit;
+
+            // No spacing to measure against means no structural test either, so such a map
+            // behaves exactly as it did before this gate existed.
+            float structural = MeanSpacing * StructuralFraction;
+            float structuralSqr = MeanSpacing > 0f ? structural * structural : float.MaxValue;
+
             int n = _partner.Length;
             var edges = new List<Edge>();
 
-            for (int round = 0; round < MaxPropagationRounds; round++)
+            // Only vertices that gained a pairing in the PREVIOUS round can offer anything new
+            // this round, so each round walks that frontier instead of rescanning the whole mesh.
+            // This is sound because nothing a round rejects can become acceptable later: a
+            // candidate is turned away either because its would-be partner is already claimed
+            // (claims are never released) or because the geometry does not fit (positions do not
+            // change during a build). A vertex that could not pair from one anchor can still pair
+            // from a different one - and that anchor, being newly paired itself, is in the
+            // frontier by construction.
+            //
+            // Round 0 seeds from everything the distance pass established, plus the centreline.
+            var frontier = new List<int>();
+            var nextFrontier = new List<int>();
+            for (int i = 0; i < n; i++)
+                if (_onPlane[i] || _partner[i] != NoPartner) frontier.Add(i);
+
+            for (int round = 0; round < MaxPropagationRounds && frontier.Count > 0; round++)
             {
                 edges.Clear();
 
-                for (int i = 0; i < n; i++)
+                for (int f = 0; f < frontier.Count; f++)
                 {
+                    int i = frontier[f];
                     // An on-plane vertex is its own reflection, so it seeds propagation into
                     // BOTH sides at once - which is what carries the pairing off the centreline
                     // on a model whose halves only meet there.
                     int j = _onPlane[i] ? i : _partner[i];
                     if (j == NoPartner) continue;
+
+                    // Where the anchor pair's own reflection lands. The residual below is measured
+                    // against THIS, so any drift already between i and j cancels out instead of
+                    // being charged to every candidate they vouch for.
+                    Vector3 anchorReflected = Reflect(vertices[i], Axis);
+                    Vector3 anchorDrift = vertices[j] - anchorReflected;
 
                     int iCount = _adjCount[i], jCount = _adjCount[j];
                     for (int x = 0; x < iCount; x++)
@@ -388,6 +568,9 @@ namespace Sculpting
                         if (_onPlane[a] || _partner[a] != NoPartner) continue;
 
                         Vector3 target = Reflect(vertices[a], Axis);
+                        // What b would be if the two halves matched locally as well as the anchor
+                        // pair does: a's reflection, carried by the anchor's own drift.
+                        Vector3 expected = target + anchorDrift;
                         float sideA = Coord(vertices[a], Axis);
 
                         for (int y = 0; y < jCount; y++)
@@ -399,8 +582,17 @@ namespace Sculpting
                             // however close the reflected position happens to land.
                             if (Coord(vertices[b], Axis) * sideA > 0f) continue;
 
-                            float d = (vertices[b] - target).sqrMagnitude;
-                            if (d <= limitSqr) edges.Add(new Edge { Sqr = d, A = a, B = b });
+                            // Both gates must pass. The absolute one keeps the pairing anchored to
+                            // real geometry (a candidate cannot be arbitrarily far from a's
+                            // reflection however well it matches locally); the structural one is
+                            // what actually discriminates between the reflection and its
+                            // neighbour.
+                            if ((vertices[b] - target).sqrMagnitude > limitSqr) continue;
+
+                            float residual = (vertices[b] - expected).sqrMagnitude;
+                            if (residual > structuralSqr) continue;
+
+                            edges.Add(new Edge { Sqr = residual, A = a, B = b });
                         }
                     }
                 }
@@ -408,6 +600,7 @@ namespace Sculpting
                 if (edges.Count == 0) return;
                 edges.Sort((p, q) => p.Sqr.CompareTo(q.Sqr));
 
+                nextFrontier.Clear();
                 int accepted = 0;
                 for (int e = 0; e < edges.Count; e++)
                 {
@@ -415,11 +608,19 @@ namespace Sculpting
                     if (_partner[edge.A] != NoPartner || _partner[edge.B] != NoPartner) continue;
                     _partner[edge.A] = edge.B;
                     _partner[edge.B] = edge.A;
+                    // Both ends become anchors for the next round - they are the only vertices
+                    // that can vouch for anything new.
+                    nextFrontier.Add(edge.A);
+                    nextFrontier.Add(edge.B);
                     accepted++;
                 }
 
                 if (accepted == 0) return;
                 PropagatedPairCount += accepted;
+
+                var swap = frontier;
+                frontier = nextFrontier;
+                nextFrontier = swap;
             }
         }
 

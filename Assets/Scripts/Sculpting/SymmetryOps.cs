@@ -68,7 +68,10 @@ namespace Sculpting
             Vector3[] verts = mesh.Vertices;
             if (verts == null || verts.Length == 0) return null;
 
-            float tolerance = SymmetryMap.DefaultTolerance(verts) * Mathf.Max(toleranceScale, 0.01f);
+            // With the triangles, the tolerance is bounded by the mesh's own vertex spacing rather
+            // than by its bounding box alone - see SymmetryMap.DefaultTolerance for why the
+            // box-only rule silently becomes too loose as a mesh gets denser.
+            float tolerance = SymmetryMap.DefaultTolerance(verts, mesh.Triangles) * Mathf.Max(toleranceScale, 0.01f);
             // With the triangles, the pairing grows along the surface out of what the distance
             // test found instead of being limited to it - see SymmetryMap.Propagate. That is what
             // makes a repair reach the parts of the model that have drifted furthest, which are
@@ -134,7 +137,12 @@ namespace Sculpting
             // the last fraction of a percent of the model sticks out of the repaired surface,
             // which is the whole visible difference between "symmetric" and "nearly symmetric".
             carriedCount = SymmetryTools.CarryUnmatched(working, live, map, sourceIsPositive);
-            if (snapped == 0 && changed == 0 && carriedCount == 0) return 0;
+
+            // Carrying keeps those vertices attached to the surface; seating them makes them lie
+            // IN it. Without this the repaired half comes back measurably rougher than the half it
+            // was copied from - see SymmetryTools.ReseatUnmatched for the numbers.
+            int reseated = SymmetryTools.ReseatUnmatched(working, live, map, sourceIsPositive);
+            if (snapped == 0 && changed == 0 && carriedCount == 0 && reseated == 0) return 0;
 
             // A topology-preserving edit still needs a full snapshot: nothing here goes through
             // the stroke-delta path that ordinary brushing uses.
@@ -178,7 +186,7 @@ namespace Sculpting
             // Same seam band the pairing uses, so the "Match Tolerance" slider means one
             // consistent thing across the whole panel: how far off the centreline a vertex may
             // sit and still count as being on it.
-            float seam = SymmetryMap.DefaultTolerance(verts) * Mathf.Max(toleranceScale, 0.01f);
+            float seam = SymmetryMap.DefaultTolerance(verts, mesh.Triangles) * Mathf.Max(toleranceScale, 0.01f);
 
             if (!SymmetryTools.MirrorAndWeld(verts, mesh.Triangles, axis, sourceIsPositive, seam,
                                              out Vector3[] newVerts, out int[] newTris,
@@ -234,7 +242,7 @@ namespace Sculpting
             // points must be to be the SAME point is not that judgement, and letting the slider
             // scale it would turn a loose pairing setting into a licence to collapse real
             // geometry (see SymmetryTools.Weld on why the second radius stays small).
-            float coincident = SymmetryMap.DefaultTolerance(working) * CoincidentFraction;
+            float coincident = SymmetryMap.DefaultTolerance(working, mesh.Triangles) * CoincidentFraction;
 
             bool didWeld = SymmetryTools.Weld(working, mesh.Triangles, axis, map.Tolerance, coincident,
                                               out Vector3[] weldedVerts, out int[] weldedTris);
