@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Jobs;
@@ -1969,7 +1970,22 @@ namespace Sculpting
             if (anyMoved) MarkPositionMirrorStale();
         }
 
-        private void HandleInflateInput(Mouse mouse, bool overUI, bool altHeld)
+        // Inflate's and Flatten's input handler and world-space wrapper were character-for-character
+        // copies of each other, differing only in which Apply*BrushLocal they ended in, so both
+        // brushes now route through these two methods. Clay, Crease/Dam Standard and Smooth keep
+        // their own handlers because they genuinely differ from this one: Clay and Crease/Dam
+        // Standard reset their stroke-continuity state on the frames this path simply returns
+        // (and Crease/Dam Standard deliberately skip UpdateStrokeSpeed), while Smooth has no
+        // polarity, a neutral preview and no stroke-speed tracking. Move, Pose and mask painting
+        // are different gestures altogether.
+        //
+        // The delegates are cached rather than passed as method groups: converting a method group
+        // allocates a new delegate on every call, and the handler runs every frame the brush hovers.
+        private Action<Vector3, Vector3, bool> _applyInflateBrushLocal;
+        private Action<Vector3, Vector3, bool> _applyFlattenBrushLocal;
+
+        private void HandleStandardBrushInput(Mouse mouse, bool overUI, bool altHeld,
+            Action<Vector3, Vector3, bool> applyBrushLocal)
         {
             _isHovering = false;
             if (overUI) return;
@@ -1991,12 +2007,13 @@ namespace Sculpting
             LogRayHit(mouse, ray, hitPoint, hitNormal);
 
             if (mouse.leftButton.isPressed && !altHeld)
-                ApplyInflateBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
+                ApplyMirroredBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive, applyBrushLocal);
             else if (rightHeld)
-                ApplyInflateBrush(hitPoint, hitNormal, !isPositive);
+                ApplyMirroredBrush(hitPoint, hitNormal, !isPositive, applyBrushLocal);
         }
 
-        private void ApplyInflateBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive)
+        private void ApplyMirroredBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive,
+            Action<Vector3, Vector3, bool> applyBrushLocal)
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
@@ -2009,7 +2026,7 @@ namespace Sculpting
             {
                 BeginMirroredDab(sign);
                 Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                ApplyInflateBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
+                applyBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
             }
 
             FlushDirtyVertices();
@@ -2114,52 +2131,6 @@ namespace Sculpting
             }
 
             if (anyMoved) MarkPositionMirrorStale();
-        }
-
-        private void HandleFlattenInput(Mouse mouse, bool overUI, bool altHeld)
-        {
-            _isHovering = false;
-            if (overUI) return;
-
-            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
-
-            _isHovering = hasHit;
-            if (!_isHovering) return;
-
-            _hoverPoint = hitPoint;
-            _hoverNormal = hitNormal;
-            UpdateStrokeSpeed(hitPoint);
-
-            bool rightHeld = mouse.rightButton.isPressed;
-            bool invertHeld = rightHeld || CtrlHeld;
-            _previewPositive = invertHeld ? !isPositive : isPositive;
-
-            LogRayHit(mouse, ray, hitPoint, hitNormal);
-
-            if (mouse.leftButton.isPressed && !altHeld)
-                ApplyFlattenBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive);
-            else if (rightHeld)
-                ApplyFlattenBrush(hitPoint, hitNormal, !isPositive);
-        }
-
-        private void ApplyFlattenBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive)
-        {
-            Transform t = sculptableMesh.transform;
-            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
-            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
-
-            BeginDirtyVertices();
-            foreach (Vector3 sign in MirrorSigns())
-            {
-                BeginMirroredDab(sign);
-                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                ApplyFlattenBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive);
-            }
-
-            FlushDirtyVertices();
         }
 
         // Projects every vertex in the footprint onto one shared plane - the classic

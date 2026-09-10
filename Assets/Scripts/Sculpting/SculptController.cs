@@ -873,10 +873,10 @@ namespace Sculpting
                     HandleDamStandardInput(mouse, overUI, altHeld);
                     break;
                 case BrushType.Inflate:
-                    HandleInflateInput(mouse, overUI, altHeld);
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyInflateBrushLocal ??= ApplyInflateBrushLocal);
                     break;
                 case BrushType.Flatten:
-                    HandleFlattenInput(mouse, overUI, altHeld);
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyFlattenBrushLocal ??= ApplyFlattenBrushLocal);
                     break;
                 case BrushType.Pose:
                     HandlePoseInput(mouse, overUI, altHeld);
