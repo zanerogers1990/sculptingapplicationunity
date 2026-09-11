@@ -2048,16 +2048,20 @@ namespace Sculpting
             List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
             if (candidates.Count == 0) return;
 
+            // Read once here and handed to whichever path runs, instead of inside each of them, so
+            // both paths are pure functions of their arguments - which is what lets a test run the
+            // two on identical inputs (see SculptControllerJobParityTests). Same value either way:
+            // Time.deltaTime cannot change within a frame.
+            float dt = Time.deltaTime;
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyInflateBrushLocalJob(localPoint, localNormal, positive, candidates, verts, normals);
+                ApplyInflateBrushLocalJob(localPoint, localNormal, positive, dt, candidates, verts, normals);
             else
-                ApplyInflateBrushLocalManaged(localPoint, localNormal, positive, candidates, verts, normals);
+                ApplyInflateBrushLocalManaged(localPoint, localNormal, positive, dt, candidates, verts, normals);
         }
 
-        private void ApplyInflateBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyInflateBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
             float sign = positive ? 1f : -1f;
-            float dt = Time.deltaTime;
             float effectiveStrength = EffectiveBrushStrengthPlateau;
             float amount = sign * EffectiveBrushStrengthAccumulate * InflateSpeed * dt;
 
@@ -2084,10 +2088,9 @@ namespace Sculpting
             ScatterJobResults(candidates, verts);
         }
 
-        private void ApplyInflateBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyInflateBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
             float sign = positive ? 1f : -1f;
-            float dt = Time.deltaTime;
             float effectiveStrength = EffectiveBrushStrengthPlateau;
             float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
             Vector3 target = localPoint + localNormal * (brushRadius * InflateOffCapFactor * sign);
@@ -2172,16 +2175,15 @@ namespace Sculpting
             List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
             if (candidates.Count == 0) return;
 
+            float dt = Time.deltaTime; // read once for both paths - see ApplyInflateBrushLocal
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyFlattenBrushLocalJob(localPoint, localNormal, positive, candidates, verts, normals);
+                ApplyFlattenBrushLocalJob(localPoint, localNormal, positive, dt, candidates, verts, normals);
             else
-                ApplyFlattenBrushLocalManaged(localPoint, localNormal, positive, candidates, verts, normals);
+                ApplyFlattenBrushLocalManaged(localPoint, localNormal, positive, dt, candidates, verts, normals);
         }
 
-        private void ApplyFlattenBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyFlattenBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
-            float dt = Time.deltaTime;
-
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
             sculptableMesh.CopyStrokeStartPositions(candidates, _nativeStrokeStart);
 
@@ -2255,9 +2257,8 @@ namespace Sculpting
             ScatterJobResults(candidates, verts);
         }
 
-        private void ApplyFlattenBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, List<int> candidates, Vector3[] verts, Vector3[] normals)
+        private void ApplyFlattenBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
-            float dt = Time.deltaTime;
             float lerpFactorScale = EffectiveBrushStrength * FlattenSpeed * dt;
             float maxOffStart = brushRadius * FlattenContrastLimit;
 
@@ -2383,16 +2384,17 @@ namespace Sculpting
             List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
             if (candidates.Count == 0) return;
 
+            float dt = Time.deltaTime; // read once for both paths - see ApplyInflateBrushLocal
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplySmoothBrushLocalJob(localPoint, candidates, verts);
+                ApplySmoothBrushLocalJob(localPoint, dt, candidates, verts);
             else
-                ApplySmoothBrushLocalManaged(localPoint, candidates, verts);
+                ApplySmoothBrushLocalManaged(localPoint, dt, candidates, verts);
         }
 
         // See SmoothRelaxJob's remarks for why this is a Jacobi-style parallel relaxation rather
         // than the managed method's Gauss-Seidel-style in-place one - a deliberate, necessary
         // substitution for parallelism, not a bug.
-        private void ApplySmoothBrushLocalJob(Vector3 localPoint, List<int> candidates, Vector3[] verts)
+        private void ApplySmoothBrushLocalJob(Vector3 localPoint, float dt, List<int> candidates, Vector3[] verts)
         {
             int totalVerts = verts.Length;
             EnsureSmoothFullMeshScratch(totalVerts);
@@ -2424,7 +2426,6 @@ namespace Sculpting
             };
             weightJob.Schedule(candidates.Count, 32).Complete();
 
-            float dt = Time.deltaTime;
             float iterAmount = EffectiveBrushStrength * MaxSmoothIterations;
             int fullIterations = Mathf.FloorToInt(iterAmount);
             float partialFactor = iterAmount - fullIterations;
@@ -2496,7 +2497,7 @@ namespace Sculpting
             return job.Schedule(candidateCount, 32, dependency);
         }
 
-        private void ApplySmoothBrushLocalManaged(Vector3 localPoint, List<int> candidates, Vector3[] verts)
+        private void ApplySmoothBrushLocalManaged(Vector3 localPoint, float dt, List<int> candidates, Vector3[] verts)
         {
             if (_smoothWeightScratch.Length < candidates.Count) _smoothWeightScratch = new float[candidates.Count];
             float[] weights = _smoothWeightScratch;
@@ -2524,7 +2525,6 @@ namespace Sculpting
             }
             if (!anyInRange) return;
 
-            float dt = Time.deltaTime;
             float iterAmount = EffectiveBrushStrength * MaxSmoothIterations;
             int fullIterations = Mathf.FloorToInt(iterAmount);
             float partialFactor = iterAmount - fullIterations;
