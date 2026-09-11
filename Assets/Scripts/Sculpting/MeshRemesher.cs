@@ -427,7 +427,7 @@ namespace Sculpting
         {
             Vector3 n = Vector3.zero;
             for (int i = 0; i < count; i++) n += normals[i];
-            return n.sqrMagnitude > 1e-12f ? n.normalized : Vector3.up;
+            return VectorMath.NormalizeOr(n, Vector3.up, 1e-12f);
         }
 
         private static int[] BuildCubeEdgeTopologyIndex()
@@ -461,7 +461,7 @@ namespace Sculpting
                 gz += corner[c] * wx * wy * sz;
             }
             var g = new Vector3(gx, gy, gz);
-            return g.sqrMagnitude > 1e-20f ? g.normalized : Vector3.zero;
+            return VectorMath.NormalizeOr(g, Vector3.zero, 1e-20f);
         }
 
         // Emits the quad for every grid-lattice edge the SDF changes sign across: the four
@@ -711,8 +711,7 @@ namespace Sculpting
                     normal += buffer.Normals[loop[i]];
                 }
                 centroid /= loop.Count;
-                int centroidIndex = buffer.AddVertex(centroid,
-                    normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up);
+                int centroidIndex = buffer.AddVertex(centroid, VectorMath.NormalizeOr(normal, Vector3.up, 1e-12f));
 
                 for (int i = 0; i < loop.Count; i++)
                 {

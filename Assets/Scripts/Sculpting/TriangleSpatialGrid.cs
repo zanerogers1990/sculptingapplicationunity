@@ -378,7 +378,12 @@ namespace Sculpting
 
             int b = hitTriangle * 3;
             Vector3 a = vertices[triangles[b]];
-            hitNormal = Vector3.Cross(vertices[triangles[b + 1]] - a, vertices[triangles[b + 2]] - a).normalized;
+            // Not Vector3.normalized: its fixed 1e-5 length cutoff zeroed the normal of every
+            // triangle under 5e-6 square units - most of a dense sculpt's - and a brush has no
+            // direction to push along without one (see VectorMath). The fallback, facing back up
+            // the ray, only matters for a sliver the ray still managed to hit.
+            hitNormal = VectorMath.NormalizeOr(
+                Vector3.Cross(vertices[triangles[b + 1]] - a, vertices[triangles[b + 2]] - a), -dir);
             return true;
         }
 

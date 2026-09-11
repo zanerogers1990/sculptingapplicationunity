@@ -627,7 +627,7 @@ namespace Sculpting
 
             Vector3 normal = Vector3.zero;
             for (int i = 0; i < crossings; i++) normal += scratch.Normals[i];
-            normal = normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up;
+            normal = VectorMath.NormalizeOr(normal, Vector3.up, 1e-12f);
 
             output.Vertices[index] = world;
             output.Normals[index] = normal;

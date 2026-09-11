@@ -268,15 +268,23 @@ namespace Sculpting
             return best >= 0 ? Mathf.Sqrt(bestSqrDist) : float.MaxValue;
         }
 
-        /// Outward geometric normal of triangle `t`, matching the winding Unity's own
-        /// RecalculateNormals assumes. Not normalised by area - callers normalise once after
-        /// combining several.
+        /// Outward unit normal of triangle `t`, matching the winding Unity's own
+        /// RecalculateNormals assumes - zero only for a triangle with no area at all. Unit length
+        /// rather than area-weighted: callers sum several and normalise once.
+        ///
+        /// Normalised through VectorMath, not Vector3.normalized. That one returns zero below a
+        /// LENGTH of 1e-5, and a cross product's length is twice the triangle's area, so every
+        /// source triangle under 5e-6 square units lost its normal. On a dense source that is most
+        /// of them - 55% of a 612k-triangle unit sphere - and the remesh built from it took its
+        /// vertex normals from nothing: they fell back to straight up (84,106 of 306,208, seen as
+        /// dark speckle that a Smooth stroke wiped away), and DualContourSolver placed those
+        /// vertices without the planes it needs.
         public Vector3 TriangleNormal(int t)
         {
             Vector3 a = _vertices[_triangles[t * 3]];
             Vector3 b = _vertices[_triangles[t * 3 + 1]];
             Vector3 c = _vertices[_triangles[t * 3 + 2]];
-            return Vector3.Cross(b - a, c - a).normalized;
+            return VectorMath.NormalizeOr(Vector3.Cross(b - a, c - a), Vector3.zero);
         }
 
         /// Squared distance from `p` to the axis-aligned box of bin (x,y,z) - zero when p is

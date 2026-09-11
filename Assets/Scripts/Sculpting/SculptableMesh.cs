@@ -204,8 +204,56 @@ namespace Sculpting
                 _meshCollider = GetComponent<MeshCollider>();
                 if (_meshCollider == null)
                     _meshCollider = gameObject.AddComponent<MeshCollider>();
-                _meshCollider.sharedMesh = _mesh;
+                ReseatCollider();
             }
+        }
+
+        /// PhysX's fast midphase (BVH34) has a known problem with meshes of more than 2^21
+        /// triangles, and Unity warns on every such cook ("Source mesh has over 2,097,152 triangles
+        /// in it, and is using the Fast Midphase option. This might cause certain collisions to not
+        /// be detected correctly..."). A high-resolution remesh passes that easily, and this
+        /// collider is not just decoration - ZSphere attach raycasts it - so past the limit it
+        /// cooks the way that warning recommends, without fast midphase.
+        private const long FastMidphaseTriangleLimit = 1L << 21;
+
+        // Switched off together past the limit. CookForFasterSimulation has to go with fast
+        // midphase: on the older BVH33 midphase it is what makes cooking slow - measured on a
+        // 2.53M-triangle remesh, 5.8 s with it against 0.76 s without, where the default BVH34 cook
+        // took 0.80 s - and nothing simulates against this collider; it only answers raycasts.
+        private const MeshColliderCookingOptions LargeMeshSuppressedOptions =
+            MeshColliderCookingOptions.UseFastMidphase | MeshColliderCookingOptions.CookForFasterSimulation;
+
+        // Which of those options ReseatCollider actually switched off, so dropping back under the
+        // limit restores exactly them - leaving a collider configured without them alone.
+        private MeshColliderCookingOptions _suppressedCookingOptions;
+
+        /// (Re)cooks the collider against the current mesh - see FastMidphaseTriangleLimit. Counts
+        /// the index buffer the collider actually cooks rather than _workingTriangles, since hidden
+        /// geometry is left out of the former.
+        private void ReseatCollider()
+        {
+            if (_meshCollider == null) return;
+
+            long triangles = 0;
+            for (int s = 0; s < _mesh.subMeshCount; s++) triangles += (long)_mesh.GetIndexCount(s) / 3;
+
+            MeshColliderCookingOptions options = _meshCollider.cookingOptions;
+            if (triangles > FastMidphaseTriangleLimit)
+            {
+                _suppressedCookingOptions |= options & LargeMeshSuppressedOptions;
+                options &= ~LargeMeshSuppressedOptions;
+            }
+            else
+            {
+                options |= _suppressedCookingOptions;
+                _suppressedCookingOptions = MeshColliderCookingOptions.None;
+            }
+
+            // Detached before the options change, so they only ever apply to one fresh cook of the
+            // current mesh rather than to whatever the collider was still holding.
+            _meshCollider.sharedMesh = null;
+            _meshCollider.cookingOptions = options;
+            _meshCollider.sharedMesh = _mesh;
         }
 
         /// Adds a SculptableMesh to `go` - whose MeshFilter must ALREADY be holding `source` -
@@ -1881,11 +1929,7 @@ namespace Sculpting
             ApplyVertices();
             EndStrokeUndo();
 
-            if (_meshCollider != null)
-            {
-                _meshCollider.sharedMesh = null;
-                _meshCollider.sharedMesh = _mesh;
-            }
+            ReseatCollider();
         }
 
         public void ResetMesh()
@@ -2249,11 +2293,7 @@ namespace Sculpting
             _mesh.colors = _cavityColors;
             BindGpuScatter();
 
-            if (_meshCollider != null)
-            {
-                _meshCollider.sharedMesh = null;
-                _meshCollider.sharedMesh = _mesh;
-            }
+            ReseatCollider();
         }
 
         /// Rebuilds the spatial index used by SelectGrab/QueryNear over the current vertex
@@ -2923,11 +2963,7 @@ namespace Sculpting
             _mesh.colors = _cavityColors;
             BindGpuScatter();
 
-            if (_meshCollider != null)
-            {
-                _meshCollider.sharedMesh = null;
-                _meshCollider.sharedMesh = _mesh;
-            }
+            ReseatCollider();
         }
     }
 }
