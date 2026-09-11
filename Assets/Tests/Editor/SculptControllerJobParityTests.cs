@@ -219,11 +219,11 @@ namespace Sculpting.Tests
                 Run(dabs, d => job(d.Point, d.Normal, tangent0, bitangent0, positive, dabDt, d.Candidates, Verts, Normals, radius, softness)));
         }
 
-        /// Currently expected to FAIL. The job path computes Flatten's weights with ClayWeightJob at
-        /// EdgeSoftness 1, which goes through ClayFalloff - and ClayFalloff was later changed from a
-        /// cubic smoothstep to a quintic smootherstep for Clay's sake. The managed path still uses the
-        /// cubic, so the two falloffs now differ by up to ~0.05 of full weight (a quarter of the radius
-        /// in from the rim), and a dense-mesh stroke (job) behaves differently from a small one (managed).
+        /// The job path computes Flatten's weights with ClayWeightJob at EdgeSoftness 1, which goes
+        /// through ClayFalloff - so when ClayFalloff went from a cubic smoothstep to a quintic
+        /// smootherstep for Clay's sake, Flatten's job path changed with it while the managed path kept
+        /// the cubic. This test is what caught it: every case diverged by ~9% of a dab's displacement
+        /// until the managed path was moved onto ClayFalloff as well.
         [Test]
         public void Flatten([Values(true, false)] bool positive, [Values(0f, 0.3f, -0.2f)] float planeOffset,
             [Values(false, true)] bool maskAndFrontFacing)

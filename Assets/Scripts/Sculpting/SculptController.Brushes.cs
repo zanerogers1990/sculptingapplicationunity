@@ -2188,8 +2188,8 @@ namespace Sculpting
             sculptableMesh.CopyStrokeStartPositions(candidates, _nativeStrokeStart);
 
             // Clay's pass-1 job, reused with the round tip (TipRoundness 1) and a full-radius
-            // taper (EdgeSoftness 1) - which reduces ClayTipShapeT01/ClayFalloff to exactly the
-            // plain smoothstep-over-the-radius weight ApplyFlattenBrushLocalManaged computes, and
+            // taper (EdgeSoftness 1) - which reduces ClayTipShapeT01/ClayFalloff to a quintic
+            // falloff over the whole radius, the same call ApplyFlattenBrushLocalManaged makes, and
             // makes Tangent0/Bitangent0 dead parameters (ClayTipShapeT01 returns before reading
             // them at roundness 1), hence Vector3.zero rather than a basis nothing consumes. Only
             // WeightsOut is consumed here (see the reduction below), so the job's two weighted-sum
@@ -2287,7 +2287,9 @@ namespace Sculpting
                 // Plane weight (no mask) and displacement weight (masked) - see
                 // ClayWeightJob.Execute, and ApplyFlattenBrushLocalJob's reduction for why Flatten
                 // in particular cannot afford a mask-tilted plane.
-                float planeW = t01 * t01 * (3f - 2f * t01) // smoothstep
+                // ClayFalloff at full edge softness - the quintic ApplyFlattenBrushLocalJob gets from
+                // ClayWeightJob. Was a cubic smoothstep, left behind when ClayFalloff went quintic.
+                float planeW = ClayFalloff(t01, 1f)
                     * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 weights[ci] = planeW * (1f - mask[i]); // masked-out vertices hold still
 
