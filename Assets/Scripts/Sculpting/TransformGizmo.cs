@@ -589,8 +589,11 @@ namespace Sculpting
                             candidateTarget.BeginMaskedTransform() ? candidateTarget : null;
 
             // The handle's own axis, in the frame the gizmo is currently drawn in - which is the
-            // single target's local axes, or world axes for a set (see ComputePivotRotation).
-            _dragAxisWorld = _dragPivotRotation * AxisDirections[_dragAxis];
+            // single target's local axes, or world axes for a set (see ComputePivotRotation). The
+            // uniform-scale cube has no axis (tagged -1) and never reads this: it scales by mouse
+            // delta instead (see DragUniformScale).
+            if (_dragAxis >= 0)
+                _dragAxisWorld = _dragPivotRotation * AxisDirections[_dragAxis];
 
             if (_dragKind == HandleKind.Move || _dragKind == HandleKind.Scale)
             {
