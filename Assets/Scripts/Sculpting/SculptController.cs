@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -74,8 +74,8 @@ namespace Sculpting
         // crease/pinch instead of a smooth bridge. 0 disables it entirely.
         //
         // Clay-only: user-reported this is the one brush that actually needs it (bridging
-        // between separately-built volumes is a Clay-specific problem) - Crease/Dam Standard/
-        // Inflate/Flatten don't call ApplySurfaceRelaxLocal at all any more, so this field has
+        // between separately-built volumes is a Clay-specific problem) - Crease/Inflate/
+        // Flatten don't call ApplySurfaceRelaxLocal at all any more, so this field has
         // no effect on them regardless of value. Was shared across every brush at first (like
         // Build Up on Hold); narrowed to Clay-only once it became clear the OTHER brushes'
         // own sharp, deliberate output (Crease's groove in particular) was getting fought by
@@ -104,10 +104,10 @@ namespace Sculpting
 
         // Remembers each brush's own polarity across switches this session (ZBrush/Blender-
         // style per-tool state), instead of one flag shared by every brush regardless of which
-        // is selected. Crease/Dam Standard default to negative (carve) since that's what most
-        // people expect the first time they pick either up - they read as "indent" tools, unlike
-        // Clay/Inflate which read as "add" tools by default. Indexed by BrushType; kept in sync
-        // with `isPositive` by the CurrentBrush/IsPositive setters below.
+        // is selected. Crease defaults to negative (carve) since that's what most people expect
+        // the first time they pick it up - it reads as an "indent" tool, unlike Clay/Inflate
+        // which read as "add" tools by default. Indexed by BrushType; kept in sync with
+        // `isPositive` by the CurrentBrush/IsPositive setters below.
         private readonly bool[] _brushPolarity = CreateDefaultBrushPolarity();
 
         private static bool[] CreateDefaultBrushPolarity()
@@ -115,16 +115,15 @@ namespace Sculpting
             var polarity = new bool[Enum.GetValues(typeof(BrushType)).Length];
             for (int i = 0; i < polarity.Length; i++) polarity[i] = true;
             polarity[(int)BrushType.Crease] = false;
-            polarity[(int)BrushType.DamStandard] = false;
             return polarity;
         }
 
         // Same per-brush-memory pattern as _brushPolarity, for whether holding the brush in
         // place keeps deepening its effect indefinitely (ON - ZBrush/Blender-style continuous
-        // accumulation) or converges to a single dab's worth and stops (OFF). Clay/Inflate/Dam
-        // Standard default ON (they read as "keep building" tools); Move/Smooth/Crease default
-        // OFF (Move/Smooth don't have this concept at all - see their apply code, which never
-        // reads this flag, same as they never read isPositive; Crease's existing single-dab-cap
+        // accumulation) or converges to a single dab's worth and stops (OFF). Clay/Inflate
+        // default ON (they read as "keep building" tools); Move/Smooth/Crease default OFF
+        // (Move/Smooth don't have this concept at all - see their apply code, which never reads
+        // this flag, same as they never read isPositive; Crease's existing single-dab-cap
         // behavior IS the desired OFF default, unchanged).
         private readonly bool[] _brushAccumulate = CreateDefaultBrushAccumulate();
 
@@ -133,7 +132,6 @@ namespace Sculpting
             var accum = new bool[Enum.GetValues(typeof(BrushType)).Length];
             accum[(int)BrushType.Clay] = true;
             accum[(int)BrushType.Inflate] = true;
-            accum[(int)BrushType.DamStandard] = true;
             return accum;
         }
 
@@ -209,10 +207,9 @@ namespace Sculpting
         [SerializeField, Range(0.3f, 3f)] private float alphaScale = 1f;
         [SerializeField] private bool invertAlpha;
 
-        [Header("Crease / Dam Standard Brush")]
+        [Header("Crease Brush")]
         [SerializeField, Range(0f, 1f)] private float creasePinch = 0.6f;
         [SerializeField, Range(0.05f, 1f)] private float creaseDepthFactor = 0.35f;
-        [SerializeField, Range(0f, 1f)] private float damLipHeight = 0.25f;
 
         [Header("Flatten Brush")]
         // Where the flatten plane sits relative to the surface it was averaged from, as a
@@ -233,6 +230,37 @@ namespace Sculpting
         [Header("Remesh Settings")]
         [SerializeField, Range(4, 500)] private int remeshResolution = 24;
 
+        [Header("Dynamic Topology")]
+        // The manual Remesh above rebuilds the WHOLE mesh at one uniform resolution; this refines
+        // locally as you sculpt, inside the brush footprint only. Off by default - see
+        // DynamicTopologySettings.Enabled for why that is not just caution.
+        [SerializeField] private DynamicTopology.DynamicTopologySettings dynamicTopology =
+            new DynamicTopology.DynamicTopologySettings();
+
+        public DynamicTopology.DynamicTopologySettings DynamicTopologySettings => dynamicTopology;
+
+        public bool DynamicTopologyEnabled
+        {
+            get => dynamicTopology.Enabled;
+            set => dynamicTopology.Enabled = value;
+        }
+
+        public float DynamicTopologyDetailSize
+        {
+            get => dynamicTopology.DetailSize;
+            set => dynamicTopology.DetailSize = Mathf.Clamp(value, MinDetailSize, MaxDetailSize);
+        }
+
+        public const float MinDetailSize = 0.002f;
+        public const float MaxDetailSize = 0.12f;
+
+        // Created lazily rather than in Awake: it holds only settings and throttle state, and a
+        // controller that never turns dynamic topology on should not allocate it at all.
+        private DynamicTopology.DynamicTopologyRemesher _dynamicTopologyRemesher;
+
+        private DynamicTopology.DynamicTopologyRemesher DynamicTopologyRemesher =>
+            _dynamicTopologyRemesher ??= new DynamicTopology.DynamicTopologyRemesher(dynamicTopology);
+
         [Header("Symmetry Repair")]
         // Which plane the correspondence-map tools work across. Deliberately its own setting
         // rather than being read off MirrorController's three toggles: those are independent and
@@ -248,7 +276,7 @@ namespace Sculpting
         [SerializeField] private bool showWireframeGizmo = false;
         [SerializeField] private bool logRayHits = false;
 
-        // Multithreads Inflate/Crease/DamStandard/Clay/Smooth's per-candidate math via Unity
+        // Multithreads Inflate/Crease/Clay/Smooth's per-candidate math via Unity
         // Jobs+Burst instead of a plain C# loop - mirrors how Blender/ZBrush get real-time perf
         // at high polycount (CPU spatial acceleration + multithreading), not GPU compute for the
         // brush math itself - a GPU brush was ruled out because hit-testing the deformed surface
@@ -428,15 +456,11 @@ namespace Sculpting
                     brushStrength = _brushStrengthPerType[(int)currentBrush];
                     frontFacingOnly = _brushFrontFacingOnly[(int)currentBrush];
                     // brushRadius deliberately carries across the switch untouched.
-                    TriggerActionToast(BrushDisplayName(currentBrush));
+                    TriggerActionToast(currentBrush.ToString());
                 }
             }
         }
 
-        /// Human-readable brush name for the switch-brush toast above (see TriggerActionToast) -
-        /// BrushType.DamStandard has no space, everything else matches its enum name as-is.
-        private static string BrushDisplayName(BrushType type) =>
-            type == BrushType.DamStandard ? "Dam Standard" : type.ToString();
         public bool IsPositive
         {
             get => isPositive;
@@ -483,7 +507,6 @@ namespace Sculpting
         public float PressureCurve { get => pressureCurve; set => pressureCurve = Mathf.Clamp(value, 0.5f, 3f); }
         public float CreasePinch { get => creasePinch; set => creasePinch = Mathf.Clamp01(value); }
         public float CreaseDepthFactor { get => creaseDepthFactor; set => creaseDepthFactor = Mathf.Clamp(value, 0.05f, 1f); }
-        public float DamLipHeight { get => damLipHeight; set => damLipHeight = Mathf.Clamp01(value); }
         public float FlattenPlaneOffset { get => flattenPlaneOffset; set => flattenPlaneOffset = Mathf.Clamp(value, -0.5f, 0.5f); }
         public float MaskHardness { get => maskHardness; set => maskHardness = Mathf.Clamp01(value); }
         public bool UseAlpha { get => useAlpha; set => useAlpha = value; }
@@ -626,27 +649,6 @@ namespace Sculpting
         // the ring cursor all stand down, exactly as they do for a non-Sculpt gizmo mode.
         private bool RegionSelectActive => RegionSelect != null && RegionSelect.IsActive;
 
-        // World-space grid that previews RemeshResolution while the R gauge is held (see
-        // HandleRemeshDensityKey) - same self-installing idiom as RegionSelect above, and for
-        // the same reason (no scene wiring reaches it through Unity MCP).
-        private RemeshDensityGrid _densityGrid;
-        public RemeshDensityGrid DensityGrid
-        {
-            get
-            {
-                if (_densityGrid != null) return _densityGrid;
-                _densityGrid = FindFirstObjectByType<RemeshDensityGrid>();
-                if (_densityGrid == null) _densityGrid = gameObject.AddComponent<RemeshDensityGrid>();
-                return _densityGrid;
-            }
-        }
-
-        /// True while the R-hold gauge is armed - RemeshDensityGrid reads this to know when to
-        /// show/fade in, SculptUIBuilder reads it to know when to show the density label, and
-        /// UpdateBrushCursor reads it to suppress the ordinary brush ring for the same reason it
-        /// already suppresses it for a region gesture or a non-Sculpt gizmo.
-        public bool ShowRemeshDensityGrid => _isAdjustingRemeshDensity;
-
         // Which whole-object tool (see GizmoMode) is currently active - HandleSculptInput
         // early-outs while a non-Sculpt mode is active so gizmo dragging and brush strokes can
         // never fight over the same click. Lazily resolved, same reasoning as Selection above.
@@ -715,8 +717,11 @@ namespace Sculpting
             HandleBrushResizeKey();
             HandleBrushStrengthKey();
             HandleRemeshDensityKey();
+            HandleRadialMenuKey();
+            HandleRegionRadialMenuKey();
             HandleUndoRedoKeys();
             HandleSaveKeys();
+            HandleDeleteObjectKey();
             UpdatePoseChainVisual();
             UpdatePenPressure();
             HandleSculptInput();
@@ -794,6 +799,17 @@ namespace Sculpting
                 return;
             }
 
+            // Same carve-out for the radial tool-select menu (Space, see HandleRadialMenuKey):
+            // it owns hover/click for picking a wedge while up, and a stray sculpt dab under it
+            // (or right as a wedge click lands) would otherwise fire the instant the menu closes.
+            if (_radialMenuOpen || _regionRadialMenuOpen)
+            {
+                _isHovering = false;
+                _isOverUI = UnityEngine.EventSystems.EventSystem.current != null &&
+                            UnityEngine.EventSystems.EventSystem.current.IsPointerOverGameObject();
+                return;
+            }
+
             // Same carve-out again for the R-hold density gauge: it owns horizontal mouse
             // movement while armed, and the grid/label are its whole visual, so - unlike the S/F
             // gauges below - the brush ring is suppressed rather than frozen in place (see
@@ -834,7 +850,7 @@ namespace Sculpting
             }
 
             // Prepare the vertex spatial index once at the start of every stroke so Clay/Smooth/
-            // Crease/Dam Standard/Move's per-stroke vertex lookups don't have to scan the whole
+            // Crease/Move's per-stroke vertex lookups don't have to scan the whole
             // mesh. Cell size tracks the current brush radius so the grid stays well-matched to
             // typical query size; the previous stroke's index is reused as-is when it still fits
             // (see SculptableMesh.PrepareSpatialIndex), since a rebuild is O(vertex count) and
@@ -855,7 +871,11 @@ namespace Sculpting
                 _strokeSpeed = 0f;
                 // Fresh stroke, fresh touched-vertex set - see _strokeDirtyVertexScratch/
                 // ApplyPostStrokeUnifyPass.
-                _strokeDirtyVertexScratch.Clear(sculptableMesh.Vertices.Length);
+                _strokeDirtyVertexScratch.Clear(sculptableMesh.VertexCount);
+                // Fresh stroke, fresh refine cadence: the throttle measures distance since the last
+                // refine, and without this a stroke starting where the previous one left off would
+                // have to travel a quarter of a brush radius before refining anything.
+                _dynamicTopologyRemesher?.ResetThrottle();
             }
 
             switch (currentBrush)
@@ -868,9 +888,6 @@ namespace Sculpting
                     break;
                 case BrushType.Crease:
                     HandleCreaseInput(mouse, overUI, altHeld);
-                    break;
-                case BrushType.DamStandard:
-                    HandleDamStandardInput(mouse, overUI, altHeld);
                     break;
                 case BrushType.Inflate:
                     HandleStandardBrushInput(mouse, overUI, altHeld, _applyInflateBrushLocal ??= ApplyInflateBrushLocal);

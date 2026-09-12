@@ -22,8 +22,13 @@ namespace Sculpting
         /// `hideOthers` takes them out of the viewport afterwards, since an operand left visible
         /// sits exactly inside the hole it just cut (or duplicates the volume it was just merged
         /// into) and reads as if nothing happened. Re-showing one is the eye toggle in the object
-        /// list. Note that this - like the delete - is NOT part of the undo step: pressing undo
-        /// brings the target's geometry back but leaves the other objects as they are.
+        /// list; hiding is NOT part of the undo step, so pressing Z brings the target's geometry
+        /// back but leaves a hidden operand hidden. A DELETED operand is different:
+        /// SelectionManager.DeleteObject records its own undo step (see its remarks), so with
+        /// deleteOthers on, one boolean now costs several Z presses to fully unwind - the deleted
+        /// operands first (each its own step), then the target's geometry - rather than one. That
+        /// trades the old single-press-reverts-everything feel for nothing ever being lost for
+        /// good, which matters more given how large an operand can be.
         public static bool Apply(SculptableMesh target, IReadOnlyList<SculptableMesh> others, BooleanOp op, int resolution,
                                  bool hideOthers, bool deleteOthers, out string message)
         {
@@ -42,13 +47,13 @@ namespace Sculpting
             var operands = new List<MeshBoolean.Operand>(others.Count);
             foreach (SculptableMesh cutter in others)
             {
-                if (cutter == null || cutter == target || cutter.Vertices == null || cutter.Vertices.Length == 0) continue;
+                if (cutter == null || cutter == target || cutter.Vertices == null || cutter.VertexCount == 0) continue;
 
                 // Into the target's local space, which is where its own vertices live and where
                 // the result has to end up (the target keeps its transform - only its mesh is
                 // replaced). Same matrix product MeshJoiner builds for CombineInstance.
                 Matrix4x4 toTarget = target.transform.worldToLocalMatrix * cutter.transform.localToWorldMatrix;
-                Vector3[] src = cutter.Vertices;
+                Vector3[] src = cutter.VerticesExact();
                 var verts = new Vector3[src.Length];
                 for (int i = 0; i < src.Length; i++) verts[i] = toTarget.MultiplyPoint3x4(src[i]);
 
@@ -56,7 +61,7 @@ namespace Sculpting
                 // Mesh instead would give the stale pre-sculpt shape, since sculpting writes
                 // through a compute shader the Mesh getters do not reflect (the same trap
                 // MeshJoiner and Remesh both document).
-                int[] tris = cutter.Triangles;
+                int[] tris = cutter.TrianglesExact();
 
                 // A mirrored or negatively-scaled cutter comes through with its triangles wound
                 // inside-out, which flips its inside/outside sign and would make it ADD material
@@ -83,7 +88,7 @@ namespace Sculpting
                 return false;
             }
 
-            Mesh result = MeshBoolean.Build(target.Vertices, target.Triangles, operands, op, resolution, out string error);
+            Mesh result = MeshBoolean.Build(target.VerticesExact(), target.TrianglesExact(), operands, op, resolution, out string error);
             if (result == null)
             {
                 message = "Nothing changed - " + error + ".";
@@ -112,7 +117,7 @@ namespace Sculpting
             string verb = op == BooleanOp.Subtract ? "Subtracted" : op == BooleanOp.Union ? "United" : "Intersected";
             string fate = deleteOthers ? ", deleted" : hideOthers ? ", hidden" : "";
             message = $"{verb} {affected} object{(affected == 1 ? "" : "s")}{fate}. " +
-                      $"{target.Triangles.Length / 3:n0} triangles.";
+                      $"{target.TriangleCount:n0} triangles.";
             return true;
         }
     }

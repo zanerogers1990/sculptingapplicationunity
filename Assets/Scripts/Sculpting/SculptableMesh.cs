@@ -86,6 +86,12 @@ namespace Sculpting
         /// dab-application, not recomputed mid-dab.
         public float CurvatureDeviationAt(int index) => Mathf.Abs(_cavityRaw[index] - _cavityMean);
 
+        /// The stored raw curvature itself, signed and un-centred - what a vertex created between
+        /// two others should start out holding, so a refine does not leave new geometry reading as
+        /// flat until the next cavity pass reaches it. Internal because it is a cache detail, not
+        /// a measurement anything outside the mesh pipeline should be interpreting.
+        internal float CurvatureRawAt(int index) => _cavityRaw[index];
+
         // Per-vertex mask: 0 = fully sculptable (default), 1 = fully protected. Every brush
         // loop multiplies its falloff weight by (1 - Mask[i]), so a masked area simply doesn't
         // move under any brush. Reset to all-zero whenever topology changes (Awake/Remesh/
@@ -129,9 +135,62 @@ namespace Sculpting
         private GpuVertexScatter _gpuScatter;
 
         public Mesh Mesh => _mesh;
+
+        /// The live vertex/normal/triangle buffers.
+        ///
+        /// THEIR .Length IS A CAPACITY, NOT A COUNT. Dynamic topology appends vertices and
+        /// triangles mid-stroke (see EnsureVertexCapacity), and it can only do that without
+        /// copying the whole mesh on every refine if the buffers run ahead of what is in use.
+        /// VertexCount and TriangleCount are the authority; anything that walks these arrays has
+        /// to bound itself by one of those, and anything that hands a whole array to code
+        /// expecting an exact fit wants the Exact accessors below instead.
+        ///
+        /// The spare tail is kept deliberately harmless rather than merely undefined - spare
+        /// vertex slots hold a copy of vertex 0 and spare triangles are degenerate - so that a
+        /// consumer this refactor missed reads something in-bounds and on-surface rather than
+        /// garbage coordinates that would blow up a bounding box or an SDF.
         public Vector3[] Vertices => _workingVertices;
         public Vector3[] Normals => _workingNormals;
         public int[] Triangles => _workingTriangles;
+
+        /// Vertices in use. Distinct from Vertices.Length - see its remarks.
+        public int VertexCount => _vertexCount;
+
+        // Vertices and triangle CORNERS actually in use. Everything at or past these is spare
+        // capacity. Kept as plain fields (not derived from the arrays) because they are read on
+        // the brush hot path and in every bounds guard in this class.
+        private int _vertexCount;
+        private int _cornerCount;
+
+        /// The same buffers trimmed to exactly what is in use, for callers that hand a whole
+        /// array to something with no count to go with it - Join, Boolean, Extract, Clone,
+        /// Export, scene save. Returns the live array itself whenever capacity already equals
+        /// count, which is every moment outside an active dynamic-topology stroke, so the common
+        /// case costs nothing at all.
+        public Vector3[] VerticesExact() => Exact(_workingVertices, _vertexCount);
+        public Vector3[] NormalsExact() => Exact(_workingNormals, _vertexCount);
+        public int[] TrianglesExact() => Exact(_workingTriangles, _cornerCount);
+        public float[] MaskExact() => Exact(_mask, _vertexCount);
+
+        private static T[] Exact<T>(T[] array, int count)
+        {
+            if (array == null || array.Length == count) return array;
+            return CloneExact(array, count);
+        }
+
+        /// Exact's always-copy form, for callers that must OWN the result - undo snapshots above
+        /// all, which are kept while the live buffer goes on being written.
+        private static T[] CloneExact<T>(T[] array, int count)
+        {
+            if (array == null) return null;
+            var copy = new T[count];
+            Array.Copy(array, copy, count);
+            return copy;
+        }
+
+        /// The live mirror pair this object is one half of, or null - set only by MirrorLink. The
+        /// vertex apply paths below report to it, which is how the other half follows an edit.
+        public MirrorLink LinkedMirror { get; internal set; }
         // Undo/redo ORDER lives in EditHistory, not here - a per-object stack cannot say
         // whether the last thing the user did was on THIS object (see EditHistory's remarks).
         // These are the hooks it drives this object's own payload stack through.
@@ -185,6 +244,7 @@ namespace Sculpting
             _workingVertices = (Vector3[])_originalVertices.Clone();
             _workingNormals = _mesh.normals;
             _workingTriangles = _mesh.triangles;
+            SetGeometryCounts(_workingVertices.Length, _workingTriangles.Length);
 
             ConfigureGpuVertexLayout(_mesh, _workingVertices.Length);
             _mesh.vertices = _workingVertices;
@@ -318,9 +378,7 @@ namespace Sculpting
         {
             _gpuScatter?.Dispose();
             _gpuScatter = null;
-            if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
-            if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
-            _nativeAdjacencySource = null;
+            DisposeNativeAdjacency();
         }
 
         // Marks the mesh's vertex buffer as compute-shader-writable (GraphicsBuffer.Target.Raw)
@@ -372,7 +430,7 @@ namespace Sculpting
             const float TargetTrianglesPerCell = 8f;
             Bounds b = _mesh.bounds;
             float volume = Mathf.Max(b.size.x * b.size.y * b.size.z, 1e-9f);
-            int triCount = Mathf.Max(1, _workingTriangles.Length / 3);
+            int triCount = Mathf.Max(1, TriangleCount);
             float cellVolume = volume * TargetTrianglesPerCell / triCount;
             float cellSize = Mathf.Max(Mathf.Pow(cellVolume, 1f / 3f), 0.001f);
 
@@ -385,7 +443,8 @@ namespace Sculpting
             Vector3 pad = b.size * 0.5f;
             b.SetMinMax(b.min - pad, b.max + pad);
 
-            _triangleGrid = new TriangleSpatialGrid(_workingVertices, _workingTriangles, b, cellSize);
+            _triangleGrid = new TriangleSpatialGrid(_workingVertices, _vertexCount, _workingTriangles, _cornerCount,
+                                                    b, cellSize);
             // A fresh build already reflects every position, so nothing queued before it applies.
             _pendingTriangleGridVertices.Clear();
         }
@@ -465,12 +524,461 @@ namespace Sculpting
             return Mathf.Min(Mathf.Abs(s.x), Mathf.Min(Mathf.Abs(s.y), Mathf.Abs(s.z)));
         }
 
+        // ------------------------------------------------------------------ growable buffers
+
+        /// Adopts `vertexCount` vertices and `cornerCount` triangle corners as what is in use, and
+        /// sizes every per-vertex and per-triangle buffer to exactly that. The replace paths
+        /// (Awake, ReplaceGeometry, ReplaceMesh, RestoreSnapshot) all hand over exact arrays, so
+        /// this is where capacity and count come back into step after a stroke that grew them
+        /// apart.
+        private void SetGeometryCounts(int vertexCount, int cornerCount)
+        {
+            _vertexCount = vertexCount;
+            _cornerCount = cornerCount;
+        }
+
+        /// Makes room for `capacity` vertices across every per-vertex buffer, without changing
+        /// VertexCount. Grows by half again rather than to exactly what was asked, so a refine
+        /// that adds a few hundred vertices at a time does not reallocate on each one.
+        ///
+        /// The spare slots are seeded with vertex 0's position rather than left at default: the
+        /// mesh's own vertex buffer is sized to CAPACITY (see EnsureMeshVertexCapacity for why it
+        /// has to be), so anything Unity derives from the whole buffer - RecalculateBounds above
+        /// all - would otherwise be dragged to the origin by a tail of zeroes.
+        private void EnsureVertexCapacity(int capacity)
+        {
+            int current = _workingVertices.Length;
+            if (current >= capacity) return;
+
+            int grown = Mathf.Max(capacity, current + current / 2);
+            Vector3 seed = _vertexCount > 0 ? _workingVertices[0] : Vector3.zero;
+
+            Array.Resize(ref _workingVertices, grown);
+            Array.Resize(ref _workingNormals, grown);
+            Array.Resize(ref _cavityColors, grown);
+            Array.Resize(ref _cavityRaw, grown);
+            Array.Resize(ref _mask, grown);
+            // Grown alongside the rest so Reset Mesh keeps describing the current vertex set - a
+            // baseline that stopped at the pre-stroke count would leave every vertex a refine
+            // added with no position to return to.
+            Array.Resize(ref _originalVertices, grown);
+            for (int i = current; i < grown; i++) _workingVertices[i] = seed;
+
+            // Sized alongside the buffers they shadow, so the "did this change under me" length
+            // checks scattered through this class keep answering about capacity consistently.
+            if (_syncedVertices != null)
+            {
+                Array.Resize(ref _syncedVertices, grown);
+                for (int i = current; i < grown; i++) _syncedVertices[i] = seed;
+                _syncedFor = _workingVertices;
+            }
+            if (_strokeRecordSlot != null)
+            {
+                Array.Resize(ref _strokeRecordSlot, grown);
+                for (int i = current; i < grown; i++) _strokeRecordSlot[i] = -1;
+            }
+            if (_hiddenVertices != null) Array.Resize(ref _hiddenVertices, grown);
+            if (_affectedStamp != null) Array.Resize(ref _affectedStamp, grown);
+            if (_normalAccumScratch != null) Array.Resize(ref _normalAccumScratch, grown);
+
+            _topology?.EnsureVertexCapacity(grown);
+            EnsureMeshVertexCapacity(grown);
+        }
+
+        /// The triangle counterpart. Spare corners are left as a degenerate (0,0,0) triangle,
+        /// which draws nothing and - unlike an arbitrary leftover index - can never reference a
+        /// vertex that no longer exists.
+        private void EnsureTriangleCapacity(int cornerCapacity)
+        {
+            int current = _workingTriangles.Length;
+            if (current >= cornerCapacity) return;
+
+            int grown = Mathf.Max(cornerCapacity, current + current / 2);
+            Array.Resize(ref _workingTriangles, grown);
+            for (int i = current; i < grown; i++) _workingTriangles[i] = 0;
+            if (_hiddenTriangles != null) Array.Resize(ref _hiddenTriangles, grown / 3);
+        }
+
+        /// Re-specifies the mesh's vertex buffer at `capacity` and re-uploads everything, which
+        /// is the one genuinely whole-mesh cost a refine can incur - so it is paid on CAPACITY
+        /// growth, not on every refine that adds a vertex.
+        ///
+        /// It cannot be avoided by sizing the buffer to the count instead: SetVertexBufferParams
+        /// discards the buffer's contents and hands back a new GraphicsBuffer, which orphans the
+        /// one GpuVertexScatter is holding (see its BindMesh) - so doing it per refine would mean
+        /// a full re-upload per refine AND a rebind, rather than a scatter write over just the
+        /// vertices that changed.
+        private void EnsureMeshVertexCapacity(int capacity)
+        {
+            if (_mesh == null || _mesh.vertexCount >= capacity) return;
+            ConfigureGpuVertexLayout(_mesh, capacity);
+            _mesh.SetVertices(_workingVertices, 0, capacity);
+            _mesh.SetNormals(_workingNormals, 0, capacity);
+            _mesh.SetColors(_cavityColors, 0, capacity);
+            BindGpuScatter();
+        }
+
+        // --------------------------------------------------- dynamic topology mutation surface
+        //
+        // Deliberately narrow and `internal`: these are the only ways the mesh's vertex and index
+        // counts move outside the wholesale replace paths, and everything that has to stay in step
+        // with them (adjacency, the grids, the GPU buffer, the undo patch) is handled either here
+        // or by the one caller, DynamicTopologyRemesher. Nothing else in the app should be
+        // appending geometry a vertex at a time.
+
+        /// Re-cooks the MeshCollider once, at the end of a stroke that changed topology, and only
+        /// then.
+        ///
+        /// Cooking is this project's standing perf ceiling - tens of milliseconds at a few hundred
+        /// thousand triangles, which is why ordinary sculpting stopped touching the collider years
+        /// ago (see the class remarks). A refine runs many times a stroke, so doing it per refine
+        /// would reinstate that cost at a worse cadence than the one it was removed from. Deferring
+        /// it to the release frame is safe because nothing hit-tests through the collider anyway -
+        /// RaycastMesh goes to _triangleGrid, which the refine keeps exact as it goes; the collider
+        /// exists for outside users like ZSphere attach, none of which can run mid-stroke.
+        public void ReseatColliderIfTopologyChanged()
+        {
+            if (!_strokeTopologyActive) return;
+            ReseatCollider();
+        }
+
+        /// The live topology map, built if a mid-Play recompile dropped it, for the one caller
+        /// that EDITS it rather than reading it - see DynamicTopologyRemesher.
+        internal MeshAdjacency EnsureAdjacencyForTopologyEdit()
+        {
+            MeshAdjacency topology = EnsureAdjacency();
+            // The map is sized to the vertex COUNT, while a refine is about to append past it.
+            // Growing it up front means the appends never reallocate mid-operation.
+            topology.EnsureVertexCapacity(_workingVertices.Length);
+            return topology;
+        }
+
+        /// Appends one vertex and returns its index. Attributes are interpolated by the caller
+        /// from whatever the new vertex sits between; its baseline (Reset Mesh) position is its
+        /// birth position, since there is no earlier shape it could return to.
+        internal int AppendVertex(Vector3 position, Vector3 normal, float mask, float cavityRaw)
+        {
+            EnsureVertexCapacity(_vertexCount + 1);
+            int v = _vertexCount++;
+            _workingVertices[v] = position;
+            _originalVertices[v] = position;
+            _workingNormals[v] = normal;
+            _mask[v] = Mathf.Clamp01(mask);
+            _cavityRaw[v] = cavityRaw;
+            _cavityColors[v] = new Color(0.5f, _mask[v], 0.5f, 1f);
+            if (_hiddenVertices != null) _hiddenVertices[v] = false;
+            // The sync baseline has to say this vertex has NOT been uploaded yet, or the drift
+            // filter would compare its birth position against a stale slot and could decide it has
+            // not moved - leaving a brand-new vertex out of the very upload that first draws it.
+            // Offsetting it far enough to beat any threshold is simpler than special-casing the
+            // filter, and it is corrected by that same upload moments later.
+            if (_syncedVertices != null) _syncedVertices[v] = position + Vector3.one * 1e3f;
+            if (_strokeRecordSlot != null) _strokeRecordSlot[v] = -1;
+
+            // The topology map has to grow in lockstep, not lazily: the caller is about to give
+            // this vertex a neighbour list, and writing one past the map's own VertexCount would
+            // put it outside the range a later compaction walks - which would then slide another
+            // vertex's list on top of it.
+            _topology?.AppendVertex();
+            return v;
+        }
+
+        /// Appends one triangle and returns its index.
+        internal int AppendTriangle(int a, int b, int c)
+        {
+            EnsureTriangleCapacity(_cornerCount + 3);
+            int t = _cornerCount / 3;
+            _workingTriangles[_cornerCount] = a;
+            _workingTriangles[_cornerCount + 1] = b;
+            _workingTriangles[_cornerCount + 2] = c;
+            _cornerCount += 3;
+            // A triangle born inside a hidden region stays hidden: its parent was, and the user
+            // hid that region on purpose. EnsureTriangleCapacity has already grown the buffer.
+            return t;
+        }
+
+        /// Overwrites an existing triangle's three corners.
+        internal void SetTriangle(int triangleIndex, int a, int b, int c)
+        {
+            int b0 = triangleIndex * 3;
+            _workingTriangles[b0] = a;
+            _workingTriangles[b0 + 1] = b;
+            _workingTriangles[b0 + 2] = c;
+        }
+
+        internal void SetTriangleHiddenFlag(int triangleIndex, bool hidden)
+        {
+            if (!_anyHidden) return;
+            EnsureVisibilityBuffer();
+            if (triangleIndex >= 0 && triangleIndex < _hiddenTriangles.Length) _hiddenTriangles[triangleIndex] = hidden;
+        }
+
+        /// Restores the counts and the triangle slots a TopologyPatch recorded - see
+        /// DynamicTopology.TopologyPatch. Truncating the counts is what removes appended geometry:
+        /// no index below the restored counts changes meaning, so every mask value, undo delta and
+        /// hidden-triangle flag on the surviving geometry stays pointed at exactly what it always
+        /// was.
+        internal void RestoreTopology(int vertexCount, int cornerCount, int[] slots, int[] corners)
+        {
+            if (slots != null && corners != null)
+            {
+                for (int k = 0; k < slots.Length; k++)
+                {
+                    int b0 = slots[k] * 3, s = k * 3;
+                    _workingTriangles[b0] = corners[s];
+                    _workingTriangles[b0 + 1] = corners[s + 1];
+                    _workingTriangles[b0 + 2] = corners[s + 2];
+                }
+            }
+
+            _vertexCount = vertexCount;
+            _cornerCount = cornerCount;
+            RebuildAfterTopologyRestore();
+        }
+
+        /// The derived state a topology restore invalidates. Heavier than the incremental apply
+        /// path - it rebuilds adjacency and both grids over the whole mesh - and deliberately so:
+        /// an undo is a discrete user action where a few tens of milliseconds is invisible, while
+        /// the incremental bookkeeping that would avoid it is exactly where a subtle corruption
+        /// would hide.
+        private void RebuildAfterTopologyRestore()
+        {
+            BuildAdjacency();
+            RebuildTriangleGrid();
+            _spatialGrid = null;
+            _pendingVertexGridVertices.Clear();
+            _syncedVertices = null;
+            _syncedFor = null;
+            EnsureVisibilityBuffer();
+
+            _mesh.SetVertices(_workingVertices, 0, _workingVertices.Length);
+            _mesh.SetNormals(_workingNormals, 0, _workingNormals.Length);
+            _mesh.SetColors(_cavityColors, 0, _cavityColors.Length);
+            RefreshVisibility();
+            RecomputeCavity();
+            BindGpuScatter();
+        }
+
+        /// Pushes a completed local remesh into everything derived from topology - the incremental
+        /// counterpart of RebuildDerivedState, and the reason a refine costs the footprint rather
+        /// than the mesh.
+        ///
+        /// Pointedly does NOT do three of the things RebuildDerivedState does: it does not reset
+        /// the mask (the vertices that had one still exist and still mean it), it does not reset
+        /// hidden geometry, and it does not finalize a linked mirror pair. The first two are safe
+        /// because every surviving index still names the same vertex; the third is because
+        /// dynamic topology is suspended outright while a pair is linked, so this is never
+        /// reached with one - see DynamicTopologyRemesher.CanRefine.
+        internal void ApplyTopologyPatch(DynamicTopology.TopologyPatch patch)
+        {
+            if (patch == null || patch.IsEmpty) return;
+
+            // The drift baseline, which the scatter at the end of this method marks against. In
+            // ordinary use ApplyVerticesLocal has already built it by the time a refine runs, but
+            // this path must not depend on that: nothing about a refine requires a dab to have
+            // been applied first, and the tests drive it on a freshly loaded mesh.
+            EnsureSyncBuffer();
+
+            // Bounds first: the grids and the collider are both sized against them, and a vertex
+            // placed outside the triangle grid's fixed box has to be caught here rather than by a
+            // raycast quietly missing it later.
+            ExpandBoundsLocal(patch.TouchedVertices);
+
+            if (_triangleGrid != null && MeshBoundsFitInsideTriangleGrid())
+            {
+                int addedTriangles = (patch.CornerCountAfter - patch.CornerCountBefore) / 3;
+                _triangleGrid.AppendTriangles(patch.CornerCountBefore / 3, addedTriangles, _vertexCount,
+                                              _workingVertices, _workingTriangles);
+                // Slots that were REWRITTEN rather than appended are still registered against the
+                // triangle they used to be; re-bucketing them is what keeps a raycast hitting the
+                // new geometry instead of the shape it replaced.
+                _rebucketScratch.Clear();
+                for (int k = 0; k < patch.ChangedTriangles.Count; k++) _rebucketScratch.Add(patch.ChangedTriangles[k]);
+                _triangleGrid.UpdateTriangles(_rebucketScratch, _workingVertices, _workingTriangles);
+            }
+            else
+            {
+                RebuildTriangleGrid();
+            }
+
+            if (_spatialGrid != null)
+            {
+                int addedVertices = patch.VertexCountAfter - patch.VertexCountBefore;
+                _spatialGrid.AppendVertices(_workingVertices, patch.VertexCountBefore, addedVertices);
+                _spatialGrid.UpdateVertices(patch.TouchedVertices);
+            }
+
+            if (_anyHidden) RefreshVisibility();
+            else UploadIndexRanges(patch);
+
+            // Exactly the tail of ApplyDirtyVertexList, over the patch's footprint instead of the
+            // brush's: build the affected set ONCE, then run normals, cavity and the upload over
+            // that same set.
+            //
+            // The set has to be the wide one - touched vertices AND their one-ring. A vertex whose
+            // own position never moved still gets a new normal when a triangle it belongs to is
+            // split or flipped, and refreshing only the touched vertices left those neighbours
+            // shaded for triangles that no longer exist. That reads as terracing across the
+            // refined area, which is easy to mistake for the topology itself being wrong.
+            BuildAffectedSet(patch.TouchedVertices);
+            RecomputeNormalsLocal();
+            RecomputeCavityLocal();
+            EnsureGpuScatter();
+            _gpuScatter.ScatterDirty(_affectedList, _affectedList.Count, _workingVertices, _workingNormals, _cavityColors);
+            ParallelPass.ForRange(_affectedList.Count, _markSyncedRange ?? (_markSyncedRange = MarkSyncedRange));
+        }
+
+        private readonly List<int> _rebucketScratch = new List<int>();
+
+        // How large the mesh's index buffer was last specified, or -1 when something else has
+        // re-specified it since (every SetTriangles call does). See UploadIndexBuffer.
+        private int _indexBufferCapacity = -1;
+
+        // Everything Unity would otherwise redo for us on an index upload. DontValidateIndices is
+        // the one that matters: SetTriangles range-checks every index on the CPU, which is an
+        // O(triangle count) pass - measured as the dominant cost of a refine at 1.3M triangles,
+        // larger than the entire topology operation it was publishing. These indices are produced
+        // by LocalTopologyEditor, which builds them from the adjacency it just maintained, and
+        // DynamicTopologyTests asserts the result is a closed 2-manifold; validating them again
+        // per refine buys nothing.
+        private const MeshUpdateFlags IndexUploadFlags =
+            MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontRecalculateBounds |
+            MeshUpdateFlags.DontNotifyMeshUsers | MeshUpdateFlags.DontResetBoneBounds;
+
+        /// Pushes the live index buffer into the mesh without going through SetTriangles.
+        ///
+        /// The index buffer is specified at CAPACITY and the submesh then describes only the part
+        /// in use, so appending triangles does not re-specify (and therefore reallocate) the buffer
+        /// on the GPU - the same reason the vertex buffer is sized to capacity, see
+        /// EnsureMeshVertexCapacity.
+        /// Uploads only the parts of the index buffer a patch actually changed.
+        ///
+        /// A refine rewrites a few hundred triangles in a mesh of a million, so uploading the whole
+        /// buffer each time is the last genuinely mesh-proportional cost on this path - 15.7 MB per
+        /// refine at 1.3M triangles, which measured as the difference between a refine that scales
+        /// with the footprint and one that scales with the model.
+        ///
+        /// Two kinds of range. The triangles a patch APPENDED are one contiguous run at the end, so
+        /// they go in a single call. The slots it REWROTE are scattered, but not evenly: they are
+        /// the triangles around one patch of surface, and triangle indices on a remeshed or
+        /// subdivided mesh are largely spatially coherent, so sorting them and merging runs
+        /// separated by small gaps collapses hundreds of slots into a handful of uploads. Copying a
+        /// few unchanged triangles inside a gap is far cheaper than the call that would avoid it.
+        private void UploadIndexRanges(DynamicTopology.TopologyPatch patch)
+        {
+            int capacity = _workingTriangles.Length;
+            if (_indexBufferCapacity != capacity)
+            {
+                // A re-specified buffer has no contents, so ranges would leave most of it
+                // undefined - this is the one case that has to upload everything. UInt32
+                // unconditionally: a mesh dynamic topology is growing has no business being pinned
+                // to a 16-bit index ceiling it could cross mid-stroke.
+                _mesh.SetIndexBufferParams(capacity, IndexFormat.UInt32);
+                _indexBufferCapacity = capacity;
+                _mesh.SetIndexBufferData(_workingTriangles, 0, 0, _cornerCount, IndexUploadFlags);
+                _mesh.SetSubMesh(0, new SubMeshDescriptor(0, _cornerCount, MeshTopology.Triangles), IndexUploadFlags);
+                return;
+            }
+
+            if (patch.CornerCountAfter > patch.CornerCountBefore)
+            {
+                _mesh.SetIndexBufferData(_workingTriangles, patch.CornerCountBefore, patch.CornerCountBefore,
+                                         patch.CornerCountAfter - patch.CornerCountBefore, IndexUploadFlags);
+            }
+
+            List<int> slots = _indexUploadScratch;
+            slots.Clear();
+            for (int k = 0; k < patch.ChangedTriangles.Count; k++) slots.Add(patch.ChangedTriangles[k]);
+            slots.Sort();
+
+            int runStart = -1, runEnd = -1;
+            for (int k = 0; k < slots.Count; k++)
+            {
+                int t = slots[k];
+                if (runStart < 0) { runStart = runEnd = t; continue; }
+                if (t - runEnd <= IndexUploadRunGap) { runEnd = t; continue; }
+                FlushIndexRun(runStart, runEnd);
+                runStart = runEnd = t;
+            }
+            if (runStart >= 0) FlushIndexRun(runStart, runEnd);
+
+            _mesh.SetSubMesh(0, new SubMeshDescriptor(0, _cornerCount, MeshTopology.Triangles), IndexUploadFlags);
+        }
+
+        private void FlushIndexRun(int firstTriangle, int lastTriangle)
+        {
+            int start = firstTriangle * 3;
+            int count = (lastTriangle - firstTriangle + 1) * 3;
+            _mesh.SetIndexBufferData(_workingTriangles, start, start, count, IndexUploadFlags);
+        }
+
+        // How many untouched triangles are worth carrying along inside one upload rather than
+        // splitting it in two. A SetIndexBufferData call costs more than copying a few dozen extra
+        // indices, so merging across small gaps is strictly cheaper.
+        private const int IndexUploadRunGap = 64;
+
+        private readonly List<int> _indexUploadScratch = new List<int>();
+
+        /// Called wherever something OTHER than UploadIndexBuffer re-specifies the mesh's index
+        /// buffer - every SetTriangles call and every Mesh.Clear - so the next upload knows the
+        /// buffer it last specified is gone.
+        private void InvalidateIndexBufferSpec() => _indexBufferCapacity = -1;
+
+        /// Drops every buffer's spare capacity, so Vertices/Normals/Triangles/Mask are once again
+        /// exactly VertexCount and TriangleCount long.
+        ///
+        /// For the whole-mesh tools - Make Symmetric, Cut &amp; Mirror, Trim - which read a buffer,
+        /// compute over a parallel copy of it and write the result straight back. Those cannot use
+        /// the Exact accessors: an exact COPY is not the live buffer, so the write-back would go
+        /// nowhere, and handing one exact array and one padded array to the same routine invites
+        /// it to walk off the end of the shorter. Compacting first lets them go on treating length
+        /// as the count the way they always have.
+        ///
+        /// O(vertex count), so it belongs on an explicit, already-expensive user action and never
+        /// on the brush path. A no-op (and free) whenever nothing has grown.
+        public void CompactBuffers()
+        {
+            if (_workingVertices.Length == _vertexCount && _workingTriangles.Length == _cornerCount) return;
+
+            _workingVertices = CloneExact(_workingVertices, _vertexCount);
+            _workingNormals = CloneExact(_workingNormals, _vertexCount);
+            _cavityColors = CloneExact(_cavityColors, _vertexCount);
+            _cavityRaw = CloneExact(_cavityRaw, _vertexCount);
+            _mask = CloneExact(_mask, _vertexCount);
+            _originalVertices = CloneExact(_originalVertices, _vertexCount);
+            _workingTriangles = CloneExact(_workingTriangles, _cornerCount);
+            if (_hiddenTriangles != null) _hiddenTriangles = CloneExact(_hiddenTriangles, TriangleCount);
+            if (_hiddenVertices != null) _hiddenVertices = CloneExact(_hiddenVertices, _vertexCount);
+
+            // Every cache keyed on a buffer's identity or length is now stale by construction.
+            _syncedVertices = null;
+            _syncedFor = null;
+            _strokeRecordSlot = null;
+            _affectedStamp = null;
+            _normalAccumScratch = null;
+            _spatialGrid = null;
+            _pendingVertexGridVertices.Clear();
+            _pendingTriangleGridVertices.Clear();
+
+            _mesh.Clear();
+            InvalidateIndexBufferSpec();
+            ConfigureGpuVertexLayout(_mesh, _vertexCount);
+            _mesh.SetVertices(_workingVertices);
+            _mesh.SetNormals(_workingNormals);
+            _mesh.SetColors(_cavityColors);
+            _mesh.SetTriangles(_workingTriangles, 0, _cornerCount, 0, true);
+            BuildAdjacency();
+            RebuildTriangleGrid();
+            BindGpuScatter();
+            RefreshVisibility();
+        }
+
         /// Rebuilds the per-vertex neighbour and incident-triangle arrays from the current
         /// triangles. O(triangle count) - cheap enough to run once per topology change but not
         /// meant to run every frame. See MeshAdjacency.
         private void BuildAdjacency()
         {
-            _topology = MeshAdjacency.Build(_workingVertices.Length, _workingTriangles);
+            _topology = MeshAdjacency.Build(_vertexCount, _workingTriangles, _cornerCount);
         }
 
         // _topology is a plain C# class, which Unity's domain-reload serializer does not carry
@@ -480,41 +988,59 @@ namespace Sculpting
         // rebuild-if-null pattern QueryNear uses for _spatialGrid. Returns it for convenience.
         private MeshAdjacency EnsureAdjacency()
         {
-            if (_topology == null || _topology.VertexCount != _workingVertices.Length)
+            if (_topology == null || _topology.VertexCount != _vertexCount)
                 BuildAdjacency();
             return _topology;
         }
 
-        // Native copy of _topology's CSR neighbour arrays for the Laplacian Burst jobs
+        // Native copy of _topology's neighbour arrays for the Laplacian Burst jobs
         // (SculptController's SmoothRelaxJob and SurfaceRelaxJob) - a job cannot touch a managed
-        // array. Neighbours of vertex i live in NeighborsFlat[OffsetsFlat[i] .. OffsetsFlat[i+1]),
-        // the layout MeshAdjacency already holds, so building it is two bulk copies.
+        // array. Neighbours of vertex i live in
+        // NeighborsFlat[StartsFlat[i] .. StartsFlat[i] + CountsFlat[i]), the layout MeshAdjacency
+        // already holds, so building it is three bulk copies.
         //
         // Rebuilt whenever the managed topology it was copied from is REPLACED, tracked by
-        // identity. This used to compare lengths only, which a topology change that keeps the
-        // vertex count passes with every neighbour wrong; and a mid-Play recompile nulls the source
-        // reference, which forces a rebuild too - every non-serializable cache here has to
+        // identity, OR MUTATED, tracked by MeshAdjacency.Version. Identity alone was enough while
+        // the only topology change was a wholesale Remesh; a local remesh edits the same instance
+        // in place, which identity cannot see - and a job reading a stale neighbour block would
+        // smooth toward vertices that have since been re-wired. A mid-Play recompile nulls the
+        // source reference, which forces a rebuild too - every non-serializable cache here has to
         // rebuild-if-null, not merely null-check.
-        private NativeArray<int> _nativeAdjacencyOffsets;
+        private NativeArray<int> _nativeAdjacencyStarts;
+        private NativeArray<int> _nativeAdjacencyCounts;
         private NativeArray<int> _nativeAdjacencyNeighbors;
         private MeshAdjacency _nativeAdjacencySource;
+        private int _nativeAdjacencyVersion = -1;
 
-        public NativeArray<int> AdjacencyOffsets { get { EnsureNativeAdjacency(); return _nativeAdjacencyOffsets; } }
+        public NativeArray<int> AdjacencyStarts { get { EnsureNativeAdjacency(); return _nativeAdjacencyStarts; } }
+        public NativeArray<int> AdjacencyCounts { get { EnsureNativeAdjacency(); return _nativeAdjacencyCounts; } }
         public NativeArray<int> AdjacencyNeighbors { get { EnsureNativeAdjacency(); return _nativeAdjacencyNeighbors; } }
 
         private void EnsureNativeAdjacency()
         {
             MeshAdjacency topology = EnsureAdjacency();
-            if (_nativeAdjacencyOffsets.IsCreated && _nativeAdjacencyNeighbors.IsCreated &&
-                ReferenceEquals(_nativeAdjacencySource, topology))
+            if (_nativeAdjacencyStarts.IsCreated && _nativeAdjacencyCounts.IsCreated &&
+                _nativeAdjacencyNeighbors.IsCreated &&
+                ReferenceEquals(_nativeAdjacencySource, topology) &&
+                _nativeAdjacencyVersion == topology.Version)
                 return;
 
-            if (_nativeAdjacencyOffsets.IsCreated) _nativeAdjacencyOffsets.Dispose();
-            if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
+            DisposeNativeAdjacency();
 
-            _nativeAdjacencyOffsets = new NativeArray<int>(topology.NeighborOffsets, Allocator.Persistent);
+            _nativeAdjacencyStarts = new NativeArray<int>(topology.NeighborStart, Allocator.Persistent);
+            _nativeAdjacencyCounts = new NativeArray<int>(topology.NeighborCount, Allocator.Persistent);
             _nativeAdjacencyNeighbors = new NativeArray<int>(topology.NeighborIndices, Allocator.Persistent);
             _nativeAdjacencySource = topology;
+            _nativeAdjacencyVersion = topology.Version;
+        }
+
+        private void DisposeNativeAdjacency()
+        {
+            if (_nativeAdjacencyStarts.IsCreated) _nativeAdjacencyStarts.Dispose();
+            if (_nativeAdjacencyCounts.IsCreated) _nativeAdjacencyCounts.Dispose();
+            if (_nativeAdjacencyNeighbors.IsCreated) _nativeAdjacencyNeighbors.Dispose();
+            _nativeAdjacencySource = null;
+            _nativeAdjacencyVersion = -1;
         }
 
         /// The average position of a vertex's directly-connected neighbors (Laplacian
@@ -523,7 +1049,7 @@ namespace Sculpting
         public Vector3 GetNeighborAverage(int vertexIndex)
         {
             MeshAdjacency topology = EnsureAdjacency();
-            int from = topology.NeighborOffsets[vertexIndex], to = topology.NeighborOffsets[vertexIndex + 1];
+            int from = topology.NeighborStart[vertexIndex], to = from + topology.NeighborCount[vertexIndex];
             if (to == from) return _workingVertices[vertexIndex];
 
             int[] neighbors = topology.NeighborIndices;
@@ -593,6 +1119,8 @@ namespace Sculpting
             EnsureSyncBuffer();
             Array.Copy(_workingVertices, _syncedVertices, _workingVertices.Length);
             _syncFilterSuspended = false;
+
+            if (LinkedMirror != null) LinkedMirror.OnAllVerticesApplied(this, fullRebuild);
         }
 
         // The dirty vertices plus their direct one-ring neighbors - the set of vertices whose
@@ -642,7 +1170,8 @@ namespace Sculpting
             int[] stamp = _affectedStamp;
             int generation = _affectedGeneration;
             List<int> affected = _affectedList;
-            int[] offsets = topology.NeighborOffsets;
+            int[] starts = topology.NeighborStart;
+            int[] counts = topology.NeighborCount;
             int[] neighbors = topology.NeighborIndices;
 
             for (int k = 0; k < dirtyVertices.Count; k++)
@@ -650,7 +1179,7 @@ namespace Sculpting
                 int vi = dirtyVertices[k];
                 if (stamp[vi] != generation) { stamp[vi] = generation; affected.Add(vi); }
 
-                for (int i = offsets[vi], end = offsets[vi + 1]; i < end; i++)
+                for (int i = starts[vi], end = i + counts[vi]; i < end; i++)
                 {
                     int ni = neighbors[i];
                     if (stamp[ni] == generation) continue;
@@ -666,6 +1195,37 @@ namespace Sculpting
         /// triangle's area, so this naturally area-weights the average, matching what
         /// RecalculateNormals() itself does - just scoped to the affected set instead of the
         /// whole mesh. Reads the set BuildAffectedSet just filled. See ApplyVerticesLocal.
+        /// Recomputes the CPU-side normal and raw curvature of exactly these vertices - no neighbour
+        /// expansion, no upload, no cavity encode, no drift bookkeeping. For vertices that moved by
+        /// less than the drift filter reports (see FilterToDrifted) but that brushes will read again:
+        /// Inflate pushes along the normal, Front Facing Only and Clay's plane weigh by it, and
+        /// Surface Relax gates on the curvature. Curvature reads only the vertex's own normal, so
+        /// normals first is the whole ordering. Must not be called from inside ApplyDirtyVertexList
+        /// before its upload, whose affected set it overwrites.
+        public void RefreshNormalsAndCurvature(List<int> vertices)
+        {
+            if (vertices == null || vertices.Count == 0) return;
+            EnsureAdjacency();
+            EnsureCavityBuffers();
+            _affectedList.Clear();
+            _affectedList.AddRange(vertices);
+            RecomputeNormalsLocal();
+            ParallelPass.ForRange(_affectedList.Count,
+                _cavityCurvatureRange ?? (_cavityCurvatureRange = CavityCurvatureRange));
+        }
+
+        /// RefreshNormalsAndCurvature over everything the current stroke has written - the undo
+        /// accumulator already lists exactly that. Run once at release (see
+        /// SculptController.HandleStrokeEndCommit), so the next stroke never starts from normals and
+        /// curvature the drift filter left stale on one half and not the other.
+        public void RefreshStrokeNormalsAndCurvature()
+        {
+            RefreshNormalsAndCurvature(_strokeDeltaIndices);
+            // The stroke's quiet moves - the ones no brush reported dirty - reach a linked mirror half
+            // here, once, rather than never (see MirrorLink.OnStrokeEnded).
+            if (LinkedMirror != null) LinkedMirror.OnStrokeEnded(this, _strokeDeltaIndices);
+        }
+
         private void RecomputeNormalsLocal()
         {
             // Split across cores above a footprint of a thousand or so vertices. Each entry writes
@@ -691,22 +1251,32 @@ namespace Sculpting
             Vector3[] verts = _workingVertices;
             Vector3[] normals = _workingNormals;
             int[] tris = _workingTriangles;
-            int[] triangleOffsets = _topology.TriangleOffsets;
+            int[] triangleStart = _topology.TriangleStart;
+            int[] triangleCount = _topology.TriangleCount;
             int[] vertexTris = _topology.TriangleIndices;
             List<int> affected = _affectedList;
 
             for (int k = start; k < end; k++)
             {
                 int i = affected[k];
-                float sx = 0f, sy = 0f, sz = 0f;
-                for (int t = triangleOffsets[i], tEnd = triangleOffsets[i + 1]; t < tEnd; t++)
+                // Double precision, and not for accuracy's sake: for mirror symmetry. A vertex and its
+                // mirror twin sum the same faces, but in a different order and with each face's edges
+                // taken from a different corner, so in float their normals differed by a few ulps.
+                // Front Facing Only's silhouette ramp turns a normal difference into a weight
+                // difference with a large gain, and mirrored strokes amplified that noise into
+                // visible drift over a session (SymmetryDriftTests). In double every face's cross
+                // product of float coordinates is EXACT - the differences need at most 25 bits and
+                // their products 51 - so both twins sum identical terms and normalize to the same
+                // float. Same cost on x64.
+                double sx = 0d, sy = 0d, sz = 0d;
+                for (int t = triangleStart[i], tEnd = t + triangleCount[i]; t < tEnd; t++)
                 {
                     int baseIndex = vertexTris[t] * 3;
                     Vector3 a = verts[tris[baseIndex]];
                     Vector3 b = verts[tris[baseIndex + 1]];
                     Vector3 c = verts[tris[baseIndex + 2]];
-                    float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
-                    float e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+                    double e1x = (double)b.x - a.x, e1y = (double)b.y - a.y, e1z = (double)b.z - a.z;
+                    double e2x = (double)c.x - a.x, e2y = (double)c.y - a.y, e2z = (double)c.z - a.z;
                     sx += e1y * e2z - e1z * e2y;
                     sy += e1z * e2x - e1x * e2z;
                     sz += e1x * e2y - e1y * e2x;
@@ -725,10 +1295,10 @@ namespace Sculpting
                 // triangles are small enough in absolute terms to get there (measured: 1124
                 // vertices zeroed around a 157k-vertex sphere's pole, where the triangles
                 // degenerate).
-                float sqrMag = sx * sx + sy * sy + sz * sz;
-                if (sqrMag <= 1e-12f) continue;
-                float inv = 1f / Mathf.Sqrt(sqrMag);
-                normals[i] = new Vector3(sx * inv, sy * inv, sz * inv);
+                double sqrMag = sx * sx + sy * sy + sz * sz;
+                if (sqrMag <= 1e-12) continue;
+                double inv = 1d / Math.Sqrt(sqrMag);
+                normals[i] = new Vector3((float)(sx * inv), (float)(sy * inv), (float)(sz * inv));
             }
         }
 
@@ -751,7 +1321,7 @@ namespace Sculpting
                 _normalAccumScratch = new Vector3[_workingVertices.Length];
             Array.Clear(_normalAccumScratch, 0, _normalAccumScratch.Length);
 
-            for (int b = 0; b + 2 < _workingTriangles.Length; b += 3)
+            for (int b = 0; b + 2 < _cornerCount; b += 3)
             {
                 int i0 = _workingTriangles[b], i1 = _workingTriangles[b + 1], i2 = _workingTriangles[b + 2];
                 Vector3 a = _workingVertices[i0];
@@ -761,7 +1331,7 @@ namespace Sculpting
                 _normalAccumScratch[i2] += face;
             }
 
-            for (int i = 0; i < _workingNormals.Length; i++)
+            for (int i = 0; i < _vertexCount; i++)
             {
                 // Same hand-rolled normalize, epsilon and keep-the-old-value fallback
                 // RecomputeNormalsLocal uses - see its remarks for why Vector3.normalized's own
@@ -873,6 +1443,11 @@ namespace Sculpting
 
         private void ApplyDirtyVertexList()
         {
+            // Before the drift filter below trims the list, and outside the profiler scope: a linked
+            // mirror half has to receive every reported position (only its own filter knows what it
+            // has already uploaded), and its apply is its own cost, not this one's.
+            if (LinkedMirror != null) LinkedMirror.OnVerticesApplied(this, _dirtyVertexList);
+
             using (ApplyMarker.Auto())
             {
                 // Everything below is proportional to how much of the mesh is reported dirty, so the
@@ -881,7 +1456,7 @@ namespace Sculpting
                 // brush hot path.
                 EnsureSyncBuffer();
                 FilterToDrifted(_dirtyVertexList);
-                if (_dirtyVertexList.Count == 0) return;
+                if (_dirtyVertexList.Count == 0) { RefreshDroppedVertices(); return; }
 
                 // Past FilterToDrifted, geometry demonstrably moved - which is exactly the timelapse
                 // recorder's definition of "the user is sculpting". Reported here rather than from
@@ -921,6 +1496,9 @@ namespace Sculpting
                 // neighbours pulled in only for their normal/colour. Split across cores the same way
                 // as the normal and cavity passes - each entry writes only its own slot.
                 ParallelPass.ForRange(_affectedList.Count, _markSyncedRange ?? (_markSyncedRange = MarkSyncedRange));
+
+                // Last, because it reuses _affectedList - see RefreshDroppedVertices.
+                RefreshDroppedVertices();
             }
         }
 
@@ -959,12 +1537,21 @@ namespace Sculpting
 
             public void Add(List<int> vertices, int vertexCount)
             {
-                // A different vertex count means the topology changed under whatever was queued,
-                // and those indices no longer name the same vertices.
-                if (_queued == null || _queued.Length != vertexCount)
+                // Grown, keeping what is already queued. A wholesale REPLACEMENT of the vertex set
+                // (Remesh, Reset, an undo across one) does invalidate every queued index, but those
+                // paths rebuild both grids outright and call Clear on the way through, so they
+                // never arrive here holding stale entries. Dynamic topology only ever APPENDS, and
+                // an append leaves every existing index naming the same vertex it always did -
+                // dropping the queue for it would silently strand whatever moved earlier in the
+                // same frame, leaving those vertices bucketed at last frame's positions.
+                if (_queued == null)
                 {
                     _queued = new bool[vertexCount];
                     Items.Clear();
+                }
+                else if (_queued.Length < vertexCount)
+                {
+                    Array.Resize(ref _queued, vertexCount);
                 }
 
                 bool[] queued = _queued;
@@ -1007,7 +1594,7 @@ namespace Sculpting
         /// an index that exists: one that doesn't is built from current positions when next needed.
         private void QueueSpatialIndexUpdates(List<int> movedVertices)
         {
-            int vertexCount = _workingVertices.Length;
+            int vertexCount = _vertexCount;
             if (_triangleGrid != null) _pendingTriangleGridVertices.Add(movedVertices, vertexCount);
             if (_spatialGrid != null) _pendingVertexGridVertices.Add(movedVertices, vertexCount);
         }
@@ -1037,7 +1624,8 @@ namespace Sculpting
                 {
                     MeshAdjacency topology = EnsureAdjacency();
                     _triangleGrid.UpdateFromMovedVertices(_pendingTriangleGridVertices.Items,
-                        topology.TriangleOffsets, topology.TriangleIndices, _workingVertices, _workingTriangles);
+                        topology.TriangleStart, topology.TriangleCount, topology.TriangleIndices,
+                        _workingVertices, _workingTriangles);
                     _pendingTriangleGridVertices.Clear();
                 }
             }
@@ -1076,7 +1664,7 @@ namespace Sculpting
             // to exist before any of them is read. Both are split across cores the same way the
             // per-stroke version is (see RecomputeCavityLocal) - this one walks the WHOLE mesh,
             // so it is the single largest cost in Remesh, Trim, Join and a scene load.
-            int vertexCount = _workingVertices.Length;
+            int vertexCount = _vertexCount;
             ParallelPass.ForRange(vertexCount,
                 _cavityFullCurvatureRange ?? (_cavityFullCurvatureRange = CavityFullCurvatureRange));
 
@@ -1224,6 +1812,7 @@ namespace Sculpting
         /// rim with one rule.
         private void FilterToDrifted(List<int> dirty)
         {
+            _driftDropped.Clear();
             if (_syncFilterSuspended) { _syncFilterSuspended = false; return; }
 
             float sqrThreshold = _resyncSqrThreshold;
@@ -1235,10 +1824,29 @@ namespace Sculpting
                 int vi = dirty[k];
                 Vector3 now = verts[vi], last = synced[vi];
                 float dx = now.x - last.x, dy = now.y - last.y, dz = now.z - last.z;
-                if (dx * dx + dy * dy + dz * dz < sqrThreshold) continue;
+                if (dx * dx + dy * dy + dz * dz < sqrThreshold) { _driftDropped.Add(vi); continue; }
                 dirty[w++] = vi;
             }
             dirty.RemoveRange(w, dirty.Count - w);
+        }
+
+        // What the last FilterToDrifted dropped - see RefreshDroppedVertices.
+        private readonly List<int> _driftDropped = new List<int>();
+
+        /// The drift filter skips the upload, the cavity encode and the spatial re-bucket for a
+        /// vertex that has not visibly moved - but not its CPU normal and raw curvature, which is
+        /// what this keeps current. Those are not display state: brushes read them. And whether a
+        /// vertex counted as "not visibly moved" is a knife edge that the two halves of a mirrored
+        /// stroke land on differently by float rounding, so leaving them stale handed one half a
+        /// stale normal and the other a fresh one - measured as a 2.3e-3 mirror error when Inflate
+        /// (which pushes along the normal) followed Clay on a 1.3M-triangle model
+        /// (SymmetryDriftTests). Dropped vertices are a footprint's faint rim, so this is a small
+        /// fraction of the normal pass the filter saves.
+        private void RefreshDroppedVertices()
+        {
+            if (_driftDropped.Count == 0) return;
+            RefreshNormalsAndCurvature(_driftDropped);
+            _driftDropped.Clear();
         }
 
         /// Same effect as RecomputeCavity(), but only for the given vertices plus their direct
@@ -1316,7 +1924,7 @@ namespace Sculpting
         {
             Vector3[] verts = _workingVertices;
             MeshAdjacency topology = _topology;
-            int from = topology.NeighborOffsets[i], to = topology.NeighborOffsets[i + 1];
+            int from = topology.NeighborStart[i], to = from + topology.NeighborCount[i];
             if (to == from) return 0f;
             int[] neighbors = topology.NeighborIndices;
 
@@ -1368,7 +1976,7 @@ namespace Sculpting
 
         private void UpdateCavityLengthScale()
         {
-            if (_workingVertices == null || _workingVertices.Length == 0)
+            if (_workingVertices == null || _vertexCount == 0)
             {
                 _cavityLengthScale = 1f;
                 RefreshResyncThreshold();
@@ -1381,7 +1989,7 @@ namespace Sculpting
             Vector3 first = _workingVertices[0];
             float minX = first.x, minY = first.y, minZ = first.z;
             float maxX = minX, maxY = minY, maxZ = minZ;
-            for (int i = 1; i < _workingVertices.Length; i++)
+            for (int i = 1; i < _vertexCount; i++)
             {
                 Vector3 p = _workingVertices[i];
                 if (p.x < minX) minX = p.x; else if (p.x > maxX) maxX = p.x;
@@ -1416,7 +2024,7 @@ namespace Sculpting
         {
             float[] raw = _cavityRaw;
             MeshAdjacency topology = _topology;
-            int from = topology.NeighborOffsets[i], to = topology.NeighborOffsets[i + 1];
+            int from = topology.NeighborStart[i], to = from + topology.NeighborCount[i];
             int[] neighbors = topology.NeighborIndices;
             float sum = raw[i];
             for (int k = from; k < to; k++) sum += raw[neighbors[k]];
@@ -1524,8 +2132,8 @@ namespace Sculpting
         /// with no mask is a far better failure than a half-applied one.
         public void SetMask(float[] mask)
         {
-            if (mask == null || _mask == null || mask.Length != _mask.Length) return;
-            for (int i = 0; i < _mask.Length; i++)
+            if (mask == null || _mask == null || mask.Length != _vertexCount) return;
+            for (int i = 0; i < _vertexCount; i++)
             {
                 _mask[i] = Mathf.Clamp01(mask[i]);
                 Color c = _cavityColors[i];
@@ -1556,7 +2164,7 @@ namespace Sculpting
             for (int k = 0; k < indices.Count; k++)
             {
                 int i = indices[k];
-                if (i < 0 || i >= _mask.Length || Mathf.Approximately(_mask[i], value)) continue;
+                if (i < 0 || i >= _vertexCount || Mathf.Approximately(_mask[i], value)) continue;
                 RecordMaskBeforeIfNeeded(i);
                 _mask[i] = value;
                 Color c = _cavityColors[i];
@@ -1581,7 +2189,7 @@ namespace Sculpting
         {
             if (_mask == null) return;
             _maskClearScratch.Clear();
-            for (int i = 0; i < _mask.Length; i++)
+            for (int i = 0; i < _vertexCount; i++)
                 if (_mask[i] > 0f) _maskClearScratch.Add(i);
             SetMaskOnVertices(_maskClearScratch, 0f);
         }
@@ -1599,7 +2207,7 @@ namespace Sculpting
         /// rather than colors alone.
         private void UploadMaskColors()
         {
-            if (_paintMaskScratch.Count > _workingVertices.Length * FullUploadVertexFraction)
+            if (_paintMaskScratch.Count > _vertexCount * FullUploadVertexFraction)
             {
                 SyncMeshFromWorkingArrays();
                 return;
@@ -1660,12 +2268,13 @@ namespace Sculpting
         public bool[] HiddenTriangles => _hiddenTriangles;
 
         /// Number of triangles in the CURRENT topology - what a caller building a per-triangle
-        /// selection needs to size its own buffers.
-        public int TriangleCount => _workingTriangles != null ? _workingTriangles.Length / 3 : 0;
+        /// selection needs to size its own buffers. Counts what is in USE, which past the first
+        /// dynamic-topology refine is less than _workingTriangles holds - see Triangles.
+        public int TriangleCount => _workingTriangles != null ? _cornerCount / 3 : 0;
 
         /// True if this vertex sits strictly inside a hidden region (see _hiddenVertices).
         public bool IsVertexHidden(int index) =>
-            _anyHidden && _hiddenVertices != null && index >= 0 && index < _hiddenVertices.Length && _hiddenVertices[index];
+            _anyHidden && _hiddenVertices != null && index >= 0 && index < _vertexCount && _hiddenVertices[index];
 
         /// Hides (or shows) the given triangles as one undoable step.
         public void SetTrianglesHidden(IReadOnlyList<int> triangleIndices, bool hidden)
@@ -1677,7 +2286,7 @@ namespace Sculpting
             for (int k = 0; k < triangleIndices.Count; k++)
             {
                 int t = triangleIndices[k];
-                if (t < 0 || t >= _hiddenTriangles.Length || _hiddenTriangles[t] == hidden) continue;
+                if (t < 0 || t >= TriangleCount || _hiddenTriangles[t] == hidden) continue;
                 _visibilityChangedScratch.Add(t);
             }
             CommitVisibilityChange(_visibilityChangedScratch, hidden);
@@ -1690,7 +2299,7 @@ namespace Sculpting
             if (!_anyHidden || _hiddenTriangles == null) return;
 
             _visibilityChangedScratch.Clear();
-            for (int t = 0; t < _hiddenTriangles.Length; t++)
+            for (int t = 0; t < TriangleCount; t++)
                 if (_hiddenTriangles[t]) _visibilityChangedScratch.Add(t);
             CommitVisibilityChange(_visibilityChangedScratch, false);
         }
@@ -1710,15 +2319,19 @@ namespace Sculpting
         private void InvertVisibilityWithoutUndo()
         {
             EnsureVisibilityBuffer();
-            for (int t = 0; t < _hiddenTriangles.Length; t++) _hiddenTriangles[t] = !_hiddenTriangles[t];
+            for (int t = 0, n = TriangleCount; t < n; t++) _hiddenTriangles[t] = !_hiddenTriangles[t];
             RefreshVisibility();
         }
 
         private void EnsureVisibilityBuffer()
         {
             int triCount = TriangleCount;
-            if (_hiddenTriangles == null || _hiddenTriangles.Length != triCount)
-                _hiddenTriangles = new bool[triCount];
+            // Grown, not resized to fit: like every other per-element buffer here this one runs
+            // ahead of the count once dynamic topology is appending triangles, and reallocating
+            // it down to the count would throw away the flags for triangles that are still
+            // hidden (see EnsureTriangleCapacity, which grows it alongside the index buffer).
+            if (_hiddenTriangles == null || _hiddenTriangles.Length < triCount)
+                Array.Resize(ref _hiddenTriangles, Mathf.Max(triCount, _workingTriangles.Length / 3));
         }
 
         // Records the undo entry for `changed` (whose flags are still at their OLD values),
@@ -1753,7 +2366,7 @@ namespace Sculpting
             for (int k = 0; k < indices.Length; k++)
             {
                 int t = indices[k];
-                if (t < 0 || t >= _hiddenTriangles.Length) continue;
+                if (t < 0 || t >= TriangleCount) continue;
                 _hiddenTriangles[t] = flags[k];
             }
             RefreshVisibility();
@@ -1782,7 +2395,8 @@ namespace Sculpting
                 _hiddenTriangles = null;
                 _hiddenVertices = null;
                 SyncMeshFromWorkingArrays();
-                _mesh.SetTriangles(_workingTriangles, 0, false);
+                InvalidateIndexBufferSpec();
+                _mesh.SetTriangles(_workingTriangles, 0, _cornerCount, 0, false);
                 BindGpuScatter();
                 return;
             }
@@ -1793,7 +2407,7 @@ namespace Sculpting
             // honest: nothing draws it either way.
             if (_hiddenVertices == null || _hiddenVertices.Length != _workingVertices.Length)
                 _hiddenVertices = new bool[_workingVertices.Length];
-            for (int i = 0; i < _hiddenVertices.Length; i++) _hiddenVertices[i] = true;
+            for (int i = 0; i < _vertexCount; i++) _hiddenVertices[i] = true;
 
             int visibleCount = 0;
             for (int t = 0; t < triCount; t++)
@@ -1823,6 +2437,7 @@ namespace Sculpting
             // shrink the bounds to the visible part alone, and both the culling volume and
             // MeshBoundsFitInsideTriangleGrid's check want the whole mesh.
             SyncMeshFromWorkingArrays();
+            InvalidateIndexBufferSpec();
             _mesh.SetTriangles(_visibleTriangleScratch, 0, false);
             // The MeshCollider is deliberately NOT re-cooked here - it keeps the full mesh.
             // Nothing hit-tests through it (RaycastMesh goes to _triangleGrid, which does honor
@@ -1853,7 +2468,7 @@ namespace Sculpting
             get
             {
                 if (_mask == null) return false;
-                for (int i = 0; i < _mask.Length; i++)
+                for (int i = 0; i < _vertexCount; i++)
                     if (_mask[i] > 0.001f) return true;
                 return false;
             }
@@ -1865,6 +2480,12 @@ namespace Sculpting
         // long drag, and (worse) makes dragging back to the start not actually return to the
         // start. Non-null exactly while such a drag is in progress; see BeginMaskedTransform.
         private Vector3[] _maskedTransformBase;
+
+        /// True while a masked Transpose/Scale drag is in progress. Dynamic topology has to stand
+        /// down for the duration: the drag re-derives every vertex from _maskedTransformBase on
+        /// each frame, and that snapshot is indexed by vertex, so appending vertices under it
+        /// leaves the drag reading past its end.
+        public bool IsMaskedTransformActive => _maskedTransformBase != null;
 
         /// Starts a mask-aware whole-object transform: instead of moving the Transform (which
         /// would drag the masked region along with everything else), the drag deforms the
@@ -1888,7 +2509,7 @@ namespace Sculpting
             _maskedTransformBase = (Vector3[])_workingVertices.Clone();
 
             BeginStrokeUndo();
-            for (int i = 0; i < _mask.Length; i++)
+            for (int i = 0; i < _vertexCount; i++)
                 if (_mask[i] < 0.999f) RecordUndoBeforeIfNeeded(i);
 
             return true;
@@ -1904,7 +2525,7 @@ namespace Sculpting
         {
             if (_maskedTransformBase == null) return;
 
-            for (int i = 0; i < _workingVertices.Length; i++)
+            for (int i = 0; i < _vertexCount; i++)
             {
                 Vector3 basePos = _maskedTransformBase[i];
                 float weight = 1f - _mask[i];
@@ -1934,7 +2555,12 @@ namespace Sculpting
 
         public void ResetMesh()
         {
-            Array.Copy(_originalVertices, _workingVertices, _originalVertices.Length);
+            // VertexCount, not _originalVertices.Length: the baseline buffer carries the same
+            // spare capacity the live one does (see EnsureVertexCapacity), and a vertex dynamic
+            // topology added during the session has its birth position recorded there, so Reset
+            // returns it to where the refine placed it rather than leaving it wherever the stroke
+            // pushed it afterwards.
+            Array.Copy(_originalVertices, _workingVertices, _vertexCount);
             _spatialGrid = null;
             ApplyVertices();
         }
@@ -1948,7 +2574,11 @@ namespace Sculpting
         /// Ordinary brush strokes use BeginStrokeUndo/EndStrokeUndo instead - see their remarks.
         public void SnapshotForUndo()
         {
-            _history.PushFullUndo((Vector3[])_workingVertices.Clone(), (int[])_workingTriangles.Clone());
+            // Trimmed to what is in use, not a clone of the whole buffer: RestoreSnapshot tells
+            // "same topology" from "rebuilt" by comparing a snapshot's lengths against the live
+            // COUNTS, so a snapshot padded out to capacity would never match itself.
+            _history.PushFullUndo(CloneExact(_workingVertices, _vertexCount),
+                                  CloneExact(_workingTriangles, _cornerCount));
             EditHistory.RecordMeshEdit(this);
         }
 
@@ -2025,7 +2655,98 @@ namespace Sculpting
             ReleaseStrokeSlots();
             _strokeDeltaIndices.Clear();
             _strokeDeltaBefore.Clear();
+            ResetStrokeTopology();
         }
+
+        // ----------------------------------------------------- stroke-wide topology accumulator
+        //
+        // A stroke refines many times (see DynamicTopologySettings.ThrottleDistanceFraction), and
+        // every one of those produces a TopologyPatch. They are folded together here into ONE undo
+        // entry covering the whole stroke, so undo stays what the user expects - one press per
+        // stroke - rather than stepping back through a refine cadence they never saw.
+        //
+        // FIRST-WRITE-WINS across the whole stroke, matching RecordUndoBeforeIfNeeded: a triangle
+        // slot rewritten by three successive refines has to restore to what it held before the
+        // first of them.
+        private bool _strokeTopologyActive;
+        private int _strokeVertexCountBefore, _strokeCornerCountBefore;
+        private readonly List<int> _strokeTopologySlots = new List<int>();
+        private readonly List<int> _strokeTopologyCorners = new List<int>();
+        private int[] _strokeTopologyStamp;
+        private int _strokeTopologyGeneration;
+
+        private void ResetStrokeTopology()
+        {
+            _strokeTopologyActive = false;
+            _strokeTopologySlots.Clear();
+            _strokeTopologyCorners.Clear();
+            _strokeTopologyGeneration++;
+        }
+
+        /// Folds one refine's patch into the stroke-wide record. Called by the remesher's caller
+        /// immediately after ApplyTopologyPatch, while the patch still describes the edit just made.
+        internal void AccumulateStrokeTopology(DynamicTopology.TopologyPatch patch)
+        {
+            if (patch == null || patch.IsEmpty) return;
+
+            if (!_strokeTopologyActive)
+            {
+                _strokeTopologyActive = true;
+                _strokeVertexCountBefore = patch.VertexCountBefore;
+                _strokeCornerCountBefore = patch.CornerCountBefore;
+                _strokeTopologyGeneration++;
+            }
+
+            int triangleCapacity = _workingTriangles.Length / 3 + 1;
+            if (_strokeTopologyStamp == null || _strokeTopologyStamp.Length < triangleCapacity)
+                Array.Resize(ref _strokeTopologyStamp, triangleCapacity);
+
+            for (int k = 0; k < patch.ChangedTriangles.Count; k++)
+            {
+                int slot = patch.ChangedTriangles[k];
+                // Only slots that predate the STROKE need a before-image: anything the stroke
+                // itself appended is removed by the truncation, so recording what it used to hold
+                // would make undo write into a slot it is about to discard.
+                if (slot * 3 >= _strokeCornerCountBefore) continue;
+                if (_strokeTopologyStamp[slot] == _strokeTopologyGeneration) continue;
+
+                _strokeTopologyStamp[slot] = _strokeTopologyGeneration;
+                _strokeTopologySlots.Add(slot);
+                int c = k * 3;
+                _strokeTopologyCorners.Add(patch.ChangedTriangleCorners[c]);
+                _strokeTopologyCorners.Add(patch.ChangedTriangleCorners[c + 1]);
+                _strokeTopologyCorners.Add(patch.ChangedTriangleCorners[c + 2]);
+            }
+        }
+
+        private void PushStrokeTopologyDelta()
+        {
+            // The vertex delta is restricted to vertices that existed BEFORE the stroke. Ones it
+            // added are removed by the truncation, and restoring a position into an index that is
+            // about to stop existing is at best wasted and at worst out of range.
+            _topologyDeltaIndices.Clear();
+            _topologyDeltaBefore.Clear();
+            for (int k = 0; k < _strokeDeltaIndices.Count; k++)
+            {
+                int vi = _strokeDeltaIndices[k];
+                if (vi >= _strokeVertexCountBefore) continue;
+                _topologyDeltaIndices.Add(vi);
+                _topologyDeltaBefore.Add(_strokeDeltaBefore[k]);
+            }
+
+            // No appended payload on the UNDO side: truncation needs none. The reciprocal redo
+            // entry captures one from the live mesh as this is applied - see CaptureTopology.
+            var payload = new SculptHistory.TopologyPayload(
+                _strokeVertexCountBefore, _strokeCornerCountBefore,
+                _strokeTopologySlots.ToArray(), _strokeTopologyCorners.ToArray(),
+                _strokeVertexCountBefore, null, null, null);
+
+            _history.PushTopologyDelta(_topologyDeltaIndices.ToArray(), _topologyDeltaBefore.ToArray(), payload);
+            ResetStrokeTopology();
+        }
+
+        private readonly List<int> _topologyDeltaIndices = new List<int>();
+        private readonly List<Vector3> _topologyDeltaBefore = new List<Vector3>();
 
         /// The mask-paint equivalent, called on mouse-press in mask mode. Separate from
         /// BeginStrokeUndo because mask painting takes its own path through SculptController and
@@ -2105,9 +2826,11 @@ namespace Sculpting
             // mask painting are separate input modes - but handling them independently means the
             // one call site SculptController already has (HandleStrokeEndCommit, which fires on
             // every mouse release regardless of mode) covers both without knowing which is live.
-            if (_strokeDeltaIndices.Count > 0)
+            if (_strokeDeltaIndices.Count > 0 || _strokeTopologyActive)
             {
-                _history.PushVertexDelta(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
+                if (_strokeTopologyActive) PushStrokeTopologyDelta();
+                else _history.PushVertexDelta(_strokeDeltaIndices.ToArray(), _strokeDeltaBefore.ToArray());
+
                 EditHistory.RecordMeshEdit(this);
                 ReleaseStrokeSlots();
                 _strokeDeltaIndices.Clear();
@@ -2130,16 +2853,54 @@ namespace Sculpting
         /// to undo, which tells EditHistory to skip this step and try the one before it.
         public bool ApplyUndoStep()
         {
-            if (!_history.TryUndo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, out SculptHistory.Restore restore)) return false;
+            if (!_history.TryUndo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, CaptureTopology,
+                                  out SculptHistory.Restore restore)) return false;
             ApplyRestore(restore);
             return true;
         }
 
         public bool ApplyRedoStep()
         {
-            if (!_history.TryRedo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, out SculptHistory.Restore restore)) return false;
+            if (!_history.TryRedo(ReadVertex, ReadMask, ReadVisibility, CaptureFull, CaptureTopology,
+                                  out SculptHistory.Restore restore)) return false;
             ApplyRestore(restore);
             return true;
+        }
+
+        /// The reciprocal of a topology step, taken from the mesh as it stands right now - which
+        /// for an undo is the post-stroke state, the only moment the vertices the stroke appended
+        /// still exist to be recorded. Their positions, normals and mask values are what a
+        /// subsequent redo puts back; the truncation that the undo is about to do is otherwise
+        /// irreversible, since nothing else in the app remembers them.
+        private SculptHistory.TopologyPayload CaptureTopology(int appendedFrom, int[] triangleSlots)
+        {
+            int appendedCount = Mathf.Max(0, _vertexCount - appendedFrom);
+            var positions = new Vector3[appendedCount];
+            var normals = new Vector3[appendedCount];
+            var mask = new float[appendedCount];
+            for (int i = 0; i < appendedCount; i++)
+            {
+                int v = appendedFrom + i;
+                positions[i] = _workingVertices[v];
+                normals[i] = _workingNormals[v];
+                mask[i] = _mask[v];
+            }
+
+            int[] corners = null;
+            if (triangleSlots != null)
+            {
+                corners = new int[triangleSlots.Length * 3];
+                for (int k = 0; k < triangleSlots.Length; k++)
+                {
+                    int b0 = triangleSlots[k] * 3, s = k * 3;
+                    corners[s] = _workingTriangles[b0];
+                    corners[s + 1] = _workingTriangles[b0 + 1];
+                    corners[s + 2] = _workingTriangles[b0 + 2];
+                }
+            }
+
+            return new SculptHistory.TopologyPayload(_vertexCount, _cornerCount, triangleSlots, corners,
+                                                     appendedFrom, positions, normals, mask);
         }
 
         private Vector3 ReadVertex(int index) => _workingVertices[index];
@@ -2147,14 +2908,15 @@ namespace Sculpting
         // Null _hiddenTriangles means nothing is hidden, so every triangle reads back visible -
         // which is exactly right for the reciprocal of an entry that is about to re-hide them.
         private bool ReadVisibility(int triangleIndex) =>
-            _hiddenTriangles != null && triangleIndex >= 0 && triangleIndex < _hiddenTriangles.Length
+            _hiddenTriangles != null && triangleIndex >= 0 && triangleIndex < TriangleCount
             && _hiddenTriangles[triangleIndex];
 
         private void CaptureFull(out Vector3[] vertices, out int[] triangles)
         {
-            vertices = (Vector3[])_workingVertices.Clone();
+            // Trimmed to the counts for the same reason SnapshotForUndo is - see its remarks.
+            vertices = CloneExact(_workingVertices, _vertexCount);
             // Not _mesh.triangles, which omits hidden triangles - see SnapshotForUndo.
-            triangles = (int[])_workingTriangles.Clone();
+            triangles = CloneExact(_workingTriangles, _cornerCount);
         }
 
         private void ApplyRestore(SculptHistory.Restore restore)
@@ -2179,7 +2941,62 @@ namespace Sculpting
                 case SculptHistory.EntryKind.VisibilityInvert:
                     InvertVisibilityWithoutUndo();
                     break;
+                case SculptHistory.EntryKind.TopologyDelta:
+                    RestoreTopologyDelta(restore.Topology, restore.Indices, restore.Positions);
+                    break;
             }
+        }
+
+        /// Undo or redo of a dynamic-topology stroke. Both directions run the same three steps in
+        /// the same order, because both are the identical "put the stored values back" operation
+        /// (see SculptHistory's remarks) - the direction only decides whether the stored counts are
+        /// smaller or larger than the current ones.
+        ///
+        /// ORDER MATTERS, and this is the order:
+        ///
+        /// 1. GROW FIRST when the stored counts exceed the live ones, and write the stored
+        ///    attributes into the vertices that are reappearing. A redo has to have somewhere to
+        ///    put them before any triangle can reference them.
+        /// 2. Restore the moved-vertex positions. Those indices all sit below both the stored and
+        ///    the live count, so they are valid whichever direction this is going.
+        /// 3. LAST, rewrite the triangle slots and set the counts. That call rebuilds adjacency,
+        ///    both spatial grids, normals and cavity in one pass - so it has to run after the
+        ///    positions are final, or every one of them would describe the shape this step is
+        ///    leaving rather than the one it is restoring.
+        private void RestoreTopologyDelta(SculptHistory.TopologyPayload payload, int[] indices, Vector3[] positions)
+        {
+            if (payload == null) return;
+
+            if (payload.VertexCount > _vertexCount && payload.AppendedPositions != null)
+            {
+                EnsureVertexCapacity(payload.VertexCount);
+                int from = payload.AppendedFrom;
+                for (int i = 0; i < payload.AppendedPositions.Length; i++)
+                {
+                    int v = from + i;
+                    if (v >= payload.VertexCount) break;
+                    _workingVertices[v] = payload.AppendedPositions[i];
+                    _originalVertices[v] = payload.AppendedPositions[i];
+                    _workingNormals[v] = payload.AppendedNormals[i];
+                    _mask[v] = payload.AppendedMask[i];
+                    _cavityColors[v] = new Color(0.5f, _mask[v], 0.5f, 1f);
+                }
+            }
+            EnsureTriangleCapacity(payload.CornerCount);
+
+            // Positions before the rebuild, so the rebuild's normals and cavity pass sees the
+            // shape the step is restoring rather than the one it is leaving.
+            if (indices != null && positions != null)
+            {
+                for (int k = 0; k < indices.Length; k++)
+                {
+                    int vi = indices[k];
+                    if (vi >= 0 && vi < payload.VertexCount) _workingVertices[vi] = positions[k];
+                }
+            }
+
+            RestoreTopology(payload.VertexCount, payload.CornerCount, payload.TriangleSlots, payload.TriangleCorners);
+            MaskVersion++;
         }
 
         /// Fast-path restore for a delta undo/redo entry - writes the given positions directly
@@ -2211,7 +3028,7 @@ namespace Sculpting
             for (int k = 0; k < indices.Length; k++)
             {
                 int i = indices[k];
-                if (i < 0 || i >= _mask.Length) continue;
+                if (i < 0 || i >= _vertexCount) continue;
                 _mask[i] = Mathf.Clamp01(values[k]);
                 Color c = _cavityColors[i];
                 c.g = _mask[i];
@@ -2230,7 +3047,7 @@ namespace Sculpting
         /// thing you undid.
         private void InvertMaskWithoutUndo()
         {
-            for (int i = 0; i < _mask.Length; i++)
+            for (int i = 0; i < _vertexCount; i++)
             {
                 _mask[i] = 1f - _mask[i];
                 Color c = _cavityColors[i];
@@ -2251,10 +3068,18 @@ namespace Sculpting
         // approximation rather than an oversight.
         private void RestoreSnapshot(Vector3[] vertices, int[] triangles)
         {
-            bool sameTopology = triangles.Length == _workingTriangles.Length && vertices.Length == _workingVertices.Length;
+            // Against the COUNTS, not the arrays' lengths - a snapshot is always exact, while the
+            // live buffers carry spare capacity once dynamic topology has run (see Vertices).
+            bool sameTopology = triangles.Length == _cornerCount && vertices.Length == _vertexCount;
             if (sameTopology)
             {
-                _workingVertices = vertices;
+                // Copied IN rather than adopted as the live buffer. A snapshot is exactly
+                // VertexCount long, and swapping it in would leave _workingVertices shorter than
+                // every buffer that shadows it (normals, cavity, mask, the sync baseline) - which
+                // the "has this changed under me" length guards on those would read as a topology
+                // change and answer by reallocating, silently discarding the normals and mask
+                // this path is not supposed to touch at all.
+                Array.Copy(vertices, _workingVertices, _vertexCount);
                 ApplyVertices();
                 return;
             }
@@ -2264,6 +3089,7 @@ namespace Sculpting
             // SculptPBR's vertex shader has no TEXCOORD0 input at all (ConfigureGpuVertexLayout
             // below drops it from the buffer entirely regardless, same as Remesh()'s tail).
             _mesh.Clear();
+            InvalidateIndexBufferSpec();
             _mesh.indexFormat = vertices.Length > 65000
                 ? UnityEngine.Rendering.IndexFormat.UInt32
                 : UnityEngine.Rendering.IndexFormat.UInt16;
@@ -2277,6 +3103,7 @@ namespace Sculpting
             _originalVertices = (Vector3[])vertices.Clone();
             _workingVertices = vertices;
             _workingTriangles = triangles;
+            SetGeometryCounts(vertices.Length, triangles.Length);
             _spatialGrid = null;
             BuildAdjacency();
             RebuildTriangleGrid();
@@ -2294,6 +3121,10 @@ namespace Sculpting
             BindGpuScatter();
 
             ReseatCollider();
+
+            // Undoing or redoing across a Remesh is a topology change like any other - see
+            // MirrorLink.OnTopologyChanged.
+            if (LinkedMirror != null) LinkedMirror.OnTopologyChanged(this);
         }
 
         /// Rebuilds the spatial index used by SelectGrab/QueryNear over the current vertex
@@ -2301,7 +3132,7 @@ namespace Sculpting
         /// PrepareSpatialIndex instead, which only rebuilds when it has to.
         public void RebuildSpatialIndex(float cellSize)
         {
-            _spatialGrid = new VertexSpatialGrid(_workingVertices, cellSize);
+            _spatialGrid = new VertexSpatialGrid(_workingVertices, _vertexCount, cellSize);
             // A fresh build already reflects every position, so nothing queued before it applies.
             _pendingVertexGridVertices.Clear();
         }
@@ -2339,7 +3170,7 @@ namespace Sculpting
         /// True if the vertex index exists and was built over THIS positions array - a same-length
         /// replacement array describes a different shape, which the index would still answer for.
         private bool SpatialIndexIsCurrent() =>
-            _spatialGrid != null && _spatialGrid.VertexCount == _workingVertices.Length &&
+            _spatialGrid != null && _spatialGrid.VertexCount == _vertexCount &&
             ReferenceEquals(_spatialGrid.Positions, _workingVertices);
 
         /// Vertex indices within `radius` of a local-space point - exact, see VertexSpatialGrid.Query.
@@ -2361,7 +3192,7 @@ namespace Sculpting
             for (int k = 0; k < candidates.Count; k++)
             {
                 int i = candidates[k];
-                if (i >= 0 && i < _hiddenVertices.Length && _hiddenVertices[i]) continue;
+                if (i >= 0 && i < _vertexCount && _hiddenVertices[i]) continue;
                 candidates[w++] = i;
             }
             candidates.RemoveRange(w, candidates.Count - w);
@@ -2504,7 +3335,8 @@ namespace Sculpting
             if (clickVertex < 0 || _mask[clickVertex] > PoseMaskThreshold) return default;
 
             MeshAdjacency topology = EnsureAdjacency();
-            int[] neighborOffsets = topology.NeighborOffsets;
+            int[] neighborStart = topology.NeighborStart;
+            int[] neighborCount = topology.NeighborCount;
             int[] neighborIndices = topology.NeighborIndices;
 
             // Pass 1: flood-fill the connected unmasked island containing the click, collecting
@@ -2522,7 +3354,7 @@ namespace Sculpting
                 int v = floodQueue.Dequeue();
                 island.Add(v);
                 bool touchesMasked = false;
-                for (int k = neighborOffsets[v], kEnd = neighborOffsets[v + 1]; k < kEnd; k++)
+                for (int k = neighborStart[v], kEnd = k + neighborCount[v]; k < kEnd; k++)
                 {
                     int n = neighborIndices[k];
                     if (_mask[n] > PoseMaskThreshold) { touchesMasked = true; continue; }
@@ -2580,7 +3412,7 @@ namespace Sculpting
                 if (d > dist[v] + 1e-6f) continue; // stale heap entry from an earlier, worse push
                 processed++;
 
-                for (int k = neighborOffsets[v], kEnd = neighborOffsets[v + 1]; k < kEnd; k++)
+                for (int k = neighborStart[v], kEnd = k + neighborCount[v]; k < kEnd; k++)
                 {
                     int n = neighborIndices[k];
                     if (!visited.Contains(n)) continue; // outside the island - never cross the mask boundary
@@ -2860,13 +3692,15 @@ namespace Sculpting
             _workingVertices = (Vector3[])vertices.Clone();
             _workingNormals = normals;
             _workingTriangles = triangles;
+            SetGeometryCounts(vertices.Length, triangles.Length);
 
             // Layout first, then contents: ConfigureGpuVertexLayout re-specifies the buffer as
             // position/normal/colour and would discard anything uploaded before it.
             ConfigureGpuVertexLayout(_mesh, _workingVertices.Length);
             _mesh.SetVertices(_workingVertices);
             _mesh.SetNormals(_workingNormals);
-            _mesh.SetTriangles(_workingTriangles, 0, false);
+            InvalidateIndexBufferSpec();
+            _mesh.SetTriangles(_workingTriangles, 0, _cornerCount, 0, false);
             _mesh.bounds = bounds;
 
             RebuildDerivedState();
@@ -2898,6 +3732,7 @@ namespace Sculpting
             _workingVertices = (Vector3[])_originalVertices.Clone();
             _workingNormals = _mesh.normals;
             _workingTriangles = _mesh.triangles;
+            SetGeometryCounts(_workingVertices.Length, _workingTriangles.Length);
 
             ConfigureGpuVertexLayout(_mesh, _workingVertices.Length);
             _mesh.vertices = _workingVertices;
@@ -2964,6 +3799,10 @@ namespace Sculpting
             BindGpuScatter();
 
             ReseatCollider();
+
+            // Remesh, Trim, Boolean, Join and Cut & Mirror all end up here - see
+            // MirrorLink.OnTopologyChanged for why that finalizes a linked mirror pair.
+            if (LinkedMirror != null) LinkedMirror.OnTopologyChanged(this);
         }
     }
 }

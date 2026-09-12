@@ -90,10 +90,13 @@ namespace Sculpting
 
             if (source == null) { error = "No object selected."; return null; }
 
-            Vector3[] srcVerts = source.Vertices;
-            Vector3[] srcNormals = source.Normals;
-            int[] srcTris = source.Triangles;
-            float[] mask = source.Mask;
+            // The Exact forms, because the length agreement checked just below is against each
+            // other rather than against a count: the raw buffers run ahead of VertexCount once
+            // dynamic topology has appended to them (see SculptableMesh.Vertices).
+            Vector3[] srcVerts = source.VerticesExact();
+            Vector3[] srcNormals = source.NormalsExact();
+            int[] srcTris = source.TrianglesExact();
+            float[] mask = source.MaskExact();
 
             if (srcVerts == null || srcTris == null || mask == null ||
                 srcNormals == null || srcNormals.Length != srcVerts.Length ||

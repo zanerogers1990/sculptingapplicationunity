@@ -22,8 +22,8 @@ namespace Sculpting
             if (mesh == null) return null;
 
             Transform t = sculptableMesh.transform;
-            Vector3[] verts = sculptableMesh.Vertices;
-            Vector3[] normals = sculptableMesh.Normals;
+            Vector3[] verts = sculptableMesh.VerticesExact();
+            Vector3[] normals = sculptableMesh.NormalsExact();
             int[] triangles = mesh.triangles;
 
             var sb = new StringBuilder();

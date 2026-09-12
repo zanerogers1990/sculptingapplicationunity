@@ -179,22 +179,55 @@ namespace Sculpting
             SelectionVersion++;
         }
 
-        /// Unregisters and destroys obj's GameObject, reselecting a remaining object if it was
-        /// primary. Non-destructive of shared state (only ever removes the one object the user
-        /// picked), so unlike Join this needs no confirmation step.
+        /// Unregisters and deactivates obj's GameObject - NOT an immediate Destroy - and records
+        /// one EditHistory scene action so Z undoes it, reselecting a remaining object if obj was
+        /// primary. Mirrors ZSphereController.Skin's Convert-undo and SceneLightManager's own
+        /// delete: parked (unregistered, inactive) rather than destroyed, so undo just reactivates
+        /// and reselects the same object - any strokes on it are untouched. The GameObject is only
+        /// actually freed once the step falls off history (or the scene is cleared), via the
+        /// discard closure below - SceneSerializer's save path walks SelectionManager.AllObjects,
+        /// not every SculptableMesh in the hierarchy, so a parked object is correctly left out of
+        /// a save made while its delete is still undoable.
         public void DeleteObject(SculptableMesh obj)
         {
             if (obj == null) return;
             bool wasPrimary = _primary == obj;
             Unregister(obj);
-            Destroy(obj.gameObject);
+            obj.gameObject.SetActive(false);
             if (wasPrimary && _allObjects.Count > 0)
             {
                 foreach (SculptableMesh candidate in _allObjects)
                 {
-                    if (candidate.Visible) { Select(candidate, false); return; }
+                    if (candidate.Visible) { Select(candidate, false); break; }
                 }
             }
+
+            // Rough mesh footprint (positions + triangle indices only) - same estimate
+            // RecordConvertUndo uses for a SculptableMesh scene action, so the memory budget
+            // sees roughly what a parked object is actually holding onto.
+            Mesh mesh = obj.Mesh;
+            long bytes = mesh != null ? (long)mesh.vertexCount * 12 + (long)mesh.triangles.Length * 4 : 0;
+
+            EditHistory.RecordSceneAction("Delete Object",
+                undo: () =>
+                {
+                    if (obj == null) return;
+                    obj.gameObject.SetActive(true);
+                    Select(obj, false);
+                },
+                redo: () =>
+                {
+                    if (obj == null) return;
+                    Unregister(obj);
+                    obj.gameObject.SetActive(false);
+                },
+                discard: () =>
+                {
+                    // Only a still-parked object is freed - one reactivated since (by a redo, or
+                    // by some other path) is real and in the scene again.
+                    if (obj != null && !obj.gameObject.activeSelf) Destroy(obj.gameObject);
+                },
+                approxBytes: bytes);
         }
     }
 }

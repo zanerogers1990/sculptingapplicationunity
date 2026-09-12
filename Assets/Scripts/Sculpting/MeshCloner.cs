@@ -2,9 +2,9 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// One-shot duplicate of a sculptable object - the same "bake the CURRENT shape into a
-    /// brand new, fully independent object" contract MeshMirror already established, minus the
-    /// reflection. Used by SceneGraphUIBuilder's "Clone Selected" button.
+    /// One-shot duplicate of a sculptable object: bakes its CURRENT shape into a brand new, fully
+    /// independent object. Used by SceneGraphUIBuilder's "Clone Selected" button, and - with a
+    /// reflection folded in - by both of MeshMirror's copies, which share every step of Duplicate.
     ///
     /// The clone lands exactly on top of the original rather than at some invented offset:
     /// where a duplicate belongs is a modelling decision (a second horn goes somewhere quite
@@ -16,54 +16,69 @@ namespace Sculpting
         public static SculptableMesh Clone(SculptableMesh source)
         {
             if (source == null) return null;
-
             Transform srcT = source.transform;
-            // Live working arrays, not the mesh asset - same reasoning as MeshMirror's own
-            // read of Vertices/Triangles: the point is to copy what the object looks like now,
-            // after however much sculpting, not what it was loaded as.
-            Vector3[] localVerts = (Vector3[])source.Vertices.Clone();
-            int[] triangles = (int[])source.Triangles.Clone();
+            return Duplicate(source, source.name + " Copy", Vector3.one, srcT.position, srcT.rotation);
+        }
 
-            var mesh = new Mesh { name = source.name + " Clone (Source)" };
-            if (localVerts.Length > 65000) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-            mesh.vertices = localVerts;
+        /// Builds the new object from source's live working arrays, with every local vertex and
+        /// normal scaled by `localSigns` (all +1 for a plain clone - see MeshMirror.ReflectGeometry),
+        /// placed at `position`/`rotation` with source's own scale.
+        internal static SculptableMesh Duplicate(SculptableMesh source, string desiredName, Vector3 localSigns,
+                                                 Vector3 position, Quaternion rotation)
+        {
+            // Live working arrays, not the mesh asset: the point is to copy what the object looks
+            // like now, after however much sculpting, not what it was loaded as.
+            MeshMirror.ReflectGeometry(source.VerticesExact(), source.NormalsExact(), source.TrianglesExact(), localSigns,
+                                       out Vector3[] vertices, out Vector3[] normals, out int[] triangles);
+
+            string name = ObjectNaming.Unique(desiredName);
+            var mesh = new Mesh { name = name + " (Source)" };
+            if (vertices.Length > 65000) mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            mesh.vertices = vertices;
             mesh.triangles = triangles;
-            mesh.RecalculateNormals();
+            // Carried over, not recalculated: RecalculateNormals splits every duplicated seam vertex
+            // into a hard crease (see MeshMirror's remarks). Only a source with no usable normals
+            // falls back to it.
+            if (normals != null) mesh.normals = normals;
+            else mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            var go = new GameObject(ObjectNaming.Unique(source.name + " Copy"), typeof(MeshFilter), typeof(MeshRenderer));
-            go.transform.SetPositionAndRotation(srcT.position, srcT.rotation);
-            go.transform.localScale = srcT.localScale;
+            var go = new GameObject(name, typeof(MeshFilter), typeof(MeshRenderer));
+            go.transform.SetPositionAndRotation(position, rotation);
+            go.transform.localScale = source.transform.localScale;
             go.GetComponent<MeshFilter>().sharedMesh = mesh;
 
             // AddComponent runs SculptableMesh.Awake synchronously, so everything below this
-            // line is operating on a fully built clone (see PrimitiveSpawner/MeshMirror, which
-            // rely on the same guarantee).
-            SculptableMesh clone = SculptableMesh.AddOwning(go, mesh);
-            var cloneMirror = go.AddComponent<MirrorController>();
+            // line is operating on a fully built copy (see PrimitiveSpawner, which relies on the
+            // same guarantee).
+            SculptableMesh copy = SculptableMesh.AddOwning(go, mesh);
+            var copyMirror = go.AddComponent<MirrorController>();
 
+            // Valid for a mirrored copy too: its local frame is the source's reflected, and every
+            // symmetry plane runs through the origin along an axis the reflection only negates, so
+            // the same flags describe the same planes.
             var sourceMirror = source.GetComponent<MirrorController>();
             if (sourceMirror != null)
             {
-                cloneMirror.MirrorX = sourceMirror.MirrorX;
-                cloneMirror.MirrorY = sourceMirror.MirrorY;
-                cloneMirror.MirrorZ = sourceMirror.MirrorZ;
-                cloneMirror.ShowPlanes = sourceMirror.ShowPlanes;
+                copyMirror.MirrorX = sourceMirror.MirrorX;
+                copyMirror.MirrorY = sourceMirror.MirrorY;
+                copyMirror.MirrorZ = sourceMirror.MirrorZ;
+                copyMirror.ShowPlanes = sourceMirror.ShowPlanes;
             }
 
-            // Vertex indices are identical (the triangle array was copied verbatim), so the
-            // mask transfers one-to-one - carrying it over means a clone made mid-workflow
-            // stays usable with masked Transpose right away instead of silently losing the
-            // masking work that set it up.
-            clone.SetMask(source.Mask);
+            // Vertex indices are identical (the triangles were copied index for index), so the
+            // mask transfers one-to-one - carrying it over means a copy made mid-workflow stays
+            // usable with masked Transpose right away instead of silently losing the masking
+            // work that set it up.
+            copy.SetMask(source.MaskExact());
 
             SculptMaterialController materialController = Object.FindFirstObjectByType<SculptMaterialController>();
             materialController?.ApplyTo(go.GetComponent<Renderer>());
 
             SelectionManager selection = Object.FindFirstObjectByType<SelectionManager>();
-            selection?.Select(clone, false);
+            selection?.Select(copy, false);
 
-            return clone;
+            return copy;
         }
     }
 }

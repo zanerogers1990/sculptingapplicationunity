@@ -43,19 +43,19 @@ namespace Sculpting
         private readonly List<int>[] _cellContents;
         // The inclusive cell range each triangle is registered over, packed so an unchanged range is
         // one integer compare - see UpdateTriangles.
-        private readonly long[] _triangleCellRange;
+        private long[] _triangleCellRange;
         // Where each triangle sits inside the list of the FIRST cell of its range (min x, y, z).
         // See the class remarks and RemoveRegistration.
-        private readonly int[] _firstCellSlot;
+        private int[] _firstCellSlot;
         // Which cell each VERTEX currently sits in, packed. A triangle's range is the bounding box
         // of its vertices' cells, so it cannot change unless one of those vertices changed cell -
         // the cheap early test UpdateFromMovedVertices runs before looking at any triangle.
-        private readonly int[] _vertexCell;
+        private int[] _vertexCell;
 
         // Per-triangle "already visited in operation N" marks, shared by the moved-triangle dedup and
         // the raycast's candidate dedup. Both run to completion on the main thread before anything
         // else touches the grid, so one array and one counter serve both.
-        private readonly int[] _triangleStamp;
+        private int[] _triangleStamp;
         private int _stampGeneration;
 
         private readonly List<int> _movedTriangleScratch = new List<int>();
@@ -76,6 +76,13 @@ namespace Sculpting
         public Bounds Bounds => _bounds;
 
         public TriangleSpatialGrid(Vector3[] vertices, int[] triangles, Bounds bounds, float cellSize)
+            : this(vertices, vertices.Length, triangles, triangles.Length, bounds, cellSize) { }
+
+        /// vertexCount/cornerCount bound what is bucketed - past the first dynamic-topology refine
+        /// both arrays carry spare capacity (see SculptableMesh.Vertices), and the spare triangles
+        /// are degenerate ones on vertex 0 that would be registered and ray-tested forever.
+        public TriangleSpatialGrid(Vector3[] vertices, int vertexCount, int[] triangles, int cornerCount,
+                                   Bounds bounds, float cellSize)
         {
             _bounds = bounds;
             _boundsMin = bounds.min;
@@ -88,19 +95,22 @@ namespace Sculpting
                 Mathf.Clamp(Mathf.CeilToInt(size.y / _cellSize), 1, 256),
                 Mathf.Clamp(Mathf.CeilToInt(size.z / _cellSize), 1, 256));
 
-            int triCount = triangles.Length / 3;
+            int triCount = Mathf.Clamp(cornerCount, 0, triangles.Length) / 3;
+            int vertCount = Mathf.Clamp(vertexCount, 0, vertices.Length);
+            _triangleCount = triCount;
+            _vertexCellCount = vertCount;
             _cellContents = new List<int>[_dims.x * _dims.y * _dims.z];
             _triangleCellRange = new long[triCount];
             _firstCellSlot = new int[triCount];
             _triangleStamp = new int[triCount];
-            _vertexCell = new int[vertices.Length];
+            _vertexCell = new int[vertCount];
 
             // Ranges and vertex cells are computed across cores; the registration that follows writes
             // shared cell lists, so it runs on this thread in triangle order.
             _passVertices = vertices;
             _passTriangles = triangles;
             ParallelPass.ForRange(triCount, BuildRangePass);
-            ParallelPass.ForRange(vertices.Length, BuildVertexCellPass);
+            ParallelPass.ForRange(vertCount, BuildVertexCellPass);
             _passVertices = null;
             _passTriangles = null;
 
@@ -249,6 +259,61 @@ namespace Sculpting
                 _firstCellSlot[movedTi] = slot;
         }
 
+        // Registered counts, as against the per-element arrays' lengths, which run ahead of them so
+        // an append does not reallocate mesh-sized arrays - see AppendTriangles.
+        private int _triangleCount;
+        private int _vertexCellCount;
+
+        /// How many triangles this index currently holds registrations for. Dynamic topology
+        /// appends past this; anything at or beyond it has not been bucketed yet.
+        public int TriangleCount => _triangleCount;
+
+        /// Registers `count` triangles starting at triangle index `from` that did not exist when
+        /// this index was built, and buckets the vertices they introduced.
+        ///
+        /// O(count), the whole point: a refine adds triangles inside one brush footprint, and
+        /// rebuilding the grid for them would cost a pass over every triangle in the mesh. The
+        /// grid's BOUNDS and cell size are fixed at construction either way - new geometry outside
+        /// the box is handled the way moved geometry already is, by SculptableMesh noticing the
+        /// mesh no longer fits and rebuilding (see MeshBoundsFitInsideTriangleGrid).
+        public void AppendTriangles(int from, int count, int vertexCount, Vector3[] vertices, int[] triangles)
+        {
+            if (count <= 0) return;
+
+            int needed = from + count;
+            if (_triangleCellRange.Length < needed)
+            {
+                // Half again rather than to fit - see VertexSpatialGrid.AppendVertices for why
+                // resizing to the exact count turns a footprint-sized operation back into a
+                // mesh-sized one.
+                int grown = Math.Max(needed, _triangleCellRange.Length + _triangleCellRange.Length / 2);
+                Array.Resize(ref _triangleCellRange, grown);
+                Array.Resize(ref _firstCellSlot, grown);
+                Array.Resize(ref _triangleStamp, grown);
+            }
+            // Vertices the new triangles reference may themselves be new. Their cells feed
+            // UpdateFromMovedVertices' "did this vertex change cell" test, so a missing entry would
+            // read as cell 0 and make the first move of a new vertex look like a jump across the
+            // grid.
+            if (_vertexCellCount < vertexCount)
+            {
+                if (_vertexCell.Length < vertexCount)
+                    Array.Resize(ref _vertexCell, Math.Max(vertexCount, _vertexCell.Length + _vertexCell.Length / 2));
+                // From the registered COUNT, not from the array's old length: the array runs ahead
+                // of the count, and starting from its length would leave the vertices in between
+                // with no cell recorded at all.
+                for (int i = _vertexCellCount; i < vertexCount; i++)
+                {
+                    Vector3 p = vertices[i];
+                    _vertexCell[i] = PackedCellOf(p.x, p.y, p.z);
+                }
+                _vertexCellCount = vertexCount;
+            }
+
+            for (int ti = from; ti < needed; ti++) InsertTriangle(ti, RangeOf(ti, vertices, triangles));
+            _triangleCount = needed;
+        }
+
         /// Re-buckets exactly the given triangles to wherever their (already-moved) vertices put them
         /// now. A triangle whose packed range is unchanged is already registered in exactly the right
         /// cells and is skipped with one compare.
@@ -291,10 +356,10 @@ namespace Sculpting
         /// The same job as UpdateTriangles, driven from the vertices that moved: a triangle's range
         /// can only change if one of its vertices changed cell, which costs one position load and one
         /// integer compare per moved vertex to rule out - and in the common case where no vertex
-        /// crossed a boundary, no triangle is looked at at all. `vertexTriangleOffsets` and
-        /// `vertexTriangles` are MeshAdjacency's incident-triangle arrays.
-        public void UpdateFromMovedVertices(List<int> movedVertices, int[] vertexTriangleOffsets, int[] vertexTriangles,
-            Vector3[] vertices, int[] triangles)
+        /// crossed a boundary, no triangle is looked at at all. `vertexTriangleStart`,
+        /// `vertexTriangleCount` and `vertexTriangles` are MeshAdjacency's incident-triangle arrays.
+        public void UpdateFromMovedVertices(List<int> movedVertices, int[] vertexTriangleStart, int[] vertexTriangleCount,
+            int[] vertexTriangles, Vector3[] vertices, int[] triangles)
         {
             int movedCount = movedVertices.Count;
             if (movedCount == 0) return;
@@ -320,7 +385,7 @@ namespace Sculpting
                 if (now == vertexCell[vi]) continue;
                 vertexCell[vi] = now;
 
-                for (int i = vertexTriangleOffsets[vi], end = vertexTriangleOffsets[vi + 1]; i < end; i++)
+                for (int i = vertexTriangleStart[vi], end = i + vertexTriangleCount[vi]; i < end; i++)
                 {
                     int ti = vertexTriangles[i];
                     if (stamp[ti] == generation) continue;

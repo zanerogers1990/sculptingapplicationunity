@@ -51,7 +51,7 @@ namespace Sculpting.Tests
 
         private delegate void InflateOrFlattenPath(Vector3 point, Vector3 normal, bool positive, float dt,
             List<int> candidates, Vector3[] verts, Vector3[] normals);
-        private delegate void CarvePath(Vector3 point, Vector3 normal, Vector3 dir, bool positive, float lipFactor,
+        private delegate void CarvePath(Vector3 point, Vector3 normal, Vector3 dir, bool positive,
             List<int> candidates, Vector3[] verts);
         private delegate void ClayPath(Vector3 point, Vector3 normal, Vector3 tangent0, Vector3 bitangent0,
             bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals,
@@ -65,7 +65,7 @@ namespace Sculpting.Tests
         private SculptableMesh _sculptable;
         private SculptController _controller;
         private Vector3[] _startVertices;
-        private int[] _neighborOffsets, _neighbors;
+        private int[] _neighborStart, _neighborCount, _neighbors;
 
         public SculptControllerJobParityTests(int subdivisions) => _subdivisions = subdivisions;
 
@@ -96,7 +96,8 @@ namespace Sculpting.Tests
             SetField(_controller, "cam", camera); // the relax job reads it
 
             _startVertices = (Vector3[])Verts.Clone();
-            _neighborOffsets = _sculptable.AdjacencyOffsets.ToArray();
+            _neighborStart = _sculptable.AdjacencyStarts.ToArray();
+            _neighborCount = _sculptable.AdjacencyCounts.ToArray();
             _neighbors = _sculptable.AdjacencyNeighbors.ToArray();
         }
 
@@ -148,7 +149,7 @@ namespace Sculpting.Tests
         }
 
         [Test]
-        public void CreaseAndDamStandard([Values(0f, 0.25f)] float lipFactor, [Values(false, true)] bool accumulate,
+        public void Crease([Values(false, true)] bool accumulate,
             [Values(false, true)] bool positive, [Values(false, true)] bool maskAndFrontFacing)
         {
             Configure(radius: 0.2f, strength: 0.5f, maskAndFrontFacing);
@@ -160,9 +161,9 @@ namespace Sculpting.Tests
             var managed = Bind<CarvePath>("ApplyCarveDabLocalManaged");
             List<Dab> dabs = BuildDabs(LongPath, _controller.BrushRadius, withDirection: true);
 
-            AssertParity(lipFactor > 0f ? "Dam Standard" : "Crease", DabSequenceTolerance,
-                Run(dabs, d => managed(d.Point, d.Normal, d.Direction, positive, lipFactor, d.Candidates, Verts)),
-                Run(dabs, d => job(d.Point, d.Normal, d.Direction, positive, lipFactor, d.Candidates, Verts)));
+            AssertParity("Crease", DabSequenceTolerance,
+                Run(dabs, d => managed(d.Point, d.Normal, d.Direction, positive, d.Candidates, Verts)),
+                Run(dabs, d => job(d.Point, d.Normal, d.Direction, positive, d.Candidates, Verts)));
         }
 
         [Test]
@@ -485,7 +486,7 @@ namespace Sculpting.Tests
             {
                 if (!blocked.Add(c)) continue;
                 picked.Add(c);
-                for (int n = _neighborOffsets[c]; n < _neighborOffsets[c + 1]; n++) blocked.Add(_neighbors[n]);
+                for (int n = _neighborStart[c], end = n + _neighborCount[c]; n < end; n++) blocked.Add(_neighbors[n]);
             }
             return picked;
         }

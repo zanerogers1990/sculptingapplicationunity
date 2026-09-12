@@ -320,10 +320,12 @@ namespace Sculpting
             float cell = tol;
             var buckets = new Dictionary<Vector3Int, List<int>>(n / 4 + 1);
 
+            // Inside the centreline band - a CANDIDATE for being on the plane, decided below.
+            var inBand = new bool[n];
             for (int i = 0; i < n; i++)
             {
                 map._partner[i] = NoPartner;
-                map._onPlane[i] = Mathf.Abs(Coord(vertices[i], axis)) <= tol;
+                inBand[i] = Mathf.Abs(Coord(vertices[i], axis)) <= tol;
 
                 Vector3Int c = CellOf(vertices[i], cell);
                 if (!buckets.TryGetValue(c, out List<int> list))
@@ -350,15 +352,40 @@ namespace Sculpting
 
             for (int i = 0; i < n; i++)
             {
-                if (map._onPlane[i]) continue;
+                float side = Coord(vertices[i], axis);
+
+                // A vertex in the centreline band nominates ITSELF too, at its distance from its own
+                // reflection, and competes in the greedy pass with every twin across the plane. It is
+                // filed as on the plane only if nothing sits closer to its reflection than it does.
+                //
+                // Being inside the band used to settle it outright - and the band is half a vertex
+                // spacing wide, which on a remesh is exactly where the first row of vertices either
+                // side of the plane lands (Surface Nets puts them near the middle of the cells that
+                // border it). Measured on a remeshed symmetric sphere: 873 of 1224 "centreline"
+                // vertices were in fact one half of a mirrored pair 0.8 spacings apart. SnapToPlane
+                // then pulled both halves onto the plane - onto each other - collapsing the edge
+                // between them: Make Symmetric turned an already symmetric model into one with 726
+                // degenerate triangles down the middle, and Cleanup welded 741 of them away
+                // (SymmetryRepairTests).
+                if (inBand[i]) edges.Add(new Edge { Sqr = 4f * side * side, A = i, B = i });
+                // Exactly on the plane: its own reflection, and nothing else can be.
+                if (side == 0f) continue;
 
                 Vector3 target = Reflect(vertices[i], axis);
-                float side = Coord(vertices[i], axis);
                 Vector3Int home = CellOf(target, cell);
 
-                for (int z = -1; z <= 1; z++)
-                for (int y = -1; y <= 1; y++)
-                for (int x = -1; x <= 1; x++)
+                // A centreline candidate is matched out to its own distance from its reflection, even
+                // past Tolerance: any twin nearer than that is a better account of it than "on the
+                // plane". The remesher leaves mirrored pairs up to ~0.8 spacings out of true, so with
+                // Tolerance alone the noisier straddling pairs found no twin, both fell back to the
+                // plane, and Cleanup welded them into each other. Never more than twice Tolerance
+                // (the band's own width), so two cells either way always cover it.
+                float reachSqr = inBand[i] ? Mathf.Max(tolSqr, 4f * side * side) : tolSqr;
+                int reachCells = reachSqr > tolSqr ? 2 : 1;
+
+                for (int z = -reachCells; z <= reachCells; z++)
+                for (int y = -reachCells; y <= reachCells; y++)
+                for (int x = -reachCells; x <= reachCells; x++)
                 {
                     if (!buckets.TryGetValue(new Vector3Int(home.x + x, home.y + y, home.z + z),
                                              out List<int> list)) continue;
@@ -366,14 +393,15 @@ namespace Sculpting
                     for (int k = 0; k < list.Count; k++)
                     {
                         int j = list[k];
-                        if (j == i || map._onPlane[j]) continue;
+                        if (j == i) continue;
                         // Must genuinely be across the plane. Without this a pair of vertices
                         // straddling the plane closer together than `tol` could pair with
-                        // themselves-ish on the same side, which is not a reflection.
-                        if (Coord(vertices[j], axis) * side > 0f) continue;
+                        // themselves-ish on the same side, which is not a reflection. Strictly across:
+                        // a vertex exactly on the plane is its own twin, never anyone else's.
+                        if (Coord(vertices[j], axis) * side >= 0f) continue;
 
                         float d = (vertices[j] - target).sqrMagnitude;
-                        if (d <= tolSqr) edges.Add(new Edge { Sqr = d, A = i, B = j });
+                        if (d <= reachSqr) edges.Add(new Edge { Sqr = d, A = i, B = j });
                     }
                 }
             }
@@ -394,6 +422,12 @@ namespace Sculpting
             {
                 Edge edge = edges[e];
                 if (map._partner[edge.A] != NoPartner || map._partner[edge.B] != NoPartner) continue;
+                if (map._onPlane[edge.A] || map._onPlane[edge.B]) continue;
+                if (edge.A == edge.B)
+                {
+                    map._onPlane[edge.A] = true; // its own reflection was the closest thing to it
+                    continue;
+                }
                 map._partner[edge.A] = edge.B;
                 map._partner[edge.B] = edge.A;
             }

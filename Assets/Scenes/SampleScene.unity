@@ -471,7 +471,7 @@ Light:
   m_BounceIntensity: 1
   m_ColorTemperature: 5000
   m_UseColorTemperature: 1
-  m_BoundingSphereOverride: {x: 4.5907e-41, y: 0, z: 0, w: 3.7145138}
+  m_BoundingSphereOverride: {x: 7.712207e-33, y: 1.4664299e-19, z: 9.102061e-12, w: 1.3555877e-19}
   m_UseBoundingSphereOverride: 0
   m_UseViewFrustumForShadowCasterCull: 1
   m_ForceVisible: 0
@@ -538,6 +538,8 @@ GameObject:
   - component: {fileID: 615892304}
   - component: {fileID: 615892303}
   - component: {fileID: 615892306}
+  - component: {fileID: 615892307}
+  - component: {fileID: 615892308}
   m_Layer: 0
   m_Name: SculptUI
   m_TagString: Untagged
@@ -621,6 +623,32 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 01b1cabcc2c40f04fa1b0b9647030119, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.ViewGizmoUIBuilder
+--- !u!114 &615892307
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 615892300}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e22d0ebe850a0404ab5a16bd7f1f3aea, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.RadialMenuUIBuilder
+  controller: {fileID: 0}
+--- !u!114 &615892308
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 615892300}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 5e1d554fcf9b0bb45bfe3c69f798785a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.RegionRadialMenuUIBuilder
+  controller: {fileID: 0}
 --- !u!1 &803899609
 GameObject:
   m_ObjectHideFlags: 0
@@ -642,6 +670,7 @@ GameObject:
   - component: {fileID: 803899620}
   - component: {fileID: 803899621}
   - component: {fileID: 803899622}
+  - component: {fileID: 803899623}
   m_Layer: 0
   m_Name: SceneSystems
   m_TagString: Untagged
@@ -768,6 +797,8 @@ MonoBehaviour:
   frontFacingOnly: 0
   buildUpOnHold: 0
   surfaceRelax: 0.35
+  poseRigidity: 0.6
+  poseSegments: 4
   lazyMouseEnabled: 0
   lazyMouseRadius: 25
   lazyMouseStrength: 1
@@ -780,16 +811,27 @@ MonoBehaviour:
   invertAlpha: 0
   creasePinch: 0.6
   creaseDepthFactor: 0.35
-  damLipHeight: 0.25
   flattenPlaneOffset: 0
   maskHardness: 0.5
   remeshResolution: 24
+  dynamicTopology:
+    Enabled: 0
+    DetailSize: 0.012
+    SplitFactor: 1.3333334
+    CollapseFactor: 0.6
+    RegionMargin: 0.25
+    ThrottleDistanceFraction: 0.25
+    Iterations: 2
+    MaxOperationsPerRefine: 6000
+    RelaxStrength: 0.35
   symmetryAxis: 0
   symmetryToleranceScale: 1
   showWireframeGizmo: 0
   logRayHits: 0
   useBurstJobs: 1
   clayEdgeSoftness: 0.6
+  clayPressureRadiusInfluence: 0.3
+  clayPressureSoftnessInfluence: 0.5
   pressureFloor: 0.12
   pressureCurve: 1.6
 --- !u!114 &803899617
@@ -865,6 +907,18 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.RegionSelectTool
   mode: 1
+--- !u!114 &803899623
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 803899609}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3c02083b0b4cc414ca99ffa63978fb88, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.SceneLightManager
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

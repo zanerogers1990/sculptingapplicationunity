@@ -174,13 +174,18 @@ namespace Sculpting
 
             public float creasePinch;
             public float creaseDepthFactor;
-            public float damLipHeight;
             public float maskHardness;
 
             public float pressureFloor;
             public float pressureCurve;
 
             public int remeshResolution;
+
+            // Dynamic topology. Saved so a session that was set up for it comes back that way,
+            // and defaulted off for a file written before it existed - which JsonUtility gives
+            // for free by leaving the field at its zero value.
+            public bool dynamicTopologyEnabled;
+            public float dynamicTopologyDetailSize;
             public bool useBurstJobs;
             public bool showWireframeGizmo;
 
@@ -240,13 +245,14 @@ namespace Sculpting
 
                 creasePinch = creasePinch,
                 creaseDepthFactor = creaseDepthFactor,
-                damLipHeight = damLipHeight,
                 maskHardness = maskHardness,
 
                 pressureFloor = pressureFloor,
                 pressureCurve = pressureCurve,
 
                 remeshResolution = remeshResolution,
+                dynamicTopologyEnabled = dynamicTopology.Enabled,
+                dynamicTopologyDetailSize = dynamicTopology.DetailSize,
                 useBurstJobs = useBurstJobs,
                 showWireframeGizmo = showWireframeGizmo,
 
@@ -288,13 +294,16 @@ namespace Sculpting
 
             CreasePinch = s.creasePinch;
             CreaseDepthFactor = s.creaseDepthFactor;
-            DamLipHeight = s.damLipHeight;
             MaskHardness = s.maskHardness;
 
             PressureFloor = s.pressureFloor;
             PressureCurve = s.pressureCurve;
 
             RemeshResolution = s.remeshResolution;
+            DynamicTopologyEnabled = s.dynamicTopologyEnabled;
+            // Zero means the file predates dynamic topology; keep whatever the inspector default
+            // is rather than clamping a missing value up to the minimum detail size.
+            if (s.dynamicTopologyDetailSize > 0f) DynamicTopologyDetailSize = s.dynamicTopologyDetailSize;
             UseBurstJobs = s.useBurstJobs;
             ShowWireframeGizmo = s.showWireframeGizmo;
 

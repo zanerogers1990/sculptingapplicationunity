@@ -27,7 +27,7 @@ namespace Sculpting
             for (int i = 0; i < objects.Count; i++)
             {
                 SculptableMesh src = objects[i];
-                if (src == null || src.Vertices == null || src.Vertices.Length == 0) continue;
+                if (src == null || src.Vertices == null || src.VertexCount == 0) continue;
 
                 // Build a PLAIN mesh from the working CPU arrays instead of handing src.Mesh
                 // directly to CombineMeshes. src.Mesh's vertex buffer is reconfigured for
@@ -41,10 +41,13 @@ namespace Sculpting
                 // feedback_unity_gpu_buffer_verification memory. Vertices/Normals/Triangles are
                 // always the authoritative CPU-side arrays regardless of GPU buffer state.
                 var plain = new Mesh { name = src.name + " (JoinSource)" };
-                if (src.Vertices.Length > 65000) plain.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-                plain.vertices = src.Vertices;
-                plain.normals = src.Normals;
-                plain.triangles = src.Triangles;
+                if (src.VertexCount > 65000) plain.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+                // The Exact forms: past the first dynamic-topology refine the working arrays
+                // carry spare capacity beyond VertexCount/TriangleCount (see SculptableMesh.Vertices),
+                // and CombineMeshes has no count to go with them.
+                plain.vertices = src.VerticesExact();
+                plain.normals = src.NormalsExact();
+                plain.triangles = src.TrianglesExact();
                 scratchMeshes.Add(plain);
 
                 instances.Add(new CombineInstance

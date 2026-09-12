@@ -41,7 +41,7 @@ namespace Sculpting
         // Each candidate's position as of THIS stroke's start (see
         // SculptableMesh.StrokeStartPosition) - the reference ClampStrokeDepth measures Clay's
         // per-stroke buildup cap against (and Flatten's contrast cap - see
-        // FlattenContrastLimit, and Crease/Dam Standard's whole carve target - see CreaseJob).
+        // FlattenContrastLimit, and Crease's whole carve target - see CreaseJob).
         // Gathered in the Clay/Flatten/Crease job paths only, alongside
         // GatherCandidatesNative's shared arrays; the managed path reads StrokeStartPosition
         // directly.
@@ -144,17 +144,22 @@ namespace Sculpting
             _nativeRelaxCurvature = new NativeArray<float>(_nativeLaplacianCapacity, Allocator.Persistent);
         }
 
+        // Grown, never resized to fit: the mesh buffer these shadow carries spare capacity that
+        // moves in steps as dynamic topology appends (see SculptableMesh.Vertices), and an exact
+        // match test would throw both arrays away and repay the O(total) refill on every one of
+        // those steps. Only a mesh that got SMALLER leaves this oversized, which costs nothing but
+        // the memory - every index written into it is still a live vertex.
         private void EnsureSmoothFullMeshScratch(int totalVertexCount)
         {
-            if (_nativeFullMeshCapacity == totalVertexCount) return;
+            if (_nativeFullMeshCapacity >= totalVertexCount && _nativeVertexToSlot.IsCreated) return;
 
             if (_nativeVertexToSlot.IsCreated) _nativeVertexToSlot.Dispose();
             if (_nativeFullPositionMirror.IsCreated) _nativeFullPositionMirror.Dispose();
 
-            _nativeFullMeshCapacity = totalVertexCount;
-            _nativeVertexToSlot = new NativeArray<int>(totalVertexCount, Allocator.Persistent);
-            for (int i = 0; i < totalVertexCount; i++) _nativeVertexToSlot[i] = -1; // one-time O(total) init
-            _nativeFullPositionMirror = new NativeArray<Vector3>(totalVertexCount, Allocator.Persistent);
+            _nativeFullMeshCapacity = Mathf.Max(totalVertexCount, _nativeFullMeshCapacity + _nativeFullMeshCapacity / 2);
+            _nativeVertexToSlot = new NativeArray<int>(_nativeFullMeshCapacity, Allocator.Persistent);
+            for (int i = 0; i < _nativeFullMeshCapacity; i++) _nativeVertexToSlot[i] = -1; // one-time O(total) init
+            _nativeFullPositionMirror = new NativeArray<Vector3>(_nativeFullMeshCapacity, Allocator.Persistent);
             _positionMirrorStale = true;
         }
 
@@ -171,19 +176,32 @@ namespace Sculpting
         // invalidates it, so no job ever reads a stale neighbour position.
         private bool _positionMirrorStale = true;
         private Vector3[] _positionMirrorSource;
+        // How many entries of the mirror were actually filled by the last refresh. Identity of the
+        // source array is NOT enough on its own: dynamic topology appends vertices into the spare
+        // capacity of the array it is already holding, so the reference is unchanged while the
+        // vertices past this count are still whatever the mirror was allocated with - zero.
+        //
+        // That is not a subtle staleness. A Laplacian reads FullPositions[neighbour] for any
+        // neighbour outside its own candidate list, so an unfilled entry hands it the ORIGIN, and
+        // the vertex gets averaged toward the middle of the object. On screen that is a long spike
+        // for every affected vertex, all converging on one point - which is exactly what a refined
+        // stroke was producing.
+        private int _positionMirrorCount;
 
         private void MarkPositionMirrorStale() => _positionMirrorStale = true;
 
-        /// Brings _nativeFullPositionMirror back in step with `verts`, if anything has moved since
-        /// it was last refreshed. Call immediately before scheduling a job that reads it.
+        /// Brings _nativeFullPositionMirror back in step with `verts`, if anything has moved - or
+        /// been ADDED - since it was last refreshed. Call immediately before scheduling a job that
+        /// reads it.
         private void RefreshPositionMirror(Vector3[] verts)
         {
             if (!_positionMirrorStale && ReferenceEquals(_positionMirrorSource, verts) &&
-                _nativeFullMeshCapacity == verts.Length)
+                _positionMirrorCount >= verts.Length && _nativeFullMeshCapacity >= verts.Length)
                 return;
 
             NativeArray<Vector3>.Copy(verts, _nativeFullPositionMirror, verts.Length);
             _positionMirrorSource = verts;
+            _positionMirrorCount = verts.Length;
             _positionMirrorStale = false;
         }
 
@@ -212,7 +230,7 @@ namespace Sculpting
 
         // Copies the current candidate footprint's position/normal/mask into the shared native
         // scratch (growing it first if needed) - shared gather step for every Tier-A job
-        // (Inflate/Crease/DamStandard/Clay), which only ever read/write within the footprint
+        // (Inflate/Crease/Clay), which only ever read/write within the footprint
         // itself and never need to look outside it (unlike Smooth's neighbor lookups).
         private void GatherCandidatesNative(List<int> candidates, Vector3[] verts, Vector3[] normals, float[] mask)
         {
@@ -311,9 +329,7 @@ namespace Sculpting
             }
         }
 
-        // Shared by Crease and DamStandard, which already share the same pinch+carve core in
-        // their managed form - Lip defaults to 0 for plain Crease, which zeroes the leading-edge
-        // term without a separate flag. AppliedOut mirrors the managed loop's own rule: ANY
+        // AppliedOut mirrors the managed loop's own rule: ANY
         // candidate within BrushRadius counts as touched/dirty, regardless of the resulting lerp
         // factor - unlike Inflate/Clay, the carving brushes never skip on weight <= 0 alone
         // (see ApplyCarveDabLocalManaged).
@@ -338,13 +354,11 @@ namespace Sculpting
             public Vector3 DirLocal; // stroke travel direction in the tangent plane; zero on a tap
             public float BrushRadius;
             public float Depth;
-            public float Lip; // 0 for plain Crease
             public float Pinch;
             public float Sign;
             public float LerpFactorScale; // brushStrength * CreaseSpeed * dabDt
             public bool Accumulate;
             public float DepthRate; // sign * creaseDepthFactor * brushStrength * CreaseSpeed * dabDt
-            public float LipRate; // 0 for plain Crease
             public float PinchRateScale; // creasePinch * brushStrength * CreaseSpeed * dabDt
             public bool FrontFacingOnly;
             public Vector3 CameraLocalPos;
@@ -362,21 +376,17 @@ namespace Sculpting
                 Vector3 start = StrokeStartIn[index];
                 SplitCarveFrame(start - LocalPoint, LocalNormal, DirLocal,
                     out float startNormal, out float startAlong, out Vector3 startAcross);
-                bool hasLip = startAlong > 0f;
 
                 if (Accumulate)
                 {
-                    float normalRate = DepthRate;
-                    if (hasLip) normalRate += LipRate;
                     // Pinch pulls across the stroke line only - see ApplyCarveDabLocalManaged.
                     SplitCarveFrame(toVert, LocalNormal, DirLocal, out _, out _, out Vector3 across);
                     Vector3 pinchDelta = -across * Mathf.Clamp01(weight * PinchRateScale);
-                    PositionsOut[index] = pos + LocalNormal * (normalRate * weight) + pinchDelta;
+                    PositionsOut[index] = pos + LocalNormal * (DepthRate * weight) + pinchDelta;
                 }
                 else
                 {
                     float carve = Depth * weight;
-                    if (hasLip) carve += Lip * weight;
                     float achieved = Vector3.Dot(pos - start, LocalNormal);
                     if (Sign * achieved > Sign * carve) carve = achieved;
 
@@ -393,7 +403,7 @@ namespace Sculpting
             }
         }
 
-        /// Crease/Dam Standard's radial profile. Was t01^3, which is a CONE: its slope is
+        /// Crease's radial profile. Was t01^3, which is a CONE: its slope is
         /// steepest exactly at the tip, so every dab left a pointed dimple and a line of them
         /// read as a row of pokes rather than one groove. Cubing a smoothstep instead keeps the
         /// same overall narrowness (both are 1/8 at half radius, so existing Crease Depth
@@ -404,6 +414,38 @@ namespace Sculpting
         {
             float s = t01 * t01 * (3f - 2f * t01);
             return s * s * s;
+        }
+
+        /// How much of the relax shell's width, measured outward from the brush radius, the step up
+        /// from RelaxInnerFloor to the shell profile is spread over.
+        ///
+        /// That step used to be instantaneous: 0.05 at the brush radius, full strength a hair
+        /// outside it. Clay's relax is batched across every mirror sign by NEAREST dab centre, so a
+        /// vertex sitting at almost exactly one radius was relaxed twenty times harder or not,
+        /// depending on a difference in position far below anything visible - which is precisely
+        /// the kind of difference two mirrored halves carry. Measured: a Clay stroke starting from a
+        /// 1e-4 mirror error ended at 3e-3 (SymmetryDriftTests' session). A tenth of the shell is
+        /// thin next to the band relax is actually for, which starts past the brush and runs to
+        /// RelaxRadiusFactor radii.
+        private const float RelaxShellEntry = 0.1f;
+
+        /// Clay's surface-relax spatial profile, shared by RelaxWeightJob and the managed setup loop
+        /// so the two cannot drift apart. See ApplySurfaceRelaxBatched for what the shape is for.
+        private static float RelaxSpatialWeight(float dist, float brushRadius, float relaxRadius,
+            float edgeSoftness, float innerFloor)
+        {
+            if (dist <= brushRadius) return innerFloor;
+            float shellT = (dist - brushRadius) / Mathf.Max(relaxRadius - brushRadius, 1e-5f);
+            float shell = ClayFalloff(1f - shellT, edgeSoftness);
+            // Past the entry band the shell profile is returned as is, not through the blend below:
+            // at the outer rim it runs down to ~1e-9, and `innerFloor + (shell - innerFloor)` rounds
+            // that to exactly 0 or to one ulp of the floor - differently under Burst and Mono, which
+            // made the job and managed paths disagree on which rim vertices a pass touched
+            // (SculptControllerJobParityTests at 1.3M triangles).
+            if (shellT >= RelaxShellEntry) return shell;
+            float entry = shellT / RelaxShellEntry;
+            entry = entry * entry * (3f - 2f * entry);
+            return innerFloor + (shell - innerFloor) * entry;
         }
 
         /// Decomposes an offset from the dab centre into the carve frame: along the carve
@@ -800,8 +842,9 @@ namespace Sculpting
         private struct SmoothRelaxJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<int> Candidates; // global vertex indices, candidate-indexed
-            [ReadOnly] public NativeArray<int> AdjacencyOffsets; // full mesh, CSR
-            [ReadOnly] public NativeArray<int> AdjacencyNeighbors; // full mesh, CSR
+            [ReadOnly] public NativeArray<int> AdjacencyStarts; // full mesh, see MeshAdjacency
+            [ReadOnly] public NativeArray<int> AdjacencyCounts; // full mesh, see MeshAdjacency
+            [ReadOnly] public NativeArray<int> AdjacencyNeighbors; // full mesh, see MeshAdjacency
             [ReadOnly] public NativeArray<int> VertexToSlot; // full mesh, -1 if not a candidate this call
             [ReadOnly] public NativeArray<Vector3> FullPositions; // full mesh mirror, for non-candidate neighbors
             [ReadOnly] public NativeArray<Vector3> PositionsRead; // candidate-indexed, this pass's input
@@ -817,8 +860,8 @@ namespace Sculpting
                 if (w <= 0f) { PositionsWrite[ci] = currentPos; return; }
 
                 int globalIdx = Candidates[ci];
-                int start = AdjacencyOffsets[globalIdx];
-                int end = AdjacencyOffsets[globalIdx + 1];
+                int start = AdjacencyStarts[globalIdx];
+                int end = start + AdjacencyCounts[globalIdx];
                 if (end == start) { PositionsWrite[ci] = currentPos; return; } // no neighbors - GetNeighborAverage returns self
 
                 Vector3 sum = Vector3.zero;
@@ -877,33 +920,35 @@ namespace Sculpting
                 // centres the square root is now taken at most once per candidate rather than once
                 // per centre, for the same reason.
                 float sqrDist = float.MaxValue;
-                int nearest = 0;
+                // Judged from the viewpoint of the dab that placed the nearest centre, not from one
+                // shared camera - see _relaxCentreCameras. An EXACT tie is taken as the most
+                // permissive of the tied viewpoints: a dab on a mirror plane and its twin place the
+                // same centre with mirrored cameras, every candidate ties between them, and "first
+                // listed wins" handed the whole relax shell the primary side's viewpoint - measured
+                // 8e-2 of mirror error on a centreline Clay stroke with Front Facing Only on
+                // (SymmetryDriftTests). The maximum does not depend on listing order.
+                float facing = 1f;
                 for (int c = 0; c < CentreCount; c++)
                 {
                     float d = (p - Centres[c]).sqrMagnitude;
-                    if (d < sqrDist) { sqrDist = d; nearest = c; }
+                    if (d < sqrDist)
+                    {
+                        sqrDist = d;
+                        facing = FrontFacingWeight(FrontFacingOnly, NormalsIn[ci], p, CentreCameras[c]);
+                    }
+                    else if (d == sqrDist && FrontFacingOnly)
+                    {
+                        facing = Mathf.Max(facing, FrontFacingWeight(true, NormalsIn[ci], p, CentreCameras[c]));
+                    }
                 }
                 if (sqrDist > RelaxRadius * RelaxRadius) { WeightsOut[ci] = 0f; return; }
 
-                float dist = Mathf.Sqrt(sqrDist);
-                float spatialWeight;
-                if (dist <= BrushRadius)
-                {
-                    spatialWeight = InnerFloor;
-                }
-                else
-                {
-                    float shellT = (dist - BrushRadius) / Mathf.Max(RelaxRadius - BrushRadius, 1e-5f);
-                    spatialWeight = ClayFalloff(1f - shellT, EdgeSoftness);
-                }
+                float spatialWeight = RelaxSpatialWeight(Mathf.Sqrt(sqrDist), BrushRadius, RelaxRadius, EdgeSoftness, InnerFloor);
 
                 float curvatureFactor = Mathf.Lerp(CurvatureFloor, 1f,
                     Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(CurvatureStart, CurvatureFull, CurvatureIn[ci])));
 
-                // Judged from the viewpoint of the dab that placed the nearest centre, not from one
-                // shared camera - see _relaxCentreCameras.
-                WeightsOut[ci] = spatialWeight * curvatureFactor * (1f - MaskIn[ci])
-                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[ci], p, CentreCameras[nearest]);
+                WeightsOut[ci] = spatialWeight * curvatureFactor * (1f - MaskIn[ci]) * facing;
             }
         }
 
@@ -915,7 +960,8 @@ namespace Sculpting
         private struct SurfaceRelaxJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<int> Candidates;
-            [ReadOnly] public NativeArray<int> AdjacencyOffsets;
+            [ReadOnly] public NativeArray<int> AdjacencyStarts;
+            [ReadOnly] public NativeArray<int> AdjacencyCounts;
             [ReadOnly] public NativeArray<int> AdjacencyNeighbors;
             [ReadOnly] public NativeArray<int> VertexToSlot;
             [ReadOnly] public NativeArray<Vector3> FullPositions;
@@ -931,8 +977,8 @@ namespace Sculpting
                 if (w <= 0f) { PositionsWrite[ci] = currentPos; return; }
 
                 int globalIdx = Candidates[ci];
-                int start = AdjacencyOffsets[globalIdx];
-                int end = AdjacencyOffsets[globalIdx + 1];
+                int start = AdjacencyStarts[globalIdx];
+                int end = start + AdjacencyCounts[globalIdx];
                 if (end == start) { PositionsWrite[ci] = currentPos; return; }
 
                 Vector3 sum = Vector3.zero;

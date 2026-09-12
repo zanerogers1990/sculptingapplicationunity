@@ -485,6 +485,33 @@ namespace Sculpting
             return changed;
         }
 
+        /// Pulls both copies of a DUPLICATED centreline vertex onto the plane: a pair the map matched
+        /// across it, inside the centreline band, whose two ends sit within `maxSeparation` of each
+        /// other. That is what a seam joined from two mirrored halves looks like - one vertex, twice,
+        /// a hair either side - and Weld can only merge the copies once they are exactly on the
+        /// plane. A genuine mirrored pair straddling the plane is left alone: its ends are a good
+        /// fraction of a vertex spacing apart, and pinning it would collapse the edge between them.
+        /// Returns how many vertices moved.
+        public static int SnapSeamDuplicates(Vector3[] vertices, SymmetryMap map, float maxSeparation)
+        {
+            if (vertices == null || map == null || map.VertexCount != vertices.Length) return 0;
+
+            int axis = map.Axis;
+            float maxSqr = maxSeparation * maxSeparation;
+            int changed = 0;
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                int j = map.PartnerOf(i);
+                if (j == SymmetryMap.NoPartner) continue;
+                float coord = SymmetryMap.Coord(vertices[i], axis);
+                if (coord == 0f || Mathf.Abs(coord) > map.Tolerance) continue;
+                if ((vertices[i] - vertices[j]).sqrMagnitude > maxSqr) continue;
+                vertices[i] = Pin(vertices[i], axis);
+                changed++;
+            }
+            return changed;
+        }
+
         /// Merges vertices that occupy the same point into single shared ones, remapping the
         /// triangles onto the survivors and dropping the triangles that collapse to nothing.
         ///
@@ -541,7 +568,11 @@ namespace Sculpting
 
             for (int i = 0; i < n; i++)
             {
-                bool onSeam = Mathf.Abs(SymmetryMap.Coord(vertices[i], axis)) <= seam;
+                // "On the seam" means ON the plane - Cleanup snaps the seam before welding. Testing the
+                // band instead also handed the generous radius to real mirrored pairs straddling the
+                // plane half a spacing out, which on a remesh is the whole first row either side: 741
+                // of them welded into each other on an already symmetric model (SymmetryRepairTests).
+                bool onSeam = SymmetryMap.Coord(vertices[i], axis) == 0f;
 
                 Vector3Int home = CellOf(vertices[i], seam);
                 int found = -1;
@@ -566,8 +597,7 @@ namespace Sculpting
                         // which is precisely the zig-zag seam SnapToPlane exists to prevent. It
                         // was also order-dependent: whether A swallowed B or B swallowed A - and
                         // so where the survivor ended up - depended on which came first.
-                        bool candidateOnSeam =
-                            Mathf.Abs(SymmetryMap.Coord(vertices[candidate], axis)) <= seam;
+                        bool candidateOnSeam = SymmetryMap.Coord(vertices[candidate], axis) == 0f;
                         float radiusSqr = (onSeam && candidateOnSeam) ? seamSqr : coincidentSqr;
 
                         float d = (vertices[candidate] - vertices[i]).sqrMagnitude;

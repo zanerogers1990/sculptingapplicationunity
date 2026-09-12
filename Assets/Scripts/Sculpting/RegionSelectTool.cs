@@ -116,7 +116,9 @@ namespace Sculpting
 
         private string _status = "";
 
-        /// One-line result of the last gesture, for the panel's status label.
+        /// One-line result of the last gesture. Not currently read by any UI (the panel label
+        /// that used to show it was removed along with the region-tool buttons - see
+        /// RegionRadialMenuUIBuilder), kept for a future overlay/toast.
         public string Status => _status;
 
         public RegionSelectMode Mode
@@ -379,9 +381,13 @@ namespace Sculpting
         private bool[] MarkCoveredVertices(SculptableMesh target, Camera cam, ScreenRegionMask region, bool actOnOutside)
         {
             Vector3[] verts = target.Vertices;
-            if (verts == null || verts.Length == 0) { _status = "No geometry."; return null; }
+            int vertexCount = target.VertexCount;
+            if (verts == null || vertexCount == 0) { _status = "No geometry."; return null; }
 
-            if (_insideScratch.Length != verts.Length) _insideScratch = new bool[verts.Length];
+            // VertexCount, not verts.Length - the buffer runs ahead of it once dynamic topology
+            // has appended to it (see SculptableMesh.Vertices), and the spare slots all sit on top
+            // of vertex 0, which would drag whatever region covers that vertex over all of them.
+            if (_insideScratch.Length != vertexCount) _insideScratch = new bool[vertexCount];
 
             // One matrix per gesture, then one multiply per vertex - Camera.WorldToScreenPoint
             // would redo the transform chain (and its own viewport lookups) per call, which is
@@ -394,7 +400,7 @@ namespace Sculpting
             List<Vector3> signs = mirror != null ? mirror.GetMirrorSigns() : null;
             bool mirrored = signs != null && signs.Count > 1;
 
-            for (int i = 0; i < verts.Length; i++)
+            for (int i = 0; i < vertexCount; i++)
             {
                 bool covered = ProjectsInside(mvp, verts[i], viewport, region);
                 if (!covered && mirrored)

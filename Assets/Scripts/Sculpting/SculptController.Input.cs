@@ -97,6 +97,9 @@ namespace Sculpting
         private bool _isAdjustingRemeshDensity;
         private float _remeshDensityStartValue;
         private float _remeshDensityStartMouseX;
+        // Where the density gauge (label + slider) freezes, same idiom as
+        // _resizeAnchorScreenPos/_strengthAdjustAnchorScreenPos above.
+        private Vector2 _remeshDensityAnchorScreenPos;
         // -1 while R is up; the time it went down otherwise, so the hold threshold and the
         // tap-vs-hold decision on release can both be measured off it.
         private float _rKeyDownTime = -1f;
@@ -184,6 +187,15 @@ namespace Sculpting
         }
 
         public bool IsAdjustingStrength => _isAdjustingStrength;
+
+        /// True while the R-hold gauge is armed - SculptUIBuilder reads this to know when to
+        /// show the density label/slider, and UpdateBrushCursor reads it to suppress the
+        /// ordinary brush ring for the same reason it already suppresses it for a region
+        /// gesture or a non-Sculpt gizmo.
+        public bool IsAdjustingRemeshDensity => _isAdjustingRemeshDensity;
+        /// Where the density gauge should anchor itself, frozen at the moment R armed the gauge -
+        /// same frozen-anchor idiom as _resizeAnchorScreenPos/_strengthAdjustAnchorScreenPos.
+        public Vector2 RemeshDensityAnchorScreenPosition => _remeshDensityAnchorScreenPos;
 
         // Polled by SculptUIBuilder every frame to draw the 2D ring cursor (see
         // UpdateBrushCursor) - same read-only delegation pattern as IsAdjustingStrength
@@ -276,15 +288,45 @@ namespace Sculpting
 
             bool saveAs = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            if (_sceneGraphForSave == null) _sceneGraphForSave = FindFirstObjectByType<SceneGraphUIBuilder>();
-            if (_sceneGraphForSave == null) return;
+            if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
+            if (_sceneGraphPanel == null) return;
 
-            _sceneGraphForSave.gameObject.SendMessage(saveAs ? "SaveAs" : "Save", SendMessageOptions.DontRequireReceiver);
+            _sceneGraphPanel.gameObject.SendMessage(saveAs ? "SaveAs" : "Save", SendMessageOptions.DontRequireReceiver);
         }
 
-        // Only ever looked up on a frame Ctrl+S is actually pressed, so the find costs nothing
-        // otherwise - same reasoning as _zsphereForUndo above.
-        private SceneGraphUIBuilder _sceneGraphForSave;
+        // Delete on the selected scene object - prompts before deleting (see
+        // SceneGraphUIBuilder.ShowDeleteSelectedConfirm), routed via SendMessage for the same
+        // reason as HandleSaveKeys above. Skipped while the ZSphere tool is active: there,
+        // Delete/Backspace already means "delete the selected RIG NODE" (see
+        // ZSphereController.Input.HandleKeys), and letting both fire off one press would delete
+        // a node AND the object it belongs to. Also skipped while a uGUI text field has focus
+        // (typing in the rename box, editing a scene-graph row) so Delete edits text instead of
+        // reaching for the object underneath it.
+        private void HandleDeleteObjectKey()
+        {
+            var kb = Keyboard.current;
+            if (kb == null || !kb.deleteKey.wasPressedThisFrame) return;
+            if (IsTypingInUI()) return;
+            if (Gizmo != null && Gizmo.Mode == GizmoMode.ZSphere) return;
+
+            if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
+            if (_sceneGraphPanel == null) return;
+
+            _sceneGraphPanel.gameObject.SendMessage("ShowDeleteSelectedConfirm", SendMessageOptions.DontRequireReceiver);
+        }
+
+        // Only ever looked up on a frame Ctrl+S or Delete is actually pressed, so the find costs
+        // nothing otherwise - same reasoning as _zsphereForUndo above.
+        private SceneGraphUIBuilder _sceneGraphPanel;
+
+        private static bool IsTypingInUI()
+        {
+            var focused = UnityEngine.EventSystems.EventSystem.current != null
+                ? UnityEngine.EventSystems.EventSystem.current.currentSelectedGameObject : null;
+            if (focused == null) return false;
+            var field = focused.GetComponent<UnityEngine.UI.InputField>();
+            return field != null && field.isFocused;
+        }
 
         private void HandleBrushSwitchKeys()
         {
@@ -311,10 +353,9 @@ namespace Sculpting
             else if (kb.digit2Key.wasPressedThisFrame) CurrentBrush = BrushType.Clay;
             else if (kb.digit3Key.wasPressedThisFrame) CurrentBrush = BrushType.Smooth;
             else if (kb.digit4Key.wasPressedThisFrame) CurrentBrush = BrushType.Crease;
-            else if (kb.digit5Key.wasPressedThisFrame) CurrentBrush = BrushType.DamStandard;
-            else if (kb.digit6Key.wasPressedThisFrame) CurrentBrush = BrushType.Inflate;
-            else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
-            else if (kb.digit8Key.wasPressedThisFrame) CurrentBrush = BrushType.Pose;
+            else if (kb.digit5Key.wasPressedThisFrame) CurrentBrush = BrushType.Inflate;
+            else if (kb.digit6Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
+            else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Pose;
 
             // M used to trigger Remesh directly; moved to R (still reachable via the Remesh
             // button in the Brush panel either way, or a plain R tap - see
@@ -464,6 +505,7 @@ namespace Sculpting
                 _isAdjustingRemeshDensity = true;
                 _remeshDensityStartValue = remeshResolution;
                 _remeshDensityStartMouseX = mouse.position.ReadValue().x;
+                _remeshDensityAnchorScreenPos = mouse.position.ReadValue();
             }
             else if (_rKeyDownTime >= 0f && !kb.rKey.isPressed)
             {
@@ -480,6 +522,86 @@ namespace Sculpting
             float deltaX = mouse.position.ReadValue().x - _remeshDensityStartMouseX;
             RemeshResolution = Mathf.RoundToInt(_remeshDensityStartValue + deltaX * RemeshDensityDragSensitivity);
         }
+
+        // Holding Space arms the radial tool-select menu (RadialMenuUIBuilder) - frozen at the
+        // position the key went down, ZBrush/Blender-style, so the ring of tool icons doesn't
+        // slide around under the cursor while picking (same anchor idiom as the S/F gauges
+        // above). Space is otherwise unused by this app, so a bare key is safe. Closed either
+        // by releasing Space here (cancel, nothing selected) or by RadialMenuUIBuilder calling
+        // CloseRadialMenu after a wedge click (confirm) - both just clear the same flag, so
+        // UpdateBrushCursor/HandleSculptInput only ever need to check the one bool below.
+        private bool _radialMenuOpen;
+        private Vector2 _radialMenuScreenPos;
+
+        public bool IsRadialMenuOpen => _radialMenuOpen;
+        public Vector2 RadialMenuScreenPosition => _radialMenuScreenPos;
+
+        private void HandleRadialMenuKey()
+        {
+            var kb = Keyboard.current;
+            var mouse = Mouse.current;
+            if (kb == null || mouse == null) return;
+
+            // Shift+Space is the OTHER radial menu (see HandleRegionRadialMenuKey) - excluded
+            // here so holding Shift first and tapping Space doesn't pop both at once.
+            bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
+
+            // Suppressed while another drag gauge or a region gesture already owns the mouse -
+            // same guard list HandleShiftSmoothOverride uses, for the same reason: two input
+            // modes both scrubbing off mouse position/clicks at once would fight each other.
+            if (kb.spaceKey.wasPressedThisFrame && !shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
+                !_isAdjustingRemeshDensity && !RegionSelectActive && !_regionRadialMenuOpen)
+            {
+                EndActiveDrags(); // don't leave a grab mid-drag while the menu is up
+                _radialMenuOpen = true;
+                _radialMenuScreenPos = mouse.position.ReadValue();
+            }
+            // Shift coming down mid-hold also bails out (rather than waiting for Space to
+            // release too) so it can't get stuck open while HandleRegionRadialMenuKey below
+            // declines to take over an already-armed menu.
+            else if (_radialMenuOpen && (!kb.spaceKey.isPressed || shiftHeld))
+            {
+                _radialMenuOpen = false;
+            }
+        }
+
+        /// Called by RadialMenuUIBuilder the instant a wedge is clicked, so picking a tool
+        /// closes the menu right away instead of waiting for Space to also come up.
+        public void CloseRadialMenu() => _radialMenuOpen = false;
+
+        // Shift+Space arms the box/lasso region radial menu (RegionRadialMenuUIBuilder) - same
+        // frozen-position-on-down idiom as HandleRadialMenuKey above, just gated on Shift so the
+        // two menus never both try to open from the same Space press.
+        private bool _regionRadialMenuOpen;
+        private Vector2 _regionRadialMenuScreenPos;
+
+        public bool IsRegionRadialMenuOpen => _regionRadialMenuOpen;
+        public Vector2 RegionRadialMenuScreenPosition => _regionRadialMenuScreenPos;
+
+        private void HandleRegionRadialMenuKey()
+        {
+            var kb = Keyboard.current;
+            var mouse = Mouse.current;
+            if (kb == null || mouse == null) return;
+
+            bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
+
+            if (kb.spaceKey.wasPressedThisFrame && shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
+                !_isAdjustingRemeshDensity && !RegionSelectActive && !_radialMenuOpen)
+            {
+                EndActiveDrags();
+                _regionRadialMenuOpen = true;
+                _regionRadialMenuScreenPos = mouse.position.ReadValue();
+            }
+            else if (_regionRadialMenuOpen && !kb.spaceKey.isPressed)
+            {
+                _regionRadialMenuOpen = false;
+            }
+        }
+
+        /// Called by RegionRadialMenuUIBuilder the instant a wedge is clicked, mirroring
+        /// CloseRadialMenu above.
+        public void CloseRegionRadialMenu() => _regionRadialMenuOpen = false;
 
         // Shared by every brush handler's invert check below - Ctrl mirrors Blender's
         // hold-to-invert sculpt convention, alongside this app's pre-existing right-mouse-
@@ -612,7 +734,7 @@ namespace Sculpting
             // own affordance instead - the R-hold density gauge joins them here, its grid/label
             // being its own affordance the same way (see DensityGrid).
             bool sculptToolActive = sculptableMesh != null && cam != null && !RegionSelectActive
-                                    && !_isAdjustingRemeshDensity
+                                    && !_isAdjustingRemeshDensity && !_radialMenuOpen && !_regionRadialMenuOpen
                                     && (Gizmo == null || Gizmo.Mode == GizmoMode.Sculpt);
 
             if (sculptToolActive && !_isOverUI)

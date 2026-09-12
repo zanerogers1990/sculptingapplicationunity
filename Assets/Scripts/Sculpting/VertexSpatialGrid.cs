@@ -20,7 +20,11 @@ namespace Sculpting
     /// been re-bucketed yet.
     internal class VertexSpatialGrid
     {
-        private readonly Vector3[] _vertices;
+        // Not readonly, unlike the rest: dynamic topology both APPENDS vertices and reallocates the
+        // positions array out from under this index when it grows capacity, and rebuilding the
+        // whole grid for either would be the O(vertex count) cost a local refine exists to avoid.
+        // See AppendVertices.
+        private Vector3[] _vertices;
         private readonly float _cellSize;
         private readonly float _invCellSize;
         private readonly Dictionary<Vector3Int, List<int>> _cells;
@@ -31,11 +35,17 @@ namespace Sculpting
         // each, so under a wide Move drag that scan was the entire cost of the update: measured in an
         // offline harness running this file on a 1.31M-triangle sphere, a 163k-vertex drag frame
         // went from 19.2 ms (37 ms worst) to 0.9 ms.
-        private readonly Vector3Int[] _vertexCell;
-        private readonly int[] _vertexSlot;
+        private Vector3Int[] _vertexCell;
+        private int[] _vertexSlot;
         private readonly List<int> _resultBuffer = new List<int>();
 
-        public int VertexCount => _vertexCell.Length;
+        // How many vertices are BUCKETED, as against how long the per-vertex arrays happen to be -
+        // those now run ahead of it so an append does not reallocate them (see AppendVertices).
+        // SculptableMesh compares this against the mesh's own vertex count to decide whether the
+        // index is still current, so it has to be the count, not the capacity.
+        private int _vertexCount;
+
+        public int VertexCount => _vertexCount;
         public float CellSize => _cellSize;
 
         /// The positions array this index was built over. SculptableMesh compares it by reference
@@ -43,11 +53,19 @@ namespace Sculpting
         public Vector3[] Positions => _vertices;
 
         public VertexSpatialGrid(Vector3[] vertices, float cellSize)
+            : this(vertices, vertices.Length, cellSize) { }
+
+        /// vertexCount bounds what is bucketed, which past the first dynamic-topology refine is
+        /// less than `vertices` holds (see SculptableMesh.Vertices). Bucketing the spare tail would
+        /// be worse than wasteful: those slots all sit on top of vertex 0, so every brush stroke
+        /// near vertex 0 would get a pile of indices back that name no real geometry.
+        public VertexSpatialGrid(Vector3[] vertices, int vertexCount, float cellSize)
         {
             _vertices = vertices;
             _cellSize = Mathf.Max(cellSize, 0.0001f);
             _invCellSize = 1f / _cellSize;
-            int n = vertices.Length;
+            int n = Mathf.Clamp(vertexCount, 0, vertices.Length);
+            _vertexCount = n;
             _vertexCell = new Vector3Int[n];
             _vertexSlot = new int[n];
 
@@ -66,6 +84,47 @@ namespace Sculpting
             }
         }
 
+        /// Takes on `count` vertices starting at index `from` that did not exist when this index
+        /// was built, and re-seats it on `positions` - which dynamic topology reallocates whenever
+        /// it grows capacity, so the array this was constructed over may no longer be the live one.
+        ///
+        /// O(count), like UpdateVertices, and for the same reason: a refine that added a few
+        /// hundred vertices inside one brush footprint must not cost a rebuild over the millions
+        /// that did not change. The grid's CELL SIZE is left as it was - a refine makes the mesh
+        /// locally denser, which puts more vertices in the cells it touched, and re-deriving a cell
+        /// size from the new density would mean rebuilding every bucket.
+        public void AppendVertices(Vector3[] positions, int from, int count)
+        {
+            _vertices = positions;
+            if (count <= 0) return;
+
+            int needed = from + count;
+            if (_vertexCell.Length < needed)
+            {
+                // Half again, not to the exact count. A refine adds a few hundred vertices to a
+                // mesh of a million, and resizing to fit would reallocate and copy both
+                // mesh-sized arrays on every one of them - which is precisely the whole-mesh cost
+                // this method exists to avoid, reintroduced by its own bookkeeping.
+                int grown = Mathf.Max(needed, _vertexCell.Length + _vertexCell.Length / 2);
+                System.Array.Resize(ref _vertexCell, grown);
+                System.Array.Resize(ref _vertexSlot, grown);
+            }
+
+            for (int i = from; i < needed; i++)
+            {
+                Vector3Int cell = CellOf(positions[i]);
+                if (!_cells.TryGetValue(cell, out List<int> list))
+                {
+                    list = new List<int>();
+                    _cells[cell] = list;
+                }
+                _vertexSlot[i] = list.Count;
+                list.Add(i);
+                _vertexCell[i] = cell;
+            }
+            _vertexCount = needed;
+        }
+
         /// Re-buckets exactly the vertices that just moved. O(moved count): a vertex that stayed in
         /// its own cell - the common case - costs one cell computation and a compare, and one that
         /// changed cell costs two dictionary lookups and a constant number of list writes.
@@ -75,7 +134,7 @@ namespace Sculpting
             for (int k = 0; k < movedVertices.Count; k++)
             {
                 int i = movedVertices[k];
-                if (i < 0 || i >= _vertexCell.Length) continue;
+                if (i < 0 || i >= _vertexCount) continue;
 
                 Vector3Int now = CellOf(_vertices[i]);
                 Vector3Int was = _vertexCell[i];

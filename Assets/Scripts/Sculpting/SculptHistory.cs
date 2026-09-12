@@ -26,6 +26,14 @@ namespace Sculpting
     ///   rather than by vertex because hiding is per-polygon - a vertex on the border of a
     ///   hidden region belongs to both hidden and visible triangles, so a per-vertex record
     ///   could not describe the change without ambiguity.
+    /// - TopologyDelta: a stroke that CHANGED the vertex and triangle counts as it went - dynamic
+    ///   topology (see DynamicTopology.DynamicTopologyRemesher). Carries an ordinary vertex delta
+    ///   for the geometry that merely moved, plus the counts to truncate back to, the triangle
+    ///   slots that were overwritten along with what they held before, and the attributes of the
+    ///   vertices the stroke appended so redo can put them back. A Full snapshot would also be
+    ///   correct, and is what Remesh uses - but a stroke refines many times over, and a whole-mesh
+    ///   clone per stroke at multi-million-vertex resolutions is precisely the cost the delta
+    ///   split above exists to avoid.
     ///
     /// Delta entries are self-symmetric: undoing one means swapping the stored "before" values
     /// into those same indices while capturing whatever is CURRENTLY there as the reciprocal
@@ -50,7 +58,61 @@ namespace Sculpting
         /// that turns out to be undoing a 200-vertex brush stroke is the expensive mistake.
         public delegate void FullCapture(out Vector3[] vertices, out int[] triangles);
 
-        public enum EntryKind { Full, VertexDelta, MaskDelta, MaskInvert, VisibilityDelta, VisibilityInvert }
+        /// Supplies the reciprocal of a TopologyDelta: the mesh's CURRENT counts, what the named
+        /// triangle slots hold right now, and the attributes of every vertex at or past
+        /// `appendedFrom` - which is exactly the geometry an undo is about to truncate away and a
+        /// redo would otherwise have no way to recreate.
+        public delegate TopologyPayload TopologyCapture(int appendedFrom, int[] triangleSlots);
+
+        public enum EntryKind { Full, VertexDelta, MaskDelta, MaskInvert, VisibilityDelta, VisibilityInvert, TopologyDelta }
+
+        /// The half of a TopologyDelta that describes STRUCTURE, as against the vertex delta that
+        /// rides alongside it describing movement. A class rather than more fields on Entry: it is
+        /// null for five of the seven entry kinds, and six more always-null arrays on a struct that
+        /// history keeps thousands of is not free.
+        public sealed class TopologyPayload
+        {
+            /// Counts to restore. Truncating to these is what removes appended geometry - no index
+            /// below them changes meaning, so every mask value, hidden-triangle flag and vertex
+            /// index in an older history entry goes on naming exactly what it always did.
+            public readonly int VertexCount;
+            public readonly int CornerCount;
+
+            /// Triangle slots to rewrite, and the three corners each should end up holding.
+            public readonly int[] TriangleSlots;
+            public readonly int[] TriangleCorners;
+
+            /// Attributes of the vertices from AppendedFrom upward, for the direction of travel
+            /// that ADDS them back. Empty on the undo side, where truncation needs no payload.
+            public readonly int AppendedFrom;
+            public readonly Vector3[] AppendedPositions;
+            public readonly Vector3[] AppendedNormals;
+            public readonly float[] AppendedMask;
+
+            public readonly long Bytes;
+
+            public TopologyPayload(int vertexCount, int cornerCount, int[] triangleSlots, int[] triangleCorners,
+                                   int appendedFrom, Vector3[] appendedPositions, Vector3[] appendedNormals,
+                                   float[] appendedMask)
+            {
+                VertexCount = vertexCount;
+                CornerCount = cornerCount;
+                TriangleSlots = triangleSlots;
+                TriangleCorners = triangleCorners;
+                AppendedFrom = appendedFrom;
+                AppendedPositions = appendedPositions;
+                AppendedNormals = appendedNormals;
+                AppendedMask = appendedMask;
+
+                long bytes = 48;
+                if (triangleSlots != null) bytes += (long)triangleSlots.Length * 4;
+                if (triangleCorners != null) bytes += (long)triangleCorners.Length * 4;
+                if (appendedPositions != null) bytes += (long)appendedPositions.Length * 12;
+                if (appendedNormals != null) bytes += (long)appendedNormals.Length * 12;
+                if (appendedMask != null) bytes += (long)appendedMask.Length * 4;
+                Bytes = bytes;
+            }
+        }
 
         private readonly struct Entry
         {
@@ -61,10 +123,12 @@ namespace Sculpting
             public readonly Vector3[] Positions;
             public readonly float[] MaskValues;
             public readonly bool[] Flags;
+            public readonly TopologyPayload Topology;
             public readonly long Bytes;
 
             private Entry(EntryKind kind, Vector3[] fullVertices, int[] fullTriangles,
-                          int[] indices, Vector3[] positions, float[] maskValues, bool[] flags)
+                          int[] indices, Vector3[] positions, float[] maskValues, bool[] flags,
+                          TopologyPayload topology = null)
             {
                 Kind = kind;
                 FullVertices = fullVertices;
@@ -73,8 +137,10 @@ namespace Sculpting
                 Positions = positions;
                 MaskValues = maskValues;
                 Flags = flags;
+                Topology = topology;
 
                 long bytes = 32; // object headers and the entry itself - small but not nothing at depth
+                if (topology != null) bytes += topology.Bytes;
                 if (fullVertices != null) bytes += (long)fullVertices.Length * 12;
                 if (fullTriangles != null) bytes += (long)fullTriangles.Length * 4;
                 if (indices != null) bytes += (long)indices.Length * 4;
@@ -101,6 +167,9 @@ namespace Sculpting
 
             public static Entry VisibilityInvert() =>
                 new Entry(EntryKind.VisibilityInvert, null, null, null, null, null, null);
+
+            public static Entry TopologyDelta(int[] indices, Vector3[] positions, TopologyPayload topology) =>
+                new Entry(EntryKind.TopologyDelta, null, null, indices, positions, null, null, topology);
         }
 
         /// What an undo/redo press wants applied. `Kind` says which fields are meaningful; see
@@ -114,9 +183,11 @@ namespace Sculpting
             public readonly Vector3[] Positions;
             public readonly float[] MaskValues;
             public readonly bool[] Flags;
+            public readonly TopologyPayload Topology;
 
             internal Restore(EntryKind kind, Vector3[] fullVertices, int[] fullTriangles,
-                             int[] indices, Vector3[] positions, float[] maskValues, bool[] flags)
+                             int[] indices, Vector3[] positions, float[] maskValues, bool[] flags,
+                             TopologyPayload topology = null)
             {
                 Kind = kind;
                 FullVertices = fullVertices;
@@ -125,6 +196,7 @@ namespace Sculpting
                 Positions = positions;
                 MaskValues = maskValues;
                 Flags = flags;
+                Topology = topology;
             }
         }
 
@@ -152,6 +224,13 @@ namespace Sculpting
         /// delta (a stroke that touched nothing, e.g. a click that missed the mesh).
         public void PushVertexDelta(int[] indices, Vector3[] beforePositions) =>
             Push(Entry.VertexDelta(indices, beforePositions));
+
+        /// Call once a stroke that CHANGED TOPOLOGY ends, with the same vertex delta an ordinary
+        /// stroke would push (restricted to vertices that existed before it) plus the structural
+        /// record. See the class remarks, and SculptableMesh.EndStrokeUndo for where the two halves
+        /// are accumulated.
+        public void PushTopologyDelta(int[] indices, Vector3[] beforePositions, TopologyPayload topology) =>
+            Push(Entry.TopologyDelta(indices, beforePositions, topology));
 
         /// The mask equivalent, pushed when a mask-paint stroke ends.
         public void PushMaskDelta(int[] indices, float[] beforeValues) =>
@@ -183,20 +262,21 @@ namespace Sculpting
         /// Pops the newest undo entry, pushes its reciprocal onto redo, and reports what to
         /// apply. False (stack untouched) if there is nothing to undo.
         public bool TryUndo(VertexReader readVertex, MaskReader readMask, VisibilityReader readVisibility,
-                            FullCapture captureFull, out Restore restore) =>
-            TryStep(_undoStack, _redoStack, readVertex, readMask, readVisibility, captureFull, out restore);
+                            FullCapture captureFull, TopologyCapture captureTopology, out Restore restore) =>
+            TryStep(_undoStack, _redoStack, readVertex, readMask, readVisibility, captureFull, captureTopology, out restore);
 
         /// Symmetric to TryUndo, walking the redo stack back onto undo.
         public bool TryRedo(VertexReader readVertex, MaskReader readMask, VisibilityReader readVisibility,
-                            FullCapture captureFull, out Restore restore) =>
-            TryStep(_redoStack, _undoStack, readVertex, readMask, readVisibility, captureFull, out restore);
+                            FullCapture captureFull, TopologyCapture captureTopology, out Restore restore) =>
+            TryStep(_redoStack, _undoStack, readVertex, readMask, readVisibility, captureFull, captureTopology, out restore);
 
         /// One shared implementation for both directions. Undo and redo of any entry kind here
         /// are the identical "take the stored values, hand back whatever is currently in their
         /// place" swap - they differ only in which stack is the source and which is the
         /// destination, so writing them twice only creates two places for a fix to be missed.
         private bool TryStep(List<Entry> from, List<Entry> to, VertexReader readVertex, MaskReader readMask,
-                             VisibilityReader readVisibility, FullCapture captureFull, out Restore restore)
+                             VisibilityReader readVisibility, FullCapture captureFull,
+                             TopologyCapture captureTopology, out Restore restore)
         {
             restore = default;
             if (from.Count == 0) return false;
@@ -222,6 +302,20 @@ namespace Sculpting
                     for (int i = 0; i < entry.Indices.Length; i++) current[i] = readVertex(entry.Indices[i]);
                     reciprocal = Entry.VertexDelta(entry.Indices, current);
                     restore = new Restore(EntryKind.VertexDelta, null, null, entry.Indices, entry.Positions, null, null);
+                    break;
+                }
+                case EntryKind.TopologyDelta:
+                {
+                    // The reciprocal is captured while the mesh is still in its post-stroke state,
+                    // which is the only moment the appended vertices still exist to be recorded.
+                    // Once this entry is applied they are truncated away, and nothing else in the
+                    // app remembers them.
+                    TopologyPayload current = captureTopology(entry.Topology.VertexCount, entry.Topology.TriangleSlots);
+                    var currentPositions = new Vector3[entry.Indices.Length];
+                    for (int i = 0; i < entry.Indices.Length; i++) currentPositions[i] = readVertex(entry.Indices[i]);
+                    reciprocal = Entry.TopologyDelta(entry.Indices, currentPositions, current);
+                    restore = new Restore(EntryKind.TopologyDelta, null, null, entry.Indices, entry.Positions,
+                                          null, null, entry.Topology);
                     break;
                 }
                 case EntryKind.MaskDelta:

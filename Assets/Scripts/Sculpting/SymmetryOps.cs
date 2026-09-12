@@ -62,9 +62,21 @@ namespace Sculpting
         /// Nothing a person sculpts ends up this close by accident.
         public const float CoincidentFraction = 0.02f;
 
+        /// How close the two halves of a matched pair must be, as a fraction of the mesh's vertex
+        /// spacing, for Cleanup to treat them as one duplicated seam vertex rather than two real
+        /// ones - see SymmetryTools.SnapSeamDuplicates. A tenth of a spacing: a joined seam's copies
+        /// are essentially coincident, while a genuine pair straddling the plane sits most of a
+        /// spacing apart.
+        public const float SeamDuplicateFraction = 0.1f;
+
         public static SymmetryMap BuildMap(SculptableMesh mesh, int axis, float toleranceScale)
         {
             if (mesh == null) return null;
+            // Every symmetry op reads a buffer, computes over a parallel copy and writes straight
+            // back into the live one, which the Exact accessors cannot serve (a copy is not the
+            // buffer). Dropping the spare capacity first lets all of them keep treating a buffer's
+            // length as the vertex count - see SculptableMesh.CompactBuffers.
+            mesh.CompactBuffers();
             Vector3[] verts = mesh.Vertices;
             if (verts == null || verts.Length == 0) return null;
 
@@ -141,7 +153,12 @@ namespace Sculpting
             // Carrying keeps those vertices attached to the surface; seating them makes them lie
             // IN it. Without this the repaired half comes back measurably rougher than the half it
             // was copied from - see SymmetryTools.ReseatUnmatched for the numbers.
-            int reseated = SymmetryTools.ReseatUnmatched(working, live, map, sourceIsPositive);
+            // Only when this press actually moved something. Reseating is a relaxation, so running it
+            // on a press that mirrored nothing kept nudging the unmatched vertices on every repeat -
+            // which reads as a repair that never settles (SymmetryRepairTests' second press).
+            int reseated = changed > 0 || carriedCount > 0
+                ? SymmetryTools.ReseatUnmatched(working, live, map, sourceIsPositive)
+                : 0;
             if (snapped == 0 && changed == 0 && carriedCount == 0 && reseated == 0) return 0;
 
             // A topology-preserving edit still needs a full snapshot: nothing here goes through
@@ -180,6 +197,9 @@ namespace Sculpting
             vertexCount = 0;
             if (mesh == null) return false;
 
+            // The one entry point here that never builds a map, so it has to drop the spare
+            // capacity itself - see BuildMap.
+            mesh.CompactBuffers();
             Vector3[] verts = mesh.Vertices;
             if (verts == null || verts.Length == 0) return false;
 
@@ -235,6 +255,9 @@ namespace Sculpting
             // allocates whole new vertex and index arrays anyway.
             var working = (Vector3[])live.Clone();
             snappedCount = SymmetryTools.SnapToPlane(working, map);
+            // The map files a seam's duplicated copies as a PAIR (they are each other's reflection),
+            // so SnapToPlane alone no longer pins them - this does, and only them.
+            snappedCount += SymmetryTools.SnapSeamDuplicates(working, map, map.MeanSpacing * SeamDuplicateFraction);
 
             // Deliberately derived from the mesh alone rather than from map.Tolerance: the Match
             // Tolerance slider widens what counts as a PAIR, which is a judgement about how far

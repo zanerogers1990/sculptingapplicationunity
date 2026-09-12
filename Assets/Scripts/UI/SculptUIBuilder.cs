@@ -57,22 +57,17 @@ namespace Sculpting
         private Image _clayButtonImage;
         private Image _smoothButtonImage;
         private Image _creaseButtonImage;
-        private Image _damButtonImage;
         private Image _inflateButtonImage;
         private Image _flattenButtonImage;
         private Image _poseButtonImage;
         private Image _maskButtonImage;
         private bool _lastShownMaskMode;
 
-        // Box/lasso hide and mask (see BuildRegionSection). The tool owns all the state; these
-        // are the controls whose highlight, enabled-ness and status text have to follow it.
+        // Box/lasso hide and mask (see RegionSelectTool) - the panel buttons that used to arm
+        // these moved to the shift-Space radial menu (RegionRadialMenuUIBuilder). This field is
+        // all that's left here: UpdateRegionMarquee/UpdateRegionCrosshair below still need it to
+        // draw the drag marquee and armed-mode crosshair, which are unrelated to the panel.
         private RegionSelectTool _regionSelect;
-        private Image _boxHideButtonImage, _lassoHideButtonImage, _boxMaskButtonImage, _lassoMaskButtonImage;
-        private Image _boxTrimButtonImage, _lassoTrimButtonImage;
-        private Button _showAllButton, _invertVisibleButton;
-        private Text _regionStatusLabel;
-        private RegionSelectMode _lastShownRegionMode = (RegionSelectMode)(-1);
-        private string _lastShownRegionStatus = "\0"; // sentinel: never equal to a real value, so the first poll draws
         private GameObject _regionMarqueeGO;
         private RegionMarqueeGraphic _regionMarquee;
         // The crosshair shown in place of the brush ring while a region mode is armed (see
@@ -91,14 +86,15 @@ namespace Sculpting
         // time someone used the hotkey.
         private Slider _remeshResolutionSlider;
 
-        // Density readout for the R-hold remesh gauge (see RemeshDensityGrid) - anchored under
-        // the world-space grid's screen projection, same "controller/tool owns the state, this
-        // just follows it" idiom as the region status label above.
-        private RemeshDensityGrid _densityGrid;
-        private GameObject _densityLabelGO;
-        private RectTransform _densityLabelRect;
-        private Text _densityLabelText;
-        private const float DensityLabelOffsetYPx = -28f;
+        // HUD gauge for the R-hold remesh gesture - a label + slider frozen at the screen
+        // position R went down at (same anchor idiom as the S/F gauges' frozen ring), same
+        // "controller/tool owns the state, this just follows it" idiom as the region status
+        // label above.
+        private GameObject _densityGaugeGO;
+        private RectTransform _densityGaugeRect;
+        private Text _densityGaugeLabel;
+        private Slider _densityGaugeSlider;
+        private const float DensityGaugeOffsetYPx = 40f;
         private int _lastShownDensity = -1;
         private Slider _brushSizeSlider;
         // Was previously created but never captured, so this slider went stale the moment a
@@ -218,6 +214,10 @@ namespace Sculpting
         {
             if (controller == null) controller = FindFirstObjectByType<SculptController>();
             _font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            // No longer set inside a panel builder (BuildRegionSection was deleted along with its
+            // buttons) - still needed every frame by RefreshRegionState to draw the drag
+            // marquee/crosshair.
+            _regionSelect = controller.RegionSelect;
 
             EnsureEventSystem();
             BuildUI();
@@ -390,7 +390,7 @@ namespace Sculpting
             RefreshSymmetryAxis();
             RefreshExtractStatus();
             RefreshRegionState();
-            UpdateDensityLabel();
+            UpdateDensityGauge();
 
             if (_polyCountLabel != null)
             {
@@ -560,17 +560,15 @@ namespace Sculpting
             _smoothButtonImage = smoothButton.GetComponent<Image>();
 
             // Second row - the panel is sized for 3 buttons per row (see CreateRow/panel
-            // width), so Crease/Dam Standard get their own row rather than squeezing 5 in.
+            // width), so Crease/Mask get their own row rather than squeezing 5 in.
             var brushRow2 = CreateRow(panel.transform);
             var creaseButton = CreateButton(brushRow2.transform, "Crease", () => SetBrushType(BrushType.Crease), "Pinches in a sharp groove, like a fingernail crease.");
-            var damButton = CreateButton(brushRow2.transform, "Dam Std", () => SetBrushType(BrushType.DamStandard), "Raises a standing lip along the stroke, like a levee.");
             var maskButton = CreateButton(brushRow2.transform, "Mask", () => controller.IsMaskPaintMode = !controller.IsMaskPaintMode,
                 "Paints a mask that protects or isolates areas from later brush strokes.");
             _creaseButtonImage = creaseButton.GetComponent<Image>();
-            _damButtonImage = damButton.GetComponent<Image>();
             _maskButtonImage = maskButton.GetComponent<Image>();
 
-            // Third row - Inflate joins Crease/Dam Standard/Mask's group of "not one of the
+            // Third row - Inflate joins Crease/Mask's group of "not one of the
             // first three" brushes, same reasoning as brushRow2 above for why it doesn't
             // squeeze into an existing row.
             var brushRow3 = CreateRow(panel.transform);
@@ -594,8 +592,6 @@ namespace Sculpting
                 SculptableMesh target = SelectedMesh();
                 if (target != null) target.ClearMask();
             }, "Removes the mask from the selected object entirely.");
-
-            BuildRegionSection(panel.transform);
 
             // One shared setting for every brush (not per-brush like Accumulate), so no resync
             // is needed elsewhere in this file - nothing but this panel ever changes it, same as
@@ -664,9 +660,6 @@ namespace Sculpting
             CreateLabel(creaseFoldout, "Depth", 12, FontStyle.Normal);
             CreateSlider(creaseFoldout, 0.05f, 1f, controller.CreaseDepthFactor, v => controller.CreaseDepthFactor = v,
                 "How deep the Crease brush's groove cuts.");
-            CreateLabel(creaseFoldout, "Dam Standard Lip Height", 12, FontStyle.Normal);
-            CreateSlider(creaseFoldout, 0f, 1f, controller.DamLipHeight, v => controller.DamLipHeight = v,
-                "How tall a standing lip the Dam Standard brush raises along its stroke.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above. One slider, because
             // Plane Offset is the only thing that distinguishes Flatten from its Fill/Scrape
@@ -760,6 +753,22 @@ namespace Sculpting
             }, "Saves the selected mesh as an OBJ file to Desktop/SculptExports.");
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
+            // A foldout rather than top-level controls: this is an opt-in mode, and it sits next to
+            // Remesh because the two are the same question asked at different scales - Remesh
+            // rebuilds the whole mesh at one density, this refines locally as you sculpt.
+            Transform dynTopoFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Dynamic Topology", false);
+            CreateToggle(dynTopoFoldout, "Dynamic Topology", controller.DynamicTopologyEnabled,
+                v => controller.DynamicTopologyEnabled = v, out _,
+                tooltip: "Adds and removes mesh detail inside the brush as you sculpt, so strokes stay smooth " +
+                         "instead of faceting on the existing topology. Applies to Clay, Crease, Inflate and " +
+                         "Flatten. Suspended while an object is mirror-linked.");
+            CreateLabel(dynTopoFoldout, "Detail Size", 12, FontStyle.Normal);
+            CreateSlider(dynTopoFoldout, SculptController.MinDetailSize, SculptController.MaxDetailSize,
+                controller.DynamicTopologyDetailSize, v => controller.DynamicTopologyDetailSize = v,
+                "Target edge length the brush refines towards. Smaller is finer and costs more. Independent of " +
+                "brush size on purpose: brush size chooses the area that gets refined, not how dense it becomes, " +
+                "so a broad stroke will not coarsen detail a small brush put in.");
+
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
             _remeshResolutionSlider = CreateSlider(panel.transform, 4f, SculptController.MaxRemeshResolution, controller.RemeshResolution,
                 v => controller.RemeshResolution = Mathf.RoundToInt(v),
@@ -768,7 +777,7 @@ namespace Sculpting
                 "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R.");
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease  5 Dam Std\n6 Inflate  7 Flatten  8 Pose  M Toggle Mask Paint\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
@@ -780,8 +789,7 @@ namespace Sculpting
             _lazyTetherGO = CreateLazyMouseTether(canvasGO.transform);
             _cursorRingGO = CreateBrushCursor(canvasGO.transform);
             _actionToastGO = CreateActionToast(canvasGO.transform);
-            _densityGrid = controller.DensityGrid; // triggers the self-install, see its remarks
-            _densityLabelGO = CreateRemeshDensityLabel(canvasGO.transform);
+            _densityGaugeGO = CreateRemeshDensityGauge(canvasGO.transform);
             // Last of all: the marquee is drawn over the model AND over the panels, since a
             // drag that starts in the viewport can easily be dragged out across one. It never
             // competes with the brush ring for attention - a region gesture being armed is
@@ -813,7 +821,6 @@ namespace Sculpting
             _clayButtonImage.color = controller.CurrentBrush == BrushType.Clay ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _smoothButtonImage.color = controller.CurrentBrush == BrushType.Smooth ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _creaseButtonImage.color = controller.CurrentBrush == BrushType.Crease ? UIFactory.ActiveColor : UIFactory.InactiveColor;
-            _damButtonImage.color = controller.CurrentBrush == BrushType.DamStandard ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _poseButtonImage.color = controller.CurrentBrush == BrushType.Pose ? UIFactory.ActiveColor : UIFactory.InactiveColor;
@@ -853,107 +860,12 @@ namespace Sculpting
             return _selection != null ? _selection.PrimarySelection : null;
         }
 
-        /// Box/lasso hide and mask (see RegionSelectTool). Sits directly under Masking because
-        /// two of its four gestures edit exactly what that section edits - the other two edit
-        /// visibility, which is the same idea pointed at a different piece of per-vertex state.
-        ///
-        /// The four gesture buttons are radio-style: clicking the armed one disarms it, so the
-        /// panel can always get back to plain sculpting without reaching for a hotkey.
-        private void BuildRegionSection(Transform panel)
-        {
-            _regionSelect = controller.RegionSelect;
-            // Starts OPEN, unlike the shaping foldouts around it: those tune a brush you already
-            // picked from a row of buttons that is always visible, whereas these gestures have
-            // no other entry point in the panel at all - collapsed, the feature is invisible
-            // unless you already know it exists. The panel scrolls, so the extra height costs
-            // nothing but a little scrolling.
-            Transform foldout = UIFactory.CreateFoldoutSection(panel, "Hide / Trim / Region Select", true);
-
-            CreateLabel(foldout,
-                "Drag a shape out from the cursor to hide, mask or trim\nwhat it covers, front and back. RMB or Ctrl reverses\n(show/unmask, or keep the covered part when trimming),\nShift acts OUTSIDE the shape, a click with no drag\nresets, Esc cancels.",
-                11, FontStyle.Italic);
-
-            var hideRow = CreateRow(foldout);
-            _boxHideButtonImage = CreateButton(hideRow.transform, "Box Hide (H)",
-                () => ToggleRegionMode(RegionSelectMode.BoxHide), "Drag a box to hide the geometry it covers.").GetComponent<Image>();
-            _lassoHideButtonImage = CreateButton(hideRow.transform, "Lasso Hide",
-                () => ToggleRegionMode(RegionSelectMode.LassoHide), "Draw a freeform outline to hide the geometry it covers.").GetComponent<Image>();
-
-            var maskRow = CreateRow(foldout);
-            _boxMaskButtonImage = CreateButton(maskRow.transform, "Box Mask (N)",
-                () => ToggleRegionMode(RegionSelectMode.BoxMask), "Drag a box to mask the geometry it covers.").GetComponent<Image>();
-            _lassoMaskButtonImage = CreateButton(maskRow.transform, "Lasso Mask",
-                () => ToggleRegionMode(RegionSelectMode.LassoMask), "Draw a freeform outline to mask the geometry it covers.").GetComponent<Image>();
-
-            var trimRow = CreateRow(foldout);
-            _boxTrimButtonImage = CreateButton(trimRow.transform, "Box Trim (T)",
-                () => ToggleRegionMode(RegionSelectMode.BoxTrim),
-                "Drag a box to CUT AWAY the geometry it covers, closing the hole behind it. RMB or Ctrl keeps the covered part instead. Undoable.").GetComponent<Image>();
-            _lassoTrimButtonImage = CreateButton(trimRow.transform, "Lasso Trim",
-                () => ToggleRegionMode(RegionSelectMode.LassoTrim),
-                "Draw a freeform outline to CUT AWAY the geometry it covers, closing the hole behind it. RMB or Ctrl keeps the covered part instead. Undoable.").GetComponent<Image>();
-
-            var actionRow = CreateRow(foldout);
-            _showAllButton = CreateButton(actionRow.transform, "Show All", () =>
-            {
-                SculptableMesh target = SelectedMesh();
-                if (target != null) target.ShowAllGeometry();
-            }, "Un-hides all geometry on the selected object.");
-            _invertVisibleButton = CreateButton(actionRow.transform, "Invert Visible", () =>
-            {
-                SculptableMesh target = SelectedMesh();
-                if (target != null) target.InvertVisibleGeometry();
-            }, "Swaps hidden and visible geometry on the selected object.");
-
-            _regionStatusLabel = CreateLabel(foldout, "", 11, FontStyle.Italic);
-            RefreshRegionButtons();
-        }
-
-        private void ToggleRegionMode(RegionSelectMode target)
-        {
-            if (_regionSelect == null) return;
-            _regionSelect.Mode = _regionSelect.Mode == target ? RegionSelectMode.Off : target;
-            RefreshRegionButtons();
-        }
-
-        private void RefreshRegionButtons()
-        {
-            if (_boxHideButtonImage == null || _regionSelect == null) return;
-            RegionSelectMode m = _regionSelect.Mode;
-            _boxHideButtonImage.color = m == RegionSelectMode.BoxHide ? RegionHideActiveColor : UIFactory.InactiveColor;
-            _lassoHideButtonImage.color = m == RegionSelectMode.LassoHide ? RegionHideActiveColor : UIFactory.InactiveColor;
-            _boxMaskButtonImage.color = m == RegionSelectMode.BoxMask ? MaskActiveColor : UIFactory.InactiveColor;
-            _lassoMaskButtonImage.color = m == RegionSelectMode.LassoMask ? MaskActiveColor : UIFactory.InactiveColor;
-            _boxTrimButtonImage.color = m == RegionSelectMode.BoxTrim ? RegionTrimActiveColor : UIFactory.InactiveColor;
-            _lassoTrimButtonImage.color = m == RegionSelectMode.LassoTrim ? RegionTrimActiveColor : UIFactory.InactiveColor;
-        }
-
-        /// Follows the tool once per frame: the mode can change from a hotkey (H/N, or any
-        /// brush key leaving the mode) as well as from these buttons, and the status line is
-        /// written by the tool itself when a gesture lands.
+        /// Follows the tool once per frame: the drag marquee and armed-mode crosshair are the
+        /// only things left here that depend on RegionSelectTool state - arming a mode itself now
+        /// happens from the shift-Space radial menu (RegionRadialMenuUIBuilder), not this panel.
         private void RefreshRegionState()
         {
             if (_regionSelect == null) return;
-
-            if (_regionSelect.Mode != _lastShownRegionMode)
-            {
-                _lastShownRegionMode = _regionSelect.Mode;
-                RefreshRegionButtons();
-            }
-
-            if (_regionStatusLabel != null && _regionSelect.Status != _lastShownRegionStatus)
-            {
-                _lastShownRegionStatus = _regionSelect.Status;
-                _regionStatusLabel.text = _lastShownRegionStatus;
-            }
-
-            // Both act on hidden geometry, so both are dead ends with nothing hidden - greying
-            // them out says so before the click rather than after it does nothing.
-            SculptableMesh target = SelectedMesh();
-            bool anyHidden = target != null && target.AnyHidden;
-            if (_showAllButton != null) _showAllButton.interactable = anyHidden;
-            if (_invertVisibleButton != null) _invertVisibleButton.interactable = anyHidden;
-
             UpdateRegionMarquee();
             UpdateRegionCrosshair();
         }
@@ -1698,52 +1610,69 @@ namespace Sculpting
             return go;
         }
 
-        /// Follows the world-space grid's screen projection every frame (see UpdateDensityLabel)
-        /// rather than sitting at a fixed screen anchor like the action toast above - the grid
-        /// itself moves and rescales with the selected object, so a fixed anchor would drift
-        /// away from "underneath the grid" the moment the object wasn't dead-center on screen.
-        private GameObject CreateRemeshDensityLabel(Transform canvasParent)
+        /// Frozen at the screen position R went down at (see SculptController's
+        /// RemeshDensityAnchorScreenPosition) rather than following a world-space object the way
+        /// the old grid preview did - same "grows/shrinks in place" idiom the S/F gauges already
+        /// use for their own frozen ring, just as a label+slider instead of a ring.
+        private GameObject CreateRemeshDensityGauge(Transform canvasParent)
         {
-            var go = new GameObject("RemeshDensityLabel", typeof(RectTransform));
+            var go = new GameObject("RemeshDensityGauge", typeof(RectTransform));
             go.transform.SetParent(canvasParent, false);
             var rect = go.GetComponent<RectTransform>();
             rect.anchorMin = rect.anchorMax = Vector2.zero;
-            rect.pivot = new Vector2(0.5f, 1f); // top-center pivot: sits just below the anchor point
-            rect.sizeDelta = new Vector2(160f, 28f);
+            rect.pivot = new Vector2(0.5f, 0f); // bottom-center pivot: sits just above the anchor point
+            rect.sizeDelta = new Vector2(200f, 52f);
+            _densityGaugeRect = rect;
 
-            var text = go.AddComponent<Text>();
-            text.font = _font;
-            text.fontSize = 18;
-            text.fontStyle = FontStyle.Bold;
-            text.alignment = TextAnchor.MiddleCenter;
-            text.color = Color.white;
-            text.raycastTarget = false;
+            var vlg = go.AddComponent<VerticalLayoutGroup>();
+            vlg.spacing = 4f;
+            vlg.childAlignment = TextAnchor.LowerCenter;
+            vlg.childControlHeight = true;
+            vlg.childControlWidth = true;
+            vlg.childForceExpandWidth = true;
+            vlg.childForceExpandHeight = false;
 
-            _densityLabelRect = rect;
-            _densityLabelText = text;
+            var textGO = new GameObject("Label", typeof(RectTransform));
+            textGO.transform.SetParent(go.transform, false);
+            textGO.AddComponent<LayoutElement>().preferredHeight = 24;
+            _densityGaugeLabel = textGO.AddComponent<Text>();
+            _densityGaugeLabel.font = _font;
+            _densityGaugeLabel.fontSize = 18;
+            _densityGaugeLabel.fontStyle = FontStyle.Bold;
+            _densityGaugeLabel.alignment = TextAnchor.MiddleCenter;
+            _densityGaugeLabel.color = Color.white;
+            _densityGaugeLabel.raycastTarget = false;
+
+            _densityGaugeSlider = CreateSlider(go.transform, 4f, SculptController.MaxRemeshResolution, controller.RemeshResolution, _ => { });
+            // Read-only readout, not a control - the value comes from the R-drag's own
+            // horizontal mouse delta (HandleRemeshDensityKey), and letting this also be
+            // click-dragged would fight that same frame's delta-driven value.
+            _densityGaugeSlider.interactable = false;
+
             go.SetActive(false);
             return go;
         }
 
-        private void UpdateDensityLabel()
+        private void UpdateDensityGauge()
         {
-            if (_densityLabelGO == null || _densityGrid == null) return;
+            if (_densityGaugeGO == null) return;
 
-            bool show = _densityGrid.IsVisible;
-            if (_densityLabelGO.activeSelf != show) _densityLabelGO.SetActive(show);
+            bool show = controller.IsAdjustingRemeshDensity;
+            if (_densityGaugeGO.activeSelf != show) _densityGaugeGO.SetActive(show);
             if (!show) return;
 
-            Vector2 screen = _densityGrid.LabelScreenPosition;
-            _densityLabelRect.position = new Vector3(screen.x, screen.y + DensityLabelOffsetYPx, 0f);
+            Vector2 anchor = controller.RemeshDensityAnchorScreenPosition;
+            _densityGaugeRect.position = new Vector3(anchor.x, anchor.y + DensityGaugeOffsetYPx, 0f);
 
-            // Only-on-change, same reasoning as the poly count label below - this runs every
+            int density = controller.RemeshResolution;
+            _densityGaugeSlider.SetValueWithoutNotify(density);
+            // Only-on-change, same reasoning as the poly count label elsewhere - this runs every
             // frame the gauge is up, and a fresh concatenation for a value that hasn't moved
             // since last frame is wasted garbage.
-            int density = controller.RemeshResolution;
             if (density != _lastShownDensity)
             {
                 _lastShownDensity = density;
-                _densityLabelText.text = "Density: " + density;
+                _densityGaugeLabel.text = "Density: " + density;
             }
         }
     }

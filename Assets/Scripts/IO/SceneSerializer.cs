@@ -89,15 +89,32 @@ namespace Sculpting.IO
                         entry.showMirrorPlanes = mirror.ShowPlanes;
                     }
 
+                    // Recorded on the original half only - see ObjectEntry.mirrorLinked.
+                    MirrorLink link = m.LinkedMirror;
+                    if (link != null && link.Source == m)
+                    {
+                        int twinIndex = meshes.IndexOf(link.Twin);
+                        if (twinIndex >= 0)
+                        {
+                            entry.mirrorLinked = true;
+                            entry.mirrorLinkTwin = twinIndex;
+                            entry.mirrorLinkCenter = link.Center;
+                            entry.mirrorLinkSigns = link.Signs;
+                        }
+                    }
+
                     // The CPU-side working arrays are authoritative; the Mesh's own getters do
                     // NOT reliably reflect compute-shader scatter writes to its Raw vertex
                     // buffer (this project has hit that twice - see SculptableMesh.Remesh and
                     // MeshJoiner). Saving from m.Mesh.vertices would silently persist the
                     // pre-sculpt shape.
-                    Vector3[] verts = m.Vertices;
-                    Vector3[] normals = m.Normals;
-                    int[] tris = m.Triangles;
-                    float[] mask = m.Mask;
+                    // Exact, not the raw buffers: those run ahead of VertexCount/TriangleCount
+                    // once dynamic topology has appended to them (see SculptableMesh.Vertices), and
+                    // the file format records a flat count.
+                    Vector3[] verts = m.VerticesExact();
+                    Vector3[] normals = m.NormalsExact();
+                    int[] tris = m.TrianglesExact();
+                    float[] mask = m.MaskExact();
 
                     entry.vertexCount = verts.Length;
                     entry.triangleIndexCount = tris.Length;
@@ -165,6 +182,7 @@ namespace Sculpting.IO
             var created = new List<SculptableMesh>(file.Meshes.Count);
             for (int i = 0; i < file.Data.objects.Count; i++)
                 created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Data.objects[i].name));
+            RestoreMirrorLinks(file.Data.objects, created);
 
             ApplySettings(file.Data);
 
@@ -212,6 +230,7 @@ namespace Sculpting.IO
                 takenNames.Add(name);
                 created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], name));
             }
+            RestoreMirrorLinks(file.Data.objects, created);
 
             // Select the first import so the gizmo is immediately pointed at what just arrived -
             // same courtesy PrimitiveSpawner does for a newly spawned primitive. Note this does
@@ -384,6 +403,22 @@ namespace Sculpting.IO
             if (!entry.visible) sculptable.SetVisible(false);
 
             return sculptable;
+        }
+
+        /// Re-forms the live mirror pairs a file recorded (see ObjectEntry.mirrorLinked). Runs once
+        /// every object exists, since an entry names its twin by index and the twin can come later
+        /// in the file. MirrorLink.Create turns away the rest of what a damaged file could hold - a
+        /// pair with itself, no mirrored axis, an object claimed twice.
+        private static void RestoreMirrorLinks(List<SculptSaveData.ObjectEntry> entries, List<SculptableMesh> created)
+        {
+            for (int i = 0; i < entries.Count && i < created.Count; i++)
+            {
+                SculptSaveData.ObjectEntry entry = entries[i];
+                if (!entry.mirrorLinked) continue;
+                int twin = entry.mirrorLinkTwin;
+                if (twin < 0 || twin >= created.Count) continue;
+                MirrorLink.Create(created[i], created[twin], entry.mirrorLinkCenter, entry.mirrorLinkSigns);
+            }
         }
 
         /// Turns a bare Mesh into a fully live, sculptable scene object. Public because model

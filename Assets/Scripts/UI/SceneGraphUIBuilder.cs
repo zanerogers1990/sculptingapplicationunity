@@ -10,7 +10,7 @@ namespace Sculpting
 {
     /// Builds the right-hand panel: scene-file actions (Import Object / Load Scene / Save
     /// Scene), add-primitive buttons, a live object list (select/visibility/delete), the
-    /// Transpose/Scale gizmo mode toolbar, one-shot Mirror, Join, and - merged in further down -
+    /// Transpose/Scale gizmo mode toolbar, separate/linked Mirror, Join, and - merged in further down -
     /// the collapsible Studio Lighting/Material/Presentation sections. Docked flush to the
     /// top-right corner at full window height, fixed there (no longer draggable), mirroring
     /// SculptUIBuilder's Sculpting Tools panel on the left.
@@ -30,6 +30,9 @@ namespace Sculpting
         private static readonly Color OkColor = new Color(0.55f, 0.85f, 0.55f);
         private static readonly Color ErrorColor = new Color(0.95f, 0.45f, 0.4f);
         private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
+        // Object-list text for either half of a live mirror pair (see MirrorLink). The name can't
+        // say it: a separate mirror copy is named exactly the same way.
+        private static readonly Color LinkedTextColor = new Color(1f, 0.82f, 0.45f);
 
         private SelectionManager _selection;
         private PrimitiveSpawner _spawner;
@@ -104,6 +107,12 @@ namespace Sculpting
         // right limbs either side of a centered torso), matching the user's own "remove an arm
         // to see the torso" framing.
         private bool _mirrorX = true, _mirrorY, _mirrorZ;
+
+        // The mirror controls that follow the selection: Mirror Linked is refused for an object
+        // already in a pair, Finalize needs one, and the note says which (see
+        // RefreshMirrorControls).
+        private Button _mirrorLinkedButton, _finalizeMirrorButton;
+        private Text _mirrorNote;
 
         // Scene-file (Import/Load/Save) state - see the old SaveLoadUIBuilder this was merged
         // from for the reasoning behind each piece.
@@ -279,7 +288,17 @@ namespace Sculpting
             UIFactory.CreateToggle(mirrorRow.transform, "X", _mirrorX, v => _mirrorX = v, tooltip: "Mirror across the X axis.");
             UIFactory.CreateToggle(mirrorRow.transform, "Y", _mirrorY, v => _mirrorY = v, tooltip: "Mirror across the Y axis.");
             UIFactory.CreateToggle(mirrorRow.transform, "Z", _mirrorZ, v => _mirrorZ = v, tooltip: "Mirror across the Z axis.");
-            UIFactory.CreateButton(panel, "Mirror Selected", DoMirror, "Creates a mirrored copy of the selected object across the checked axes.");
+            GameObject mirrorButtonRow = UIFactory.CreateRow(panel, 26f);
+            UIFactory.CreateButton(mirrorButtonRow.transform, "Mirror Separate", () => DoMirror(false),
+                "Creates a mirrored copy across the checked axes. The copy is its own object from then on.");
+            _mirrorLinkedButton = UIFactory.CreateButton(mirrorButtonRow.transform, "Mirror Linked", () => DoMirror(true),
+                "Creates a mirrored copy that stays linked: move, rotate, scale or sculpt either one and the other " +
+                "follows, mirrored, until you finalize. Remesh, Trim, Boolean and Join finalize it too.");
+            _finalizeMirrorButton = UIFactory.CreateButton(panel, "Finalize Mirror", FinalizeMirror,
+                "Ends the selected object's mirror link, leaving two separate objects exactly where they are.");
+            // Built with two lines because CreateLabel sizes itself from the newlines it starts with,
+            // and every note RefreshMirrorControls writes is two lines.
+            _mirrorNote = UIFactory.CreateLabel(panel, "\n", 11, FontStyle.Italic);
 
             UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
             _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm,
@@ -642,16 +661,23 @@ namespace Sculpting
                 }
                 else
                 {
-                    Button nameBtn = UIFactory.CreateButton(row.transform, obj.name, () => OnRowClicked(obj),
-                        "Click to select, Ctrl+click to add to selection, double-click to rename.");
+                    // Either half of a live mirror pair says so in its text colour and tooltip.
+                    MirrorLink link = obj.LinkedMirror;
+                    SculptableMesh partner = link != null ? link.PartnerOf(obj) : null;
+                    string tooltip = "Click to select, Ctrl+click to add to selection, double-click to rename.";
+                    if (partner != null)
+                        tooltip = $"Mirror-linked with \"{partner.name}\": moving or sculpting either one mirrors onto the other. " + tooltip;
+
+                    Button nameBtn = UIFactory.CreateButton(row.transform, obj.name, () => OnRowClicked(obj), tooltip);
                     nameBtn.GetComponent<Image>().color = _selection.PrimarySelection == obj ? UIFactory.ActiveColor
                         : _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
+                    if (partner != null) nameBtn.GetComponentInChildren<Text>().color = LinkedTextColor;
                     AddDoubleClickHandler(nameBtn.gameObject, () => BeginInlineRename(obj));
                 }
 
                 UIFactory.CreateToggle(row.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v),
                     tooltip: "Shows or hides this object in the viewport.");
-                UIFactory.CreateButton(row.transform, "X", () => _selection.DeleteObject(obj), "Deletes this object.");
+                UIFactory.CreateButton(row.transform, "X", () => ShowDeleteConfirm(obj), "Deletes this object (asks to confirm).");
             }
 
             RefreshSelectedObjectControls();
@@ -673,6 +699,7 @@ namespace Sculpting
                 _renameField.SetTextWithoutNotify(primary != null ? primary.name : string.Empty);
             }
             if (_cloneButton != null) _cloneButton.interactable = primary != null;
+            RefreshMirrorControls(primary);
         }
 
         /// Renames the primary selection. Trims, and ignores an empty result rather than
@@ -1055,7 +1082,7 @@ namespace Sculpting
 
         // ------------------------------------------------------------------------------ mirror
 
-        private void DoMirror()
+        private void DoMirror(bool linked)
         {
             if (_selection == null || _spawner == null) return;
             if (!_mirrorX && !_mirrorY && !_mirrorZ) return;
@@ -1064,8 +1091,45 @@ namespace Sculpting
             SculptableMesh main = _spawner.MainObject;
             if (target == null || main == null) return;
 
-            MeshMirror.MirrorAcross(target, main.transform.position, _mirrorX, _mirrorY, _mirrorZ);
+            MeshMirror.MirrorAcross(target, main.transform.position, _mirrorX, _mirrorY, _mirrorZ, linked);
         }
+
+        /// Nothing to refresh here: ending a link bumps SelectionVersion, which redraws the list and
+        /// this section on the next Update.
+        private void FinalizeMirror()
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            MirrorLink link = primary != null ? primary.LinkedMirror : null;
+            if (link != null) link.Unlink();
+        }
+
+        private void RefreshMirrorControls(SculptableMesh primary)
+        {
+            MirrorLink link = primary != null ? primary.LinkedMirror : null;
+            // One pair per object (see MirrorLink.Create); a Separate copy of a linked object is fine.
+            if (_mirrorLinkedButton != null) _mirrorLinkedButton.interactable = primary != null && link == null;
+            if (_finalizeMirrorButton != null) _finalizeMirrorButton.interactable = link != null;
+            if (_mirrorNote == null) return;
+
+            SculptableMesh partner = link != null ? link.PartnerOf(primary) : null;
+            if (partner == null)
+            {
+                _mirrorNote.text = "Linked copies follow each other's moves\nand sculpting until you finalize.";
+                _mirrorNote.color = HintColor;
+                return;
+            }
+
+            // A deleted half is only parked until its undo step expires (see
+            // SelectionManager.DeleteObject), and the pair holds through that - so it is still
+            // named, just flagged.
+            string deleted = partner.gameObject.activeInHierarchy ? string.Empty : " (deleted)";
+            _mirrorNote.text = $"Linked with \"{partner.name}\"{deleted} across {AxisNames(link.Signs)}.\n" +
+                               "Moves and sculpting mirror live.";
+            _mirrorNote.color = OkColor;
+        }
+
+        private static string AxisNames(Vector3 signs) =>
+            (signs.x < 0f ? "X" : string.Empty) + (signs.y < 0f ? "Y" : string.Empty) + (signs.z < 0f ? "Z" : string.Empty);
 
         // -------------------------------------------------------------------------------- join
 
@@ -1177,6 +1241,31 @@ namespace Sculpting
                                             hideOthers: true, deleteOthers: deleteOthers, out string message);
             SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
             RefreshList();
+        }
+
+        // ----------------------------------------------------------------------------- delete
+
+        /// Entry point for the Delete key (see SculptController.Input.HandleDeleteObjectKey,
+        /// which SendMessages here rather than holding a direct reference - same idiom as
+        /// Save/SaveAs). Targets the primary selection, matching what the Delete key deletes in
+        /// every other DCC.
+        private void ShowDeleteSelectedConfirm()
+        {
+            if (_selection != null) ShowDeleteConfirm(_selection.PrimarySelection);
+        }
+
+        /// Confirms before calling SelectionManager.DeleteObject. DeleteObject is undoable (see
+        /// its remarks - it parks the object rather than destroying it outright), but an
+        /// accidental press - the Delete key especially, one row of keys from Backspace - still
+        /// shouldn't yank a model out of the viewport unasked; the prompt names the plain Z key,
+        /// not Ctrl+Z, since Ctrl+Z is intercepted by the Unity Editor's own global Undo during
+        /// development (see HandleUndoRedoKeys's remarks) rather than reaching this app's history.
+        /// Shared by both the row's X button and the Delete key so there's exactly one place a
+        /// deletion can happen without this prompt.
+        private void ShowDeleteConfirm(SculptableMesh obj)
+        {
+            if (obj == null || _selection == null) return;
+            ShowConfirm($"Delete \"{obj.name}\"? Undo (Z) restores it.", null, () => _selection.DeleteObject(obj));
         }
 
         // ------------------------------------------------------------------- confirmation modal

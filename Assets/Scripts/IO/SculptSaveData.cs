@@ -52,6 +52,14 @@ namespace Sculpting.IO
             /// False when the mesh had no per-vertex mask worth storing, so an unmasked object
             /// costs no mask block at all. Checked instead of inferring from vertexCount.
             public bool hasMask;
+
+            /// Set only on the ORIGINAL half of a live mirror pair (see MirrorLink): the index into
+            /// `objects` of its twin, and the plane the two mirror across. The twin's own entry
+            /// records nothing, so a load can never form the same pair twice.
+            public bool mirrorLinked;
+            public int mirrorLinkTwin;
+            public Vector3 mirrorLinkCenter;
+            public Vector3 mirrorLinkSigns;
         }
 
         [Serializable]

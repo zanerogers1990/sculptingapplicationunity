@@ -27,6 +27,9 @@ namespace Sculpting
             // a compute shader that Mesh.vertices does not reflect, so reading the Mesh would cut
             // the shape the object had before it was ever sculpted. The same trap MeshJoiner,
             // MeshBooleanTool and Remesh all document.
+            // Spare capacity dropped first so the lengths below are the counts, which is what the
+            // trimmer's own index bookkeeping assumes - see SculptableMesh.CompactBuffers.
+            target.CompactBuffers();
             Vector3[] verts = target.Vertices;
             int[] tris = target.Triangles;
             if (verts == null || verts.Length == 0 || tris == null || tris.Length < 3)

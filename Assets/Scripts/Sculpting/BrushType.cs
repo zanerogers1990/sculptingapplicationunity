@@ -6,7 +6,6 @@ namespace Sculpting
         Clay,
         Smooth,
         Crease,
-        DamStandard,
         Inflate,
         Flatten,
         Pose
