@@ -123,8 +123,9 @@ namespace Sculpting
         // surface-relax pass. Shared rather than one set each because the two can never be live
         // at the same time (relax runs inside a Clay dab, Smooth is a different brush entirely),
         // and sized independently of _nativeScratchCapacity above because relax's candidate list
-        // reaches 2.5x the brush radius, well past the footprint the shared brush scratch is
-        // grown to. _nativeRelaxCurvature is relax-only (Smooth has no curvature gate).
+        // is the union over a whole frame's dab centres, wider than any one dab's footprint the
+        // shared brush scratch is grown to. _nativeRelaxCurvature is relax-only (Smooth has no
+        // curvature gate).
         private NativeArray<int> _nativeLaplacianCandidates;
         private NativeArray<float> _nativeRelaxCurvature;
         private int _nativeLaplacianCapacity;
@@ -144,11 +145,11 @@ namespace Sculpting
             _nativeRelaxCurvature = new NativeArray<float>(_nativeLaplacianCapacity, Allocator.Persistent);
         }
 
-        // Grown, never resized to fit: the mesh buffer these shadow carries spare capacity that
-        // moves in steps as dynamic topology appends (see SculptableMesh.Vertices), and an exact
-        // match test would throw both arrays away and repay the O(total) refill on every one of
-        // those steps. Only a mesh that got SMALLER leaves this oversized, which costs nothing but
-        // the memory - every index written into it is still a live vertex.
+        // Grown, never resized to fit: the mesh buffer these shadow carries spare capacity that can
+        // move in steps (see SculptableMesh.Vertices), and an exact match test would throw both
+        // arrays away and repay the O(total) refill on every one of those steps. Only a mesh that
+        // got SMALLER leaves this oversized, which costs nothing but the memory - every index
+        // written into it is still a live vertex.
         private void EnsureSmoothFullMeshScratch(int totalVertexCount)
         {
             if (_nativeFullMeshCapacity >= totalVertexCount && _nativeVertexToSlot.IsCreated) return;
@@ -177,15 +178,14 @@ namespace Sculpting
         private bool _positionMirrorStale = true;
         private Vector3[] _positionMirrorSource;
         // How many entries of the mirror were actually filled by the last refresh. Identity of the
-        // source array is NOT enough on its own: dynamic topology appends vertices into the spare
-        // capacity of the array it is already holding, so the reference is unchanged while the
-        // vertices past this count are still whatever the mirror was allocated with - zero.
+        // source array is NOT enough on its own: a vertex appended into the spare capacity of the
+        // array already being held leaves the reference unchanged while the vertices past this count
+        // are still whatever the mirror was allocated with - zero.
         //
         // That is not a subtle staleness. A Laplacian reads FullPositions[neighbour] for any
         // neighbour outside its own candidate list, so an unfilled entry hands it the ORIGIN, and
         // the vertex gets averaged toward the middle of the object. On screen that is a long spike
-        // for every affected vertex, all converging on one point - which is exactly what a refined
-        // stroke was producing.
+        // for every affected vertex, all converging on one point.
         private int _positionMirrorCount;
 
         private void MarkPositionMirrorStale() => _positionMirrorStale = true;
@@ -226,6 +226,7 @@ namespace Sculpting
             _nativeLaplacianCapacity = 0;
             if (_nativeRelaxCentres.IsCreated) _nativeRelaxCentres.Dispose();
             if (_nativeRelaxCentreCameras.IsCreated) _nativeRelaxCentreCameras.Dispose();
+            ReleaseDabProgramResources();
         }
 
         // Copies the current candidate footprint's position/normal/mask into the shared native
@@ -311,7 +312,7 @@ namespace Sculpting
                 if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
 
                 float t01 = 1f - dist / BrushRadius;
-                float weight = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index])
+                float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index])
                     * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
                 if (weight <= 0f) { AppliedOut[index] = 0; return; }
 
@@ -366,41 +367,77 @@ namespace Sculpting
             public void Execute(int index)
             {
                 Vector3 pos = PositionsIn[index];
-                Vector3 toVert = pos - LocalPoint;
-                float dist = toVert.magnitude;
-                if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
-
-                float weight = CarveFalloff(1f - dist / BrushRadius) * (1f - MaskIn[index])
-                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
-
-                Vector3 start = StrokeStartIn[index];
-                SplitCarveFrame(start - LocalPoint, LocalNormal, DirLocal,
-                    out float startNormal, out float startAlong, out Vector3 startAcross);
-
-                if (Accumulate)
+                var settings = new CarveSettings
                 {
-                    // Pinch pulls across the stroke line only - see ApplyCarveDabLocalManaged.
-                    SplitCarveFrame(toVert, LocalNormal, DirLocal, out _, out _, out Vector3 across);
-                    Vector3 pinchDelta = -across * Mathf.Clamp01(weight * PinchRateScale);
-                    PositionsOut[index] = pos + LocalNormal * (DepthRate * weight) + pinchDelta;
-                }
-                else
+                    BrushRadius = BrushRadius, Depth = Depth, Pinch = Pinch, Sign = Sign,
+                    LerpFactorScale = LerpFactorScale, Accumulate = Accumulate, DepthRate = DepthRate,
+                    PinchRateScale = PinchRateScale, FrontFacingOnly = FrontFacingOnly,
+                };
+                if (!CarveStep(ref pos, NormalsIn[index], MaskIn[index], StrokeStartIn[index],
+                        LocalPoint, LocalNormal, DirLocal, CameraLocalPos, settings))
                 {
-                    float carve = Depth * weight;
-                    float achieved = Vector3.Dot(pos - start, LocalNormal);
-                    if (Sign * achieved > Sign * carve) carve = achieved;
-
-                    Vector3 pinched = startAcross * (1f - Pinch * weight);
-                    SplitCarveFrame(toVert, LocalNormal, DirLocal, out _, out _, out Vector3 across);
-                    if (across.sqrMagnitude < pinched.sqrMagnitude) pinched = across;
-
-                    Vector3 target = LocalPoint + LocalNormal * (startNormal + carve)
-                        + DirLocal * startAlong + pinched;
-                    float lerp = Mathf.Clamp01(weight * LerpFactorScale);
-                    PositionsOut[index] = pos + (target - pos) * lerp;
+                    AppliedOut[index] = 0;
+                    return;
                 }
+                PositionsOut[index] = pos;
                 AppliedOut[index] = 1;
             }
+        }
+
+        /// Everything about a carve dab that is the same for every dab of a frame - see CarveStep.
+        private struct CarveSettings
+        {
+            public float BrushRadius;
+            public float Depth;
+            public float Pinch;
+            public float Sign;
+            public float LerpFactorScale;
+            public bool Accumulate;
+            public float DepthRate;
+            public float PinchRateScale;
+            public bool FrontFacingOnly;
+        }
+
+        /// One carve dab applied to one vertex: CreaseJob's body, shared with CarveProgramJob so the
+        /// per-dab and the batched paths cannot drift apart. Reads nothing but this vertex, which is
+        /// what lets a whole frame of dabs run vertex-parallel (see CarveProgramJob). Returns false,
+        /// leaving `pos` untouched, for a vertex outside the dab - the managed loop's `continue`.
+        private static bool CarveStep(ref Vector3 pos, Vector3 normal, float mask, Vector3 start,
+            Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal, Vector3 cameraLocalPos, in CarveSettings s)
+        {
+            Vector3 toVert = pos - localPoint;
+            float dist = toVert.magnitude;
+            if (dist > s.BrushRadius) return false;
+
+            float weight = CarveFalloff(1f - dist / s.BrushRadius) * (1f - mask)
+                * FrontFacingWeight(s.FrontFacingOnly, normal, pos, cameraLocalPos);
+
+            SplitCarveFrame(start - localPoint, localNormal, dirLocal,
+                out float startNormal, out float startAlong, out Vector3 startAcross);
+
+            if (s.Accumulate)
+            {
+                // Pinch pulls across the stroke line only - see ApplyCarveDabLocalManaged.
+                SplitCarveFrame(toVert, localNormal, dirLocal, out _, out _, out Vector3 across);
+                Vector3 pinchDelta = -across * Mathf.Clamp01(weight * s.PinchRateScale);
+                pos = pos + localNormal * (s.DepthRate * weight) + pinchDelta;
+            }
+            else
+            {
+                float carve = s.Depth * weight;
+                float achieved = Vector3.Dot(pos - start, localNormal);
+                if (s.Sign * achieved > s.Sign * carve) carve = achieved;
+
+                Vector3 pinched = startAcross * (1f - s.Pinch * weight);
+                SplitCarveFrame(toVert, localNormal, dirLocal, out _, out _, out Vector3 across);
+                if (across.sqrMagnitude < pinched.sqrMagnitude) pinched = across;
+
+                Vector3 target = localPoint + localNormal * (startNormal + carve)
+                    + dirLocal * startAlong + pinched;
+                float lerp = Mathf.Clamp01(weight * s.LerpFactorScale);
+                pos = pos + (target - pos) * lerp;
+            }
+            return true;
         }
 
         /// Crease's radial profile. Was t01^3, which is a CONE: its slope is
@@ -409,43 +446,26 @@ namespace Sculpting
         /// same overall narrowness (both are 1/8 at half radius, so existing Crease Depth
         /// settings still feel the same) while flattening the slope to zero at BOTH ends - a
         /// rounded valley floor that neighbouring dabs blend into continuously.
-        /// Plain float math so Burst inlines it, same as ClayFalloff.
+        /// Plain float math so Burst inlines it, same as ClayFalloff. A custom falloff curve (see
+        /// BrushFalloff) replaces it.
         private static float CarveFalloff(float t01)
         {
             float s = t01 * t01 * (3f - 2f * t01);
-            return s * s * s;
+            return BrushFalloff.Apply(t01, s * s * s);
         }
-
-        /// How much of the relax shell's width, measured outward from the brush radius, the step up
-        /// from RelaxInnerFloor to the shell profile is spread over.
-        ///
-        /// That step used to be instantaneous: 0.05 at the brush radius, full strength a hair
-        /// outside it. Clay's relax is batched across every mirror sign by NEAREST dab centre, so a
-        /// vertex sitting at almost exactly one radius was relaxed twenty times harder or not,
-        /// depending on a difference in position far below anything visible - which is precisely
-        /// the kind of difference two mirrored halves carry. Measured: a Clay stroke starting from a
-        /// 1e-4 mirror error ended at 3e-3 (SymmetryDriftTests' session). A tenth of the shell is
-        /// thin next to the band relax is actually for, which starts past the brush and runs to
-        /// RelaxRadiusFactor radii.
-        private const float RelaxShellEntry = 0.1f;
 
         /// Clay's surface-relax spatial profile, shared by RelaxWeightJob and the managed setup loop
         /// so the two cannot drift apart. See ApplySurfaceRelaxBatched for what the shape is for.
-        private static float RelaxSpatialWeight(float dist, float brushRadius, float relaxRadius,
-            float edgeSoftness, float innerFloor)
+        private static float RelaxSpatialWeight(float dist, float relaxRadius, float edgeBand, float innerFloor)
         {
-            if (dist <= brushRadius) return innerFloor;
-            float shellT = (dist - brushRadius) / Mathf.Max(relaxRadius - brushRadius, 1e-5f);
-            float shell = ClayFalloff(1f - shellT, edgeSoftness);
-            // Past the entry band the shell profile is returned as is, not through the blend below:
-            // at the outer rim it runs down to ~1e-9, and `innerFloor + (shell - innerFloor)` rounds
-            // that to exactly 0 or to one ulp of the floor - differently under Burst and Mono, which
-            // made the job and managed paths disagree on which rim vertices a pass touched
-            // (SculptControllerJobParityTests at 1.3M triangles).
-            if (shellT >= RelaxShellEntry) return shell;
-            float entry = shellT / RelaxShellEntry;
-            entry = entry * entry * (3f - 2f * entry);
-            return innerFloor + (shell - innerFloor) * entry;
+            if (dist >= relaxRadius) return 0f;
+            float u = (dist - relaxRadius * (1f - edgeBand)) / (relaxRadius * edgeBand);
+            if (u <= 0f) return innerFloor;
+            // A polynomial bump rather than sin^2: Burst and Mono round transcendentals
+            // differently, and the job and managed paths must agree on which vertices have weight.
+            // Both terms reach exactly 0 at the rim, so nothing on the ring itself is moved.
+            float bump = 16f * u * u * (1f - u) * (1f - u);
+            return innerFloor * (1f - u) + (1f - innerFloor) * bump;
         }
 
         /// Decomposes an offset from the dab centre into the carve frame: along the carve
@@ -528,7 +548,10 @@ namespace Sculpting
         // outer edge band. Shared by ClayWeightJob (Burst) and ApplyClayBrushLocalManaged so
         // both brush paths build an identical flat-topped profile; plain float math, so Burst
         // can inline it into the job same as any other method call.
-        private static float ClayFalloff(float t01, float edgeSoftness)
+        private static float ClayFalloff(float t01, float edgeSoftness) =>
+            BrushFalloff.Apply(t01, ClayFalloffBuiltIn(t01, edgeSoftness)); // a custom curve replaces it
+
+        private static float ClayFalloffBuiltIn(float t01, float edgeSoftness)
         {
             // Max() rather than trusting the caller: ClayEdgeSoftness/the Range attribute both
             // clamp to 0.05, but a scene serialized before this field existed can still feed a
@@ -599,41 +622,51 @@ namespace Sculpting
             public void Execute(int index)
             {
                 Vector3 pos = PositionsIn[index];
-                Vector3 toVert = pos - LocalPoint;
-                float t01 = ClayTipShapeT01(toVert, BrushRadius, Tangent0, Bitangent0, TipRoundness);
-                if (t01 <= 0f)
-                {
-                    WeightsOut[index] = 0f;
-                    PlaneWeightsOut[index] = 0f;
-                    WeightedPosOut[index] = Vector3.zero;
-                    WeightedNormalOut[index] = Vector3.zero;
-                    return;
-                }
-
-                // TWO weights, and the difference between them is the whole point of the split.
-                //
-                // The plane weight has NO mask term, because the area plane is a measurement of the
-                // surface the brush is standing on, and the mask says which vertices may MOVE, not
-                // which ones the surface is made of. Folding the mask in fits the plane to whatever
-                // sliver of the footprint happens to be unmasked, which drags its origin out to the
-                // rim and swings its normal round with it: measured on a 145k-triangle sculpt at a
-                // 0.15 radius, a hard mask edge sweeping across the footprint tilted the plane 19
-                // degrees at a third covered, 34 degrees at half, and 58 degrees at five sixths,
-                // with the plane's height under the brush centre dropping 8%, 18% and 44% of a brush
-                // radius respectively. Clay and Flatten then push every unmasked vertex onto THAT
-                // plane, so a stroke run alongside a mask lifts a ridge that follows the mask's
-                // outline - the reported "weird raised surface around the mask area".
-                //
-                // Front Facing Only stays in, and deliberately: unlike the mask it IS a statement
-                // about which surface this stroke is on (the near wall of a fin, not the far one),
-                // so a plane measured across both walls would be the wrong surface.
-                float planeW = ClayFalloff(t01, EdgeSoftness)
-                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
+                Vector3 normal = NormalsIn[index];
+                float weight = ClayWeight(pos, normal, MaskIn[index], LocalPoint, BrushRadius, Tangent0, Bitangent0,
+                    TipRoundness, EdgeSoftness, FrontFacingOnly, CameraLocalPos, out float planeW);
+                WeightsOut[index] = weight;
                 PlaneWeightsOut[index] = planeW;
-                WeightsOut[index] = planeW * (1f - MaskIn[index]);
                 WeightedPosOut[index] = pos * planeW;
-                WeightedNormalOut[index] = NormalsIn[index] * planeW;
+                WeightedNormalOut[index] = normal * planeW;
             }
+        }
+
+        /// ClayWeightJob's per-vertex body, shared with ClayProgramJob. Returns the displacement
+        /// weight (mask applied) and, through planeW, its mask-free twin the area plane is fitted
+        /// with; both are 0 outside the tip.
+        private static float ClayWeight(Vector3 pos, Vector3 normal, float mask, Vector3 localPoint, float brushRadius,
+            Vector3 tangent0, Vector3 bitangent0, float tipRoundness, float edgeSoftness, bool frontFacingOnly,
+            Vector3 cameraLocalPos, out float planeW)
+        {
+            Vector3 toVert = pos - localPoint;
+            float t01 = ClayTipShapeT01(toVert, brushRadius, tangent0, bitangent0, tipRoundness);
+            if (t01 <= 0f)
+            {
+                planeW = 0f;
+                return 0f;
+            }
+
+            // TWO weights, and the difference between them is the whole point of the split.
+            //
+            // The plane weight has NO mask term, because the area plane is a measurement of the
+            // surface the brush is standing on, and the mask says which vertices may MOVE, not
+            // which ones the surface is made of. Folding the mask in fits the plane to whatever
+            // sliver of the footprint happens to be unmasked, which drags its origin out to the
+            // rim and swings its normal round with it: measured on a 145k-triangle sculpt at a
+            // 0.15 radius, a hard mask edge sweeping across the footprint tilted the plane 19
+            // degrees at a third covered, 34 degrees at half, and 58 degrees at five sixths,
+            // with the plane's height under the brush centre dropping 8%, 18% and 44% of a brush
+            // radius respectively. Clay and Flatten then push every unmasked vertex onto THAT
+            // plane, so a stroke run alongside a mask lifts a ridge that follows the mask's
+            // outline - the reported "weird raised surface around the mask area".
+            //
+            // Front Facing Only stays in, and deliberately: unlike the mask it IS a statement
+            // about which surface this stroke is on (the near wall of a fin, not the far one),
+            // so a plane measured across both walls would be the wrong surface.
+            planeW = ClayFalloff(t01, edgeSoftness)
+                * FrontFacingWeight(frontFacingOnly, normal, pos, cameraLocalPos);
+            return planeW * (1f - mask);
         }
 
         // Clay's pass 2 - per-candidate displacement toward the plane computed from pass 1's
@@ -673,65 +706,26 @@ namespace Sculpting
 
             public void Execute(int index)
             {
-                float weight = WeightsIn[index];
-                if (weight <= 0f) { AppliedOut[index] = 0; return; }
-
                 Vector3 pos = PositionsIn[index];
-
-                if (UseAlpha)
+                var settings = new ClayDisplaceSettings
                 {
-                    Vector3 toVert = pos - LocalPoint;
-                    float u = Vector3.Dot(toVert, Tangent) * InvStampRadius;
-                    float v = Vector3.Dot(toVert, Bitangent) * InvStampRadius;
-                    float ru = u * CosR - v * SinR;
-                    float rv = u * SinR + v * CosR;
-                    if (ru < -1f || ru > 1f || rv < -1f || rv > 1f) { AppliedOut[index] = 0; return; }
-
-                    float a = SampleAlphaBilinear(AlphaSamples, AlphaSize, ru * 0.5f + 0.5f, rv * 0.5f + 0.5f);
-                    weight *= InvertAlpha ? 1f - a : a;
-                    if (weight <= 0f) { AppliedOut[index] = 0; return; }
+                    Height = Height, LerpFactorScale = LerpFactorScale, UseAlpha = UseAlpha, InvertAlpha = InvertAlpha,
+                    CosR = CosR, SinR = SinR, InvStampRadius = InvStampRadius, AlphaSize = AlphaSize,
+                    Accumulate = Accumulate, Rate = Rate, MaxAlong = MaxAlong,
+                };
+                if (!ClayDisplace(ref pos, WeightsIn[index], StrokeStartIn[index], LocalPoint, PlaneOrigin, PlaneNormal,
+                        Tangent, Bitangent, settings, AlphaSamples))
+                {
+                    AppliedOut[index] = 0;
+                    return;
                 }
-
-                // See ApplyClayBrushLocalManaged's Accumulate branch for why this blends two
-                // terms (a constant build rate + a self-limiting flatten-toward-plane term)
-                // instead of a plain push - fills dips/settles bumps while still building
-                // indefinitely as long as the stroke is held.
-                // Height is scaled by the same per-vertex `weight` the lerp factor uses, so the
-                // TARGET follows the brush profile rather than being one flat height shared by
-                // the whole footprint. Without this the falloff only controlled how FAST each
-                // vertex reached an identical height - so it washed out completely on any dab
-                // held to convergence, and Clay's settled form was a flat-topped cylinder with
-                // near-vertical walls at the footprint boundary (the "blobby" result) instead
-                // of the falloff-shaped pad the profile describes. Same reason this multiply
-                // has to come AFTER the alpha multiply above: an alpha stamp previously only
-                // varied approach speed and flattened out to the same uniform plateau at
-                // convergence, where now it carves real relief into the deposited clay.
-                Vector3 toPlane = pos - PlaneOrigin;
-                float alongNormal = Vector3.Dot(toPlane, PlaneNormal);
-                Vector3 tangentialOffset = toPlane - PlaneNormal * alongNormal;
-                Vector3 target = PlaneOrigin + tangentialOffset + PlaneNormal * (Height * weight);
-                Vector3 toTarget = target - pos;
-                float lerp = Mathf.Clamp01(weight * LerpFactorScale);
-
-                Vector3 moved = Accumulate
-                    ? pos + PlaneNormal * (Rate * weight) + toTarget * lerp
-                    : pos + toTarget * lerp;
-
-                // Inlined ClampStrokeDepth - a Burst job can't call the shared static without
-                // dragging Vector3 method-call overhead into the inner loop, and the two must
-                // stay identical or the Burst and managed paths would diverge (see
-                // MinJobVertexCount: which one runs depends only on footprint size).
-                float along = Vector3.Dot(moved - StrokeStartIn[index], PlaneNormal);
-                bool overshot = Height >= 0f ? along > MaxAlong : along < MaxAlong;
-                if (overshot) moved -= PlaneNormal * (along - MaxAlong);
-
-                PositionsOut[index] = moved;
+                PositionsOut[index] = pos;
                 AppliedOut[index] = 1;
             }
 
             // Line-for-line port of BrushAlphaLibrary.Sample, operating on a NativeArray copy of
             // the same cached float[] instead of porting any noise/hash generation math to Burst.
-            private static float SampleAlphaBilinear(NativeArray<float> samples, int size, float u, float v)
+            internal static float SampleAlphaBilinear(NativeArray<float> samples, int size, float u, float v)
             {
                 u = Mathf.Clamp01(u);
                 v = Mathf.Clamp01(v);
@@ -752,6 +746,81 @@ namespace Sculpting
                 float b = Mathf.Lerp(s01, s11, tx);
                 return Mathf.Lerp(a, b, ty);
             }
+        }
+
+        /// Everything about a Clay dab's displacement that is the same for every dab of a frame.
+        private struct ClayDisplaceSettings
+        {
+            public float Height;
+            public float LerpFactorScale;
+            public bool UseAlpha;
+            public bool InvertAlpha;
+            public float CosR, SinR;
+            public float InvStampRadius;
+            public int AlphaSize;
+            public bool Accumulate;
+            public float Rate;
+            public float MaxAlong;
+        }
+
+        /// ClayDisplacementJob's per-vertex body, shared with ClayProgramJob so the per-dab and
+        /// batched paths cannot drift apart. Returns false, leaving `pos` untouched, at each of the
+        /// managed loop's three skip points (see ClayDisplacementJob).
+        private static bool ClayDisplace(ref Vector3 pos, float weight, Vector3 strokeStart, Vector3 localPoint,
+            Vector3 planeOrigin, Vector3 planeNormal, Vector3 tangent, Vector3 bitangent, in ClayDisplaceSettings s,
+            NativeArray<float> alphaSamples)
+        {
+            if (weight <= 0f) return false;
+
+            if (s.UseAlpha)
+            {
+                Vector3 toVert = pos - localPoint;
+                float u = Vector3.Dot(toVert, tangent) * s.InvStampRadius;
+                float v = Vector3.Dot(toVert, bitangent) * s.InvStampRadius;
+                float ru = u * s.CosR - v * s.SinR;
+                float rv = u * s.SinR + v * s.CosR;
+                if (ru < -1f || ru > 1f || rv < -1f || rv > 1f) return false;
+
+                float a = ClayDisplacementJob.SampleAlphaBilinear(alphaSamples, s.AlphaSize, ru * 0.5f + 0.5f, rv * 0.5f + 0.5f);
+                weight *= s.InvertAlpha ? 1f - a : a;
+                if (weight <= 0f) return false;
+            }
+
+            // See ApplyClayBrushLocalManaged's Accumulate branch for why this blends two
+            // terms (a constant build rate + a self-limiting flatten-toward-plane term)
+            // instead of a plain push - fills dips/settles bumps while still building
+            // indefinitely as long as the stroke is held.
+            // Height is scaled by the same per-vertex `weight` the lerp factor uses, so the
+            // TARGET follows the brush profile rather than being one flat height shared by
+            // the whole footprint. Without this the falloff only controlled how FAST each
+            // vertex reached an identical height - so it washed out completely on any dab
+            // held to convergence, and Clay's settled form was a flat-topped cylinder with
+            // near-vertical walls at the footprint boundary (the "blobby" result) instead
+            // of the falloff-shaped pad the profile describes. Same reason this multiply
+            // has to come AFTER the alpha multiply above: an alpha stamp previously only
+            // varied approach speed and flattened out to the same uniform plateau at
+            // convergence, where now it carves real relief into the deposited clay.
+            Vector3 toPlane = pos - planeOrigin;
+            float alongNormal = Vector3.Dot(toPlane, planeNormal);
+            Vector3 tangentialOffset = toPlane - planeNormal * alongNormal;
+            Vector3 target = planeOrigin + tangentialOffset + planeNormal * (s.Height * weight);
+            Vector3 toTarget = target - pos;
+            float lerp = Mathf.Clamp01(weight * s.LerpFactorScale);
+
+            Vector3 moved = s.Accumulate
+                ? pos + planeNormal * (s.Rate * weight) + toTarget * lerp
+                : pos + toTarget * lerp;
+
+            // Inlined ClampStrokeDepth - a Burst job can't call the shared static without
+            // dragging Vector3 method-call overhead into the inner loop, and the two must
+            // stay identical or the Burst and managed paths would diverge (see
+                // MinJobVertexCount: which one runs depends only on footprint size).
+            float along = Vector3.Dot(moved - strokeStart, planeNormal);
+            bool overshot = s.Height >= 0f ? along > s.MaxAlong : along < s.MaxAlong;
+            if (overshot) moved -= planeNormal * (along - s.MaxAlong);
+
+            pos = moved;
+            return true;
         }
 
         // Flatten's pass 2 - direct Burst port of ApplyFlattenBrushLocalManaged's per-candidate
@@ -820,7 +889,7 @@ namespace Sculpting
                 float dist = Vector3.Distance(pos, LocalPoint);
                 if (dist > BrushRadius) { WeightsOut[index] = 0f; return; }
                 float t01 = 1f - dist / BrushRadius;
-                WeightsOut[index] = t01 * t01 * (3f - 2f * t01) * (1f - MaskIn[index]) // smoothstep, masked-out
+                WeightsOut[index] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index]) // smoothstep, masked-out
                     * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
             }
         }
@@ -864,14 +933,18 @@ namespace Sculpting
                 int end = start + AdjacencyCounts[globalIdx];
                 if (end == start) { PositionsWrite[ci] = currentPos; return; } // no neighbors - GetNeighborAverage returns self
 
-                Vector3 sum = Vector3.zero;
+                // Summed in double so the result does not depend on neighbour order - see
+                // SculptableMesh.GetNeighborAverage for why an ulp here is a mirror-symmetry bug.
+                double sx = 0d, sy = 0d, sz = 0d;
                 for (int n = start; n < end; n++)
                 {
                     int neighborGlobal = AdjacencyNeighbors[n];
                     int slot = VertexToSlot[neighborGlobal];
-                    sum += slot >= 0 ? PositionsRead[slot] : FullPositions[neighborGlobal];
+                    Vector3 q = slot >= 0 ? PositionsRead[slot] : FullPositions[neighborGlobal];
+                    sx += q.x; sy += q.y; sz += q.z;
                 }
-                Vector3 average = sum / (end - start);
+                double invCount = 1d / (end - start);
+                var average = new Vector3((float)(sx * invCount), (float)(sy * invCount), (float)(sz * invCount));
 
                 Vector3 toAverage = average - currentPos;
                 float lerp = Mathf.Clamp01(w * PassFactor * LerpFactorScale);
@@ -879,19 +952,16 @@ namespace Sculpting
             }
         }
 
-        /// Clay's surface-relax weights (see ApplySurfaceRelaxBatched for what each term means and
-        /// why it is shaped this way) - the same formula the managed setup loop computes, moved
-        /// into a job because it runs over a candidate list 2.5x the brush radius wide, i.e.
-        /// roughly six times the surface area of the dab it is supporting.
+        /// Clay's surface-relax weights (see RelaxRadiusFactor for what each term means and why it
+        /// is shaped this way) - the same formula the managed setup loop computes, in a job because
+        /// it runs over the union of a whole frame's dab footprints.
         ///
-        /// The shell profile is measured from the NEAREST of the frame's dab centres rather than
-        /// from one point, because relax now runs once per frame across every dab that frame
-        /// placed rather than once per dab - see ApplySurfaceRelaxBatched. That is the exact
-        /// generalisation of the single-centre profile: with one centre it reduces to it
-        /// identically, and with several it keeps RelaxInnerFloor over the whole swept path (the
-        /// region the user is actively shaping, which relax deliberately leaves alone) while the
-        /// full-strength shell forms around the outside of the sweep, which is where a seam with
-        /// neighbouring geometry actually is.
+        /// The profile is measured from the NEAREST of the frame's dab centres rather than from one
+        /// point, because relax runs once per frame across every dab that frame placed rather than
+        /// once per dab - see ApplySurfaceRelaxBatched. That is the exact generalisation of the
+        /// single-centre profile: with one centre it reduces to it identically, and with several it
+        /// keeps RelaxInnerFloor down the middle of the swept path (the region the user is actively
+        /// shaping) while the edge band runs along the stroke's two sides.
         [BurstCompile(CompileSynchronously = true)]
         private struct RelaxWeightJob : IJobParallelFor
         {
@@ -943,7 +1013,7 @@ namespace Sculpting
                 }
                 if (sqrDist > RelaxRadius * RelaxRadius) { WeightsOut[ci] = 0f; return; }
 
-                float spatialWeight = RelaxSpatialWeight(Mathf.Sqrt(sqrDist), BrushRadius, RelaxRadius, EdgeSoftness, InnerFloor);
+                float spatialWeight = RelaxSpatialWeight(Mathf.Sqrt(sqrDist), RelaxRadius, EdgeSoftness, InnerFloor);
 
                 float curvatureFactor = Mathf.Lerp(CurvatureFloor, 1f,
                     Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(CurvatureStart, CurvatureFull, CurvatureIn[ci])));
@@ -981,15 +1051,20 @@ namespace Sculpting
                 int end = start + AdjacencyCounts[globalIdx];
                 if (end == start) { PositionsWrite[ci] = currentPos; return; }
 
-                Vector3 sum = Vector3.zero;
+                // Summed in double so the result does not depend on neighbour order - see
+                // SculptableMesh.GetNeighborAverage for why an ulp here is a mirror-symmetry bug.
+                double sx = 0d, sy = 0d, sz = 0d;
                 for (int n = start; n < end; n++)
                 {
                     int neighborGlobal = AdjacencyNeighbors[n];
                     int slot = VertexToSlot[neighborGlobal];
-                    sum += slot >= 0 ? PositionsRead[slot] : FullPositions[neighborGlobal];
+                    Vector3 q = slot >= 0 ? PositionsRead[slot] : FullPositions[neighborGlobal];
+                    sx += q.x; sy += q.y; sz += q.z;
                 }
 
-                Vector3 toAverage = sum / (end - start) - currentPos;
+                double invCount = 1d / (end - start);
+                Vector3 toAverage = new Vector3((float)(sx * invCount), (float)(sy * invCount),
+                    (float)(sz * invCount)) - currentPos;
                 PositionsWrite[ci] = currentPos + toAverage * Mathf.Clamp01(w * PassFactor);
             }
         }

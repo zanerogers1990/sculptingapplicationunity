@@ -4,13 +4,13 @@ using UnityEngine;
 
 namespace Sculpting.Tests
 {
-    /// Covers the buffer substrate dynamic topology is built on: MeshAdjacency's (start, count)
-    /// layout and its in-place mutation, and the spatial grids' ability to take on vertices and
-    /// triangles that did not exist when they were built.
+    /// Covers the growable buffer substrate: MeshAdjacency's (start, count) layout and its in-place
+    /// mutation, and the spatial grids' ability to take on vertices and triangles that did not exist
+    /// when they were built.
     ///
     /// The first test here is the important one. Moving MeshAdjacency off monotonic CSR offsets
-    /// touched every Laplacian in the app (Smooth, surface relax, cavity, the post-stroke unify
-    /// pass), all of which sum neighbours in array order - so a reordering too small to fail a
+    /// touched every Laplacian in the app (Smooth, surface relax, cavity), all of which sum
+    /// neighbours in array order - so a reordering too small to fail a
     /// topology assertion would still move results in the last bits of a float, which is exactly
     /// the resolution SymmetryDriftTests measures at. ReproducesTheCsrBuildExactly pins the new
     /// build against an independent implementation of the old one.

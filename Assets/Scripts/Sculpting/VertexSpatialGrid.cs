@@ -20,9 +20,9 @@ namespace Sculpting
     /// been re-bucketed yet.
     internal class VertexSpatialGrid
     {
-        // Not readonly, unlike the rest: dynamic topology both APPENDS vertices and reallocates the
-        // positions array out from under this index when it grows capacity, and rebuilding the
-        // whole grid for either would be the O(vertex count) cost a local refine exists to avoid.
+        // Not readonly, unlike the rest: vertices can be APPENDED and the positions array
+        // reallocated out from under this index when it grows capacity, and rebuilding the whole
+        // grid for either would be an O(vertex count) cost over geometry that did not change.
         // See AppendVertices.
         private Vector3[] _vertices;
         private readonly float _cellSize;
@@ -40,7 +40,7 @@ namespace Sculpting
         private readonly List<int> _resultBuffer = new List<int>();
 
         // How many vertices are BUCKETED, as against how long the per-vertex arrays happen to be -
-        // those now run ahead of it so an append does not reallocate them (see AppendVertices).
+        // those can run ahead of it so an append does not reallocate them (see AppendVertices).
         // SculptableMesh compares this against the mesh's own vertex count to decide whether the
         // index is still current, so it has to be the count, not the capacity.
         private int _vertexCount;
@@ -55,8 +55,8 @@ namespace Sculpting
         public VertexSpatialGrid(Vector3[] vertices, float cellSize)
             : this(vertices, vertices.Length, cellSize) { }
 
-        /// vertexCount bounds what is bucketed, which past the first dynamic-topology refine is
-        /// less than `vertices` holds (see SculptableMesh.Vertices). Bucketing the spare tail would
+        /// vertexCount bounds what is bucketed, which can be less than `vertices` holds (see
+        /// SculptableMesh.Vertices). Bucketing the spare tail would
         /// be worse than wasteful: those slots all sit on top of vertex 0, so every brush stroke
         /// near vertex 0 would get a pile of indices back that name no real geometry.
         public VertexSpatialGrid(Vector3[] vertices, int vertexCount, float cellSize)
@@ -85,14 +85,14 @@ namespace Sculpting
         }
 
         /// Takes on `count` vertices starting at index `from` that did not exist when this index
-        /// was built, and re-seats it on `positions` - which dynamic topology reallocates whenever
-        /// it grows capacity, so the array this was constructed over may no longer be the live one.
+        /// was built, and re-seats it on `positions` - which is reallocated whenever the mesh grows
+        /// capacity, so the array this was constructed over may no longer be the live one.
         ///
-        /// O(count), like UpdateVertices, and for the same reason: a refine that added a few
-        /// hundred vertices inside one brush footprint must not cost a rebuild over the millions
-        /// that did not change. The grid's CELL SIZE is left as it was - a refine makes the mesh
-        /// locally denser, which puts more vertices in the cells it touched, and re-deriving a cell
-        /// size from the new density would mean rebuilding every bucket.
+        /// O(count), like UpdateVertices, and for the same reason: a few hundred vertices added
+        /// inside one brush footprint must not cost a rebuild over the millions that did not change.
+        /// The grid's CELL SIZE is left as it was - locally denser geometry puts more vertices in the
+        /// cells it touched, and re-deriving a cell size from the new density would mean rebuilding
+        /// every bucket.
         public void AppendVertices(Vector3[] positions, int from, int count)
         {
             _vertices = positions;
@@ -101,7 +101,7 @@ namespace Sculpting
             int needed = from + count;
             if (_vertexCell.Length < needed)
             {
-                // Half again, not to the exact count. A refine adds a few hundred vertices to a
+                // Half again, not to the exact count. An append adds a few hundred vertices to a
                 // mesh of a million, and resizing to fit would reallocate and copy both
                 // mesh-sized arrays on every one of them - which is precisely the whole-mesh cost
                 // this method exists to avoid, reintroduced by its own bookkeeping.

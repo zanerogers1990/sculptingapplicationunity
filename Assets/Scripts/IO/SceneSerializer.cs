@@ -108,9 +108,8 @@ namespace Sculpting.IO
                     // buffer (this project has hit that twice - see SculptableMesh.Remesh and
                     // MeshJoiner). Saving from m.Mesh.vertices would silently persist the
                     // pre-sculpt shape.
-                    // Exact, not the raw buffers: those run ahead of VertexCount/TriangleCount
-                    // once dynamic topology has appended to them (see SculptableMesh.Vertices), and
-                    // the file format records a flat count.
+                    // Exact, not the raw buffers: those can run ahead of VertexCount/TriangleCount
+                    // (see SculptableMesh.Vertices), and the file format records a flat count.
                     Vector3[] verts = m.VerticesExact();
                     Vector3[] normals = m.NormalsExact();
                     int[] tris = m.TrianglesExact();
@@ -452,7 +451,7 @@ namespace Sculpting.IO
         // ------------------------------------------------------------------- model import
 
         /// Every extension the Import button accepts, for the file dialog's filter.
-        public static readonly string[] ImportableExtensions = { "sculpt", "obj" };
+        public static readonly string[] ImportableExtensions = { "sculpt", "obj", "stl" };
 
         /// Import dispatch: a .sculpt file brings in a whole saved session's objects, anything
         /// else is treated as a model file. Keeps the UI free of format knowledge - the button
@@ -466,18 +465,28 @@ namespace Sculpting.IO
             if (path.EndsWith(FileExtension, StringComparison.OrdinalIgnoreCase))
                 return Import(path, out importedCount, out error);
 
+            // Each model format owns nothing but its own parser: every importer hands back a
+            // plain Mesh in Unity space (axes and winding already converted - see each one's
+            // remarks on why the conversions differ), and PlaceImportedMesh does the identical
+            // scene placement for all of them.
+            Mesh mesh = null;
             if (path.EndsWith(".obj", StringComparison.OrdinalIgnoreCase))
+                mesh = ObjImporter.Import(path, out error);
+            else if (path.EndsWith(".stl", StringComparison.OrdinalIgnoreCase))
+                mesh = StlImporter.Import(path, out error);
+            else
             {
-                if (!ImportModel(path, out error)) return false;
-                importedCount = 1;
-                return true;
+                error = "Unsupported file type - expected .sculpt, .obj or .stl.";
+                return false;
             }
 
-            error = "Unsupported file type - expected .sculpt or .obj.";
-            return false;
+            if (mesh == null) return false;
+            PlaceImportedMesh(mesh);
+            importedCount = 1;
+            return true;
         }
 
-        /// Brings a single model file in as one new sculptable object.
+        /// Brings an already-parsed model mesh into the scene as one new sculptable object.
         ///
         /// The model's LOCAL vertex coordinates are used exactly as authored, and the object is
         /// placed by moving its TRANSFORM instead. That distinction matters: the mirror/symmetry
@@ -485,11 +494,8 @@ namespace Sculpting.IO
         /// re-centre the model would move its symmetry plane off the centreline the modeller
         /// built it around. Positioning via the transform keeps that intact while still
         /// guaranteeing the model lands somewhere visible.
-        private static bool ImportModel(string path, out string error)
+        private static void PlaceImportedMesh(Mesh mesh)
         {
-            Mesh mesh = ObjImporter.Import(path, out error);
-            if (mesh == null) return false;
-
             var selection = UnityEngine.Object.FindFirstObjectByType<SelectionManager>();
             SculptableMesh anchor = selection != null && selection.AllObjects.Count > 0 ? selection.AllObjects[0] : null;
 
@@ -523,7 +529,6 @@ namespace Sculpting.IO
                 mesh, UniqueName(mesh.name, taken), position, Quaternion.identity, Vector3.one * scale);
 
             selection?.Select(created, false);
-            return true;
         }
 
         private static void CaptureSettings(SculptSaveData data)
@@ -540,21 +545,25 @@ namespace Sculpting.IO
                 data.material.normalStrength = mat.NormalStrength;
                 data.material.normalNoiseScale = mat.NormalNoiseScale;
                 data.material.flatShading = mat.FlatShading;
-                data.material.cavityEnabled = mat.CavityEnabled;
-                data.material.recessColor = mat.RecessColor;
-                data.material.cavityIntensity = mat.CavityIntensity;
-                data.material.cavityRange = mat.CavityRange;
+                data.material.screenCavityEnabled = mat.CavityEnabled;
+                data.material.cavityRidge = mat.CavityRidge;
+                data.material.cavityValley = mat.CavityValley;
                 data.material.matcapEnabled = mat.MatcapEnabled;
                 data.material.matcapName = mat.MatcapName;
                 data.material.matcapIntensity = mat.MatcapIntensity;
                 data.material.matcapTintStrength = mat.MatcapTintStrength;
             }
 
-            var light = UnityEngine.Object.FindFirstObjectByType<LightingRigController>();
+            var light = LightingPresetController.Instance;
             if (light != null)
             {
-                data.environment.studioLightingEnabled = light.StudioLightingEnabled;
-                data.environment.lightingMode = (int)light.Mode;
+                data.environment.lightingPreset = light.PresetId;
+                data.environment.lightingFivePoint = light.FivePoint;
+                data.environment.lightingBrightness = light.Brightness;
+                data.environment.lightingRotation = light.Rotation;
+                data.environment.lightingFollowCamera = light.FollowCamera;
+                data.environment.lightingWorldYaw = light.WorldYaw;
+                data.environment.lightingShadows = light.Shadows;
             }
 
             var bg = UnityEngine.Object.FindFirstObjectByType<BackgroundController>();
@@ -624,10 +633,9 @@ namespace Sculpting.IO
                 mat.NormalStrength = data.material.normalStrength;
                 mat.NormalNoiseScale = data.material.normalNoiseScale;
                 mat.FlatShading = data.material.flatShading;
-                mat.CavityEnabled = data.material.cavityEnabled;
-                mat.RecessColor = data.material.recessColor;
-                mat.CavityIntensity = data.material.cavityIntensity;
-                mat.CavityRange = data.material.cavityRange;
+                mat.CavityEnabled = data.material.screenCavityEnabled;
+                mat.CavityRidge = data.material.cavityRidge;
+                mat.CavityValley = data.material.cavityValley;
                 mat.MatcapIntensity = data.material.matcapIntensity;
                 mat.MatcapTintStrength = data.material.matcapTintStrength;
                 // Name before the toggle: MatcapEnabled with nothing selected picks the first
@@ -643,12 +651,10 @@ namespace Sculpting.IO
             var env = data.environment;
             if (env != null)
             {
-                var light = UnityEngine.Object.FindFirstObjectByType<LightingRigController>();
-                if (light != null)
-                {
-                    light.StudioLightingEnabled = env.studioLightingEnabled;
-                    light.Mode = (LightingMode)env.lightingMode;
-                }
+                LightingPresetController.Instance?.ApplySaved(
+                    env.lightingPreset, env.lightingFivePoint, env.lightingBrightness,
+                    env.lightingRotation, env.lightingFollowCamera, env.lightingWorldYaw,
+                    env.lightingShadows);
 
                 // HDRI before the background: the background's Hdri mode is only honoured once
                 // an image is actually loaded, so applying it the other way round would silently

@@ -90,6 +90,8 @@ namespace Sculpting
         {
             Mouse mouse = Mouse.current;
             if (mouse == null) return;
+            // The turntable's clean view is look-only.
+            if (TurntableController.CleanViewActive) return;
 
             Keyboard kb = Keyboard.current;
             bool shift = kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed);

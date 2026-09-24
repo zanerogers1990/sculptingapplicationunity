@@ -131,7 +131,12 @@ namespace Sculpting
             // Panel's own Strength/Size sliders can also change these from outside (F/S drag,
             // scroll-resize) - same SetValueWithoutNotify resync SculptUIBuilder.Update does.
             if (_strengthSlider != null) _strengthSlider.SetValueWithoutNotify(controller.BrushStrength);
-            if (_sizeSlider != null) _sizeSlider.SetValueWithoutNotify(controller.BrushRadius);
+            if (_sizeSlider != null)
+            {
+                _sizeSlider.minValue = controller.BrushSizeMin;
+                _sizeSlider.maxValue = controller.BrushSizeMax;
+                _sizeSlider.SetValueWithoutNotify(controller.BrushSize);
+            }
 
             string hoveredLabel = null;
             for (int i = 0; i < _wedges.Length; i++)
@@ -303,8 +308,8 @@ namespace Sculpting
                 "Brush Strength - also adjustable by holding F and dragging, or the side panel.");
 
             UIFactory.CreateLabel(panelGO.transform, "Size", 12, FontStyle.Normal);
-            _sizeSlider = UIFactory.CreateSlider(panelGO.transform, SculptController.MinBrushRadius, SculptController.MaxBrushRadius,
-                controller.BrushRadius, v => controller.BrushRadius = v,
+            _sizeSlider = UIFactory.CreateSlider(panelGO.transform, controller.BrushSizeMin, controller.BrushSizeMax,
+                controller.BrushSize, v => controller.BrushSize = v,
                 "Brush Size - also adjustable by holding S and dragging, scrolling over the model, or the side panel.");
         }
 

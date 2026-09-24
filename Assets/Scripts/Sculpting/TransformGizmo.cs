@@ -151,6 +151,12 @@ namespace Sculpting
         /// for the duration - see ZSphereController.HandleInput.
         public bool IsDragging => _dragging;
 
+        /// True while the running drag is a ROTATE. A rotate drag also writes every target's
+        /// Position (it orbits a set about the shared pivot), and a target whose position setter
+        /// means something other than "put it here" - the mold's parting surface turns a position
+        /// into a slide along the pull axis - has to be able to tell that write apart from a move.
+        public bool IsRotating => _dragging && _dragKind == HandleKind.Rotate;
+
         /// Whether `ray` currently hits one of this gizmo's handles. Lets a tool that owns the
         /// same click give the gizmo first refusal on it, rather than both acting on one press.
         /// Returns false when the gizmo is not showing, so a put-away gizmo blocks nothing.
@@ -232,9 +238,37 @@ namespace Sculpting
             _root.SetActive(false);
         }
 
+        /// A script recompile in Play mode re-creates this component WITHOUT running Awake, and
+        /// the handle arrays are readonly, which Unity's reload serialization never restores - so
+        /// they came back full of nulls while _root (a plain field, which it does restore) still
+        /// pointed at the old handles, and every Update threw from ApplyHandleVisibility. Rebuilt
+        /// here instead: the old handles are dropped and a fresh set made.
+        private const string HandlesRootName = "TransformGizmoHandles";
+
+        private void EnsureHandles()
+        {
+            if (_root != null && _uniformHandle != null && _moveGroups[0] != null && _rotateHandles[0] != null &&
+                _scaleGroups[0] != null)
+                return;
+
+            // By name rather than through _root: whether a reload restores _root depends on what
+            // Unity chose to serialize, and a root it did not restore is still a child of ours -
+            // left behind, it is an invisible second gizmo whose colliders the handle picker can hit.
+            for (int i = transform.childCount - 1; i >= 0; i--)
+            {
+                GameObject child = transform.GetChild(i).gameObject;
+                if (child.name != HandlesRootName) continue;
+                child.SetActive(false);
+                Destroy(child);
+            }
+            BuildHandles();
+            _root.SetActive(false);
+        }
+
         private void Update()
         {
             if (_cam == null) _cam = Camera.main;
+            EnsureHandles();
 
             RefreshTargets();
 
@@ -245,7 +279,8 @@ namespace Sculpting
             // belonging to other tools, and a blanket "anything but Sculpt" test showed these
             // handles on top of those tools.
             bool externallyOwned = _externalTargets.Count > 0;
-            bool active = _cam != null && _targets.Count > 0 &&
+            // Put away (and unpickable, via _root.activeSelf) in the turntable's clean view.
+            bool active = _cam != null && _targets.Count > 0 && !TurntableController.CleanViewActive &&
                           (externallyOwned || Mode == GizmoMode.Transpose || Mode == GizmoMode.Scale);
 
             if (_root.activeSelf != active) _root.SetActive(active);
@@ -304,10 +339,17 @@ namespace Sculpting
             if (scale && !AnyTargetSupportsScale()) scale = false;
             if (rotate && !AnyTargetSupportsRotation() && _targets.Count == 1) rotate = false;
 
+            int moveMask = 0, rotateMask = 0;
+            for (int t = 0; t < _targets.Count; t++)
+            {
+                moveMask |= _targets[t].MoveAxisMask;
+                rotateMask |= _targets[t].RotateAxisMask;
+            }
+
             for (int i = 0; i < 3; i++)
             {
-                _moveGroups[i].SetActive(move);
-                _rotateHandles[i].SetActive(rotate);
+                _moveGroups[i].SetActive(move && (moveMask & (1 << i)) != 0);
+                _rotateHandles[i].SetActive(rotate && (rotateMask & (1 << i)) != 0);
                 _scaleGroups[i].SetActive(scale);
             }
             _uniformHandle.SetActive(scale && (handles & GizmoHandleSet.UniformScale) != 0);
@@ -460,41 +502,17 @@ namespace Sculpting
         private void TryPickObject(Mouse mouse)
         {
             // A ZSphere rig owns its own selection and drives the gizmo from it - picking a mesh
-            // or a light out from under it would swap the gizmo onto something that tool has no
-            // say over. Lights are exempt: THEY are what this method selects, so a light already
-            // holding the gizmo must still be able to hand it to another one.
-            if (_externalTargets.Count > 0 && !(_externalSource is SceneLightManager)) return;
+            // out from under it would swap the gizmo onto something that tool has no say over.
+            if (_externalTargets.Count > 0) return;
 
             Ray ray = _cam.ScreenPointToRay(mouse.position.ReadValue());
             Keyboard kb = Keyboard.current;
             bool additive = kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed ||
                                            kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
 
-            // Whichever is actually in front wins, so a light sitting between the camera and the
-            // model is clickable and one behind it is not - the same "closest hit" rule the handle
-            // picker uses.
-            SceneLightManager lights = LightManager;
-            float lightDist = float.MaxValue;
-            SceneLight lightHit = lights != null ? lights.Raycast(ray, out lightDist) : null;
-            if (lightHit == null) lightDist = float.MaxValue;
-
             SelectionManager selection = Selection;
             SculptableMesh meshHit = selection != null ? selection.Raycast(ray) : null;
-            float meshDist = float.MaxValue;
-            if (meshHit != null && meshHit.RaycastMesh(ray, 1000f, out Vector3 meshPoint, out _))
-                meshDist = Vector3.Distance(ray.origin, meshPoint);
-
-            if (lightHit != null && lightDist <= meshDist)
-            {
-                lights.Select(lightHit, additive);
-                return;
-            }
-
             if (meshHit == null) return;
-
-            // Selecting a mesh gives up any light selection, so exactly one kind of thing is ever
-            // under the gizmo - see SceneLightManager's class remarks.
-            lights?.ClearSelection();
 
             if (additive)
             {
@@ -509,51 +527,19 @@ namespace Sculpting
             SelectionFlashEffect.Play(meshHit.gameObject);
         }
 
-        // Found lazily and ADDED to this GameObject if the scene has none - the same
-        // self-installing idiom SculptController uses for RegionSelectTool, and for the same
-        // reason: this project's scene file is edited through Unity MCP, which cannot wire object
-        // references, so a component that installs itself is the one that reliably exists at
-        // runtime. It also means a scene saved before lights existed picks the feature up with no
-        // scene edit at all.
-        private SceneLightManager _lightManager;
-        private SceneLightManager LightManager
-        {
-            get
-            {
-                if (_lightManager != null) return _lightManager;
-                _lightManager = FindFirstObjectByType<SceneLightManager>();
-                if (_lightManager == null) _lightManager = gameObject.AddComponent<SceneLightManager>();
-                return _lightManager;
-            }
-        }
-
-        /// The scene's light manager, self-installing on first use. Exposed so the lighting panel
-        /// reaches the same instance rather than creating a second one.
-        public SceneLightManager Lights => LightManager;
-
         private bool TryBeginDrag(Mouse mouse)
         {
             Ray ray = _cam.ScreenPointToRay(mouse.position.ReadValue());
-            if (!TryPickHandle(ray, out GizmoHandleTag tag, out float handleDistance)) return false;
+            // A handle beats a MESH regardless of depth - they are drawn always-on-top precisely
+            // so a gizmo sitting inside the model stays grabbable, and the picker has to agree
+            // with what is on screen.
+            if (!TryPickHandle(ray, out GizmoHandleTag tag, out _)) return false;
 
             // The tool owning the gizmo may keep the press even over a handle. A ZSphere rig does
             // wherever the cursor is on a sphere's body: the arrow shafts start at the selected
             // sphere's centre, so otherwise every grab of that sphere became a one-axis drag.
             if (_externalTargets.Count > 0 && _externalSource is IGizmoPointerClaim claim && claim.ClaimsPointer(ray))
                 return false;
-
-            // A handle beats a MESH regardless of depth - they are drawn always-on-top precisely
-            // so a gizmo sitting inside the model stays grabbable, and the picker has to agree
-            // with what is on screen. It must NOT beat another always-on-top control that is
-            // genuinely in front of it, though: a light marker behind a handle is unreachable
-            // otherwise, which is exactly what stopped a second light from ever being shift-added
-            // to the selection - the handles around the first one swallowed the click.
-            SceneLightManager lights = LightManager;
-            if (lights != null)
-            {
-                lights.Raycast(ray, out float lightDistance);
-                if (lightDistance < handleDistance) return false;
-            }
 
             _dragging = true;
             _dragKind = tag.Kind;
@@ -655,8 +641,8 @@ namespace Sculpting
 
             // A source with its own history keeps it: recording a scene-level transform step for
             // the same drag would make one gesture take two undo presses to reverse. A source
-            // WITHOUT one (scene lights, whose targets are plain Transforms) still needs the
-            // gizmo's step, or its drags would not be undoable at all.
+            // WITHOUT one (plain Transform targets) still needs the gizmo's step, or its drags
+            // would not be undoable at all.
             bool changed = source != null && source.RecordsOwnUndoStep
                 ? AnyTargetMoved()
                 : RecordTransformUndo();
@@ -889,7 +875,7 @@ namespace Sculpting
 
         private void BuildHandles()
         {
-            _root = new GameObject("TransformGizmoHandles");
+            _root = new GameObject(HandlesRootName);
             _root.transform.SetParent(transform, false);
 
             for (int axis = 0; axis < 3; axis++)

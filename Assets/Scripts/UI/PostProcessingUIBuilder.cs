@@ -126,7 +126,7 @@ namespace Sculpting
             {
                 "Single solid colour (Color A) behind the sculpt.",
                 "Two-colour gradient from Color A (bottom) to Color B (top).",
-                "The loaded HDRI environment image, if one is loaded in Studio Lighting.",
+                "The loaded HDRI environment image, if one is loaded in HDRI Environment.",
             };
             for (int i = 0; i < BgModes.Length; i++)
             {
@@ -163,7 +163,7 @@ namespace Sculpting
 
             if (_bgHint != null)
                 _bgHint.text = _background.HdriBackgroundUnavailable
-                    ? "No HDRI loaded - showing the gradient. Load one in Studio Lighting."
+                    ? "No HDRI loaded - showing the gradient. Load one in HDRI Environment."
                     : string.Empty;
         }
     }

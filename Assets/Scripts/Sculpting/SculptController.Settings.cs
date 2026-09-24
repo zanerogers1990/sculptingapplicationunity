@@ -146,10 +146,21 @@ namespace Sculpting
         /// file would restore the current brush correctly and silently reset every other brush's
         /// remembered feel to defaults the first time it was selected.
         [Serializable]
+        public class FalloffCurveEntry
+        {
+            public int brush;
+            public Vector2[] points;
+        }
+
+        [Serializable]
         public class Settings
         {
             public float brushStrength;
             public float brushRadius;
+            // Inverted ("world" rather than "screen") so a file from before screen-space sizing
+            // existed - where JsonUtility leaves it false - opens in the new default mode.
+            public bool worldSpaceBrushSize;
+            public float brushScreenRadius;
             public int currentBrush;
             public bool isPositive;
             public bool accumulate;
@@ -181,11 +192,6 @@ namespace Sculpting
 
             public int remeshResolution;
 
-            // Dynamic topology. Saved so a session that was set up for it comes back that way,
-            // and defaulted off for a file written before it existed - which JsonUtility gives
-            // for free by leaving the field at its zero value.
-            public bool dynamicTopologyEnabled;
-            public float dynamicTopologyDetailSize;
             public bool useBurstJobs;
             public bool showWireframeGizmo;
 
@@ -195,6 +201,8 @@ namespace Sculpting
             // trusted - a file written by an older build (or hand-edited) can legitimately have
             // fewer entries than today's BrushType has members.
             public float[] perBrushStrength;
+            // Custom falloff curves, one entry per brush that has one (see BrushFalloff).
+            public FalloffCurveEntry[] falloffCurves;
             // No perBrushRadius counterpart: radius is one value shared by every brush (see
             // _brushStrengthPerType), saved as `brushRadius` above. A file written before that
             // change still carries the old per-brush array; JsonUtility drops the unknown field
@@ -221,6 +229,8 @@ namespace Sculpting
             {
                 brushStrength = brushStrength,
                 brushRadius = brushRadius,
+                worldSpaceBrushSize = !screenSpaceBrushSize,
+                brushScreenRadius = brushScreenRadius,
                 currentBrush = cur,
                 isPositive = isPositive,
                 accumulate = accumulate,
@@ -251,8 +261,6 @@ namespace Sculpting
                 pressureCurve = pressureCurve,
 
                 remeshResolution = remeshResolution,
-                dynamicTopologyEnabled = dynamicTopology.Enabled,
-                dynamicTopologyDetailSize = dynamicTopology.DetailSize,
                 useBurstJobs = useBurstJobs,
                 showWireframeGizmo = showWireframeGizmo,
 
@@ -263,7 +271,31 @@ namespace Sculpting
                 perBrushAccumulate = (bool[])_brushAccumulate.Clone(),
                 perBrushAccumulateStrength = (float[])_accumulateStrengthPerType.Clone(),
                 perBrushFrontFacingOnly = (bool[])_brushFrontFacingOnly.Clone(),
+                falloffCurves = CaptureFalloffCurves(),
             };
+        }
+
+        private FalloffCurveEntry[] CaptureFalloffCurves()
+        {
+            var entries = new System.Collections.Generic.List<FalloffCurveEntry>();
+            for (int b = 0; b < _falloffCurves.Length; b++)
+                if (_falloffCurves[b] != null)
+                    entries.Add(new FalloffCurveEntry { brush = b, points = _falloffCurves[b].Points.ToArray() });
+            return entries.ToArray();
+        }
+
+        private void ApplyFalloffCurves(FalloffCurveEntry[] entries)
+        {
+            for (int b = 0; b < _falloffCurves.Length; b++) _falloffCurves[b] = null;
+            if (entries == null) return;
+            foreach (FalloffCurveEntry e in entries)
+            {
+                if (e == null || e.points == null || e.brush < 0 || e.brush >= _falloffCurves.Length) continue;
+                var curve = new BrushFalloffCurve();
+                curve.Points.AddRange(e.points);
+                curve.Normalize();
+                _falloffCurves[e.brush] = curve;
+            }
         }
 
         /// Routes through the public CLAMPING properties wherever one exists rather than
@@ -279,6 +311,7 @@ namespace Sculpting
             CopyPerBrush(s.perBrushAccumulate, _brushAccumulate);
             CopyPerBrush(s.perBrushAccumulateStrength, _accumulateStrengthPerType);
             CopyPerBrush(s.perBrushFrontFacingOnly, _brushFrontFacingOnly);
+            ApplyFalloffCurves(s.falloffCurves);
 
             ClayHeightFactor = s.clayHeightFactor;
             ClayTipRoundness = s.clayTipRoundness;
@@ -300,10 +333,6 @@ namespace Sculpting
             PressureCurve = s.pressureCurve;
 
             RemeshResolution = s.remeshResolution;
-            DynamicTopologyEnabled = s.dynamicTopologyEnabled;
-            // Zero means the file predates dynamic topology; keep whatever the inspector default
-            // is rather than clamping a missing value up to the minimum detail size.
-            if (s.dynamicTopologyDetailSize > 0f) DynamicTopologyDetailSize = s.dynamicTopologyDetailSize;
             UseBurstJobs = s.useBurstJobs;
             ShowWireframeGizmo = s.showWireframeGizmo;
 
@@ -314,6 +343,10 @@ namespace Sculpting
             CurrentBrush = (BrushType)Mathf.Clamp(s.currentBrush, 0, System.Enum.GetValues(typeof(BrushType)).Length - 1);
             BrushStrength = s.brushStrength;
             BrushRadius = s.brushRadius;
+            ScreenSpaceBrushSize = !s.worldSpaceBrushSize;
+            // 0 is a file from before screen-space sizing - keep the default rather than clamping
+            // it to the minimum.
+            if (s.brushScreenRadius > 0f) BrushScreenRadius = s.brushScreenRadius;
             IsPositive = s.isPositive;
             Accumulate = s.accumulate;
             AccumulateStrength = s.accumulateStrength;

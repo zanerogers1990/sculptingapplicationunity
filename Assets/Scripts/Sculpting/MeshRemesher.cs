@@ -54,10 +54,17 @@ namespace Sculpting
             public bool IsEmpty => Vertices == null || Vertices.Length == 0 || Triangles == null || Triangles.Length < 3;
         }
 
-        // Reused across remesh calls instead of allocating fresh each time. Safe because the
-        // remesh entry points are always called synchronously to completion from the main
-        // thread only - never concurrently or re-entrantly - so there is no aliasing hazard.
+        // Reused across remesh calls instead of allocating fresh each time. Every entry point
+        // that touches it - and the dense-extraction scratch below - holds ExtractionLock for
+        // the whole call, so the calls are serialised whichever thread makes them.
         private static readonly MeshGeometryBuffer _buffer = new MeshGeometryBuffer();
+
+        /// Held for the whole of every extraction, because they all share this class's scratch
+        /// buffers. Almost every caller is on the main thread and never contends for it; it
+        /// exists for the mold builder, which extracts its draft halves on a worker so a build
+        /// does not freeze the app. A main-thread remesh started while one of those is running
+        /// waits for it rather than corrupting it.
+        internal static readonly object ExtractionLock = new object();
 
         public static Mesh Remesh(Vector3[] sourceVertices, int[] sourceTriangles, int resolution)
             => BuildMesh(RemeshGeometry(sourceVertices, sourceTriangles, resolution));
@@ -65,18 +72,21 @@ namespace Sculpting
         /// The remesh proper. See RemeshResult for why this, and not a Mesh, is the primary form.
         internal static RemeshResult RemeshGeometry(Vector3[] sourceVertices, int[] sourceTriangles, int resolution)
         {
-            resolution = Mathf.Clamp(resolution, 4, MaxResolution);
+            lock (ExtractionLock)
+            {
+                resolution = Mathf.Clamp(resolution, 4, MaxResolution);
 
-            Bounds bounds = ComputeBounds(sourceVertices);
-            float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
-            float cellSize = maxExtent / resolution;
-            Vector3Int dims = GridDimensions(bounds, cellSize, out Vector3 origin);
+                Bounds bounds = ComputeBounds(sourceVertices);
+                float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
+                float cellSize = maxExtent / resolution;
+                Vector3Int dims = GridDimensions(bounds, cellSize, out Vector3 origin);
 
-            _buffer.Reset();
-            SparseRemesher.Build(sourceVertices, sourceTriangles, origin, cellSize, dims, _buffer, out _);
-            PatchHoles(_buffer);
+                _buffer.Reset();
+                SparseRemesher.Build(sourceVertices, sourceTriangles, origin, cellSize, dims, _buffer, out _);
+                PatchHoles(_buffer);
 
-            return Finish(_buffer);
+                return Finish(_buffer);
+            }
         }
 
         /// Cell dimensions (and, via `origin`, the corner sample the grid starts at) of a
@@ -244,10 +254,13 @@ namespace Sculpting
 
         internal static RemeshResult BuildFromSdfGeometry(float[] sdf, Vector3Int dims, Vector3 origin, float cellSize)
         {
-            _buffer.Reset();
-            BuildDenseSurface(sdf, dims, dims.x + 1, dims.y + 1, origin, cellSize, _buffer);
-            PatchHoles(_buffer);
-            return Finish(_buffer);
+            lock (ExtractionLock)
+            {
+                _buffer.Reset();
+                BuildDenseSurface(sdf, dims, dims.x + 1, dims.y + 1, origin, cellSize, _buffer);
+                PatchHoles(_buffer);
+                return Finish(_buffer);
+            }
         }
 
         private static int SampleIndex(int x, int y, int z, int sx, int sy) => x + sx * (y + sy * z);

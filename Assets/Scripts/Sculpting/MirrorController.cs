@@ -73,7 +73,9 @@ namespace Sculpting
 
         private void UpdatePlane(Transform plane, bool axisActive)
         {
-            bool visible = axisActive && showPlanes && _sculptableMesh.Visible;
+            // The clean-view check is here rather than a flip of showPlanes, which is saved into
+            // scene files - a save made mid-presentation would otherwise lose the planes.
+            bool visible = axisActive && showPlanes && _sculptableMesh.Visible && !TurntableController.CleanViewActive;
             if (plane.gameObject.activeSelf != visible) plane.gameObject.SetActive(visible);
             if (!visible) return;
 

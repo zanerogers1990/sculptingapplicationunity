@@ -68,6 +68,12 @@ namespace Sculpting
         // chosen to match Clay's own default (0.6) for a comparable one-dab feel.
         private const float InflateSpeed = 4f;
         private const float InflateOffCapFactor = 0.6f;
+        // The Accumulate-ON push rate, per dab-second. Much lower than InflateSpeed: that path has
+        // no target to converge on, and at InflateSpeed one ordinary pass at the default strength
+        // swelled the surface by about three brush RADII - the "balloons the sphere" behaviour.
+        // At this rate the same pass raises the centre of the stroke by roughly a quarter of the
+        // radius, in line with what one default-strength Clay pass builds.
+        private const float InflateAccumulateSpeed = 1.25f;
         // Flatten eases each vertex toward the footprint's own area plane, so - unlike Clay's
         // live-replanned buildup - it CONVERGES on its own: once the footprint is flat the
         // remaining distance to the plane is zero and further dwelling does nothing. That is why
@@ -176,13 +182,6 @@ namespace Sculpting
         // TriangleSpatialGrid for why this matters at higher triangle counts.
         private readonly DirtyVertexSet _dirtyVertexScratch = new DirtyVertexSet();
 
-        // Union of _dirtyVertexScratch across every frame of the CURRENT stroke - cleared once on
-        // mouse-down (see HandleSculptInput) rather than every frame, and unioned into (never
-        // cleared by) FlushDirtyVertices below. HandleStrokeEndCommit reads this on release to run
-        // ApplyPostStrokeUnifyPass over everything the whole stroke touched, across however many
-        // brushes/frames/mirror dabs contributed to it - not just the last frame's footprint.
-        private readonly DirtyVertexSet _strokeDirtyVertexScratch = new DirtyVertexSet();
-
         /// Add-once-if-not-present set of vertex indices, stamp-marked rather than hashed.
         ///
         /// This was a HashSet&lt;int&gt;, and it is written once per moved vertex per dab - which on
@@ -220,19 +219,6 @@ namespace Sculpting
                 Items.Clear();
             }
 
-            /// Grows the stamp array to cover a mesh that just got bigger, KEEPING what is already
-            /// marked. Distinct from Clear, which starts a new build: dynamic topology appends
-            /// vertices part-way through a frame whose dirty set is still being used, and throwing
-            /// that set away mid-frame would lose everything the dab before the refine had moved.
-            /// Append-only growth is what makes keeping it safe - every existing index still names
-            /// the vertex it always did.
-            public void EnsureCapacity(int vertexCount)
-            {
-                if (_stamp == null) { _stamp = new int[vertexCount]; _generation = 1; return; }
-                if (_stamp.Length >= vertexCount) return;
-                System.Array.Resize(ref _stamp, vertexCount);
-            }
-
             public void Add(int vertexIndex)
             {
                 // Bounds-checked rather than trusting the caller: every brush indexes this with a
@@ -258,128 +244,8 @@ namespace Sculpting
         /// an empty apply would still walk the sync/filter preamble for no result.
         private void FlushDirtyVertices()
         {
-            FoldDirtyIntoStroke();
-            PushDirtyVertices();
-        }
-
-        /// Folds the frame's dirty set into the stroke-wide one, the one place every brush's
-        /// per-frame flush already passes through - see _strokeDirtyVertexScratch's remarks.
-        private void FoldDirtyIntoStroke()
-        {
-            List<int> items = _dirtyVertexScratch.Items;
-            for (int i = 0; i < items.Count; i++) _strokeDirtyVertexScratch.Add(items[i]);
-        }
-
-        private void PushDirtyVertices()
-        {
             if (_dirtyVertexScratch.Count == 0) return;
             sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch.Items);
-            RefineTopologyIfDue();
-        }
-
-        /// The single hook dynamic topology enters through. Sits here, after the frame's dab has
-        /// been applied, because this is the one place EVERY brush's per-frame flush passes
-        /// through - so no brush can be added later that silently skips it, and no brush needed a
-        /// line of its own.
-        ///
-        /// The refined region is derived from the dirty set rather than plumbed down from the
-        /// brush: that set IS the footprint, by construction, across every mirror sign and every
-        /// sub-dab of the frame. Taking it from here means the refine follows mirrored strokes and
-        /// multi-dab frames for free, and the brush handlers stay untouched.
-        private void RefineTopologyIfDue()
-        {
-            if (sculptableMesh == null) return;
-
-            DynamicTopology.DynamicTopologyRemesher remesher = DynamicTopologyRemesher;
-            if (!remesher.CanRefine(sculptableMesh, currentBrush)) return;
-            // A masked whole-object Transpose/Scale re-derives its result from a pre-drag snapshot
-            // every frame (SculptableMesh.BeginMaskedTransform), which changing the vertex count
-            // under would leave indexing past the end of.
-            if (sculptableMesh.IsMaskedTransformActive) return;
-
-            if (!TryVertexBounds(_dirtyVertexScratch.Items, out Vector3 centreLocal, out float radiusLocal)) return;
-            if (!remesher.ShouldRefine(sculptableMesh, centreLocal, radiusLocal)) return;
-            RunRefine(remesher, centreLocal, radiusLocal);
-        }
-
-        /// Move and Pose refine at the EDGES of a gesture - once as it starts, once as it ends -
-        /// rather than continuously the way the deforming brushes do.
-        ///
-        /// Not a limitation of the remesher but of the brushes: both capture a vertex selection
-        /// with fixed indices and weights on the press frame and re-derive the whole drag from it
-        /// (SculptableMesh.SelectGrab/SelectPose), so changing the vertex set underneath aims those
-        /// indices at different geometry. Blender excludes grab-type brushes from dyntopo outright
-        /// for the same reason. Refining at the bounds gets most of the value anyway: on press the
-        /// pull starts from adequate density instead of dragging three vertices into a spike, and
-        /// on release whatever the drag stretched is brought back to the target edge length.
-        private void RefineTopologyAtStrokeBounds(Vector3 centreLocal, float radiusLocal)
-        {
-            if (sculptableMesh == null) return;
-            DynamicTopology.DynamicTopologyRemesher remesher = DynamicTopologyRemesher;
-            if (!remesher.CanRefineAtStrokeBounds(sculptableMesh, currentBrush)) return;
-            if (sculptableMesh.IsMaskedTransformActive) return;
-            RunRefine(remesher, centreLocal, radiusLocal);
-        }
-
-        /// The end of a Move or Pose gesture, over everything the whole gesture touched - so a long
-        /// pull is re-tessellated along its entire length, not just where it finished.
-        private void RefineTopologyAfterStroke()
-        {
-            if (sculptableMesh == null) return;
-            if (!DynamicTopologyRemesher.CanRefineAtStrokeBounds(sculptableMesh, currentBrush)) return;
-            if (!TryVertexBounds(_strokeDirtyVertexScratch.Items, out Vector3 centre, out float radius)) return;
-            RefineTopologyAtStrokeBounds(centre, radius);
-        }
-
-        private void RunRefine(DynamicTopology.DynamicTopologyRemesher remesher, Vector3 centreLocal, float radiusLocal)
-        {
-            DynamicTopology.TopologyPatch patch = remesher.Refine(sculptableMesh, centreLocal, radiusLocal);
-            if (patch == null) return;
-
-            sculptableMesh.ApplyTopologyPatch(patch);
-            // Folded into the stroke's own undo entry rather than pushed as one of its own, so a
-            // single undo press takes back the stroke AND the topology it created.
-            sculptableMesh.AccumulateStrokeTopology(patch);
-            // The refine both MOVED vertices (the relax pass) and ADDED them, and the Laplacian
-            // jobs' full-mesh position mirror knows about neither - see RefreshPositionMirror for
-            // what reading it unrefreshed does to the surface.
-            MarkPositionMirrorStale();
-
-            // The mesh the rest of this frame's bookkeeping refers to just changed size. Both dirty
-            // sets are indexed by vertex and would reject (silently, by bounds check) every vertex
-            // the refine added, so they are re-sized here rather than at the next stroke - see
-            // DirtyVertexSet.Clear.
-            _dirtyVertexScratch.EnsureCapacity(sculptableMesh.VertexCount);
-            _strokeDirtyVertexScratch.EnsureCapacity(sculptableMesh.VertexCount);
-        }
-
-        /// The bounding sphere of a set of vertices, in local space. Returns false when that is
-        /// empty or degenerate.
-        private bool TryVertexBounds(List<int> items, out Vector3 centreLocal, out float radiusLocal)
-        {
-            centreLocal = default;
-            radiusLocal = 0f;
-
-            if (items == null || items.Count == 0) return false;
-
-            Vector3[] verts = sculptableMesh.Vertices;
-            int vertexCount = sculptableMesh.VertexCount;
-            Vector3 min = Vector3.positiveInfinity, max = Vector3.negativeInfinity;
-            bool any = false;
-            for (int k = 0; k < items.Count; k++)
-            {
-                int i = items[k];
-                if ((uint)i >= (uint)vertexCount) continue;
-                Vector3 p = verts[i];
-                min = Vector3.Min(min, p);
-                max = Vector3.Max(max, p);
-                any = true;
-            }
-            if (!any) return false;
-
-            centreLocal = (min + max) * 0.5f;
-            radiusLocal = Mathf.Max((max - min).magnitude * 0.5f, 1e-5f);
-            return true;
         }
 
         // Smooth's per-application relaxation strength: brushStrength scales how many
@@ -427,112 +293,47 @@ namespace Sculpting
         // shrugs off on its own.
         private const float AccumulatePressureInfluence = 0.5f;
 
-        // Mitigates (does not fully solve - the real fix is distance-based stroke spacing, a
-        // bigger separate change) the "blob where a stroke decelerates into a stop" artifact:
-        // every brush deposits once per rendered FRAME, not once per unit of distance the cursor
-        // actually travels, so a decelerating stroke packs many overlapping full-strength
-        // deposits into a small area right where it slows down, on top of the fast-moving middle
-        // of the same stroke that only got one deposit per (much larger) step. Scaling
-        // Accumulate's rate down as stroke speed drops toward zero softens that without
-        // eliminating the deliberate ZBrush/Blender-style "hold in place to keep building"
-        // feature outright - AccumulateSpeedFloor keeps a genuine stationary hold still building,
-        // just more gently, rather than stopping dead.
-        // Was a flat 1 world unit/sec. That made pacing depend on scene scale AND on brush
-        // size: the same physical drag reads as a much "slower" stroke with a small brush or on
-        // a small object, so the carve quietly faded toward nothing on exactly the close-in
-        // detail work Crease exists for. Pacing is a statement about travel relative
-        // to the BRUSH ("how many brush widths did this stroke cover"), so the reference is one
-        // brush diameter per second and the absolute constant is gone.
+        // One brush diameter per second: the stroke speed the distance-paced brushes are
+        // calibrated against (see DabTimeQuantum), and the rate Build Up on Hold feeds virtual
+        // travel at. Relative to the brush rather than an absolute speed, because "how many brush
+        // widths did the stroke cover" is what decides how worked-over a surface looks.
         private float StrokePacingReference => Mathf.Max(brushRadius * 2f, 0.001f);
-        // Diameters/sec past which the pacing stops counting extra speed. Purely a spike guard
-        // for a frame in which the cursor teleports (a drag re-entering the mesh, a frame
-        // hitch); ordinary strokes live far below it, and inside it the factor stays LINEAR in
-        // speed, which is what makes the deposit per centimetre of travel speed-invariant.
-        private const float StrokePacingCeiling = 3f;
-        // Calibration gain - the counterpart of ClayReferenceStrokeSpeed. Clay got an explicit
-        // constant so that switching it to distance pacing deposited what time pacing used to;
-        // Crease/Inflate got the speed factor with no such compensation, and at a
-        // normal carving speed that silently cost them roughly 4x. That is the difference
-        // between "calmer" and the reported "straight up not working". Sized so one pass at max
-        // Brush Strength reaches the full plateau/dab depth, which puts the 0.1 default at a
-        // clearly visible cut rather than a rounding error.
-        // Only Inflate is left on this path: Crease has since moved to real
-        // distance-spaced dabs (ApplyCarveStroke), which is what this factor was approximating.
-        private const float StrokePacingGain = 4f;
-        // Rate a motionless cursor still builds at, as a fraction of a full-speed stroke's.
-        // Only used when Build Up on Hold is ON; with it OFF there is no floor at all, which is
-        // what turns "held in place" into "deposits nothing" - see AccumulateSpeedFactor.
+
+        // Every brush should behave the same at any size, just scaled - ZBrush's brushes do, which
+        // is what lets a sculptor block out with a huge brush and detail with a tiny one without
+        // retuning strength. Three of ours didn't: Clay's per-dab approach to its plateau was
+        // proportional to the radius (small brushes were weak), and Crease's dig rate and Inflate's
+        // push were fixed world distances per dab/frame (small brushes dug and ballooned out of
+        // all proportion - Inflate at a 0.05 radius could swell a 0.5 sphere to twice its size in
+        // one stroke). Each now multiplies its world-distance rate by RadiusScale and uses a
+        // size-independent fraction for anything that approaches a target. At this reference
+        // radius every rate is exactly what it was, so existing slider settings keep their feel at
+        // ordinary sizes.
+        private const float StrengthReferenceRadius = 0.25f;
+        private float RadiusScale => brushRadius / StrengthReferenceRadius;
+
+        // With Build Up on Hold ON, a motionless cursor keeps building at this fraction of a
+        // stroke moving at StrokePacingReference - the steppers feed it in as virtual travel (see
+        // ApplyCarveStroke, StepDabStroke). With it OFF a stopped cursor places no dabs at all.
         private const float AccumulateSpeedFloor = 0.35f;
 
-        // With Build Up on Hold OFF the floor drops to zero, which makes the per-frame deposit
-        // proportional to stroke speed - and that is exactly distance pacing: a stroke half as
-        // fast deposits half as much per frame but spends twice as many frames covering the same
-        // ground, so the material laid down per centimetre is the same either way. A stopped
-        // cursor has zero speed and so deposits nothing. This is the cheap form of the
-        // "distance-based stroke spacing" the comment above calls the real fix; Clay does the
-        // full sub-stepped version (ApplyClayStroke) because its flat stamp leaves visible gaps
-        // between dabs if a fast drag outruns the frame rate, which these smooth-falloff brushes
-        // do not.
-        //
-        // Note _strokeSpeed is smoothed, so lifting off or stopping dead fades out over ~0.2s
-        // rather than cutting instantly. That is deliberate - it reads as a soft stroke end
-        // rather than a hard clip - but it does mean "stop" is a fast taper, not a hard stop.
-        // Build Up on Hold ON keeps the original capped shape verbatim: a floor so a genuine
-        // stationary hold still builds, saturating at 1 once the stroke is moving normally.
-        //
-        // With it OFF the factor is LINEAR in speed (up to the spike guard) and carries the
-        // calibration gain. The linearity is the distance pacing - clamping it at 1 was the
-        // other half of why the carving brushes went quiet, because every stroke faster than
-        // the reference fell straight back to time pacing and so still deposited less the
-        // faster it moved. A stopped cursor is still exactly zero, which is the behaviour this
-        // whole mechanism exists for.
-        private float AccumulateSpeedFactor => buildUpOnHold
-            ? Mathf.Lerp(AccumulateSpeedFloor, 1f, Mathf.Clamp01(_strokeSpeed / StrokePacingReference))
-            : StrokePacingGain * Mathf.Min(_strokeSpeed / StrokePacingReference, StrokePacingCeiling);
+        // Every brush now places a fixed quantum per dab, and dabs by distance travelled (Clay:
+        // ApplyClayStroke, Crease: ApplyCarveStroke, the rest: StepDabStroke), so the material laid
+        // down per centimetre no longer depends on stroke speed or frame rate. The measured-speed
+        // factor that used to approximate that for the frame-paced brushes is gone; what it was
+        // compensating for no longer exists.
 
-        private float EffectiveBrushStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * AccumulateSpeedFactor * accumulateStrength;
+        /// The Accumulate-OFF (ease toward one dab's worth, then stop) strength for every
+        /// distance-paced brush. Multiplied by accumulateStrength because that slider is the
+        /// build-up strength for BOTH build-up modes - see its "Build-Up Strength" label.
+        private float EffectiveDabStrength => EffectiveBrushStrength * accumulateStrength;
 
-        /// Build-up rate for the Accumulate-OFF path - the one that eases toward a single dab's
-        /// worth of depth and stops - as used by Inflate. Crease used it too
-        /// until it moved to distance-spaced dabs (see ApplyCarveStroke) and took Clay's
-        /// speed-free pacing with them - see EffectiveCarveStrength.
-        ///
-        /// That path is self-limiting, so it was never the runaway "digs forever" case Accumulate
-        /// is. But it still approaches its plateau on a CLOCK, which means holding still keeps
-        /// deepening the cut until it bottoms out, and easing off to place a careful crease cuts
-        /// deeper than drawing the same line at speed. Pacing the approach by stroke speed makes
-        /// the depth a function of the path drawn rather than how long the cursor lingered on it.
-        /// This can only ever slow the approach, never overshoot: the plateau still caps it.
-        ///
-        /// Deliberately NOT applied to Smooth, Flatten or Move. Holding those in place to keep
-        /// working an area is the point of them, and every sculpting app behaves that way - the
-        /// complaint this addresses was specifically about carving brushes deepening under a
-        /// stationary or slowing cursor.
-        /// Multiplied by accumulateStrength for the same reason the Accumulate path is: with
-        /// Accumulate OFF (Crease's default) that slider was a dead control, so the one knob a
-        /// user reaches for when a carve is too shallow did nothing at all on the brush most
-        /// likely to need it. It is the build-up strength for BOTH build-up modes now - see the
-        /// field's own remarks and its "Build-Up Strength" label in SculptUIBuilder.
-        private float EffectiveBrushStrengthPlateau => EffectiveBrushStrength * accumulateStrength
-            * (buildUpOnHold ? 1f : AccumulateSpeedFactor);
+        /// The Accumulate-ON (keeps building for as long as the stroke travels) strength.
+        private float EffectiveDabStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
 
-        /// Clay's own accumulate strength, identical to the above minus AccumulateSpeedFactor.
-        /// That factor exists to stop a time-driven brush dumping material wherever the cursor
-        /// slows down; Clay no longer deposits on a clock at all (see ApplyClayStroke), so a
-        /// slow stroke already lays down exactly the same material per unit of travel as a fast
-        /// one. Keeping the factor here would double-count speed and invert the intent - fast
-        /// strokes would deposit MORE per unit distance than careful ones. The other brushes
-        /// are still time-driven and still want it.
-        private float EffectiveClayStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
-
-        /// Crease's equivalents of the two above, and speed-free for exactly the
-        /// same reason: it now places a fixed quantum of carve every CreaseDabSpacing
-        /// of travel (see ApplyCarveStroke) rather than a slice of each frame's time, so the
-        /// deposit per centimetre is already stroke-speed-invariant. AccumulateSpeedFactor on
-        /// top of that would double-count speed. Build Up on Hold is honoured by feeding the
-        /// stepper virtual travel while the cursor sits still, not by scaling these.
-        private float EffectiveCarveStrength => EffectiveBrushStrength * accumulateStrength;
-        private float EffectiveCarveStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
+        /// Clay's accumulate strength - the same value, kept under its own name because Clay's
+        /// ClayWeight/ClayDisplace plumbing predates the other brushes' move to dabs.
+        private float EffectiveClayStrengthAccumulate => EffectiveDabStrengthAccumulate;
 
         /// The mirror sign list for the CURRENT target, off the reference SyncSelectionTarget
         /// already resolved once this frame.
@@ -611,15 +412,20 @@ namespace Sculpting
         /// back to the primary side, then reflecting the frame forward, gives the mirrored dab the
         /// mirror image of the primary frame exactly, so it samples the stamp at identical
         /// coordinates. The primary dab (mask 0) is unchanged bit for bit.
-        private void BuildDabTangentBasis(Vector3 normal, out Vector3 tangent, out Vector3 bitangent)
+        private void BuildDabTangentBasis(Vector3 normal, out Vector3 tangent, out Vector3 bitangent) =>
+            DabTangentBasis(normal, _dabFlipMask, out tangent, out bitangent);
+
+        /// BuildDabTangentBasis for an explicit flip mask - what a batched dab program uses, since it
+        /// runs after _dabFlipMask has moved on (see SculptController.DabProgram).
+        private static void DabTangentBasis(Vector3 normal, int flipMask, out Vector3 tangent, out Vector3 bitangent)
         {
-            if (_dabFlipMask == 0)
+            if (flipMask == 0)
             {
                 BuildTangentBasis(normal, out tangent, out bitangent);
                 return;
             }
 
-            Vector3 sign = SignOfFlipMask(_dabFlipMask);
+            Vector3 sign = SignOfFlipMask(flipMask);
             BuildTangentBasis(Vector3.Scale(normal, sign), out tangent, out bitangent);
             tangent = Vector3.Scale(tangent, sign);
             bitangent = Vector3.Scale(bitangent, sign);
@@ -749,6 +555,10 @@ namespace Sculpting
         /// Snapshots every vertex the current group's dabs can write, before the first of them runs.
         private void BeginMirrorGroup(ref MirroredDabWalk walk)
         {
+            // Recording a batched program (see SculptController.DabProgram): every vertex takes its
+            // own snapshot when it runs the op, so there is nothing to gather here.
+            if (_dabProgramRecording) { RecordDabOp(DabOpKind.GroupBegin); return; }
+
             Vector3[] verts = sculptableMesh.Vertices;
             if (_mirrorGroupStamp == null || _mirrorGroupStamp.Length != verts.Length)
             {
@@ -788,6 +598,7 @@ namespace Sculpting
 
         private void AccumulateMirrorOrdering()
         {
+            if (_dabProgramRecording) { RecordDabOp(DabOpKind.Accumulate); return; }
             Vector3[] verts = sculptableMesh.Vertices;
             for (int u = 0; u < _mirrorGroupVertices.Count; u++)
                 _mirrorGroupDeltaSum[u] += verts[_mirrorGroupVertices[u]] - _mirrorGroupBefore[u];
@@ -795,6 +606,7 @@ namespace Sculpting
 
         private void RestoreMirrorGroup()
         {
+            if (_dabProgramRecording) { RecordDabOp(DabOpKind.Restore); return; }
             Vector3[] verts = sculptableMesh.Vertices;
             for (int u = 0; u < _mirrorGroupVertices.Count; u++) verts[_mirrorGroupVertices[u]] = _mirrorGroupBefore[u];
             MarkPositionMirrorStale();
@@ -804,6 +616,7 @@ namespace Sculpting
         /// vertex no ordering touched gets its own position back bit for bit.
         private void CommitMirrorGroup(int orderings)
         {
+            if (_dabProgramRecording) { RecordDabOp(DabOpKind.Commit, 1f / orderings); return; }
             Vector3[] verts = sculptableMesh.Vertices;
             float inv = 1f / orderings; // a power of two, so exact
             for (int u = 0; u < _mirrorGroupVertices.Count; u++)
@@ -853,127 +666,14 @@ namespace Sculpting
             if (mouse == null || sculptableMesh == null) return;
             if (mouse.leftButton.wasReleasedThisFrame || mouse.rightButton.wasReleasedThisFrame)
             {
-                // Runs BEFORE EndStrokeUndo, not after: this pass's own vertex moves have to land
-                // inside the SAME accumulated undo delta as the rest of the stroke, so one Undo
-                // reverts the whole thing (the stroke plus its unify pass) rather than needing two.
-                // Before the unify pass, so the relaxation it runs sees the final topology rather
-                // than smoothing geometry that is about to be re-tessellated underneath it.
-                RefineTopologyAfterStroke();
-                ApplyPostStrokeUnifyPass();
                 // Once per stroke, over everything it touched: the relax shell's quiet moves are not
                 // refreshed per frame (that would give back what the drift filter saves), so without
                 // this the NEXT stroke could read normals and curvature left stale on one half of the
                 // model and fresh on the other - see SculptableMesh.RefreshDroppedVertices.
                 sculptableMesh.RefreshStrokeNormalsAndCurvature();
-                // Before EndStrokeUndo commits, because it reads whether the stroke changed
-                // topology - which EndStrokeUndo clears as it pushes.
-                sculptableMesh.ReseatColliderIfTopologyChanged();
                 sculptableMesh.EndStrokeUndo();
                 _strokeEndFadeTimer = StrokeEndFadeDuration;
             }
-        }
-
-        // How much of the gap toward each vertex's neighbor average ApplyPostStrokeUnifyPass
-        // closes in its one pass. Deliberately small and fixed, not an iteration ramp like
-        // Smooth's own MaxSmoothIterations - this isn't a tool the user reaches for, it's one
-        // quiet pass that runs automatically on every stroke release, so it has to stay far too
-        // gentle to read as "the surface got smoothed" on its own; it only has to blend away the
-        // faint facet where one frame's dab meets the next; see the method's own remarks.
-        private const float PostStrokeUnifyAmount = 0.35f;
-
-        // Candidate-indexed scratch for the pass below - reused across strokes rather than
-        // reallocated, same reasoning as _clayWeightScratch/_smoothWeightScratch.
-        private float[] _postStrokeUnifyWeightScratch = System.Array.Empty<float>();
-        private Vector3[] _postStrokeUnifyDeltaScratch = System.Array.Empty<Vector3>();
-
-        /// Runs once, when a stroke ends (see HandleStrokeEndCommit), over every vertex ANY brush
-        /// moved during the whole stroke - not just Clay's own per-frame Surface Relax above,
-        /// which only ever sees one frame's dab footprint and only ever rides along on Clay.
-        /// Consecutive dabs (of any brush, Clay's flat-topped plateau most of all) leave a faint
-        /// facet where one frame's geometry meets the next; one gentle, curvature-gated Laplacian
-        /// pass over the whole stroke's footprint blends those together into one continuous
-        /// surface, "unifying" it the way a real sculptor's hand settles clay after a pass.
-        ///
-        /// Curvature-gated with the exact same shape (and the exact same calibrated constants -
-        /// see their own remarks) as Clay's Surface Relax above: a vertex whose curvature already
-        /// departs sharply from the mesh's own baseline (a genuine seam/pinch) gets real
-        /// correction, while an ordinary rounded feature - which measures close to baseline by
-        /// this same test - is mostly left alone. That is what keeps this "without removing
-        /// detail" rather than sanding the whole stroke smooth.
-        ///
-        /// Deliberately plain managed C#, not a Burst job: unlike Surface Relax, which reruns
-        /// every frame of a held stroke, this runs exactly once, at release - even a wide stroke's
-        /// full touched-vertex set is a one-off cost at that point, not a per-frame one.
-        private void ApplyPostStrokeUnifyPass()
-        {
-            if (sculptableMesh == null) return;
-            List<int> touched = _strokeDirtyVertexScratch.Items;
-            if (touched.Count == 0) return;
-
-            SculptableMesh mesh = sculptableMesh;
-            Vector3[] verts = mesh.Vertices;
-            float[] mask = mesh.Mask;
-
-            if (_postStrokeUnifyWeightScratch.Length < touched.Count)
-                _postStrokeUnifyWeightScratch = new float[touched.Count];
-            float[] weights = _postStrokeUnifyWeightScratch;
-
-            bool anyInRange = false;
-            for (int ci = 0; ci < touched.Count; ci++)
-            {
-                int i = touched[ci];
-                // A Remesh mid-stroke resizes the mesh out from under indices gathered on earlier
-                // frames - see DirtyVertexSet's own remarks on the same hazard.
-                if ((uint)i >= (uint)verts.Length) { weights[ci] = 0f; continue; }
-
-                float curvatureDeviation = mesh.CurvatureDeviationAt(i);
-                float curvatureFactor = Mathf.Lerp(RelaxCurvatureFloor, 1f,
-                    Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(RelaxCurvatureStart, RelaxCurvatureFull, curvatureDeviation)));
-                float w = curvatureFactor * (1f - mask[i]);
-                weights[ci] = w;
-                if (w > 0f) anyInRange = true;
-            }
-            if (!anyInRange) return;
-
-            // Reuses the per-frame scratch set as plain scratch here (not through
-            // BeginDirtyVertices/FlushDirtyVertices - this pass's own results must NOT fold back
-            // into _strokeDirtyVertexScratch, which is about to be cleared by the next stroke's
-            // mouse-down and has no reason to remember this pass's touches beyond that).
-            _dirtyVertexScratch.Clear(verts.Length);
-
-            // Jacobi, not Gauss-Seidel: every target is measured against the surface as the stroke
-            // left it, and only then is anything written. Updating in place let each vertex read
-            // neighbours this same loop had already moved, so the result depended on the order of
-            // `touched` - and that order is primary side first, then the mirrored side in the
-            // mirrored query's own cell-walk order, which is not the mirror of the first. A
-            // perfectly mirrored stroke therefore came back asymmetric on EVERY release, for every
-            // brush, anywhere on the model: measured 0 -> 5e-5 for Crease and 8e-7 -> 5.5e-4 for
-            // Inflate three brush radii from the plane (SymmetryDriftTests).
-            if (_postStrokeUnifyDeltaScratch.Length < touched.Count)
-                _postStrokeUnifyDeltaScratch = new Vector3[touched.Count];
-            Vector3[] deltas = _postStrokeUnifyDeltaScratch;
-            for (int ci = 0; ci < touched.Count; ci++)
-            {
-                float w = weights[ci];
-                if (w <= 0f) continue;
-                int i = touched[ci];
-                deltas[ci] = (mesh.GetNeighborAverage(i) - verts[i]) * (w * PostStrokeUnifyAmount);
-            }
-
-            bool anyMoved = false;
-            for (int ci = 0; ci < touched.Count; ci++)
-            {
-                if (weights[ci] <= 0f) continue;
-                int i = touched[ci];
-                mesh.RecordUndoBeforeIfNeeded(i);
-                verts[i] += deltas[ci];
-                anyMoved = true;
-                _dirtyVertexScratch.Add(i);
-            }
-
-            if (!anyMoved) return;
-            MarkPositionMirrorStale();
-            sculptableMesh.ApplyVerticesLocal(_dirtyVertexScratch.Items);
         }
 
         // Left mouse paints mask (protects the area from every brush - see
@@ -996,7 +696,7 @@ namespace Sculpting
         private void HandleMaskPaintInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
-            if (overUI) return;
+            if (overUI) { ResetDabStroke(); return; }
 
             // Mask painting queries the vertex spatial index (SculptableMesh.PaintMask ->
             // QueryNear) just like the sculpting brushes do, so it needs the same start-of-
@@ -1018,13 +718,14 @@ namespace Sculpting
                 // HandleStrokeEndCommit already fires EndStrokeUndo on every mouse release
                 // regardless of which mode is active.
                 sculptableMesh.BeginMaskStroke();
+                ResetDabStroke();
             }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
-            if (!_isHovering) return;
+            if (!_isHovering) { ResetDabStroke(); return; }
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
@@ -1036,20 +737,31 @@ namespace Sculpting
             bool erasing = rightHeld || CtrlHeld;
             _previewPositive = !erasing; // green while painting, red while erasing
 
-            if (altHeld) return;
-            if (mouse.leftButton.isPressed) ApplyMaskPaint(hitPoint, !erasing);
-            else if (rightHeld) ApplyMaskPaint(hitPoint, false);
+            if (altHeld) { ResetDabStroke(); return; }
+            if (mouse.leftButton.isPressed) ApplyMaskPaint(hitPoint, hitNormal, !erasing, Time.deltaTime);
+            else if (rightHeld) ApplyMaskPaint(hitPoint, hitNormal, false, Time.deltaTime);
+            else ResetDabStroke();
         }
 
-        private void ApplyMaskPaint(Vector3 worldPoint, bool applying)
+        // Mask paints in distance-spaced dabs like every brush (see StepDabStroke), holding still
+        // included: a soft mask brush is meant to be a dwell-to-build-up wash.
+        private void ApplyMaskPaint(Vector3 worldPoint, Vector3 worldNormal, bool applying, float dt)
         {
             Transform t = sculptableMesh.transform;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
             float speed = Mathf.Lerp(MaskPaintSpeedSoft, MaskPaintSpeedHard, maskHardness);
-            float amount = (applying ? 1f : -1f) * EffectiveBrushStrength * speed * Time.deltaTime;
+            _maskDabAmount = (applying ? 1f : -1f) * EffectiveBrushStrength * speed * DabTimeQuantum;
+            StepDabStroke(localPoint, sculptableMesh.WorldToLocalNormal(worldNormal), dt, DabHoldMode.AlwaysWorks,
+                _placeMaskDab ??= PlaceMaskDab);
+        }
 
+        private float _maskDabAmount;
+        private Action<Vector3, Vector3> _placeMaskDab;
+
+        private void PlaceMaskDab(Vector3 localPoint, Vector3 localNormal)
+        {
             foreach (Vector3 sign in MirrorSigns())
-                sculptableMesh.PaintMask(Vector3.Scale(localPoint, sign), brushRadius, amount, maskHardness);
+                sculptableMesh.PaintMask(Vector3.Scale(localPoint, sign), brushRadius, _maskDabAmount, maskHardness);
         }
 
         private void HandleClayInput(Mouse mouse, bool overUI, bool altHeld)
@@ -1065,7 +777,6 @@ namespace Sculpting
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
-            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             bool invertHeld = rightHeld || CtrlHeld;
@@ -1125,15 +836,12 @@ namespace Sculpting
         // which no plausible drag exceeds.
         private const int ClayMaxDabsPerFrame = 24;
 
-        // Travel that a single dab's worth of material corresponds to, expressed as the stroke
-        // speed at which the new distance-driven pacing deposits exactly what the old
-        // time-driven pacing did. Purely a calibration constant so existing Brush Strength /
-        // Clay Depth settings keep feeling the same: at this speed the two schemes agree
-        // exactly, below it the new one deposits less per second (but the same per centimetre),
-        // above it more per second. Its counterpart on the carving brushes is StrokePacingGain,
-        // which encodes the same "keep the existing settings feeling the same" calibration for
-        // their own switch to distance pacing.
-        private const float ClayReferenceStrokeSpeed = 1f;
+        // The dt one Clay dab is worth - a calibration constant, not an elapsed time. It was the
+        // dab SPACING (a fifth of the radius), which made the fraction of the way to the plateau
+        // each dab covers proportional to the brush size: the same stroke settled fully at a big
+        // radius and barely started at a small one. Fixed at what the spacing was at
+        // StrengthReferenceRadius; the build rate, which IS a distance, gets RadiusScale instead.
+        private const float ClayDabTimeQuantum = ClayDabSpacingFraction * StrengthReferenceRadius;
 
         // Distance travelled since the last dab was placed, carried ACROSS frames. Without it a
         // slow drag - one that covers less than a dab spacing per frame - would round down to
@@ -1161,12 +869,13 @@ namespace Sculpting
 
             float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
             // One dab = one fixed quantum of material, NOT a slice of this frame's time.
-            float dabDt = spacing / ClayReferenceStrokeSpeed;
+            float dabDt = ClayDabTimeQuantum;
 
             // One dirty set and one relax batch for the WHOLE frame, however many dabs it turns
             // out to place - see FlushClayFrame.
             BeginDirtyVertices();
             BeginRelaxBatch();
+            BeginClayDabs();
 
             if (_lastClayStrokeLocal.HasValue)
             {
@@ -1208,6 +917,7 @@ namespace Sculpting
                 ApplyClayBrushAtLocal(localPoint, localNormal, positive, dabDt);
             }
 
+            EndClayDabs(positive);
             FlushClayFrame();
 
             _lastClayStrokeLocal = localPoint;
@@ -1226,18 +936,8 @@ namespace Sculpting
         /// lags behind the cursor on a wide stroke" latency was going.
         private void FlushClayFrame()
         {
-            // The dabs' own footprints join the stroke's unify set BEFORE relax adds to the frame's
-            // dirty set, and relax's additions are pushed to the mesh without joining it. Relax
-            // reports a shell vertex dirty only once it has visibly drifted
-            // (SculptableMesh.HasVisiblyDrifted), which is a knife edge that two mirrored halves
-            // land on differently by float rounding - so the release-time unify pass smoothed a
-            // vertex on one side and not its twin. Measured on a centreline Clay stroke: 6.7e-7 of
-            // mirror error before unify, 1.6e-5 after; with that knife edge taken out, 1.9e-7
-            // (SymmetryDriftTests). The shell has just been relaxed; unify is for the seams between
-            // dabs, which are inside their footprints.
-            FoldDirtyIntoStroke();
             ApplySurfaceRelaxBatched();
-            PushDirtyVertices();
+            FlushDirtyVertices();
         }
 
         private void ApplyClayBrushAtLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt)
@@ -1285,28 +985,21 @@ namespace Sculpting
         // default clayTipRoundness=1, so this changes nothing for the plain round tip.
         private const float Sqrt2 = 1.4142136f;
 
-        // v1 of ApplySurfaceRelaxLocal reused the calling brush's OWN candidate list and its
-        // OWN brushRadius-sized falloff - which weighted relax by distance from THIS dab's
-        // centre. That put the WEAKEST relax exactly at the dab's own edge, which is exactly
-        // where a neighboring dab's geometry begins - i.e. exactly where a seam pinches.
-        // Verified live: two lobes sculpted right next to each other still pinched hard with
-        // surfaceRelax at its default 0.35. Reaching further than the dab itself (into the
-        // neighbor's territory) fixed that half of it.
+        // Where relax acts, and why only inside the brush ring.
         //
-        // v2/v3 (this version's predecessor) then applied near-full strength across almost the
-        // WHOLE reach, including the brush's own core - which fixed the seam but broke the
-        // brush itself: user-reported, verified live, Crease's own groove couldn't hold shape
-        // and Clay's own accumulate-mode buildup was net LOSING height every dab (relax pulling
-        // a freshly-raised peak back down toward its still-low neighbors faster than Clay could
-        // raise it - eventually undershooting past the start height entirely on a held stroke).
-        // Both are the SAME bug: relax was second-guessing the brush's own CURRENT dab, not
-        // just the seam around it. RelaxInnerFloor is the fix - inside the brush's own radius
-        // (dist <= brushRadius) is exactly where the user is actively shaping RIGHT NOW, sharp
-        // or not, and gets left alone; only the SHELL beyond it (out to relaxRadius) - the
-        // transition into whatever geometry was already there before this dab, which is where a
-        // seam with a NEIGHBORING dab actually forms - gets meaningful relax.
-        private const float RelaxRadiusFactor = 2.5f;
-        private const float RelaxEdgeSoftness = 0.35f;
+        // It used to reach 2.5 brush radii, relaxing a "shell" around the dab on the reasoning that
+        // the seam with neighbouring geometry sits just outside the dab. That meant every Clay
+        // stroke quietly moved surface well beyond the ring the user could see - which is what the
+        // user asked to stop - and it was also more than half the cost of a Clay frame at 1.3M
+        // triangles (BrushStrokeBenchmarks). Relax now stays inside the ring: RelaxInnerFloor in
+        // the core, where the user is actively shaping (full-strength relax there fought the
+        // brush - Clay's own buildup went net NEGATIVE on a held stroke), rising to full strength
+        // across the outer RelaxEdgeBand of the radius - Clay's own falloff edge, where one dab's
+        // plateau meets the surface it was laid on and where a stroke's side seams form - and back
+        // to 0 on the ring itself. The curvature gate below still concentrates it on genuine
+        // pinches.
+        private const float RelaxRadiusFactor = 1f;
+        private const float RelaxEdgeBand = 0.35f;
         private const float RelaxInnerFloor = 0.05f;
         // Max relaxation passes surfaceRelax=1 folds into one dab - same "iteration count IS
         // the strength knob" idea Smooth's own MaxSmoothIterations uses (a single pass is too
@@ -1341,10 +1034,11 @@ namespace Sculpting
         ///
         /// This used to be deliberately plain managed C#, on the reasoning that a few passes over
         /// a footprint-bounded candidate list was a small fraction of what Smooth's own job
-        /// exists to make fast. Measurement said otherwise, and by a wide margin: "footprint-
-        /// bounded" is 2.5x the brush radius here, about six times the dab's own surface area, so
-        /// on a 270k-triangle sphere at a 0.25 brush radius this pass alone accounted for 52.8ms
-        /// of a 61.1ms Clay dab - 86% of it. It now takes the same Burst path Smooth does.
+        /// exists to make fast. Measurement said otherwise, and by a wide margin: when relax reached
+        /// 2.5x the brush radius, about six times the dab's own surface area, on a 270k-triangle
+        /// sphere at a 0.25 brush radius this pass alone accounted for 52.8ms of a 61.1ms Clay dab
+        /// - 86% of it. It now takes the same Burst path Smooth does (and stays inside the ring -
+        /// see RelaxRadiusFactor).
         // The centres of every dab this frame placed, across every mirror sign - the input to the
         // one batched relax pass that runs after them (see ApplySurfaceRelaxBatched). Reused
         // between frames rather than reallocated; ClayMaxDabsPerFrame x 8 mirror signs bounds it.
@@ -1538,11 +1232,39 @@ namespace Sculpting
 
             int[] stamp = _relaxUnionStamp;
             int generation = _relaxUnionGeneration;
+
+            // One query per viewpoint - i.e. per mirror side, since each side's dabs carry their own
+            // reflected camera - covering a sphere around all of that side's centres, instead of one
+            // query per centre. A frame's centres sit a fifth of a radius apart and their footprints
+            // overlap by ~90%, so a query per centre re-walked the same cells a dozen times; at 1.3M
+            // triangles that was the bulk of what the relax pass cost. The sphere is a superset of the
+            // per-centre union, and a superset changes nothing: RelaxWeightJob gives every candidate
+            // beyond relax reach of its nearest centre weight 0, SurfaceRelaxJob leaves weight-0
+            // slots exactly where they are, and a neighbour read from an unmoved slot is the same
+            // value the full-mesh mirror would have supplied.
+            _relaxGroupDone.Clear();
             for (int c = 0; c < _relaxCentres.Count; c++)
             {
+                Vector3 viewpoint = _relaxCentreCameras[c];
+                if (_relaxGroupDone.Contains(viewpoint)) continue;
+                _relaxGroupDone.Add(viewpoint);
+
+                Vector3 min = _relaxCentres[c], max = min;
+                for (int k = c + 1; k < _relaxCentres.Count; k++)
+                {
+                    if (_relaxCentreCameras[k] != viewpoint) continue;
+                    min = Vector3.Min(min, _relaxCentres[k]);
+                    max = Vector3.Max(max, _relaxCentres[k]);
+                }
+                Vector3 centre = (min + max) * 0.5f;
+                float extent = 0f;
+                for (int k = c; k < _relaxCentres.Count; k++)
+                    if (_relaxCentreCameras[k] == viewpoint)
+                        extent = Mathf.Max(extent, Vector3.Distance(_relaxCentres[k], centre));
+
                 // QueryNear hands back the spatial grid's own reused buffer, so this has to consume
-                // it fully before the next centre's query overwrites it.
-                List<int> near = sculptableMesh.QueryNear(_relaxCentres[c], queryRadius);
+                // it fully before the next query overwrites it.
+                List<int> near = sculptableMesh.QueryNear(centre, extent + queryRadius);
                 for (int k = 0; k < near.Count; k++)
                 {
                     int vi = near[k];
@@ -1553,6 +1275,10 @@ namespace Sculpting
             }
             return _relaxCandidateUnion;
         }
+
+        // Viewpoints GatherRelaxCandidates has already queried this frame - at most one per mirror
+        // sign, so a list scan beats hashing.
+        private readonly List<Vector3> _relaxGroupDone = new List<Vector3>(8);
 
         private void EnsureRelaxCentresNative()
         {
@@ -1613,7 +1339,7 @@ namespace Sculpting
                 WeightsOut = _nativeClayWeights,
                 BrushRadius = brushRadius,
                 RelaxRadius = relaxRadius,
-                EdgeSoftness = RelaxEdgeSoftness,
+                EdgeSoftness = RelaxEdgeBand,
                 InnerFloor = RelaxInnerFloor,
                 CurvatureFloor = RelaxCurvatureFloor,
                 CurvatureStart = RelaxCurvatureStart,
@@ -1728,13 +1454,9 @@ namespace Sculpting
                     }
                 }
                 if (sqrDist > relaxRadiusSqr) { weights[ci] = 0f; continue; }
-                // Shell profile, not a falloff from the dab centre: RelaxInnerFloor inside the
-                // brush's own radius (leave the current dab alone - see its remarks), ramping
-                // up to full strength just past brushRadius and tapering again only at the
-                // outer rim (relaxRadius) - see RelaxRadiusFactor's remarks for why the SHELL,
-                // not the core, is where a seam with a neighboring dab actually needs fixing.
-                float spatialWeight = RelaxSpatialWeight(Mathf.Sqrt(sqrDist), brushRadius, relaxRadius,
-                    RelaxEdgeSoftness, RelaxInnerFloor);
+                // Edge-band profile, not a falloff from the dab centre - see RelaxRadiusFactor.
+                float spatialWeight = RelaxSpatialWeight(Mathf.Sqrt(sqrDist), relaxRadius,
+                    RelaxEdgeBand, RelaxInnerFloor);
 
                 // CurvatureDeviationAt is unclamped (unlike the visual cavity tint) - see
                 // RelaxCurvatureFloor's remarks for why that distinction is what makes this
@@ -1819,6 +1541,14 @@ namespace Sculpting
 
         private void ApplyClayBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt)
         {
+            if (_dabProgramRecording)
+            {
+                // Batched - see BeginClayDabs. The relax centre is recorded as it is below.
+                RecordApplyDab(localPoint, localNormal, tangent0, bitangent0, dt);
+                RecordRelaxCentre(localPoint);
+                return;
+            }
+
             Vector3[] verts = sculptableMesh.Vertices;
             Vector3[] normals = sculptableMesh.Normals;
 
@@ -1842,12 +1572,30 @@ namespace Sculpting
             // dab centre in it - see ApplySurfaceRelaxBatched. Recorded here rather than in
             // ApplyClayBrushAtLocal so a mirrored dab contributes its own (mirrored) centre, and
             // only for dabs that actually landed on geometry.
+            RecordRelaxCentre(localPoint);
+        }
+
+        private void RecordRelaxCentre(Vector3 localPoint)
+        {
             // Once per sign, not once per ordering - a repeat ordering re-applies the same dab.
             if (surfaceRelax > 0f && !_mirrorRepeatOrdering)
             {
                 _relaxCentres.Add(localPoint);
                 _relaxCentreCameras.Add(_dabCameraLocal); // lockstep - see _relaxCentreCameras
             }
+        }
+
+        /// A frame's Clay dabs run as one batched Burst job when jobs are on (see
+        /// SculptController.DabProgram): between these two calls ApplyClayBrushLocal records instead
+        /// of applying. With jobs off every dab applies immediately, as it always has.
+        private void BeginClayDabs()
+        {
+            if (useBurstJobs) BeginDabProgram(sculptableMesh.Vertices.Length);
+        }
+
+        private void EndClayDabs(bool positive)
+        {
+            if (_dabProgramRecording) RunClayProgram(positive);
         }
 
         private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness)
@@ -1923,7 +1671,7 @@ namespace Sculpting
                 InvStampRadius = 1f / Mathf.Max(0.0001f, effectiveRadius * alphaScale),
                 AlphaSize = useAlpha ? _nativeAlphaSize : 0,
                 Accumulate = accumulate,
-                Rate = sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt,
+                Rate = sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt * RadiusScale,
                 MaxAlong = height * (accumulate ? ClayStrokeDepthLimitAccumulate : ClayStrokeDepthLimit),
             };
             dispJob.Schedule(candidates.Count, 32).Complete();
@@ -2020,7 +1768,7 @@ namespace Sculpting
                     // bumps toward one shared level AS mass builds, instead of uniformly
                     // ballooning every vertex (dips and bumps alike) by the same amount and
                     // preserving whatever unevenness was already there underneath the stroke.
-                    Vector3 buildDelta = planeNormal * (sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt) * weight;
+                    Vector3 buildDelta = planeNormal * (sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt * RadiusScale) * weight;
 
                     Vector3 toPlaneAcc = verts[i] - planeOrigin;
                     float alongNormalAcc = Vector3.Dot(toPlaneAcc, planeNormal);
@@ -2122,9 +1870,7 @@ namespace Sculpting
             bitangent = Vector3.Cross(normal, tangent);
         }
 
-        // Deliberately no UpdateStrokeSpeed call: Crease no longer paces itself off a measured
-        // cursor speed, it places a fixed carve every fixed distance travelled (see
-        // ApplyCarveStroke). Inflate is the only brush still on the speed factor.
+        // Crease places a fixed carve every fixed distance travelled (see ApplyCarveStroke).
         private void HandleCreaseInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
@@ -2167,8 +1913,7 @@ namespace Sculpting
         // value the distance-driven pacing cuts per centimetre of travel what the old
         // time-driven pacing cut at an ordinary carving speed, so existing Brush Strength /
         // Crease Depth settings keep feeling the same. Sized so a single pass at full Brush
-        // Strength reaches the plateau depth - the same calibration StrokePacingGain encoded for
-        // the scheme this replaces. Counterpart of Clay's ClayReferenceStrokeSpeed.
+        // Strength reaches the plateau depth. Counterpart of Clay's ClayDabTimeQuantum.
         private const float CreaseDabTimeQuantum = 0.2f;
         // How fast the carve frame (normal and travel direction) eases toward each new sample.
         // The raycast hands back the hit TRIANGLE's flat face normal (see
@@ -2208,7 +1953,9 @@ namespace Sculpting
                 _carveStrokeDir = Vector3.zero;
                 _carveDabCarry = 0f;
                 _lastCarveStrokeLocal = localPoint;
+                BeginCarveDabs();
                 ApplyCarveDab(localPoint, positive);
+                EndCarveDabs(positive);
                 FlushDirtyVertices();
                 return;
             }
@@ -2244,6 +1991,7 @@ namespace Sculpting
             _carveDabCarry += advance;
 
             int placed = 0;
+            BeginCarveDabs();
             while (_carveDabCarry >= spacing && placed < CreaseMaxDabsPerFrame)
             {
                 _carveDabCarry -= spacing;
@@ -2254,6 +2002,7 @@ namespace Sculpting
                 ApplyCarveDab(Vector3.Lerp(from, localPoint, u), positive);
                 placed++;
             }
+            EndCarveDabs(positive);
             // Hit the ceiling: drop the unspent travel instead of banking it into a burst of
             // dabs next frame, which would dig hardest exactly where the stroke was already
             // struggling to keep up.
@@ -2285,6 +2034,19 @@ namespace Sculpting
                 sum += normals[i] * (1f - dist * invRadius);
             }
             return sum.sqrMagnitude > 1e-8f ? sum.normalized : fallback;
+        }
+
+        /// A frame's carve dabs run as one batched Burst job when jobs are on (see
+        /// SculptController.DabProgram): between these two calls ApplyCarveDab records instead of
+        /// applying. With jobs off every dab applies immediately, as it always has.
+        private void BeginCarveDabs()
+        {
+            if (useBurstJobs) BeginDabProgram(sculptableMesh.Vertices.Length);
+        }
+
+        private void EndCarveDabs(bool positive)
+        {
+            if (_dabProgramRecording) RunCarveProgram(positive);
         }
 
         private void ApplyCarveDab(Vector3 localPoint, bool positive)
@@ -2330,6 +2092,12 @@ namespace Sculpting
         private void ApplyCarveDabLocal(Vector3 localPoint, Vector3 localNormal, Vector3 dirLocal,
             bool positive)
         {
+            if (_dabProgramRecording)
+            {
+                RecordApplyDab(localPoint, localNormal, dirLocal);
+                return;
+            }
+
             Vector3[] verts = sculptableMesh.Vertices;
             List<int> candidates = sculptableMesh.QueryNear(localPoint, brushRadius);
             if (candidates.Count == 0) return;
@@ -2344,8 +2112,8 @@ namespace Sculpting
             bool positive, List<int> candidates, Vector3[] verts)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveCarveStrength;
-            float effectiveStrengthAccumulate = EffectiveCarveStrengthAccumulate;
+            float effectiveStrength = EffectiveDabStrength;
+            float effectiveStrengthAccumulate = EffectiveDabStrengthAccumulate;
 
             GatherCandidatesNative(candidates, verts, sculptableMesh.Normals, sculptableMesh.Mask);
             // The dab's whole target is measured from here - see ApplyCarveDabLocal's remarks.
@@ -2368,7 +2136,7 @@ namespace Sculpting
                 Sign = sign,
                 LerpFactorScale = effectiveStrength * CreaseSpeed * CreaseDabTimeQuantum,
                 Accumulate = accumulate,
-                DepthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
+                DepthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum * RadiusScale,
                 PinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum,
                 FrontFacingOnly = frontFacingOnly,
                 CameraLocalPos = _dabCameraLocal,
@@ -2382,11 +2150,11 @@ namespace Sculpting
             bool positive, List<int> candidates, Vector3[] verts)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveCarveStrength;
-            float effectiveStrengthAccumulate = EffectiveCarveStrengthAccumulate;
+            float effectiveStrength = EffectiveDabStrength;
+            float effectiveStrengthAccumulate = EffectiveDabStrengthAccumulate;
             float depth = brushRadius * creaseDepthFactor * sign;
             float lerpScale = effectiveStrength * CreaseSpeed * CreaseDabTimeQuantum;
-            float depthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
+            float depthRate = sign * creaseDepthFactor * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum * RadiusScale;
             float pinchRateScale = creasePinch * effectiveStrengthAccumulate * CreaseSpeed * CreaseDabTimeQuantum;
             Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
             SculptableMesh mesh = sculptableMesh;
@@ -2456,11 +2224,10 @@ namespace Sculpting
         // Inflate's and Flatten's input handler and world-space wrapper were character-for-character
         // copies of each other, differing only in which Apply*BrushLocal they ended in, so both
         // brushes now route through these two methods. Clay, Crease and Smooth keep their own
-        // handlers because they genuinely differ from this one: Clay and Crease reset their
-        // stroke-continuity state on the frames this path simply returns (and Crease
-        // deliberately skips UpdateStrokeSpeed), while Smooth has no polarity, a neutral preview
-        // and no stroke-speed tracking. Move, Pose and mask painting are different gestures
-        // altogether.
+        // handlers because they genuinely differ from this one: Clay and Crease carry extra
+        // per-stroke state (a frozen tip frame, a travel direction) through their own dab
+        // steppers, while Smooth has no polarity and a neutral preview. Move, Pose and mask
+        // painting are different gestures altogether.
         //
         // The delegates are cached rather than passed as method groups: converting a method group
         // allocates a new delegate on every call, and the handler runs every frame the brush hovers.
@@ -2468,20 +2235,19 @@ namespace Sculpting
         private Action<Vector3, Vector3, bool, float> _applyFlattenBrushLocal;
 
         private void HandleStandardBrushInput(Mouse mouse, bool overUI, bool altHeld,
-            Action<Vector3, Vector3, bool, float> applyBrushLocal)
+            Action<Vector3, Vector3, bool, float> applyBrushLocal, float dabDt, DabHoldMode hold, bool footprintNormal)
         {
             _isHovering = false;
-            if (overUI) return;
+            if (overUI) { ResetDabStroke(); return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
-            if (!_isHovering) return;
+            if (!_isHovering) { ResetDabStroke(); return; }
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
-            UpdateStrokeSpeed(hitPoint);
 
             bool rightHeld = mouse.rightButton.isPressed;
             bool invertHeld = rightHeld || CtrlHeld;
@@ -2489,13 +2255,46 @@ namespace Sculpting
 
             LogRayHit(mouse, ray, hitPoint, hitNormal);
 
+            bool sculptingLeft = mouse.leftButton.isPressed && !altHeld;
+            if (!sculptingLeft && !rightHeld) { ResetDabStroke(); return; }
+
             // dt is read once here and handed down - see ApplyInflateBrushLocal.
-            if (mouse.leftButton.isPressed && !altHeld)
-                ApplyMirroredBrush(hitPoint, hitNormal, invertHeld ? !isPositive : isPositive, Time.deltaTime, applyBrushLocal);
-            else if (rightHeld)
-                ApplyMirroredBrush(hitPoint, hitNormal, !isPositive, Time.deltaTime, applyBrushLocal);
+            ApplyStandardStroke(hitPoint, hitNormal, sculptingLeft ? (invertHeld ? !isPositive : isPositive) : !isPositive,
+                Time.deltaTime, applyBrushLocal, dabDt, hold, footprintNormal);
         }
 
+        /// One frame of a distance-paced Inflate/Flatten/Standard/Layer stroke: however many dabs
+        /// this frame's travel calls for (see StepDabStroke), each mirrored, all pushed into the
+        /// mesh at once. footprintNormal: push along the footprint's averaged normal instead of the
+        /// hit triangle's - the brushes that move everything along ONE direction need it, because
+        /// the facet normal jitters from triangle to triangle and would steer each dab differently.
+        private void ApplyStandardStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive, float dt,
+            Action<Vector3, Vector3, bool, float> applyBrushLocal, float dabDt, DabHoldMode hold, bool footprintNormal)
+        {
+            Transform t = sculptableMesh.transform;
+            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
+            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+            if (footprintNormal) localNormal = AverageFootprintNormal(localPoint, localNormal);
+
+            _standardDabApply = applyBrushLocal;
+            _standardDabPositive = positive;
+            _standardDabDt = dabDt;
+            BeginDirtyVertices();
+            StepDabStroke(localPoint, localNormal, dt, hold, _placeStandardDab ??= PlaceStandardDab);
+            FlushDirtyVertices();
+        }
+
+        // The dab StepDabStroke is placing - fields rather than a closure so the per-frame path
+        // allocates nothing.
+        private Action<Vector3, Vector3, bool, float> _standardDabApply;
+        private bool _standardDabPositive;
+        private float _standardDabDt;
+        private Action<Vector3, Vector3> _placeStandardDab;
+
+        private void PlaceStandardDab(Vector3 localPoint, Vector3 localNormal) =>
+            ApplyMirroredDabLocal(localPoint, localNormal, _standardDabPositive, _standardDabDt, _standardDabApply);
+
+        /// One dab, applied once (the world-space entry point the tests drive directly).
         private void ApplyMirroredBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive, float dt,
             Action<Vector3, Vector3, bool, float> applyBrushLocal)
         {
@@ -2506,6 +2305,13 @@ namespace Sculpting
             Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
 
             BeginDirtyVertices();
+            ApplyMirroredDabLocal(localPoint, localNormal, positive, dt, applyBrushLocal);
+            FlushDirtyVertices();
+        }
+
+        private void ApplyMirroredDabLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt,
+            Action<Vector3, Vector3, bool, float> applyBrushLocal)
+        {
             // Order-symmetric near a mirror plane - see MirroredDabWalk.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
             while (NextMirroredDab(ref dabs, out Vector3 sign))
@@ -2513,8 +2319,6 @@ namespace Sculpting
                 Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
                 applyBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive, dt);
             }
-
-            FlushDirtyVertices();
         }
 
         // Pushes each vertex outward along its OWN normal (the mesh's per-vertex normals,
@@ -2547,8 +2351,8 @@ namespace Sculpting
         private void ApplyInflateBrushLocalJob(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveBrushStrengthPlateau;
-            float amount = sign * EffectiveBrushStrengthAccumulate * InflateSpeed * dt;
+            float effectiveStrength = EffectiveDabStrength;
+            float amount = sign * EffectiveDabStrengthAccumulate * InflateAccumulateSpeed * dt * RadiusScale;
 
             GatherCandidatesNative(candidates, verts, normals, sculptableMesh.Mask);
             var job = new InflateJob
@@ -2576,15 +2380,15 @@ namespace Sculpting
         private void ApplyInflateBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveBrushStrengthPlateau;
-            float effectiveStrengthAccumulate = EffectiveBrushStrengthAccumulate;
+            float effectiveStrength = EffectiveDabStrength;
+            float effectiveStrengthAccumulate = EffectiveDabStrengthAccumulate;
             Vector3 target = localPoint + localNormal * (brushRadius * InflateOffCapFactor * sign);
             Vector3 cameraLocalPos = _dabCameraLocal; // this dab's viewpoint - see _dabCameraLocal
             SculptableMesh mesh = sculptableMesh;
             float[] mask = mesh.Mask;
             float radiusSqr = brushRadius * brushRadius;
             float invRadius = 1f / brushRadius;
-            float accumulateRate = sign * effectiveStrengthAccumulate * InflateSpeed * dt;
+            float accumulateRate = sign * effectiveStrengthAccumulate * InflateAccumulateSpeed * dt * RadiusScale;
             float lerpScale = effectiveStrength * InflateSpeed * dt;
             bool anyMoved = false;
 
@@ -2599,7 +2403,7 @@ namespace Sculpting
 
                 Vector3 n = normals[i];
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
-                float weight = t01 * t01 * (3f - 2f * t01) * (1f - mask[i]) // smoothstep, masked-out
+                float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
                     * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 if (weight <= 0f) continue;
 
@@ -2822,13 +2626,13 @@ namespace Sculpting
         private void HandleSmoothInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
-            if (overUI) return;
+            if (overUI) { ResetDabStroke(); return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
-            if (!_isHovering) return;
+            if (!_isHovering) { ResetDabStroke(); return; }
 
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
@@ -2839,22 +2643,42 @@ namespace Sculpting
             // Same Alt-reserved-for-orbit rule as Clay; either mouse button smooths since
             // there's no positive/negative to invert.
             if ((mouse.leftButton.isPressed && !altHeld) || mouse.rightButton.isPressed)
-                ApplySmoothBrush(hitPoint, Time.deltaTime); // dt read once - see ApplyInflateBrushLocal
+                ApplySmoothStroke(hitPoint, hitNormal, Time.deltaTime); // dt read once - see ApplyInflateBrushLocal
+            else
+                ResetDabStroke();
         }
 
+        /// One frame of a distance-paced Smooth stroke - see StepDabStroke. Holding still keeps
+        /// smoothing (DabHoldMode.AlwaysWorks).
+        private void ApplySmoothStroke(Vector3 worldPoint, Vector3 worldNormal, float dt)
+        {
+            Transform t = sculptableMesh.transform;
+            BeginDirtyVertices();
+            StepDabStroke(t.InverseTransformPoint(worldPoint), sculptableMesh.WorldToLocalNormal(worldNormal), dt,
+                DabHoldMode.AlwaysWorks, _placeSmoothDab ??= PlaceSmoothDab);
+            FlushDirtyVertices();
+        }
+
+        private Action<Vector3, Vector3> _placeSmoothDab;
+
+        private void PlaceSmoothDab(Vector3 localPoint, Vector3 localNormal) => ApplySmoothDabLocal(localPoint, DabTimeQuantum);
+
+        /// One dab, applied once (the world-space entry point the tests drive directly).
         private void ApplySmoothBrush(Vector3 worldPoint, float dt)
         {
             Transform t = sculptableMesh.transform;
-            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-
             BeginDirtyVertices();
+            ApplySmoothDabLocal(t.InverseTransformPoint(worldPoint), dt);
+            FlushDirtyVertices();
+        }
+
+        private void ApplySmoothDabLocal(Vector3 localPoint, float dt)
+        {
             // Order-symmetric near a mirror plane - see MirroredDabWalk. Smooth also reads one ring
             // past its footprint, which MirrorInteractionMargin covers.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
             while (NextMirroredDab(ref dabs, out Vector3 sign))
                 ApplySmoothBrushLocal(Vector3.Scale(localPoint, sign), dt);
-
-            FlushDirtyVertices();
         }
 
         private void ApplySmoothBrushLocal(Vector3 localPoint, float dt)
@@ -3000,7 +2824,7 @@ namespace Sculpting
                 if (sqrDist > radiusSqr) { weights[ci] = 0f; continue; }
 
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
-                weights[ci] = t01 * t01 * (3f - 2f * t01) * (1f - mask[i]) // smoothstep, masked-out
+                weights[ci] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
                     * FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
                 anyInRange = true;
             }
@@ -3110,12 +2934,6 @@ namespace Sculpting
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
 
-            // BEFORE the selection is captured, not after: the selection records vertex indices and
-            // weights, and a refine that ran afterwards would be adding vertices the drag has no
-            // entry for. Refining here is what stops a Move on coarse geometry from dragging three
-            // vertices out into a spike.
-            RefineTopologyAtStrokeBounds(localHit, brushRadius);
-
             var selections = new List<(SculptableMesh.GrabSelection, Vector3)>();
             foreach (Vector3 sign in MirrorSigns())
             {
@@ -3124,7 +2942,8 @@ namespace Sculpting
                 // getting this wrong here strands half of the far side's vertices behind for the
                 // entire drag rather than merely weakening one frame of it.
                 BeginMirroredDab(sign);
-                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, _dabCameraLocal);
+                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, _dabCameraLocal,
+                    moveConnectedOnly);
                 if (selection.IsValid) selections.Add((selection, sign));
             }
             if (selections.Count == 0) return;
@@ -3155,6 +2974,7 @@ namespace Sculpting
         {
             EndMoveDrag();
             EndPoseDrag();
+            EndSnakeDrag();
         }
 
         // Same click/hold-drag/release shape as HandleMoveDrag above, right down to reusing

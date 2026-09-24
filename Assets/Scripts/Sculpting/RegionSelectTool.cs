@@ -182,6 +182,10 @@ namespace Sculpting
 
         private void Update()
         {
+            // Nothing is armed or dragged over a turntable presentation; the mode itself is left
+            // as it was, for when the panels come back.
+            if (TurntableController.CleanViewActive) return;
+
             HandleModeKeys();
             if (mode == RegionSelectMode.Off) return;
 
@@ -384,9 +388,9 @@ namespace Sculpting
             int vertexCount = target.VertexCount;
             if (verts == null || vertexCount == 0) { _status = "No geometry."; return null; }
 
-            // VertexCount, not verts.Length - the buffer runs ahead of it once dynamic topology
-            // has appended to it (see SculptableMesh.Vertices), and the spare slots all sit on top
-            // of vertex 0, which would drag whatever region covers that vertex over all of them.
+            // VertexCount, not verts.Length - the buffer can run ahead of it (see
+            // SculptableMesh.Vertices), and the spare slots all sit on top of vertex 0, which would
+            // drag whatever region covers that vertex over all of them.
             if (_insideScratch.Length != vertexCount) _insideScratch = new bool[vertexCount];
 
             // One matrix per gesture, then one multiply per vertex - Camera.WorldToScreenPoint

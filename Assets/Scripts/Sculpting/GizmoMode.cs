@@ -15,6 +15,10 @@ namespace Sculpting
         Scale,
         /// Blockout mode: TransformGizmo hides itself and ZSphereController owns the mouse for
         /// placing, posing and skinning a ZSphere rig.
-        ZSphere
+        ZSphere,
+        /// Mold mode: MoldController owns the mouse for placing pins, sprues and vents on the
+        /// parting surface, and pushes its own targets to the gizmo for dragging them (and the
+        /// parting surface itself) around.
+        Mold
     }
 }

@@ -91,8 +91,8 @@ namespace Sculpting
             if (source == null) { error = "No object selected."; return null; }
 
             // The Exact forms, because the length agreement checked just below is against each
-            // other rather than against a count: the raw buffers run ahead of VertexCount once
-            // dynamic topology has appended to them (see SculptableMesh.Vertices).
+            // other rather than against a count: the raw buffers can run ahead of VertexCount (see
+            // SculptableMesh.Vertices).
             Vector3[] srcVerts = source.VerticesExact();
             Vector3[] srcNormals = source.NormalsExact();
             int[] srcTris = source.TrianglesExact();

@@ -8,6 +8,10 @@ namespace Sculpting
         Crease,
         Inflate,
         Flatten,
-        Pose
+        Pose,
+        // Appended, never inserted: per-brush settings are saved as arrays indexed by this enum.
+        Standard,
+        Layer,
+        SnakeHook
     }
 }

@@ -32,6 +32,8 @@ namespace Sculpting
         {
             SelectionFlashEffect existing = target.GetComponent<SelectionFlashEffect>();
             if (existing != null) Destroy(existing);
+            // Nothing flashes over a turntable presentation.
+            if (TurntableController.CleanViewActive) return;
             SelectionFlashEffect effect = target.AddComponent<SelectionFlashEffect>();
             effect.Init(duration > 0f ? duration : DefaultFlashDuration, color ?? DefaultFlashColor);
         }

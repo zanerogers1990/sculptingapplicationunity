@@ -10,12 +10,8 @@ Shader "Custom/SculptPBR"
         _NormalNoiseScale("Normal Detail Scale", Range(1,300)) = 60
         _FlatShading("Flat Shading", Float) = 0
 
-        // One colour, and it only ever goes INTO recesses - see ApplyCavity for why the
-        // matching "peak" tint that used to sit alongside it was removed.
-        _CavityEnabled("Cavity Enabled", Float) = 1
-        _RecessColor("Recess Color", Color) = (0.12,0.10,0.09,1)
-        _CavityIntensity("Cavity Intensity", Range(0,2)) = 1.0
-        _CavityRange("Cavity Range", Range(0.05,2.0)) = 0.25
+        // Cavity has no material properties: it's the screen-space curvature driven by
+        // ScreenCavityFeature's globals (see ScreenCavityFactor).
 
         // Matcap ("material capture", as in ZBrush/Blender/Nomad): a photo of a sphere shaded
         // exactly how the surface should look, indexed by the view-space normal. It replaces
@@ -60,6 +56,38 @@ Shader "Custom/SculptPBR"
         }
         LOD 300
 
+        // Shared by the forward pass and the cavity normals pass, so both see one
+        // UnityPerMaterial layout.
+        HLSLINCLUDE
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+            CBUFFER_START(UnityPerMaterial)
+                half4 _BaseColor;
+                half _Metallic;
+                half _Smoothness;
+                half _NormalStrength;
+                half _NormalNoiseScale;
+                half _FlatShading;
+                half4 _MaskTintColor;
+                half _MaskTintStrength;
+                half _MatcapEnabled;
+                half _MatcapIntensity;
+                half _MatcapTintStrength;
+            CBUFFER_END
+
+            // "Shade Flat" normal from the screen-space derivatives of the interpolated world
+            // position - see the forward fragment's remarks. Flipped to agree with the smooth
+            // normal because the cross product's sign depends on derivative direction.
+            float3 SculptShadingNormalWS(float3 positionWS, float3 normalWS)
+            {
+                float3 smoothNormalWS = normalize(normalWS);
+                if (_FlatShading < 0.5)
+                    return smoothNormalWS;
+                float3 flatNormalWS = normalize(cross(ddy(positionWS), ddx(positionWS)));
+                return dot(flatNormalWS, smoothNormalWS) < 0.0 ? -flatNormalWS : flatNormalWS;
+            }
+        ENDHLSL
+
         Pass
         {
             Name "ForwardLit"
@@ -103,26 +131,14 @@ Shader "Custom/SculptPBR"
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
-            CBUFFER_START(UnityPerMaterial)
-                half4 _BaseColor;
-                half _Metallic;
-                half _Smoothness;
-                half _NormalStrength;
-                half _NormalNoiseScale;
-                half _FlatShading;
-                half _CavityEnabled;
-                half4 _RecessColor;
-                half _CavityIntensity;
-                half _CavityRange;
-                half4 _MaskTintColor;
-                half _MaskTintStrength;
-                half _MatcapEnabled;
-                half _MatcapIntensity;
-                half _MatcapTintStrength;
-            CBUFFER_END
-
             TEXTURE2D(_MatcapTex);
             SAMPLER(sampler_MatcapTex);
+
+            // Written by ScreenCavityFeature for the camera currently rendering. Globals, not
+            // material properties - cavity is a viewport setting, like Blender's.
+            TEXTURE2D(_SculptCavityNormals);   // xyz = view-space normal, w = eye depth (0 = empty)
+            float4 _SculptCavityParams;        // x = on for this camera, y/z = ridge/valley control, w = offset (px)
+            float4 _SculptCavityTexel;         // 1/width, 1/height, width, height
 
             // Compact hashed value noise for a small tangent/UV-independent surface
             // micro-bump (see _NormalStrength). The mesh's spherical remesh UVs get badly
@@ -175,27 +191,53 @@ Shader "Custom/SculptPBR"
                 return normalize(n - tangentialGrad * _NormalStrength);
             }
 
-            // Shades `color` by the per-vertex cavity term - vertex color .r: 0 = convex/peak,
-            // 0.5 = flat, 1 = concave/recess, written by SculptableMesh.RecomputeCavity after
-            // every stroke. Pulled out of the fragment body so the matcap path can run the same
-            // ramp over the matcap's color that the PBR path runs over the albedo: cavity is a
-            // property of the geometry, not of which shading model happens to be switched on.
-            //
-            // ONE colour, into recesses only. This used to also lerp convex vertices toward a
-            // separate near-white "peak" colour, which is what made cavity shading read as a
-            // mess rather than as depth: the two ramps met at the 0.5 flat baseline, so every
-            // surface was being tinted towards something almost everywhere, the light half
-            // washed the base colour (and, on the matcap path, the matcap's own baked lighting)
-            // out toward white, and the two tints fought over which of them a given area was
-            // "mostly" in. Cavity's whole job is to darken the creases the light does not reach;
-            // brightening the bits that already catch the light adds no information and destroys
-            // the surface colour that the material or the matcap was chosen for. Below 0.5 this
-            // now does nothing at all, which is the point - a convex surface is simply left as
-            // whatever it was already being shaded.
-            half3 ApplyCavity(half3 color, half cavity)
+            // Workbench's soft clamp: linear for small curvature, easing into a ceiling of
+            // 0.25 / control. The control is 0.5 / ridge^2 (or 0.7 / valley^2), so the Ridge and
+            // Valley sliders raise the ceiling rather than scaling the whole response.
+            float CavitySoftClamp(float curvature, float control)
             {
-                half recessT = smoothstep(0.5, 0.5 + _CavityRange, cavity);
-                return lerp(color, _RecessColor.rgb, saturate(recessT * _CavityIntensity));
+                if (curvature < 0.5 / control)
+                    return curvature * (1.0 - curvature * control);
+                return 0.25 / control;
+            }
+
+            // Blender Workbench's screen-space cavity (Viewport Shading > Cavity > Screen): a port
+            // of curvature_compute in workbench_curvature_lib.glsl. The divergence of the
+            // view-space normal field across the pixel's four neighbours says how fast the surface
+            // turns on screen - positive over a ridge, negative in a valley - and becomes a
+            // multiplier on the final colour: up to x(1 + ridge^2) on ridges, down to
+            // x(1 - 0.71 valley^2) in valleys. Because it's measured in screen pixels, zooming in
+            // makes the same crease read softer and zooming out makes fine detail pop - the look
+            // Blender users expect, and why it needs no tuning per mesh density.
+            //
+            // Returns 1 (no change) when this camera has no cavity buffer, and at silhouettes:
+            // Workbench rejects a pixel whose neighbours belong to another object (via its
+            // object-id buffer); the nearest thing this buffer carries is a jump in eye depth,
+            // which also covers the empty background (w = 0) around the model's outline.
+            half ScreenCavityFactor(float4 positionCS)
+            {
+                if (_SculptCavityParams.x < 0.5)
+                    return 1.0;
+
+                float2 uv = GetNormalizedScreenSpaceUV(positionCS);
+                float2 dx = float2(_SculptCavityTexel.x * _SculptCavityParams.w, 0.0);
+                float2 dy = float2(0.0, _SculptCavityTexel.y * _SculptCavityParams.w);
+
+                float4 centre = SAMPLE_TEXTURE2D_LOD(_SculptCavityNormals, sampler_LinearClamp, uv, 0);
+                float4 up     = SAMPLE_TEXTURE2D_LOD(_SculptCavityNormals, sampler_LinearClamp, uv + dy, 0);
+                float4 down   = SAMPLE_TEXTURE2D_LOD(_SculptCavityNormals, sampler_LinearClamp, uv - dy, 0);
+                float4 right  = SAMPLE_TEXTURE2D_LOD(_SculptCavityNormals, sampler_LinearClamp, uv + dx, 0);
+                float4 left   = SAMPLE_TEXTURE2D_LOD(_SculptCavityNormals, sampler_LinearClamp, uv - dx, 0);
+
+                float4 neighbourDepth = float4(up.w, down.w, right.w, left.w);
+                if (centre.w <= 0.0 || any(abs(neighbourDepth - centre.w) > centre.w * 0.05))
+                    return 1.0;
+
+                float normalDiff = (up.y - down.y) + (right.x - left.x);
+                float curvature = normalDiff < 0.0
+                    ? -2.0 * CavitySoftClamp(-normalDiff, _SculptCavityParams.z)
+                    :  2.0 * CavitySoftClamp(normalDiff, _SculptCavityParams.y);
+                return (half)clamp(1.0 + curvature, 0.0, 4.0);
             }
 
             Varyings SculptPBRVertex(Attributes input)
@@ -225,17 +267,11 @@ Shader "Custom/SculptPBR"
             // Takes normalWS AFTER flat-shading and the procedural normal detail have had their
             // say, so faceting and surface grain read through a matcap exactly as they do under
             // real lights.
-            half3 MatcapShade(float3 normalWS, half cavity)
+            half3 MatcapShade(float3 normalWS)
             {
                 float3 normalVS = normalize(mul((float3x3)UNITY_MATRIX_V, normalWS));
                 float2 matcapUV = normalVS.xy * 0.5 + 0.5;
                 half3 color = SAMPLE_TEXTURE2D(_MatcapTex, sampler_MatcapTex, matcapUV).rgb * _MatcapIntensity;
-
-                // Cavity goes ON TOP of the matcap, not underneath it. There is no lighting term
-                // in this path for a tinted albedo to survive into, so shading the albedo the way
-                // the PBR path does would have thrown the cavity away entirely.
-                if (_CavityEnabled > 0.5)
-                    color = ApplyCavity(color, cavity);
 
                 // Off by default: a matcap carries its own colour and multiplying the base colour
                 // through it just fights that. Kept as a dial for the grey-clay case, where a
@@ -291,32 +327,20 @@ Shader "Custom/SculptPBR"
                 // so it's flipped to agree with the smooth normal's general direction rather
                 // than trusting a fixed cross-product order.
                 float3 positionOS = TransformWorldToObject(input.positionWS);
-                float3 smoothNormalWS = normalize(input.normalWS);
-                float3 normalWS;
-                if (_FlatShading > 0.5)
-                {
-                    float3 flatNormalWS = normalize(cross(ddy(input.positionWS), ddx(input.positionWS)));
-                    normalWS = dot(flatNormalWS, smoothNormalWS) < 0.0 ? -flatNormalWS : flatNormalWS;
-                }
-                else
-                {
-                    normalWS = smoothNormalWS;
-                }
+                float3 normalWS = SculptShadingNormalWS(input.positionWS, input.normalWS);
                 if (_NormalStrength > 0.0001)
                     normalWS = PerturbNormal(normalWS, positionOS);
 
                 half4 litColor;
                 if (_MatcapEnabled > 0.5)
-                {
-                    litColor = half4(MatcapShade(normalWS, input.color.r), 1.0);
-                }
+                    litColor = half4(MatcapShade(normalWS), 1.0);
                 else
-                {
-                    half3 albedo = _BaseColor.rgb;
-                    if (_CavityEnabled > 0.5)
-                        albedo = ApplyCavity(albedo, input.color.r);
-                    litColor = PhysicallyShade(input, normalWS, albedo);
-                }
+                    litColor = PhysicallyShade(input, normalWS, _BaseColor.rgb);
+
+                // Cavity multiplies the FINISHED colour, as Workbench composites it - over a
+                // matcap's baked lighting or the lit PBR result alike - and before the mask tint,
+                // so a masked crease still reads as a crease.
+                litColor.rgb *= ScreenCavityFactor(input.positionCS);
 
                 // vertex color .g: 0 = unmasked, 1 = fully protected (written by
                 // SculptableMesh.PaintMask/RecomputeCavityAt). Darkens the fully-lit result
@@ -330,6 +354,63 @@ Shader "Custom/SculptPBR"
                 half mask = input.color.g;
                 litColor.rgb = lerp(litColor.rgb, litColor.rgb * _MaskTintColor.rgb, saturate(mask * _MaskTintStrength));
                 return litColor;
+            }
+            ENDHLSL
+        }
+
+        // Feeds ScreenCavityFeature's buffer: view-space normal + eye depth, drawn before
+        // opaques. Same vertex transform as ForwardLit so each forward fragment finds its own
+        // surface at the centre of the buffer. The procedural normal detail is deliberately left
+        // out - it's surface grain, and cavity would outline every speck of it.
+        Pass
+        {
+            Name "SculptCavityNormals"
+            Tags { "LightMode" = "SculptCavityNormals" }
+            ZWrite On
+            ZTest LEqual
+
+            HLSLPROGRAM
+            #pragma target 3.5
+            #pragma vertex CavityNormalsVertex
+            #pragma fragment CavityNormalsFragment
+            #pragma multi_compile_instancing
+
+            struct Attributes
+            {
+                float4 positionOS : POSITION;
+                float3 normalOS   : NORMAL;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+                float3 positionWS : TEXCOORD0;
+                float3 normalWS   : TEXCOORD1;
+                UNITY_VERTEX_OUTPUT_STEREO
+            };
+
+            Varyings CavityNormalsVertex(Attributes input)
+            {
+                Varyings output = (Varyings)0;
+                UNITY_SETUP_INSTANCE_ID(input);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
+
+                VertexPositionInputs posInputs = GetVertexPositionInputs(input.positionOS.xyz);
+                output.positionCS = posInputs.positionCS;
+                output.positionWS = posInputs.positionWS;
+                output.normalWS = TransformObjectToWorldNormal(input.normalOS);
+                return output;
+            }
+
+            float4 CavityNormalsFragment(Varyings input) : SV_Target
+            {
+                float3 normalWS = SculptShadingNormalWS(input.positionWS, input.normalWS);
+                float3 normalVS = normalize(mul((float3x3)UNITY_MATRIX_V, normalWS));
+                // Eye depth from the view-space position, not positionCS.w, so it's right under
+                // an orthographic camera too.
+                float eyeDepth = -TransformWorldToView(input.positionWS).z;
+                return float4(normalVS, eyeDepth);
             }
             ENDHLSL
         }

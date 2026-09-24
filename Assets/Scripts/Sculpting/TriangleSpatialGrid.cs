@@ -78,9 +78,9 @@ namespace Sculpting
         public TriangleSpatialGrid(Vector3[] vertices, int[] triangles, Bounds bounds, float cellSize)
             : this(vertices, vertices.Length, triangles, triangles.Length, bounds, cellSize) { }
 
-        /// vertexCount/cornerCount bound what is bucketed - past the first dynamic-topology refine
-        /// both arrays carry spare capacity (see SculptableMesh.Vertices), and the spare triangles
-        /// are degenerate ones on vertex 0 that would be registered and ray-tested forever.
+        /// vertexCount/cornerCount bound what is bucketed - both arrays can carry spare capacity
+        /// (see SculptableMesh.Vertices), and the spare triangles are degenerate ones on vertex 0
+        /// that would be registered and ray-tested forever.
         public TriangleSpatialGrid(Vector3[] vertices, int vertexCount, int[] triangles, int cornerCount,
                                    Bounds bounds, float cellSize)
         {
@@ -264,15 +264,15 @@ namespace Sculpting
         private int _triangleCount;
         private int _vertexCellCount;
 
-        /// How many triangles this index currently holds registrations for. Dynamic topology
-        /// appends past this; anything at or beyond it has not been bucketed yet.
+        /// How many triangles this index currently holds registrations for. AppendTriangles adds
+        /// past this; anything at or beyond it has not been bucketed yet.
         public int TriangleCount => _triangleCount;
 
         /// Registers `count` triangles starting at triangle index `from` that did not exist when
         /// this index was built, and buckets the vertices they introduced.
         ///
-        /// O(count), the whole point: a refine adds triangles inside one brush footprint, and
-        /// rebuilding the grid for them would cost a pass over every triangle in the mesh. The
+        /// O(count), the whole point: triangles added inside one brush footprint would otherwise
+        /// cost a pass over every triangle in the mesh to bucket. The
         /// grid's BOUNDS and cell size are fixed at construction either way - new geometry outside
         /// the box is handled the way moved geometry already is, by SculptableMesh noticing the
         /// mesh no longer fits and rebuilding (see MeshBoundsFitInsideTriangleGrid).

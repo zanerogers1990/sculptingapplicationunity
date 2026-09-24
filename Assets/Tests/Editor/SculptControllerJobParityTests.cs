@@ -135,9 +135,6 @@ namespace Sculpting.Tests
         {
             Configure(radius: 0.2f, strength: 0.6f, maskAndFrontFacing);
             _controller.Accumulate = accumulate;
-            // With Build Up on Hold off, Inflate paces its deposit by stroke speed, which is zero
-            // here - both paths would do nothing and agree vacuously. On, it builds at the floor rate.
-            _controller.BuildUpOnHold = true;
 
             var job = Bind<InflateOrFlattenPath>("ApplyInflateBrushLocalJob");
             var managed = Bind<InflateOrFlattenPath>("ApplyInflateBrushLocalManaged");
@@ -146,6 +143,94 @@ namespace Sculpting.Tests
             AssertParity("Inflate", DabSequenceTolerance,
                 Run(dabs, d => managed(d.Point, d.Normal, positive, FrameDt, d.Candidates, Verts, Normals)),
                 Run(dabs, d => job(d.Point, d.Normal, positive, FrameDt, d.Candidates, Verts, Normals)));
+        }
+
+        /// A custom falloff curve reaches the Burst jobs through a SharedStatic (see BrushFalloff),
+        /// which a job can silently fail to see - so the job and managed paths are compared with
+        /// one installed, and the job is checked to actually respond to it.
+        [Test]
+        public void CustomFalloffCurve([Values("Inflate", "Crease", "Clay", "Standard")] string brush)
+        {
+            Sequence builtIn = RunFalloffCase(brush, jobs: true);
+            BrushFalloff.SetActive(BrushFalloffCurve.Preset(FalloffPreset.Plateau));
+            try
+            {
+                switch (brush)
+                {
+                    case "Inflate": Inflate(accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                    case "Crease": Crease(accumulate: false, positive: false, maskAndFrontFacing: false); break;
+                    case "Clay": Clay(1f, accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                    default: StandardAndLayer("ApplyStandardBrushLocal", accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                }
+                Sequence curved = RunFalloffCase(brush, jobs: true);
+                float change = MaxDelta(builtIn.Vertices, curved.Vertices, out _);
+                Assert.That(change, Is.GreaterThan(DabSequenceTolerance * MeaningfulDisplacementFactor),
+                    $"{brush}: the job ignored the custom falloff curve.");
+            }
+            finally
+            {
+                BrushFalloff.SetActive(null);
+            }
+        }
+
+        private Sequence RunFalloffCase(string brush, bool jobs)
+        {
+            Configure(radius: 0.2f, strength: 0.5f, maskAndFrontFacing: false);
+            _controller.Accumulate = true;
+            bool jobsBefore = _controller.UseBurstJobs;
+            _controller.UseBurstJobs = jobs;
+            try
+            {
+                string method = brush == "Crease" ? null : "Apply" + brush + "BrushLocal";
+                List<Dab> dabs = BuildDabs(LongPath, _controller.BrushRadius, withDirection: brush == "Crease");
+                if (brush == "Crease")
+                {
+                    var carve = Bind<CarvePath>("ApplyCarveDabLocalJob");
+                    return Run(dabs, d => carve(d.Point, d.Normal, d.Direction, false, d.Candidates, Verts));
+                }
+                if (brush == "Clay")
+                {
+                    var clay = Bind<ClayPath>("ApplyClayBrushLocalJob");
+                    BuildTangentBasis(dabs[0].Normal, out Vector3 t0, out Vector3 b0);
+                    float radius = _controller.BrushRadius, soft = _controller.ClayEdgeSoftness;
+                    return Run(dabs, d => clay(d.Point, d.Normal, t0, b0, true, 0.05f, d.Candidates, Verts, Normals, radius, soft));
+                }
+                var apply = Bind<Action<Vector3, Vector3, bool, float>>(method);
+                return Run(dabs, d => apply(d.Point, d.Normal, true, 0.1f));
+            }
+            finally
+            {
+                _controller.UseBurstJobs = jobsBefore;
+            }
+        }
+
+        /// Standard and Layer choose their path inside one entry point, so the two runs flip
+        /// useBurstJobs instead of calling the paths directly. dt is the dab quantum production uses.
+        [Test]
+        public void StandardAndLayer([Values("ApplyStandardBrushLocal", "ApplyLayerBrushLocal")] string method,
+            [Values(true, false)] bool accumulate, [Values(true, false)] bool positive,
+            [Values(false, true)] bool maskAndFrontFacing)
+        {
+            Configure(radius: 0.2f, strength: 0.6f, maskAndFrontFacing);
+            _controller.Accumulate = accumulate;
+            _controller.LayerHeight = 0.15f;
+            var apply = Bind<Action<Vector3, Vector3, bool, float>>(method);
+            List<Dab> dabs = BuildDabs(LongPath, _controller.BrushRadius, withDirection: false);
+            const float dabDt = 0.1f; // DabTimeQuantum
+
+            bool jobsBefore = _controller.UseBurstJobs;
+            try
+            {
+                _controller.UseBurstJobs = false;
+                Sequence managed = Run(dabs, d => apply(d.Point, d.Normal, positive, dabDt));
+                _controller.UseBurstJobs = true;
+                Sequence job = Run(dabs, d => apply(d.Point, d.Normal, positive, dabDt));
+                AssertParity(method, DabSequenceTolerance, managed, job);
+            }
+            finally
+            {
+                _controller.UseBurstJobs = jobsBefore;
+            }
         }
 
         [Test]
@@ -212,7 +297,7 @@ namespace Sculpting.Tests
             List<Dab> dabs = BuildDabs(LongPath, queryRadius, withDirection: false);
             // Production freezes the square tip's frame at the first dab of a stroke.
             BuildTangentBasis(dabs[0].Normal, out Vector3 tangent0, out Vector3 bitangent0);
-            const float dabDt = 0.04f; // Clay's dab quantum: spacing / ClayReferenceStrokeSpeed at this radius
+            const float dabDt = 0.05f; // Clay's dab quantum - see ClayDabTimeQuantum
             float softness = _controller.ClayEdgeSoftness;
 
             AssertParity("Clay", DabSequenceTolerance,
@@ -294,7 +379,7 @@ namespace Sculpting.Tests
 
         private void RunRelax(float passAmount, bool independentCandidates, bool bounded)
         {
-            float relaxRadius = _controller.BrushRadius * 2.5f; // RelaxRadiusFactor
+            float relaxRadius = _controller.BrushRadius * 1f; // RelaxRadiusFactor
             List<Dab> centres = BuildDabs(ShortPath, relaxRadius, withDirection: false);
 
             var candidates = new List<int>();
@@ -554,7 +639,7 @@ namespace Sculpting.Tests
         /// fifth of an edge on top - the cell-scale roughness a remeshed sculpt has, and what gives the
         /// Laplacian tests something to move. Deterministic, closed, no duplicate vertices.
         /// 7 subdivisions is 163,842 vertices / 327,680 triangles; 8 is 655,362 / 1,310,720.
-        private static Mesh BuildNoisyIcosphere(int subdivisions)
+        internal static Mesh BuildNoisyIcosphere(int subdivisions)
         {
             float t = (1f + Mathf.Sqrt(5f)) * 0.5f;
             var verts = new List<Vector3>

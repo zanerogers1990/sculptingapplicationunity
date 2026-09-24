@@ -163,29 +163,6 @@ namespace Sculpting
             _smoothedPenPressure = Mathf.Lerp(_smoothedPenPressure, raw, Mathf.Clamp01(Time.deltaTime * PressureSmoothingSpeed));
         }
 
-        private const float StrokeSpeedSmoothingSpeed = 15f;
-        private Vector3? _lastStrokeHitPointWorld;
-        private float _strokeSpeed;
-
-        // Called once per brush application (not per Mirror copy - see UpdatePenPressure's own
-        // remarks on why that matters) from each accumulate-capable brush's Handle*Input, right
-        // after that frame's raycast hit is known. Smoothed for the same reason pressure is -
-        // raw per-frame speed is noisy (frame-time jitter, small hand tremor), and feeding that
-        // straight into the accumulate rate would just trade "blob at the stop" for "flicker
-        // mid-stroke".
-        private void UpdateStrokeSpeed(Vector3 worldHitPoint)
-        {
-            float dt = Mathf.Max(Time.deltaTime, 0.0001f);
-            // No prior point on a stroke's first frame - every stroke's first touch is
-            // inherently a stationary point sample, not yet a stroke, so treat it as speed 0
-            // (gentle first dab) rather than assuming full speed.
-            float instant = _lastStrokeHitPointWorld.HasValue
-                ? Vector3.Distance(worldHitPoint, _lastStrokeHitPointWorld.Value) / dt
-                : 0f;
-            _lastStrokeHitPointWorld = worldHitPoint;
-            _strokeSpeed = Mathf.Lerp(_strokeSpeed, instant, Mathf.Clamp01(dt * StrokeSpeedSmoothingSpeed));
-        }
-
         public bool IsAdjustingStrength => _isAdjustingStrength;
 
         /// True while the R-hold gauge is armed - SculptUIBuilder reads this to know when to
@@ -307,7 +284,10 @@ namespace Sculpting
             var kb = Keyboard.current;
             if (kb == null || !kb.deleteKey.wasPressedThisFrame) return;
             if (IsTypingInUI()) return;
-            if (Gizmo != null && Gizmo.Mode == GizmoMode.ZSphere) return;
+            // Also skipped in Mold mode for the same reason: there Delete means "remove the
+            // selected pin/sprue/vent" (see MoldController.HandleKeys), and letting both fire
+            // would take the model with it.
+            if (Gizmo != null && (Gizmo.Mode == GizmoMode.ZSphere || Gizmo.Mode == GizmoMode.Mold)) return;
 
             if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
             if (_sceneGraphPanel == null) return;
@@ -356,6 +336,9 @@ namespace Sculpting
             else if (kb.digit5Key.wasPressedThisFrame) CurrentBrush = BrushType.Inflate;
             else if (kb.digit6Key.wasPressedThisFrame) CurrentBrush = BrushType.Flatten;
             else if (kb.digit7Key.wasPressedThisFrame) CurrentBrush = BrushType.Pose;
+            else if (kb.digit8Key.wasPressedThisFrame) CurrentBrush = BrushType.Standard;
+            else if (kb.digit9Key.wasPressedThisFrame) CurrentBrush = BrushType.Layer;
+            else if (kb.digit0Key.wasPressedThisFrame) CurrentBrush = BrushType.SnakeHook;
 
             // M used to trigger Remesh directly; moved to R (still reachable via the Remesh
             // button in the Brush panel either way, or a plain R tap - see
@@ -433,7 +416,7 @@ namespace Sculpting
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while resizing
                 _isResizingBrush = true;
-                _resizeStartRadius = brushRadius;
+                _resizeStartRadius = BrushSize;
                 _resizeStartMouseX = mouse.position.ReadValue().x;
                 _resizeAnchorScreenPos = mouse.position.ReadValue();
             }
@@ -445,7 +428,42 @@ namespace Sculpting
             if (!_isResizingBrush) return;
 
             float deltaX = mouse.position.ReadValue().x - _resizeStartMouseX;
-            BrushRadius = _resizeStartRadius + deltaX * ResizeSensitivity;
+            // In pixels the drag maps one-to-one onto the ring's diameter: half a pixel of radius
+            // per pixel of travel.
+            BrushSize = _resizeStartRadius + deltaX * (screenSpaceBrushSize ? 0.5f : ResizeSensitivity);
+        }
+
+        /// Screen-space brush size (see screenSpaceBrushSize): turns BrushScreenRadius into the
+        /// world-space brushRadius every brush reads, at the depth of the surface under the cursor -
+        /// or, off the model, at the distance the ring cursor itself falls back to - so the ring
+        /// keeps its size on screen however far the camera is.
+        ///
+        /// Frozen while a mouse button is held. A stroke has to keep one world size from press to
+        /// release: re-deriving it per frame would change the footprint mid-stroke every time the
+        /// surface under the cursor moved nearer or further (a stroke over a curved form, or up a
+        /// Clay build-up's own rising wall). Runs before HandleSculptInput, so the press frame
+        /// itself freezes the size the ring was showing on the frame before.
+        private void SyncScreenSpaceBrushRadius()
+        {
+            if (!screenSpaceBrushSize || cam == null || sculptableMesh == null) return;
+            Mouse mouse = Mouse.current;
+            if (mouse != null && (mouse.leftButton.isPressed || mouse.rightButton.isPressed)) return;
+
+            Vector3 worldPoint;
+            if (_isHovering)
+            {
+                worldPoint = _hoverPoint;
+            }
+            else
+            {
+                if (mouse == null) return;
+                float fallbackDistance = Mathf.Max(1f, Vector3.Distance(cam.transform.position, sculptableMesh.transform.position));
+                worldPoint = cam.ScreenPointToRay(mouse.position.ReadValue()).GetPoint(fallbackDistance);
+            }
+
+            float pixelsPerWorldUnit = ProjectDiameterToScreenPixels(worldPoint, 1f) * 0.5f;
+            if (pixelsPerWorldUnit <= 0f) return;
+            BrushRadius = brushScreenRadius / pixelsPerWorldUnit / Mathf.Max(AverageScale(), 1e-6f);
         }
 
         // Holding F enters a strength-adjust mode (instead of sculpting) where horizontal
@@ -630,7 +648,7 @@ namespace Sculpting
             float scroll = mouse.scroll.ReadValue().y;
             if (Mathf.Abs(scroll) < 0.01f) return;
 
-            BrushRadius = brushRadius * (1f + Mathf.Sign(scroll) * ScrollResizePercentPerNotch);
+            BrushSize = BrushSize * (1f + Mathf.Sign(scroll) * ScrollResizePercentPerNotch);
         }
 
         /// Double-clicking anywhere in the viewport (that isn't UI, and isn't the Alt-orbit
@@ -813,6 +831,20 @@ namespace Sculpting
             _showBrushCursor = show;
             if (show) _brushCursorColor = color;
             Cursor.visible = !show && !_showRegionCrosshair;
+        }
+
+        /// Everything this component draws over the viewport, put away for the turntable's clean
+        /// view. Cursor.visible is left alone: TurntableController owns the pointer there.
+        private void EnterPresentationIdle()
+        {
+            _isHovering = false;
+            // Cleared so the wheel zooms the camera anywhere in the clean view, rather than
+            // being held by a brush resize that can't happen there.
+            IsHoveringSculptSurface = false;
+            _showBrushCursor = false;
+            _showRegionCrosshair = false;
+            for (int i = 0; i < _poseChainLines.Count; i++)
+                if (_poseChainLines[i] != null) _poseChainLines[i].gameObject.SetActive(false);
         }
 
         // Measures how many screen pixels `worldRadius` covers at `worldCenter` by projecting

@@ -41,12 +41,18 @@ namespace Sculpting
         [Header("Brush Settings")]
         [SerializeField, Range(0.01f, 1f)] private float brushStrength = 0.1f;
         [SerializeField, Range(0.05f, 2f)] private float brushRadius = 0.5f;
+        // ZBrush's "Draw Size": the brush is sized in SCREEN pixels, so it stays the same size on
+        // screen as you zoom in for detail or out for big forms, and brushRadius (the world-space
+        // value every brush actually reads) follows from it - see SyncScreenSpaceBrushRadius. Off
+        // is the old behaviour: a fixed world size that looks bigger the closer you get.
+        [SerializeField] private bool screenSpaceBrushSize = true;
+        [SerializeField, Range(MinBrushScreenRadius, MaxBrushScreenRadius)] private float brushScreenRadius = 60f;
         [SerializeField] private BrushType currentBrush = BrushType.Move;
         [SerializeField] private bool isPositive = true;
         [SerializeField] private bool accumulate = true;
         // Multiplies the build-up rate of BOTH paths - the Accumulate-on rate
-        // (EffectiveBrushStrengthAccumulate) and the Accumulate-off ease-toward-a-plateau rate
-        // (EffectiveBrushStrengthPlateau). Lets a stroke build up faster or slower than
+        // (EffectiveDabStrengthAccumulate) and the Accumulate-off ease-toward-a-plateau rate
+        // (EffectiveDabStrength). Lets a stroke build up faster or slower than
         // brushStrength alone would give, without touching brushStrength itself. Shown as
         // "Build-Up Strength" rather than "Accumulate Strength": it used to apply only to the
         // Accumulate-on path, which made it a dead control on every brush that defaults to
@@ -62,7 +68,7 @@ namespace Sculpting
         // When ON, a brush held motionless keeps deforming (the ZBrush/Blender "airbrush" feel).
         // When OFF - the default - a stroke's build-up is paced by how far the cursor TRAVELS
         // rather than how long it is held, so stopping stops, and slowing down to place a
-        // careful crease no longer buries it under extra material. See AccumulateSpeedFactor.
+        // careful crease no longer buries it under extra material. See StepDabStroke.
         // Shared across brushes rather than per-brush (like Lazy Mouse, unlike Accumulate): it
         // is a statement about how strokes should feel, not about one brush's behaviour.
         [SerializeField] private bool buildUpOnHold = false;
@@ -132,6 +138,7 @@ namespace Sculpting
             var accum = new bool[Enum.GetValues(typeof(BrushType)).Length];
             accum[(int)BrushType.Clay] = true;
             accum[(int)BrushType.Inflate] = true;
+            accum[(int)BrushType.Standard] = true;
             return accum;
         }
 
@@ -221,6 +228,17 @@ namespace Sculpting
         // three separate brushes, since Flatten/Fill/Scrape differ ONLY by where this plane sits.
         [SerializeField, Range(-0.5f, 0.5f)] private float flattenPlaneOffset = 0f;
 
+        [Header("Layer Brush")]
+        // How far one Layer stroke raises (or, inverted, lowers) the surface, as a fraction of
+        // brushRadius. A stroke never goes past it however many times it crosses itself.
+        [SerializeField, Range(0.02f, 1f)] private float layerHeight = 0.15f;
+
+        [Header("Move Brush")]
+        // ZBrush's Move Topological: grab only what is connected to the point under the cursor
+        // through the surface inside the brush, so a Move on one finger does not also drag the
+        // finger next to it, or the lip below the one being moved.
+        [SerializeField] private bool moveConnectedOnly = false;
+
         [Header("Masking")]
         // 0 = smoothstep across the whole radius (soft, gradual edges), 1 = full weight
         // everywhere inside the radius with a hard cutoff (immediate, opaque) - see
@@ -229,37 +247,6 @@ namespace Sculpting
 
         [Header("Remesh Settings")]
         [SerializeField, Range(4, 500)] private int remeshResolution = 24;
-
-        [Header("Dynamic Topology")]
-        // The manual Remesh above rebuilds the WHOLE mesh at one uniform resolution; this refines
-        // locally as you sculpt, inside the brush footprint only. Off by default - see
-        // DynamicTopologySettings.Enabled for why that is not just caution.
-        [SerializeField] private DynamicTopology.DynamicTopologySettings dynamicTopology =
-            new DynamicTopology.DynamicTopologySettings();
-
-        public DynamicTopology.DynamicTopologySettings DynamicTopologySettings => dynamicTopology;
-
-        public bool DynamicTopologyEnabled
-        {
-            get => dynamicTopology.Enabled;
-            set => dynamicTopology.Enabled = value;
-        }
-
-        public float DynamicTopologyDetailSize
-        {
-            get => dynamicTopology.DetailSize;
-            set => dynamicTopology.DetailSize = Mathf.Clamp(value, MinDetailSize, MaxDetailSize);
-        }
-
-        public const float MinDetailSize = 0.002f;
-        public const float MaxDetailSize = 0.12f;
-
-        // Created lazily rather than in Awake: it holds only settings and throttle state, and a
-        // controller that never turns dynamic topology on should not allocate it at all.
-        private DynamicTopology.DynamicTopologyRemesher _dynamicTopologyRemesher;
-
-        private DynamicTopology.DynamicTopologyRemesher DynamicTopologyRemesher =>
-            _dynamicTopologyRemesher ??= new DynamicTopology.DynamicTopologyRemesher(dynamicTopology);
 
         [Header("Symmetry Repair")]
         // Which plane the correspondence-map tools work across. Deliberately its own setting
@@ -326,9 +313,9 @@ namespace Sculpting
         // on the other side of 1, not a smaller floor alone.
         [SerializeField, Range(0.5f, 3f)] private float pressureCurve = 1.6f;
 
-        // Was 0.05 - too coarse once the camera is zoomed in close (CameraOrbitController's
-        // minDistance is 0.5) for fine detail work: the smallest available brush still covered
-        // a visibly large patch of the zoomed-in surface. 0.01 matches the floor
+        // Was 0.05 - too coarse once the camera is zoomed in close (CameraOrbitController lets it
+        // approach to within minSurfaceGap of the surface) for fine detail work: the smallest
+        // available brush still covered a visibly large patch of the zoomed-in surface. 0.01 matches the floor
         // RebuildSpatialIndex/QueryNear already clamp their own cell size to, so the rest of the
         // brush pipeline was already exercised at this scale.
         public const float MinBrushRadius = 0.01f;
@@ -337,6 +324,9 @@ namespace Sculpting
         // effectiveReach), on top of ordinary sculpting on a bigger-than-default figure. See
         // ResizeSensitivity above, scaled to match.
         public const float MaxBrushRadius = 8f;
+        // Screen-space brush size bounds, in pixels of RADIUS. 60 is ZBrush's default Draw Size.
+        public const float MinBrushScreenRadius = 2f;
+        public const float MaxBrushScreenRadius = 600f;
 
         private bool _isHovering;
         private Vector3 _hoverPoint;
@@ -387,11 +377,37 @@ namespace Sculpting
         }
 
         // One value for every brush, unlike BrushStrength above - see _brushStrengthPerType.
+        // Always the WORLD-space radius the brushes use. In screen-space mode it is derived every
+        // frame from BrushScreenRadius, so setting it directly only lasts until the next frame -
+        // user-facing controls go through BrushSize instead.
         public float BrushRadius
         {
             get => brushRadius;
             set => brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
         }
+
+        public bool ScreenSpaceBrushSize { get => screenSpaceBrushSize; set => screenSpaceBrushSize = value; }
+
+        public float BrushScreenRadius
+        {
+            get => brushScreenRadius;
+            set => brushScreenRadius = Mathf.Clamp(value, MinBrushScreenRadius, MaxBrushScreenRadius);
+        }
+
+        /// The brush size in whichever unit the user is working in - pixels in screen-space mode,
+        /// world units otherwise. What the size sliders, S-drag and scroll-resize all edit.
+        public float BrushSize
+        {
+            get => screenSpaceBrushSize ? brushScreenRadius : brushRadius;
+            set
+            {
+                if (screenSpaceBrushSize) BrushScreenRadius = value;
+                else BrushRadius = value;
+            }
+        }
+
+        public float BrushSizeMin => screenSpaceBrushSize ? MinBrushScreenRadius : MinBrushRadius;
+        public float BrushSizeMax => screenSpaceBrushSize ? MaxBrushScreenRadius : MaxBrushRadius;
 
         // Action toast (Undo/Redo/Save/Save As) - see TriggerActionToast/_actionToastTimer.
         public bool ShowActionToast => _actionToastTimer > 0f;
@@ -444,6 +460,7 @@ namespace Sculpting
                     EndActiveDrags();
                     _lastCarveStrokeLocal = null;
                     _lastClayStrokeLocal = null;
+                    ResetDabStroke();
                     _brushPolarity[(int)currentBrush] = isPositive;
                     _brushAccumulate[(int)currentBrush] = accumulate;
                     _accumulateStrengthPerType[(int)currentBrush] = accumulateStrength;
@@ -508,6 +525,44 @@ namespace Sculpting
         public float CreasePinch { get => creasePinch; set => creasePinch = Mathf.Clamp01(value); }
         public float CreaseDepthFactor { get => creaseDepthFactor; set => creaseDepthFactor = Mathf.Clamp(value, 0.05f, 1f); }
         public float FlattenPlaneOffset { get => flattenPlaneOffset; set => flattenPlaneOffset = Mathf.Clamp(value, -0.5f, 0.5f); }
+        public float LayerHeight { get => layerHeight; set => layerHeight = Mathf.Clamp(value, 0.02f, 1f); }
+
+        // ------------------------------------------------------------------ falloff curves
+
+        // Per brush, like strength: null is the brush's own built-in falloff. See BrushFalloff.
+        private readonly BrushFalloffCurve[] _falloffCurves = new BrushFalloffCurve[Enum.GetValues(typeof(BrushType)).Length];
+        private BrushFalloffCurve _syncedFalloff;
+        private int _syncedFalloffVersion = -1;
+
+        /// The current brush's custom falloff, or null while it uses its built-in one. The curve
+        /// editor edits this instance in place and calls Normalize, which bumps its Version.
+        public BrushFalloffCurve CurrentFalloffCurve => _falloffCurves[(int)currentBrush];
+
+        public bool CustomFalloff
+        {
+            get => CurrentFalloffCurve != null;
+            set
+            {
+                if (value == CustomFalloff) return;
+                _falloffCurves[(int)currentBrush] = value ? BrushFalloffCurve.Preset(FalloffPreset.Smooth) : null;
+            }
+        }
+
+        public void SetFalloffPreset(FalloffPreset preset) =>
+            _falloffCurves[(int)currentBrush] = BrushFalloffCurve.Preset(preset);
+
+        /// Installs the current brush's curve as the active falloff table, when it changed. Mask
+        /// painting keeps its own Hardness control, so it never uses a curve.
+        private void SyncBrushFalloff()
+        {
+            BrushFalloffCurve curve = _isMaskPaintMode ? null : CurrentFalloffCurve;
+            int version = curve?.Version ?? -1;
+            if (curve == _syncedFalloff && version == _syncedFalloffVersion) return;
+            BrushFalloff.SetActive(curve);
+            _syncedFalloff = curve;
+            _syncedFalloffVersion = version;
+        }
+        public bool MoveConnectedOnly { get => moveConnectedOnly; set => moveConnectedOnly = value; }
         public float MaskHardness { get => maskHardness; set => maskHardness = Mathf.Clamp01(value); }
         public bool UseAlpha { get => useAlpha; set => useAlpha = value; }
         public BrushAlphaType AlphaType { get => alphaType; set => alphaType = value; }
@@ -713,6 +768,17 @@ namespace Sculpting
             if (_strokeEndFadeTimer > 0f) _strokeEndFadeTimer = Mathf.Max(0f, _strokeEndFadeTimer - Time.deltaTime);
 
             SyncSelectionTarget();
+
+            // The turntable's clean view is a presentation: no strokes, no brush ring, and none
+            // of the bare-key shortcuts - an R there would remesh, a Z undo, a Delete prompt for
+            // an object no panel is showing. A stroke already underway still gets its release.
+            if (TurntableController.CleanViewActive)
+            {
+                EnterPresentationIdle();
+                HandleStrokeEndCommit();
+                return;
+            }
+
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
             HandleBrushStrengthKey();
@@ -724,6 +790,8 @@ namespace Sculpting
             HandleDeleteObjectKey();
             UpdatePoseChainVisual();
             UpdatePenPressure();
+            SyncScreenSpaceBrushRadius();
+            SyncBrushFalloff();
             HandleSculptInput();
             HandleBrushSizeScroll();
             HandleStrokeEndCommit();
@@ -733,7 +801,16 @@ namespace Sculpting
         // Cursor.visible is a global OS setting, not per-component - if this component (or the
         // whole app) goes away while the ring cursor had it hidden, the real pointer must come
         // back or the user is left with no visible cursor at all outside this app's control.
-        private void OnDisable() => Cursor.visible = true;
+        private void OnDisable()
+        {
+            Cursor.visible = true;
+            // The falloff table is process-wide (see BrushFalloff) and outlives this component -
+            // leaving a custom curve installed would bend every brush in the next session, or in
+            // the editor's tests.
+            BrushFalloff.SetActive(null);
+            _syncedFalloff = null;
+            _syncedFalloffVersion = -1;
+        }
 
         private void OnApplicationFocus(bool hasFocus)
         {
@@ -761,8 +838,7 @@ namespace Sculpting
             _lastCarveStrokeLocal = null;
             _lastClayStrokeLocal = null;
             _lastClayStrokeNormalLocal = null;
-            _lastStrokeHitPointWorld = null;
-            _strokeSpeed = 0f;
+            ResetDabStroke();
         }
 
         private void HandleSculptInput()
@@ -864,18 +940,8 @@ namespace Sculpting
             {
                 sculptableMesh.PrepareSpatialIndex(Mathf.Max(brushRadius * 0.5f, 0.01f));
                 sculptableMesh.BeginStrokeUndo();
-                // Fresh stroke, fresh speed reading - without this, a new stroke's first frame
-                // would measure "speed" against wherever the cursor last hit the mesh at the END
-                // of a PREVIOUS, unrelated stroke (see UpdateStrokeSpeed's remarks).
-                _lastStrokeHitPointWorld = null;
-                _strokeSpeed = 0f;
-                // Fresh stroke, fresh touched-vertex set - see _strokeDirtyVertexScratch/
-                // ApplyPostStrokeUnifyPass.
-                _strokeDirtyVertexScratch.Clear(sculptableMesh.VertexCount);
-                // Fresh stroke, fresh refine cadence: the throttle measures distance since the last
-                // refine, and without this a stroke starting where the previous one left off would
-                // have to travel a quarter of a brush radius before refining anything.
-                _dynamicTopologyRemesher?.ResetThrottle();
+                // A fresh stroke never joins the segment the last one ended on.
+                ResetDabStroke();
             }
 
             switch (currentBrush)
@@ -890,10 +956,25 @@ namespace Sculpting
                     HandleCreaseInput(mouse, overUI, altHeld);
                     break;
                 case BrushType.Inflate:
-                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyInflateBrushLocal ??= ApplyInflateBrushLocal);
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyInflateBrushLocal ??= ApplyInflateBrushLocal,
+                        DabTimeQuantum, DabHoldMode.BuildUpOnHold, footprintNormal: false);
                     break;
                 case BrushType.Flatten:
-                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyFlattenBrushLocal ??= ApplyFlattenBrushLocal);
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyFlattenBrushLocal ??= ApplyFlattenBrushLocal,
+                        DabTimeQuantum, DabHoldMode.AlwaysWorks, footprintNormal: false);
+                    break;
+                case BrushType.Standard:
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyStandardBrushLocal ??= ApplyStandardBrushLocal,
+                        DabTimeQuantum, DabHoldMode.BuildUpOnHold, footprintNormal: true);
+                    break;
+                case BrushType.Layer:
+                    // Layer converges on its height, so holding it still is harmless and finishes
+                    // the layer under the cursor - like Flatten.
+                    HandleStandardBrushInput(mouse, overUI, altHeld, _applyLayerBrushLocal ??= ApplyLayerBrushLocal,
+                        DabTimeQuantum, DabHoldMode.AlwaysWorks, footprintNormal: true);
+                    break;
+                case BrushType.SnakeHook:
+                    HandleSnakeHookInput(mouse, overUI, altHeld);
                     break;
                 case BrushType.Pose:
                     HandlePoseInput(mouse, overUI, altHeld);

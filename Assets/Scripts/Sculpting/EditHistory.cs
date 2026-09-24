@@ -56,8 +56,10 @@ namespace Sculpting
             /// The edited object, or null for a scene action.
             public SculptableMesh Target;
             public string Label;
-            public Action Undo;
-            public Action Redo;
+            /// Returns false when the step no longer applies (see RecordSceneAction's Func
+            /// overload), which makes TakeStep skip on to the next one.
+            public Func<bool> Undo;
+            public Func<bool> Redo;
             public Action Discard;
             public long SceneBytes;
         }
@@ -84,6 +86,17 @@ namespace Sculpting
         /// into a new mesh. `approxBytes` is whatever the closures are holding alive, so the
         /// memory budget can see it; pass 0 for an action that retains nothing.
         public static void RecordSceneAction(string label, Action undo, Action redo, Action discard, long approxBytes)
+        {
+            if (undo == null || redo == null) return;
+            RecordSceneAction(label, () => { undo(); return true; }, () => { redo(); return true; }, discard, approxBytes);
+        }
+
+        /// The same, for a step that can stop applying after the fact - its closures return
+        /// false when there is nothing left for them to act on, and the press moves straight on
+        /// to the step before, exactly as a mesh step whose object was deleted already does.
+        /// Mold edits use this: a step recorded in one mold session means nothing once that
+        /// session is closed, and a press that silently did nothing would read as undo broken.
+        public static void RecordSceneAction(string label, Func<bool> undo, Func<bool> redo, Action discard, long approxBytes)
         {
             if (undo == null || redo == null) return;
             DiscardRedo();
@@ -139,7 +152,7 @@ namespace Sculpting
                 }
                 else
                 {
-                    if (undoing) step.Undo(); else step.Redo();
+                    if (!(undoing ? step.Undo() : step.Redo())) continue;
                 }
 
                 to.Add(step);

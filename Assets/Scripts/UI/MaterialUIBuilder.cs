@@ -8,7 +8,7 @@ using Sculpting.IO;
 namespace Sculpting
 {
     /// Builds the "Material" section: base PBR sliders (color, metallic, smoothness, normal
-    /// detail), the single-colour cavity recess controls, and the matcap palette, all wired
+    /// detail), the screen-space cavity (Ridge/Valley), and the matcap palette, all wired
     /// directly to SculptMaterialController.
     ///
     /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
@@ -76,14 +76,13 @@ namespace Sculpting
 
             Transform cavity = UIFactory.CreateFoldoutSection(panel, "Cavity", false);
             UIFactory.CreateToggle(cavity, "Enabled", _material.CavityEnabled, v => _material.CavityEnabled = v,
-                tooltip: "Darkens creases and recesses based on the mesh's curvature, like dirt collecting in tight spots.");
-            UIFactory.CreateColorPicker(cavity, "Recess Color", _material.RecessColor, c => _material.RecessColor = c);
-            UIFactory.CreateLabel(cavity, "Cavity Intensity", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityIntensity, v => _material.CavityIntensity = v,
-                "How strongly Recess Color blends into recesses - 0 is off, higher is darker.");
-            UIFactory.CreateLabel(cavity, "Cavity Range", 12, FontStyle.Normal);
-            UIFactory.CreateSlider(cavity, 0.05f, 2f, _material.CavityRange, v => _material.CavityRange = v,
-                "How sharp a crease must be to get tinted - low affects broad curves, high confines it to the deepest creases only.");
+                tooltip: "Screen-space cavity, like Blender's: brightens ridges and darkens creases so surface detail pops. Measured on screen, so it stays crisp at any mesh density.");
+            UIFactory.CreateLabel(cavity, "Ridge", 12, FontStyle.Normal);
+            UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityRidge, v => _material.CavityRidge = v,
+                "How much raised edges and ridges are brightened - 0 leaves them alone.");
+            UIFactory.CreateLabel(cavity, "Valley", 12, FontStyle.Normal);
+            UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityValley, v => _material.CavityValley = v,
+                "How much creases and recesses are darkened - 0 leaves them alone.");
 
             BuildMatcapSection(UIFactory.CreateFoldoutSection(panel, "Matcap", false));
         }

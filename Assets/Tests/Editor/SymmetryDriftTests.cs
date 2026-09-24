@@ -17,7 +17,7 @@ namespace Sculpting.Tests
     /// The mesh is built symmetric TO THE BIT across all three planes (see SymmetricTestMesh), so
     /// every vertex's partner is known exactly and no tolerance is needed to find it. A stroke is
     /// then driven through the production per-frame entry points - the same sign loops, flush and
-    /// post-stroke unify pass a real stroke takes - and the halves are compared vertex for vertex.
+    /// release refresh a real stroke takes - and the halves are compared vertex for vertex.
     /// The only asymmetry allowed is float rounding from sums visited in a different order on the
     /// two sides, which is orders of magnitude below anything a stroke does.
     ///
@@ -70,7 +70,7 @@ namespace Sculpting.Tests
         private Vector3[] _startVertices;
         private int[][] _partners;
 
-        private float _beforeUnifyPair, _beforeUnifyPlane, _strokeMs;
+        private float _strokeMs;
 
         public SymmetryDriftTests(int subdivisions) => _subdivisions = subdivisions;
 
@@ -138,9 +138,6 @@ namespace Sculpting.Tests
             _controller.BrushRadius = BrushRadius;
             _controller.BrushStrength = 0.5f;
             _controller.AccumulateStrength = 1f;
-            // Inflate paces its build-up by a stroke-speed tracker these tests never feed; with
-            // Build Up on Hold on it builds at the floor rate instead of not at all.
-            _controller.BuildUpOnHold = true;
             _controller.FrontFacingOnly = false;
             _controller.UseAlpha = false;
             _controller.FlattenPlaneOffset = 0f;
@@ -244,7 +241,6 @@ namespace Sculpting.Tests
 
             // What a mouse press does before the first frame of a stroke.
             _sculptable.BeginStrokeUndo();
-            TestReflection.Invoke(TestReflection.GetField(_controller, "_strokeDirtyVertexScratch"), "Clear", Verts.Length);
             TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
             TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
             TestReflection.SetField(_controller, "_lastCarveStrokeLocal", null);
@@ -274,9 +270,7 @@ namespace Sculpting.Tests
             }
             _strokeMs = (float)clock.Elapsed.TotalMilliseconds / StrokeFrames;
 
-            Measure(SymmetryMap.AxisX, out _beforeUnifyPair, out _beforeUnifyPlane, out _, out _);
             // What a mouse release does (HandleStrokeEndCommit, minus the undo commit).
-            TestReflection.Invoke(_controller, "ApplyPostStrokeUnifyPass");
             _sculptable.RefreshStrokeNormalsAndCurvature();
         }
 
@@ -292,8 +286,7 @@ namespace Sculpting.Tests
         {
             Measure(axis, out float pair, out float plane, out float displacement, out int worst);
             string report = $"{label} [axis {axis}]: pair {pair:E2}, plane {plane:E2}, " +
-                            $"displacement {displacement:E3} (before unify: pair {_beforeUnifyPair:E2}, " +
-                            $"plane {_beforeUnifyPlane:E2}), {_strokeMs:F2} ms/frame";
+                            $"displacement {displacement:E3}, {_strokeMs:F2} ms/frame";
             TestContext.WriteLine(report);
 
             Assert.That(displacement, Is.GreaterThan(5e-5f), $"{report} - the stroke barely moved the mesh, so symmetry would prove nothing.");

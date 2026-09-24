@@ -19,10 +19,10 @@ namespace Sculpting
     /// (start, count) rather than the monotonic CSR offsets this used to hold, where a vertex's
     /// list ended exactly where the next one began. That packing is why the whole structure had to
     /// be thrown away and rebuilt from scratch on any topology change: giving one vertex a seventh
-    /// neighbour meant shifting every entry after it. Dynamic topology changes valence for a
-    /// handful of vertices inside a brush footprint, thousands of times a stroke, so a list has to
-    /// be able to move without disturbing anything else - which it now can, because nothing reads
-    /// this block sequentially any more. See SetNeighbors for where a relocated list goes.
+    /// neighbour meant shifting every entry after it. With (start, count) a list can move without
+    /// disturbing anything else, because nothing reads this block sequentially any more - so a
+    /// local topology change costs a handful of relocations rather than a whole-mesh rebuild. See
+    /// SetNeighbors for where a relocated list goes.
     ///
     /// Ordering is deliberately IDENTICAL to the build it replaced: incident triangles ascend, and
     /// neighbours appear in the order the HashSet-per-vertex build first inserted them (triangle
@@ -62,9 +62,9 @@ namespace Sculpting
 
         // Compact once at least this fraction of a block is abandoned. Half is deliberately
         // generous: compaction is O(vertex count), and the point of relocating rather than
-        // shifting is that a refine never pays a whole-mesh cost. A footprint's worth of
-        // relocations is a few thousand entries against a block of millions, so on a dense mesh
-        // this threshold is essentially never reached mid-stroke.
+        // shifting is that a local topology change never pays a whole-mesh cost. A footprint's
+        // worth of relocations is a few thousand entries against a block of millions, so on a
+        // dense mesh this threshold is essentially never reached.
         private const float CompactWasteFraction = 0.5f;
 
         private MeshAdjacency() { }

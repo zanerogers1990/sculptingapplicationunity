@@ -286,9 +286,7 @@ namespace Sculpting
             // Only reachable if something rebuilt one half without reporting it. Copying by index
             // into a different vertex set would scramble it, so the pair ends instead. Compared by
             // VertexCount rather than by the buffers' lengths, which are capacities that the two
-            // halves can reach at different moments (see SculptableMesh.Vertices) - though in
-            // practice neither half ever grows one, since dynamic topology stays suspended for as
-            // long as a pair is linked.
+            // halves can reach at different moments (see SculptableMesh.Vertices).
             if (changed.VertexCount != follower.VertexCount) { Unlink(); return false; }
 
             _applying = true;

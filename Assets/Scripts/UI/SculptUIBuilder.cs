@@ -53,6 +53,7 @@ namespace Sculpting
         private Slider _accumulateStrengthSlider;
         private Text _frontFacingOnlyToggleLabel;
         private Toggle _frontFacingOnlyToggle;
+        private Toggle _customFalloffToggle;
         private Image _moveButtonImage;
         private Image _clayButtonImage;
         private Image _smoothButtonImage;
@@ -60,6 +61,9 @@ namespace Sculpting
         private Image _inflateButtonImage;
         private Image _flattenButtonImage;
         private Image _poseButtonImage;
+        private Image _standardButtonImage;
+        private Image _layerButtonImage;
+        private Image _snakeHookButtonImage;
         private Image _maskButtonImage;
         private bool _lastShownMaskMode;
 
@@ -242,7 +246,14 @@ namespace Sculpting
             // adjustments made straight from the viewport - SetValueWithoutNotify avoids
             // feeding the change back into the controller through the slider's own
             // onValueChanged.
-            if (_brushSizeSlider != null) _brushSizeSlider.SetValueWithoutNotify(controller.BrushRadius);
+            if (_brushSizeSlider != null)
+            {
+                // The range follows the unit - pixels or world units - which the toggle below can
+                // switch at any time.
+                _brushSizeSlider.minValue = controller.BrushSizeMin;
+                _brushSizeSlider.maxValue = controller.BrushSizeMax;
+                _brushSizeSlider.SetValueWithoutNotify(controller.BrushSize);
+            }
             if (_remeshResolutionSlider != null) _remeshResolutionSlider.SetValueWithoutNotify(controller.RemeshResolution);
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
@@ -375,6 +386,9 @@ namespace Sculpting
                 // Same per-brush memory for Front Facing Only (see
                 // SculptController._brushFrontFacingOnly) - e.g. turning it on for Clay must not
                 // leave it on the next time Move is picked up.
+                // Falloff curves are per brush too (see SculptController._falloffCurves).
+                if (_customFalloffToggle != null) _customFalloffToggle.SetIsOnWithoutNotify(controller.CustomFalloff);
+
                 if (_frontFacingOnlyToggle != null)
                 {
                     _frontFacingOnlyToggle.SetIsOnWithoutNotify(controller.FrontFacingOnly);
@@ -509,9 +523,12 @@ namespace Sculpting
                 "How much effect each pass of the brush has. Also adjustable by holding F and dragging.");
 
             CreateLabel(panel.transform, "Brush Size", 14, FontStyle.Normal);
-            _brushSizeSlider = CreateSlider(panel.transform, SculptController.MinBrushRadius, SculptController.MaxBrushRadius,
-                controller.BrushRadius, v => controller.BrushRadius = v,
-                "Radius of the brush in world units. Also adjustable by holding S and dragging, or scrolling over the model.");
+            _brushSizeSlider = CreateSlider(panel.transform, controller.BrushSizeMin, controller.BrushSizeMax,
+                controller.BrushSize, v => controller.BrushSize = v,
+                "Radius of the brush - in screen pixels, or in world units with Screen-Space Size off. Also adjustable by holding S and dragging, or scrolling over the model.");
+            CreateToggle(panel.transform, "Screen-Space Size", controller.ScreenSpaceBrushSize,
+                v => controller.ScreenSpaceBrushSize = v, out _,
+                tooltip: "On (ZBrush's Draw Size): the brush stays the same size on screen as you zoom. Off: the brush has a fixed size on the model.");
 
             _positiveToggle = CreateToggle(panel.transform, "Positive (Add)", controller.IsPositive, v =>
             {
@@ -578,6 +595,17 @@ namespace Sculpting
             _inflateButtonImage = inflateButton.GetComponent<Image>();
             _flattenButtonImage = flattenButton.GetComponent<Image>();
             _poseButtonImage = poseButton.GetComponent<Image>();
+
+            var brushRow4 = CreateRow(panel.transform);
+            var standardButton = CreateButton(brushRow4.transform, "Standard", () => SetBrushType(BrushType.Standard),
+                "Raises the surface along its average normal - ZBrush's default brush.");
+            var layerButton = CreateButton(brushRow4.transform, "Layer", () => SetBrushType(BrushType.Layer),
+                "Raises the surface by one even height that crossing your own stroke never doubles - see Layer Height below.");
+            var snakeHookButton = CreateButton(brushRow4.transform, "Snakehook", () => SetBrushType(BrushType.SnakeHook),
+                "Pulls the surface out after the cursor - drag out horns, tentacles and fingers.");
+            _standardButtonImage = standardButton.GetComponent<Image>();
+            _layerButtonImage = layerButton.GetComponent<Image>();
+            _snakeHookButtonImage = snakeHookButton.GetComponent<Image>();
             RefreshBrushButtons();
 
             // Collapsed by default, same reasoning as the other shaping foldouts below.
@@ -592,6 +620,16 @@ namespace Sculpting
                 SculptableMesh target = SelectedMesh();
                 if (target != null) target.ClearMask();
             }, "Removes the mask from the selected object entirely.");
+            var maskFilterRow = CreateRow(maskFoldout);
+            CreateButton(maskFilterRow.transform, "Blur", () => FilterSelectedMask(SculptableMesh.MaskFilter.Blur, 2),
+                "Softens the mask's edge.");
+            CreateButton(maskFilterRow.transform, "Sharpen", () => FilterSelectedMask(SculptableMesh.MaskFilter.Sharpen, 2),
+                "Tightens a soft mask edge toward a hard one.");
+            var maskGrowRow = CreateRow(maskFoldout);
+            CreateButton(maskGrowRow.transform, "Grow", () => FilterSelectedMask(SculptableMesh.MaskFilter.Grow, 2),
+                "Expands the mask outward by a couple of edge rings.");
+            CreateButton(maskGrowRow.transform, "Shrink", () => FilterSelectedMask(SculptableMesh.MaskFilter.Shrink, 2),
+                "Pulls the mask inward by a couple of edge rings.");
 
             // One shared setting for every brush (not per-brush like Accumulate), so no resync
             // is needed elsewhere in this file - nothing but this panel ever changes it, same as
@@ -670,6 +708,15 @@ namespace Sculpting
             CreateSlider(flattenFoldout, -0.5f, 0.5f, controller.FlattenPlaneOffset,
                 v => controller.FlattenPlaneOffset = v,
                 "Where the flatten plane sits relative to the surface - negative scrapes material away, positive fills up to the plane.");
+
+            BuildFalloffSection(panel.transform);
+
+            Transform layerFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Layer / Move", false);
+            CreateLabel(layerFoldout, "Layer Height", 12, FontStyle.Normal);
+            CreateSlider(layerFoldout, 0.02f, 1f, controller.LayerHeight, v => controller.LayerHeight = v,
+                "How far one Layer stroke raises the surface, as a fraction of the brush size.");
+            CreateToggle(layerFoldout, "Move: Connected Only", controller.MoveConnectedOnly, v => controller.MoveConnectedOnly = v, out _,
+                tooltip: "Move only grabs surface connected to the point under the cursor (ZBrush's Move Topological) - moving one finger leaves its neighbour alone.");
 
             // Collapsed by default, same reasoning as "Clay Shaping" above.
             Transform poseFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Pose Shaping", false);
@@ -753,22 +800,6 @@ namespace Sculpting
             }, "Saves the selected mesh as an OBJ file to Desktop/SculptExports.");
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
-            // A foldout rather than top-level controls: this is an opt-in mode, and it sits next to
-            // Remesh because the two are the same question asked at different scales - Remesh
-            // rebuilds the whole mesh at one density, this refines locally as you sculpt.
-            Transform dynTopoFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Dynamic Topology", false);
-            CreateToggle(dynTopoFoldout, "Dynamic Topology", controller.DynamicTopologyEnabled,
-                v => controller.DynamicTopologyEnabled = v, out _,
-                tooltip: "Adds and removes mesh detail inside the brush as you sculpt, so strokes stay smooth " +
-                         "instead of faceting on the existing topology. Applies to Clay, Crease, Inflate and " +
-                         "Flatten. Suspended while an object is mirror-linked.");
-            CreateLabel(dynTopoFoldout, "Detail Size", 12, FontStyle.Normal);
-            CreateSlider(dynTopoFoldout, SculptController.MinDetailSize, SculptController.MaxDetailSize,
-                controller.DynamicTopologyDetailSize, v => controller.DynamicTopologyDetailSize = v,
-                "Target edge length the brush refines towards. Smaller is finer and costs more. Independent of " +
-                "brush size on purpose: brush size chooses the area that gets refined, not how dense it becomes, " +
-                "so a broad stroke will not coarsen detail a small brush put in.");
-
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
             _remeshResolutionSlider = CreateSlider(panel.transform, 4f, SculptController.MaxRemeshResolution, controller.RemeshResolution,
                 v => controller.RemeshResolution = Mathf.RoundToInt(v),
@@ -777,7 +808,7 @@ namespace Sculpting
                 "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R.");
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  8 Standard\n9 Layer  0 Snakehook  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
             // Built last so it sits on top of every other child in this canvas's sibling order
@@ -824,6 +855,9 @@ namespace Sculpting
             _inflateButtonImage.color = controller.CurrentBrush == BrushType.Inflate ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _flattenButtonImage.color = controller.CurrentBrush == BrushType.Flatten ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _poseButtonImage.color = controller.CurrentBrush == BrushType.Pose ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _standardButtonImage.color = controller.CurrentBrush == BrushType.Standard ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _layerButtonImage.color = controller.CurrentBrush == BrushType.Layer ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _snakeHookButtonImage.color = controller.CurrentBrush == BrushType.SnakeHook ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _maskButtonImage.color = controller.IsMaskPaintMode ? MaskActiveColor : UIFactory.InactiveColor;
         }
 
@@ -858,6 +892,41 @@ namespace Sculpting
         {
             if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
             return _selection != null ? _selection.PrimarySelection : null;
+        }
+
+        /// ZBrush's brush Curve: a per-brush falloff drawn by hand. Off, the brush keeps its own
+        /// built-in falloff (shown faintly in the graph); on, the curve replaces it.
+        private void BuildFalloffSection(Transform parent)
+        {
+            Transform foldout = UIFactory.CreateFoldoutSection(parent, "Falloff Curve", false);
+            _customFalloffToggle = CreateToggle(foldout, "Custom Falloff (this brush)", controller.CustomFalloff,
+                v => controller.CustomFalloff = v, out _,
+                tooltip: "Replace this brush's falloff with the curve below. Each brush keeps its own curve.");
+
+            var graphGO = new GameObject("FalloffCurve", typeof(RectTransform), typeof(CanvasRenderer), typeof(FalloffCurveGraphic));
+            graphGO.transform.SetParent(foldout, false);
+            graphGO.AddComponent<LayoutElement>().preferredHeight = 110f;
+            var graph = graphGO.GetComponent<FalloffCurveGraphic>();
+            graph.Source = () => controller.CurrentFalloffCurve;
+            graph.raycastTarget = true;
+
+            CreateLabel(foldout, "Left: brush centre   Right: edge\nDrag points - click to add - right-click to remove", 10, FontStyle.Italic);
+            var presetRow = CreateRow(foldout);
+            foreach (FalloffPreset preset in (FalloffPreset[])System.Enum.GetValues(typeof(FalloffPreset)))
+            {
+                FalloffPreset p = preset;
+                CreateButton(presetRow.transform, p.ToString(), () =>
+                {
+                    controller.SetFalloffPreset(p);
+                    _customFalloffToggle.SetIsOnWithoutNotify(true);
+                }, "Start this brush's curve from the " + p + " shape.");
+            }
+        }
+
+        private void FilterSelectedMask(SculptableMesh.MaskFilter filter, int steps)
+        {
+            SculptableMesh target = SelectedMesh();
+            if (target != null) target.FilterMask(filter, steps);
         }
 
         /// Follows the tool once per frame: the drag marquee and armed-mode crosshair are the

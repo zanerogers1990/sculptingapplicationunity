@@ -71,13 +71,13 @@ namespace Sculpting.IO
             public float normalStrength;
             public float normalNoiseScale = 60f;
             public bool flatShading;
-            // Cavity is one colour now, into recesses only. A file saved before that also
-            // carries a `peakColor`; JsonUtility drops fields it has no member for, so those
-            // files still load - they just lose a setting that no longer does anything.
-            public bool cavityEnabled;
-            public Color recessColor = Color.black;
-            public float cavityIntensity = 1f;
-            public float cavityRange = 0.25f;
+            // Screen-space cavity (Blender-style ridge/valley). Older files carry the retired
+            // per-vertex tint's cavityEnabled/recessColor/cavityIntensity/cavityRange (and, older
+            // still, peakColor); JsonUtility drops keys it has no member for, so those files load
+            // with these defaults instead of carrying an unrelated on/off state across.
+            public bool screenCavityEnabled = true;
+            public float cavityRidge = 1f;
+            public float cavityValley = 1f;
 
             // Matcap by file name rather than by path: the image lives in the app's own Matcaps
             // folder, so a name still resolves on a machine where the app is installed somewhere
@@ -92,8 +92,16 @@ namespace Sculpting.IO
         [Serializable]
         public class EnvironmentSettings
         {
-            public bool studioLightingEnabled = true;
-            public int lightingMode;
+            // Lighting preset (see LightingPresetController). Files from before presets carry the
+            // retired studio rig's studioLightingEnabled/lightingMode instead; JsonUtility drops
+            // those, and an empty id resolves to the default preset.
+            public string lightingPreset = string.Empty;
+            public bool lightingFivePoint;
+            public float lightingBrightness = 1f;
+            public float lightingRotation;
+            public bool lightingFollowCamera = true;
+            public float lightingWorldYaw;
+            public bool lightingShadows = true;
 
             public int backgroundMode;
             public Color backgroundColorA = Color.black;

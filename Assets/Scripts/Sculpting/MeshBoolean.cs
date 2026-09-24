@@ -55,11 +55,38 @@ namespace Sculpting
             public bool IsValid => Vertices != null && Vertices.Length > 0 && Triangles != null && Triangles.Length >= 3;
         }
 
-        /// Samples ~1.5GB of float+bool grid at the very top end, which is already more than
-        /// this is worth; past it the honest answer is "lower the resolution", not an
-        /// out-of-memory crash halfway through with the user's mesh already snapshotted for
-        /// undo. Checked before anything is allocated so the failure is clean.
-        private const long MaxGridSamples = 96L * 1000 * 1000;
+        /// The real ceiling on resolution, and the only one: past it the honest answer is
+        /// "lower the resolution", not an out-of-memory crash halfway through with the user's
+        /// mesh already snapshotted for undo. Checked before anything is allocated so the
+        /// failure is clean, and reported with a resolution that WOULD fit.
+        ///
+        /// A sample costs 10 bytes at peak - the combined field and the per-operand field are
+        /// 4 each and live for the whole call, and SampleSignedField's inside/needs-distance
+        /// masks are a byte each on top while it runs - so this is about 1.9GB.
+        ///
+        /// The number of samples is NOT resolution cubed: `resolution` counts cells along the
+        /// target's LONGEST axis, so a flat target spends far fewer. A mold half around a lure
+        /// (2.24 x 0.97 x 0.20) is only 3.9% of a cube, which is why it can run at resolutions
+        /// a compact model could never reach - and why the clamp below has to leave room for
+        /// that instead of capping everyone at what a cube can afford.
+        private const long MaxGridSamples = 192L * 1000 * 1000;
+
+        /// The combined field of a boolean, sampled but not yet turned back into a surface.
+        public readonly struct SampledField
+        {
+            public readonly float[] Sdf;
+            public readonly Vector3Int Dims;
+            public readonly Vector3 Origin;
+            public readonly float CellSize;
+
+            public SampledField(float[] sdf, Vector3Int dims, Vector3 origin, float cellSize)
+            {
+                Sdf = sdf;
+                Dims = dims;
+                Origin = origin;
+                CellSize = cellSize;
+            }
+        }
 
         /// Runs `op` between `targetVertices/Triangles` and every operand, returning a new mesh
         /// in the target's local space - or null with `error` set, in which case the caller must
@@ -71,19 +98,55 @@ namespace Sculpting
         /// fine detail out of a big block wants a higher number than remeshing the block would.
         public static Mesh Build(Vector3[] targetVertices, int[] targetTriangles, IReadOnlyList<Operand> operands, BooleanOp op, int resolution, out string error)
         {
+            if (!TrySample(targetVertices, targetTriangles, operands, op, resolution, out SampledField field, out error))
+                return null;
+
+            Mesh mesh = MeshRemesher.BuildFromSdf(field.Sdf, field.Dims, field.Origin, field.CellSize);
+            if (mesh == null || mesh.vertexCount == 0)
+            {
+                Object.Destroy(mesh);
+                error = EmptyResultError(op);
+                return null;
+            }
+
+            return mesh;
+        }
+
+        /// The message for a boolean that left nothing behind.
+        public static string EmptyResultError(BooleanOp op) =>
+            op == BooleanOp.Subtract ? "the cutter removed the whole target - nothing left" : "the result is empty";
+
+        /// Everything Build does except extracting the surface: validates, sizes the grid,
+        /// samples every operand onto it and folds them together.
+        ///
+        /// Split out so a caller can run it OFF the main thread. It touches no Unity object and no
+        /// shared state - each call builds its own accelerator and its own grids - which is not
+        /// true of the extraction (MeshRemesher's scratch buffers are shared, see its
+        /// ExtractionLock). The mold builder runs this on a worker so a draft build no longer
+        /// freezes the app while it samples.
+        public static bool TrySample(Vector3[] targetVertices, int[] targetTriangles, IReadOnlyList<Operand> operands,
+                                     BooleanOp op, int resolution, out SampledField sampled, out string error)
+        {
+            sampled = default;
             error = null;
             if (targetVertices == null || targetVertices.Length == 0 || targetTriangles == null || targetTriangles.Length < 3)
             {
                 error = "the target has no geometry";
-                return null;
+                return false;
             }
             if (operands == null || operands.Count == 0)
             {
                 error = "no second object to combine with";
-                return null;
+                return false;
             }
 
-            resolution = Mathf.Clamp(resolution, 4, 512);
+            // Upper bound is deliberately far above what a compact target can afford: the
+            // MaxGridSamples check below is the real guard and it accounts for the target's
+            // actual shape, where a flat clamp cannot. 512 used to sit here, and on an
+            // anisotropic target (a mold half around a long flat model) it was cutting off
+            // resolutions that would have fitted in a fraction of the memory budget - the
+            // cavity was being rounded away by a limit that had nothing to do with the machine.
+            resolution = Mathf.Clamp(resolution, 4, 2048);
 
             Bounds targetBounds = MeshRemesher.ComputeBounds(targetVertices);
             float targetExtent = Mathf.Max(targetBounds.size.x, targetBounds.size.y, targetBounds.size.z, 0.0001f);
@@ -111,7 +174,7 @@ namespace Sculpting
             if (usable == 0)
             {
                 error = "no second object to combine with";
-                return null;
+                return false;
             }
             if (!anyOverlap && op != BooleanOp.Union)
             {
@@ -123,7 +186,7 @@ namespace Sculpting
                 error = op == BooleanOp.Subtract
                     ? "the cutter does not overlap the target - nothing to subtract"
                     : "the objects do not overlap - the intersection would be empty";
-                return null;
+                return false;
             }
 
             Vector3Int dims = MeshRemesher.GridDimensions(gridBounds, cellSize, out Vector3 origin);
@@ -135,7 +198,7 @@ namespace Sculpting
                 // the user has to pick depends on the bounds, which they cannot see.
                 int suggestion = Mathf.Max(4, Mathf.FloorToInt(resolution * Mathf.Pow(MaxGridSamples / (float)sampleCount, 1f / 3f)));
                 error = $"resolution {resolution} needs too much memory for these bounds - try {suggestion} or lower";
-                return null;
+                return false;
             }
 
             var sdf = new float[sampleCount];
@@ -151,17 +214,8 @@ namespace Sculpting
                 Combine(sdf, operandSdf, op, sx, sy, sz);
             }
 
-            Mesh mesh = MeshRemesher.BuildFromSdf(sdf, dims, origin, cellSize);
-            if (mesh == null || mesh.vertexCount == 0)
-            {
-                Object.Destroy(mesh);
-                error = op == BooleanOp.Subtract
-                    ? "the cutter removed the whole target - nothing left"
-                    : "the result is empty";
-                return null;
-            }
-
-            return mesh;
+            sampled = new SampledField(sdf, dims, origin, cellSize);
+            return true;
         }
 
         /// Folds `b` into `a` in place. The three ops are the standard constructive-solid-

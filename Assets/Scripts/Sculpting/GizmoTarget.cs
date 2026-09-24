@@ -32,6 +32,16 @@ namespace Sculpting
         public virtual Vector3 LocalScale { get => Vector3.one; set { } }
         public virtual bool SupportsScale => false;
 
+        /// Which of the gizmo's own local axes (bit 0 = X, 1 = Y, 2 = Z, in the frame Rotation
+        /// defines) get move arrows / rotate rings. All three by default.
+        ///
+        /// For a target where some directions mean nothing - a mold vent can slide along the
+        /// parting sheet and swing about the pull axis, but lifting it off the sheet or rolling it
+        /// about its own length does nothing at all - a handle that visibly does nothing reads as
+        /// broken. Across a multi-target selection the gizmo shows the union.
+        public virtual int MoveAxisMask => 0b111;
+        public virtual int RotateAxisMask => 0b111;
+
         /// Roughly how big this target is in world units. The gizmo sizes its arms from this so
         /// the handles stay grabbable against a pea and against a whole torso alike.
         public abstract float WorldRadius { get; }

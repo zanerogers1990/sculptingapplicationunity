@@ -42,9 +42,9 @@ namespace Sculpting
                 // always the authoritative CPU-side arrays regardless of GPU buffer state.
                 var plain = new Mesh { name = src.name + " (JoinSource)" };
                 if (src.VertexCount > 65000) plain.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-                // The Exact forms: past the first dynamic-topology refine the working arrays
-                // carry spare capacity beyond VertexCount/TriangleCount (see SculptableMesh.Vertices),
-                // and CombineMeshes has no count to go with them.
+                // The Exact forms: the working arrays can carry spare capacity beyond
+                // VertexCount/TriangleCount (see SculptableMesh.Vertices), and CombineMeshes has
+                // no count to go with them.
                 plain.vertices = src.VerticesExact();
                 plain.normals = src.NormalsExact();
                 plain.triangles = src.TrianglesExact();

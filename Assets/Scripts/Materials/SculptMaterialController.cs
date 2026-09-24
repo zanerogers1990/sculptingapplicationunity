@@ -3,8 +3,8 @@ using UnityEngine;
 namespace Sculpting
 {
     /// Assigns a runtime instance of the Custom/SculptPBR shader to the sculpted mesh and
-    /// exposes its parameters (base PBR sliders, a procedural normal-detail strength, and
-    /// the single-colour cavity recess shading) so they're editable live from the Material UI panel
+    /// exposes its parameters (base PBR sliders, a procedural normal-detail strength, matcap,
+    /// and the screen-space cavity) so they're editable live from the Material UI panel
     /// instead of only through the Inspector.
     public class SculptMaterialController : MonoBehaviour
     {
@@ -18,21 +18,14 @@ namespace Sculpting
         // SculptableMesh's shared-vertex data model.
         [SerializeField] private bool flatShading = false;
 
-        // Cavity is ONE colour, and it only goes into recesses - see SculptPBR.shader's
-        // ApplyCavity for why the near-white "peak" colour that used to sit alongside this was
-        // removed rather than just turned down.
-        [SerializeField] private bool cavityEnabled = false;
-        [SerializeField] private Color recessColor = new Color(0.12f, 0.10f, 0.09f);
-        [SerializeField, Range(0f, 2f)] private float cavityIntensity = 1f;
-        // Upper bound is well past the 1.0 the encoded cavity value can ever reach, and that
-        // is deliberate: the ramp is smoothstep(0.5, 0.5 + range, cavity), so a range wider
-        // than the signal is the only way to ask for "deepest creases only". It used to stop
-        // at 0.6, which still darkens a fully-saturated vertex by ~93% - on a dense imported
-        // model, where a large share of vertices clamp to 1.0, that left no way to pull the
-        // tint back off everything but the sharpest recesses. This is NOT a duplicate of
-        // intensity: widening the ramp fades shallow curvature far faster than deep, so the
-        // affected area shrinks rather than the whole tint dimming uniformly.
-        [SerializeField, Range(0.05f, 2f)] private float cavityRange = 0.25f;
+        // Blender-style screen-space cavity (ScreenCavityFeature): brightens ridges and darkens
+        // valleys by how fast the surface turns on screen. Ridge/Valley are Workbench's own
+        // factors, same 0-2 range and 1.0 defaults. Named screenCavityEnabled rather than
+        // reusing the old per-vertex tint's cavityEnabled, so a scene that serialized that one
+        // (off) doesn't switch off a different feature.
+        [SerializeField] private bool screenCavityEnabled = true;
+        [SerializeField, Range(0f, 2f)] private float cavityRidge = 1f;
+        [SerializeField, Range(0f, 2f)] private float cavityValley = 1f;
 
         // Matcap shading (see MatcapLibrary for where the images come from). Stored by NAME,
         // not by texture reference: names are what a .sculpt file can carry between machines,
@@ -55,10 +48,9 @@ namespace Sculpting
         public float NormalStrength { get => normalStrength; set { normalStrength = Mathf.Clamp(value, 0f, 2f); Push(); } }
         public float NormalNoiseScale { get => normalNoiseScale; set { normalNoiseScale = Mathf.Clamp(value, 1f, 300f); Push(); } }
         public bool FlatShading { get => flatShading; set { flatShading = value; Push(); } }
-        public bool CavityEnabled { get => cavityEnabled; set { cavityEnabled = value; Push(); } }
-        public Color RecessColor { get => recessColor; set { recessColor = value; Push(); } }
-        public float CavityIntensity { get => cavityIntensity; set { cavityIntensity = Mathf.Clamp(value, 0f, 2f); Push(); } }
-        public float CavityRange { get => cavityRange; set { cavityRange = Mathf.Clamp(value, 0.05f, 2f); Push(); } }
+        public bool CavityEnabled { get => screenCavityEnabled; set { screenCavityEnabled = value; Push(); } }
+        public float CavityRidge { get => cavityRidge; set { cavityRidge = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float CavityValley { get => cavityValley; set { cavityValley = Mathf.Clamp(value, 0f, 2f); Push(); } }
 
         /// Whether matcap shading replaces the lit PBR result. Turning it on with no matcap
         /// picked selects the first one in the library rather than showing a flat white sphere -
@@ -149,6 +141,32 @@ namespace Sculpting
                 ApplyTo(sm.GetComponent<Renderer>());
         }
 
+        /// Whether masked areas are darkened. Off for the turntable's clean view, which shows the
+        /// model as it will look, not what is currently protected from the brushes. Not part of
+        /// Push: nothing else writes the tint, so the material's own value is the one to restore.
+        public bool MaskTintVisible
+        {
+            get => _maskTintHiddenFrom < 0f;
+            set
+            {
+                if (_material == null || value == MaskTintVisible) return;
+                if (value)
+                {
+                    _material.SetFloat(MaskTintStrengthId, _maskTintHiddenFrom);
+                    _maskTintHiddenFrom = -1f;
+                }
+                else
+                {
+                    _maskTintHiddenFrom = _material.GetFloat(MaskTintStrengthId);
+                    _material.SetFloat(MaskTintStrengthId, 0f);
+                }
+            }
+        }
+
+        private static readonly int MaskTintStrengthId = Shader.PropertyToID("_MaskTintStrength");
+        // The strength the tint had before it was hidden; negative while it is showing.
+        [System.NonSerialized] private float _maskTintHiddenFrom = -1f;
+
         /// Applies the shared runtime material to a renderer - called for every existing
         /// object in Awake() above, and by PrimitiveSpawner/MeshMirror for objects created
         /// after startup, so newly spawned/mirrored objects render with the same live-editable
@@ -161,6 +179,12 @@ namespace Sculpting
 
         private void Push()
         {
+            // Cavity is global render state rather than a material property, so it's pushed
+            // even if the material failed to build.
+            ScreenCavity.Enabled = screenCavityEnabled;
+            ScreenCavity.Ridge = cavityRidge;
+            ScreenCavity.Valley = cavityValley;
+
             if (_material == null) return;
             _material.SetColor("_BaseColor", baseColor);
             _material.SetFloat("_Metallic", metallic);
@@ -168,10 +192,6 @@ namespace Sculpting
             _material.SetFloat("_NormalStrength", normalStrength);
             _material.SetFloat("_NormalNoiseScale", normalNoiseScale);
             _material.SetFloat("_FlatShading", flatShading ? 1f : 0f);
-            _material.SetFloat("_CavityEnabled", cavityEnabled ? 1f : 0f);
-            _material.SetColor("_RecessColor", recessColor);
-            _material.SetFloat("_CavityIntensity", cavityIntensity);
-            _material.SetFloat("_CavityRange", cavityRange);
 
             // A recompile mid-Play drops _matcapTexture (it's [NonSerialized], and the library's
             // statics go with it), which would leave the material pointing at a destroyed

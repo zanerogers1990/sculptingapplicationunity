@@ -315,7 +315,22 @@ namespace Sculpting
             _intersectButton = UIFactory.CreateButton(booleanRow.transform, "Intersect", () => ShowBooleanConfirm(BooleanOp.Intersect),
                 "Keeps only the volume where the selected objects overlap.");
 
+            // Mold Maker: a whole workflow of its own, so what sits here is only the door into
+            // it - a button and a line of state. The tools themselves open as a full-screen
+            // workspace that stands in front of this panel, because molding is a mode rather
+            // than a tool and every control it needs would not fit in this column beside the
+            // scene list. See MoldUIBuilder. Self-installed if the scene predates the feature.
+            var mold = FindFirstObjectByType<Sculpting.Molding.MoldUIBuilder>();
+            if (mold == null) mold = gameObject.AddComponent<Sculpting.Molding.MoldUIBuilder>();
+            mold.BuildContent(UIFactory.CreateFoldoutSection(panel, "Mold Maker", true));
+
             BuildTimelapseSection(panel);
+
+            // Turntable: spin, clean view and the 360 loop recorder. Its own builder, filled into
+            // a foldout like the Mold Maker's, and self-installed the same way.
+            var turntable = FindFirstObjectByType<TurntableUIBuilder>();
+            if (turntable == null) turntable = gameObject.AddComponent<TurntableUIBuilder>();
+            turntable.BuildContent(UIFactory.CreateFoldoutSection(panel, "Turntable", false));
 
             // Material / Presentation used to be separate always-open panels (bottom-center,
             // bottom-right). Merged into this panel as collapsible sections - one panel to dock
@@ -324,10 +339,9 @@ namespace Sculpting
             // canvas - they just fill whatever content transform they're handed (see
             // LightingUIBuilder.BuildContent's remarks).
             //
-            // Lighting is handed the panel ITSELF rather than a section of its own: the fixed
-            // studio rig it used to wrap is gone, and what is left - Scene Lights and HDRI
-            // Environment - are two unrelated things that were only ever siblings because the rig
-            // was their parent. They make their own top-level foldouts.
+            // Lighting is handed the panel ITSELF rather than a section of its own: its two
+            // parts - the Lighting presets and HDRI Environment - make their own top-level
+            // foldouts.
             var lighting = FindFirstObjectByType<LightingUIBuilder>();
             var material = FindFirstObjectByType<MaterialUIBuilder>();
             var presentation = FindFirstObjectByType<PostProcessingUIBuilder>();
@@ -574,7 +588,7 @@ namespace Sculpting
             }
 
             // Typed paths are used verbatim - no extension is appended, because this same field
-            // has to be able to name a .obj as well as a .sculpt.
+            // has to be able to name a model file (.obj/.stl) as well as a .sculpt.
             string typed = _fallbackField != null ? _fallbackField.text?.Trim().Trim('"') : null;
             if (string.IsNullOrEmpty(typed)) { SetStatus("Type a file path first.", ErrorColor, hold: false); return null; }
             return typed;
@@ -613,7 +627,7 @@ namespace Sculpting
 
         private void ShowHint()
         {
-            _statusLabel.text = "Import adds a model (.obj). Load opens a saved scene (.sculpt).";
+            _statusLabel.text = "Import adds a model (.obj, .stl). Load opens a saved scene (.sculpt).";
             _statusLabel.color = HintColor;
             _statusClearAt = -1f;
         }

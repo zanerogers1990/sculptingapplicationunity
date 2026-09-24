@@ -274,6 +274,20 @@ namespace Sculpting.TimelapseEditor
                     if (GUILayout.Button("Show In Explorer"))
                         EditorUtility.RevealInFinder(last);
             }
+
+            // The turntable's 360 loop is recorded from the app's Scene panel (Turntable), but
+            // encoded by the same service, so its output is listed here too.
+            string loop = TimelapseRecorderService.LastLoopPath;
+            if (!string.IsNullOrEmpty(loop))
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Last 360 turntable loop", EditorStyles.miniBoldLabel);
+                EditorGUILayout.SelectableLabel(loop, EditorStyles.wordWrappedMiniLabel,
+                    GUILayout.Height(32f));
+                using (new EditorGUI.DisabledScope(!File.Exists(loop)))
+                    if (GUILayout.Button("Show Loop In Explorer"))
+                        EditorUtility.RevealInFinder(loop);
+            }
         }
     }
 }

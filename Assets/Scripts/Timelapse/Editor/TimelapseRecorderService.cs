@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using UnityEditor;
+using UnityEditor.Media;
 using UnityEditor.Recorder;
 using UnityEditor.Recorder.Encoder;
 using UnityEditor.Recorder.Input;
@@ -65,6 +66,83 @@ namespace Sculpting.TimelapseEditor
             LoadPrefs();
             EditorApplication.update += OnEditorUpdate;
             EditorApplication.playModeStateChanged += OnPlayModeChanged;
+
+            LoopVideoSink.Begin = BeginLoopVideo;
+            LoopVideoSink.AddFrame = AddLoopFrame;
+            LoopVideoSink.End = EndLoopVideo;
+        }
+
+        // ------------------------------------------------------------ turntable 360 loop video
+
+        // The turntable's 360 loop is encoded here rather than through Recorder: a seamless loop
+        // needs exactly one revolution's worth of frames in the file, and MediaEncoder writes
+        // precisely the frames it is handed - see LoopVideoSink.
+        private static MediaEncoder _loopEncoder;
+        private static string _loopPath;
+
+        /// Where the last 360 loop went (MP4 or PNG folder), for the window's status block.
+        public static string LastLoopPath { get; private set; }
+
+        private static string BeginLoopVideo(TurntableLoopSettings settings)
+        {
+            EndLoopVideo(false);
+
+            // The turntable names its folder (Recordings, the timelapse's default too); the
+            // timelapse's own setting is only a fallback.
+            string folder = string.IsNullOrEmpty(settings.outputFolder) ? OutputFolder : settings.outputFolder;
+            Directory.CreateDirectory(folder);
+            _loopPath = Path.Combine(folder, $"Turntable_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.mp4");
+
+            // Bitrate scaled to the pixel rate: ~0.2 bits per pixel per frame is visually
+            // lossless for a smooth-shaded turntable, where the default "high" preset still
+            // bands the gradients on the background and the matcap.
+            long bitRate = (long)(settings.width * (long)settings.height * settings.frameRate * 0.2f);
+            var attributes = new VideoTrackEncoderAttributes(new H264EncoderAttributes
+            {
+                // A keyframe every second and no B-frames: players scrub and loop cleanly, and
+                // the first frame is always a keyframe, which is what a looping player jumps to.
+                gopSize = (uint)Mathf.Max(1, settings.frameRate),
+                numConsecutiveBFrames = 0,
+                profile = VideoEncodingProfile.H264High
+            })
+            {
+                frameRate = new MediaRational(settings.frameRate),
+                width = (uint)settings.width,
+                height = (uint)settings.height,
+                targetBitRate = (uint)Mathf.Clamp(bitRate, 2_000_000L, 100_000_000L),
+                bitRateMode = VideoBitrateMode.High
+            };
+
+            try
+            {
+                _loopEncoder = new MediaEncoder(_loopPath, attributes);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[Turntable] Could not open the video encoder: {e.Message}");
+                _loopEncoder = null;
+                return null;
+            }
+            return _loopPath;
+        }
+
+        private static void AddLoopFrame(Texture2D frame) => _loopEncoder?.AddFrame(frame);
+
+        private static void EndLoopVideo(bool completed)
+        {
+            if (_loopEncoder == null) return;
+            _loopEncoder.Dispose();
+            _loopEncoder = null;
+
+            if (completed)
+            {
+                LastLoopPath = _loopPath;
+            }
+            else
+            {
+                try { if (File.Exists(_loopPath)) File.Delete(_loopPath); } catch (Exception) { }
+            }
+            StateChanged?.Invoke();
         }
 
         // ------------------------------------------------------------------------- the loop

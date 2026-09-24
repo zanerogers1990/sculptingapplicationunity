@@ -670,7 +670,6 @@ GameObject:
   - component: {fileID: 803899620}
   - component: {fileID: 803899621}
   - component: {fileID: 803899622}
-  - component: {fileID: 803899623}
   m_Layer: 0
   m_Name: SceneSystems
   m_TagString: Untagged
@@ -743,9 +742,14 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 60eb6efb953c7dd4c9b4d2f08bc3ef2f, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.LightingRigController
-  studioLightingEnabled: 0
-  mode: 0
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.LightingPresetController
+  presetId: studio
+  fivePoint: 0
+  brightness: 1
+  rotation: 0
+  followCamera: 1
+  worldYaw: 0
+  shadows: 1
 --- !u!4 &803899614
 Transform:
   m_ObjectHideFlags: 0
@@ -814,16 +818,6 @@ MonoBehaviour:
   flattenPlaneOffset: 0
   maskHardness: 0.5
   remeshResolution: 24
-  dynamicTopology:
-    Enabled: 0
-    DetailSize: 0.012
-    SplitFactor: 1.3333334
-    CollapseFactor: 0.6
-    RegionMargin: 0.25
-    ThrottleDistanceFraction: 0.25
-    Iterations: 2
-    MaxOperationsPerRefine: 6000
-    RelaxStrength: 0.35
   symmetryAxis: 0
   symmetryToleranceScale: 1
   showWireframeGizmo: 0
@@ -907,18 +901,6 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::Sculpting.RegionSelectTool
   mode: 1
---- !u!114 &803899623
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 803899609}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 3c02083b0b4cc414ca99ffa63978fb88, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.SceneLightManager
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

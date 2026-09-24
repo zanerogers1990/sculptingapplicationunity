@@ -132,8 +132,14 @@ namespace Sculpting
         /// Lives here rather than in either caller because both the brush controller's
         /// double-click pick and the transform gizmo's click-to-select need exactly this, and a
         /// second copy would be a second place for the visibility rule to drift.
-        public SculptableMesh Raycast(Ray ray, float maxDistance = 1000f)
+        public SculptableMesh Raycast(Ray ray, float maxDistance = 1000f) => Raycast(ray, out _, maxDistance);
+
+        /// Raycast, also reporting how far along the ray the hit is (world units, assuming a
+        /// normalized ray direction) - what CameraOrbitController needs to keep the camera and
+        /// its near plane out of the surface it is looking at.
+        public SculptableMesh Raycast(Ray ray, out float distance, float maxDistance = 1000f)
         {
+            distance = 0f;
             SculptableMesh closest = null;
             float closestSqr = float.MaxValue;
             for (int i = 0; i < _allObjects.Count; i++)
@@ -147,6 +153,7 @@ namespace Sculpting
                 closestSqr = sqr;
                 closest = obj;
             }
+            if (closest != null) distance = Mathf.Sqrt(closestSqr);
             return closest;
         }
 
@@ -181,8 +188,7 @@ namespace Sculpting
 
         /// Unregisters and deactivates obj's GameObject - NOT an immediate Destroy - and records
         /// one EditHistory scene action so Z undoes it, reselecting a remaining object if obj was
-        /// primary. Mirrors ZSphereController.Skin's Convert-undo and SceneLightManager's own
-        /// delete: parked (unregistered, inactive) rather than destroyed, so undo just reactivates
+        /// primary. Mirrors ZSphereController.Skin's Convert-undo: parked (unregistered, inactive) rather than destroyed, so undo just reactivates
         /// and reselects the same object - any strokes on it are untouched. The GameObject is only
         /// actually freed once the step falls off history (or the scene is cleared), via the
         /// discard closure below - SceneSerializer's save path walks SelectionManager.AllObjects,
