@@ -257,6 +257,28 @@ namespace Sculpting
             return go;
         }
 
+        /// Re-points a slider at a (possibly new) range and value without firing onValueChanged.
+        ///
+        /// SetValueWithoutNotify alone is not enough when the RANGE moves: Slider's minValue and
+        /// maxValue setters re-clamp the current value and send it (Slider.Set with the callback
+        /// on). A slider bound to a model value then writes the clamped number straight back into
+        /// the model - the brush-size slider did exactly that whenever the size switched between
+        /// pixels and world units, resizing the brush to whatever the stale value clamped to. The
+        /// listeners are parked for the range change only, and only when the range actually
+        /// changed, so a per-frame resync costs nothing in the usual case.
+        public static void SetRangeAndValueWithoutNotify(Slider slider, float min, float max, float value)
+        {
+            if (slider.minValue != min || slider.maxValue != max)
+            {
+                Slider.SliderEvent listeners = slider.onValueChanged;
+                slider.onValueChanged = new Slider.SliderEvent();
+                slider.minValue = min;
+                slider.maxValue = max;
+                slider.onValueChanged = listeners;
+            }
+            slider.SetValueWithoutNotify(value);
+        }
+
         public static Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange, string tooltip = null)
         {
             var sliderGO = new GameObject("Slider", typeof(RectTransform));

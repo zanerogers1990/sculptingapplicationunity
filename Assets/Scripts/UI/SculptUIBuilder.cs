@@ -249,10 +249,9 @@ namespace Sculpting
             if (_brushSizeSlider != null)
             {
                 // The range follows the unit - pixels or world units - which the toggle below can
-                // switch at any time.
-                _brushSizeSlider.minValue = controller.BrushSizeMin;
-                _brushSizeSlider.maxValue = controller.BrushSizeMax;
-                _brushSizeSlider.SetValueWithoutNotify(controller.BrushSize);
+                // switch at any time. Changed without notify: see SetRangeAndValueWithoutNotify.
+                UIFactory.SetRangeAndValueWithoutNotify(_brushSizeSlider,
+                    controller.BrushSizeMin, controller.BrushSizeMax, controller.BrushSize);
             }
             if (_remeshResolutionSlider != null) _remeshResolutionSlider.SetValueWithoutNotify(controller.RemeshResolution);
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);

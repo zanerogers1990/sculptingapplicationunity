@@ -133,9 +133,8 @@ namespace Sculpting
             if (_strengthSlider != null) _strengthSlider.SetValueWithoutNotify(controller.BrushStrength);
             if (_sizeSlider != null)
             {
-                _sizeSlider.minValue = controller.BrushSizeMin;
-                _sizeSlider.maxValue = controller.BrushSizeMax;
-                _sizeSlider.SetValueWithoutNotify(controller.BrushSize);
+                UIFactory.SetRangeAndValueWithoutNotify(_sizeSlider,
+                    controller.BrushSizeMin, controller.BrushSizeMax, controller.BrushSize);
             }
 
             string hoveredLabel = null;
