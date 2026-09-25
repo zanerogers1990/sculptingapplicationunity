@@ -119,18 +119,13 @@ namespace Sculpting
         private Button _mirrorLinkedButton, _finalizeMirrorButton;
         private Text _mirrorNote;
 
-        // Scene-file (Import/Load/Save) state - see the old SaveLoadUIBuilder this was merged
-        // from for the reasoning behind each piece.
+        // Scene-file (Import/Load/Save) display - see the old SaveLoadUIBuilder this was merged
+        // from for the reasoning behind each piece. The document itself (current file, the
+        // save/load work) is SceneDocumentController's.
         private Text _statusLabel;
         private float _statusClearAt = -1f;
         private InputField _fallbackField;
-        private string _lastDirectory;
-
-        // The file this session's scene currently corresponds to - null until the first
-        // successful Save As or a "Replace scene" Load, matching how Save/Save As are supposed
-        // to differ (see Save/SaveAs below). Deliberately NOT touched by "Add to current scene"
-        // imports, since those don't make the imported file the document Ctrl+S would overwrite.
-        private string _currentSavePath;
+        private SceneDocumentController _document;
 
         // The panel's own Canvas GameObject, watched by Update so the panel can rebuild itself
         // if anything ever destroys it out from under this component. Root-level parenting (see
@@ -139,11 +134,6 @@ namespace Sculpting
         // because of every panel in the app this is the one whose disappearance can cost real
         // work - there is no other route to Save Scene.
         private GameObject _canvasRoot;
-
-        // Set right before actually closing the app, so OnWantsToQuit's re-entry (Quit() itself
-        // raises wantsToQuit again) lets the second pass through instead of popping the exit
-        // prompt a second time over its own shutdown.
-        private bool _quitConfirmed;
 
         // Start(), not Awake() - reads/uses SelectionManager.AllObjects (via RefreshList),
         // which needs every SculptableMesh's OnEnable to have already registered - see
@@ -155,6 +145,12 @@ namespace Sculpting
             _controller = FindFirstObjectByType<SculptController>();
             _gizmo = FindFirstObjectByType<TransformGizmo>();
             _zsphere = FindFirstObjectByType<ZSphereController>();
+
+            _document = GetComponent<SceneDocumentController>();
+            if (_document == null) _document = gameObject.AddComponent<SceneDocumentController>();
+            _document.FallbackPathText = () => _fallbackField != null ? _fallbackField.text : null;
+            _document.Status += (message, ok) => SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
+
             BuildUI();
             RefreshList();
             RefreshMultiObjectButtons();
@@ -178,7 +174,7 @@ namespace Sculpting
 
         private bool OnWantsToQuit()
         {
-            if (_quitConfirmed) return true;
+            if (_document.QuitConfirmed) return true;
             ShowExitConfirm();
             return false;
         }
@@ -467,23 +463,10 @@ namespace Sculpting
 
         // -------------------------------------------------------------- scene file actions
 
-        /// Brings a single model in alongside whatever is already in the scene. Separate from
-        /// Load Scene precisely because it never asks a question: adding a model to what you are
-        /// working on is the only thing it can sensibly mean.
-        private void ImportObject()
-        {
-            // SceneSerializer.ImportableExtensions, not a hard-coded "obj": ImportAny already
-            // dispatches a .sculpt file to the whole-session importer, and the constant exists
-            // to say so. Hard-coding the narrower list here meant the picker HID .sculpt files
-            // from a button that has always been able to open them.
-            string path = PickPath("Import object", SceneSerializer.ImportableExtensions);
-            if (path == null) return;
-
-            if (SceneSerializer.ImportAny(path, out int count, out string error))
-                SetStatus($"Imported {Path.GetFileName(path)}", OkColor, hold: true);
-            else
-                SetStatus("Import failed: " + error, ErrorColor, hold: false);
-        }
+        // Thin forwarders onto SceneDocumentController: the panel's buttons bind to these.
+        private void ImportObject() => _document.ImportObject();
+        private void Save() => _document.Save();
+        private void SaveAs() => _document.SaveAs();
 
         /// Opens a saved scene, then asks how to bring it in. The prompt exists because both
         /// answers are reasonable and one of them is destructive: replacing discards everything
@@ -493,7 +476,7 @@ namespace Sculpting
         /// own name and object count are in the prompt.
         private void LoadScene()
         {
-            string path = PickPath("Load scene", "sculpt");
+            string path = _document.PickPath("Load scene", "sculpt");
             if (path == null) return;
 
             string name = Path.GetFileName(path);
@@ -502,20 +485,15 @@ namespace Sculpting
                 null,
                 new UIFactory.ModalChoice("Add to current scene", () =>
                 {
-                    if (SceneSerializer.ImportAny(path, out int count, out string error))
+                    if (_document.AddFromScene(path, out int count, out string error))
                         SetStatus($"Added {count} object{(count == 1 ? "" : "s")} from {name}", OkColor, hold: true);
                     else
                         SetStatus("Load failed: " + error, ErrorColor, hold: false);
                 }),
                 new UIFactory.ModalChoice("Replace scene (cannot be undone)", () =>
                 {
-                    if (SceneSerializer.Load(path, out string error))
+                    if (_document.LoadReplacing(path, out string error))
                     {
-                        // The loaded file becomes the current document, same as opening a file
-                        // in any other creative app - a Ctrl+S right after Load should overwrite
-                        // THIS file, not ask where to save.
-                        _currentSavePath = path;
-
                         // Only the replacing path needs this: it restores brush/material/
                         // lighting/camera wholesale, so the Studio Lighting/Material/
                         // Presentation sections merged into this panel are showing values that
@@ -533,49 +511,6 @@ namespace Sculpting
                 }));
         }
 
-        /// Quick save: overwrites the current document with no prompt. Falls back to Save As
-        /// the first time, when there is no current document yet to overwrite - matching how
-        /// Ctrl+S behaves in most creative software. Also reachable via the Ctrl+S hotkey (see
-        /// SculptController.HandleSaveKeys), which SendMessages this by name.
-        private void Save()
-        {
-            if (string.IsNullOrEmpty(_currentSavePath))
-            {
-                SaveAs();
-                return;
-            }
-
-            if (SceneSerializer.Save(_currentSavePath, out string error))
-            {
-                SetStatus($"Saved {Path.GetFileName(_currentSavePath)} ({FileSizeMb(_currentSavePath)})", OkColor, hold: true);
-                if (_controller != null) _controller.TriggerActionToast("Saved");
-            }
-            else
-            {
-                SetStatus("Save failed: " + error, ErrorColor, hold: false);
-            }
-        }
-
-        /// Always prompts for a location, then makes that the current document for subsequent
-        /// quick Saves. Also reachable via the Ctrl+Shift+S hotkey (see
-        /// SculptController.HandleSaveKeys), which SendMessages this by name.
-        private void SaveAs()
-        {
-            string path = PickSavePath();
-            if (path == null) return;
-
-            if (SceneSerializer.Save(path, out string error))
-            {
-                _currentSavePath = path;
-                SetStatus($"Saved {Path.GetFileName(path)} ({FileSizeMb(path)})", OkColor, hold: true);
-                if (_controller != null) _controller.TriggerActionToast("Saved As");
-            }
-            else
-            {
-                SetStatus("Save failed: " + error, ErrorColor, hold: false);
-            }
-        }
-
         /// The Exit button's prompt - also what the OS window's own close button triggers (see
         /// OnWantsToQuit). Cancel is added automatically by ShowModal, so closing the app always
         /// has a way back.
@@ -584,86 +519,8 @@ namespace Sculpting
             UIFactory.ShowModal(
                 "Exit the app?\n\nSave your work first?",
                 null,
-                new UIFactory.ModalChoice("Save and Exit", ExitSaveAndQuit),
-                new UIFactory.ModalChoice("Exit Without Saving", QuitNow));
-        }
-
-        /// Same fallback-to-Save-As as the Save button, except it only actually closes the app
-        /// once the file has been written - a failed save or a cancelled Save As leaves the app
-        /// open rather than quitting over work that was never written to disk.
-        private void ExitSaveAndQuit()
-        {
-            string path = _currentSavePath;
-            if (string.IsNullOrEmpty(path))
-            {
-                path = PickSavePath();
-                if (path == null) return; // cancelled - stay open
-            }
-
-            if (SceneSerializer.Save(path, out string error))
-            {
-                _currentSavePath = path;
-                QuitNow();
-            }
-            else
-            {
-                SetStatus("Save failed: " + error, ErrorColor, hold: false);
-            }
-        }
-
-        private void QuitNow()
-        {
-            _quitConfirmed = true;
-#if UNITY_EDITOR
-            UnityEditor.EditorApplication.isPlaying = false;
-#else
-            Application.Quit();
-#endif
-        }
-
-        // ----------------------------------------------------------------------- path picking
-
-        /// The OS picker where there is one, the fallback field otherwise. Returns null when the
-        /// user cancels, which every caller treats as "do nothing" - deliberately NOT an error,
-        /// since cancelling is a normal thing to do.
-        private string PickPath(string title, params string[] extensions)
-        {
-            if (FileDialog.IsSupported)
-            {
-                string chosen = FileDialog.OpenFile(title, StartDirectory(), extensions);
-                if (!string.IsNullOrEmpty(chosen)) _lastDirectory = FileDialog.DirectoryFor(chosen);
-                return string.IsNullOrEmpty(chosen) ? null : chosen;
-            }
-
-            // Typed paths are used verbatim - no extension is appended, because this same field
-            // has to be able to name a model file (.obj/.stl) as well as a .sculpt.
-            string typed = _fallbackField != null ? _fallbackField.text?.Trim().Trim('"') : null;
-            if (string.IsNullOrEmpty(typed)) { SetStatus("Type a file path first.", ErrorColor, hold: false); return null; }
-            return typed;
-        }
-
-        private string PickSavePath()
-        {
-            if (FileDialog.IsSupported)
-            {
-                string chosen = FileDialog.SaveFile("Save scene", StartDirectory(), "sculpt-session", "sculpt");
-                if (!string.IsNullOrEmpty(chosen)) _lastDirectory = FileDialog.DirectoryFor(chosen);
-                return string.IsNullOrEmpty(chosen) ? null : chosen;
-            }
-
-            // NormalizePath here (unlike PickPath) because a save target is always a .sculpt, so
-            // a bare name can safely be completed into one.
-            string typed = _fallbackField != null ? _fallbackField.text : null;
-            return SceneSerializer.NormalizePath(typed);
-        }
-
-        private string StartDirectory() =>
-            string.IsNullOrEmpty(_lastDirectory) ? SceneSerializer.DefaultDirectory : _lastDirectory;
-
-        private static string FileSizeMb(string path)
-        {
-            try { return (new FileInfo(path).Length / 1024f / 1024f).ToString("F1") + " MB"; }
-            catch { return "saved"; }
+                new UIFactory.ModalChoice("Save and Exit", _document.ExitSaveAndQuit),
+                new UIFactory.ModalChoice("Exit Without Saving", _document.QuitNow));
         }
 
         private void SetStatus(string message, Color color, bool hold)
@@ -1307,11 +1164,10 @@ namespace Sculpting
 
         // ----------------------------------------------------------------------------- delete
 
-        /// Entry point for the Delete key (see SculptController.Input.HandleDeleteObjectKey,
-        /// which SendMessages here rather than holding a direct reference - same idiom as
-        /// Save/SaveAs). Targets the primary selection, matching what the Delete key deletes in
-        /// every other DCC.
-        private void ShowDeleteSelectedConfirm()
+        /// Entry point for the Delete key (see SculptController.Input.HandleDeleteObjectKey).
+        /// Targets the primary selection, matching what the Delete key deletes in every other
+        /// DCC.
+        internal void ShowDeleteSelectedConfirm()
         {
             if (_selection != null) ShowDeleteConfirm(_selection.PrimarySelection);
         }

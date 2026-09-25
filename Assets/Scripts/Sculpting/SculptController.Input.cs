@@ -1,3 +1,4 @@
+using Sculpting.IO;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -259,10 +260,9 @@ namespace Sculpting
         private LatheController _latheForUndo;
 
         // Ctrl+S / Ctrl+Shift+S, matching the quick-save/save-as split most creative software
-        // uses (see SceneGraphUIBuilder.Save/SaveAs). Routed via SendMessage rather than a
-        // direct reference - same "invoke a private MonoBehaviour method without reflection"
-        // idiom RebuildOtherPanels already uses - because this controller has no other reason
-        // to depend on the scene-file UI panel.
+        // uses (see SceneDocumentController.Save/SaveAs). The document, not the panel that shows
+        // it, is what gets saved - the panel hears about the result through the document's
+        // Status event like it does for its own buttons.
         private void HandleSaveKeys()
         {
             var kb = Keyboard.current;
@@ -271,15 +271,15 @@ namespace Sculpting
 
             bool saveAs = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
-            if (_sceneGraphPanel == null) return;
+            if (_document == null) _document = FindFirstObjectByType<SceneDocumentController>();
+            if (_document == null) return;
 
-            _sceneGraphPanel.gameObject.SendMessage(saveAs ? "SaveAs" : "Save", SendMessageOptions.DontRequireReceiver);
+            if (saveAs) _document.SaveAs(); else _document.Save();
         }
 
         // Delete on the selected scene object - prompts before deleting (see
-        // SceneGraphUIBuilder.ShowDeleteSelectedConfirm), routed via SendMessage for the same
-        // reason as HandleSaveKeys above. Skipped while the ZSphere tool is active: there,
+        // SceneGraphUIBuilder.ShowDeleteSelectedConfirm; the prompt is the panel's, so this asks
+        // the panel). Skipped while the ZSphere tool is active: there,
         // Delete/Backspace already means "delete the selected RIG NODE" (see
         // ZSphereController.Input.HandleKeys), and letting both fire off one press would delete
         // a node AND the object it belongs to. Also skipped while a uGUI text field has focus
@@ -300,11 +300,12 @@ namespace Sculpting
             if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
             if (_sceneGraphPanel == null) return;
 
-            _sceneGraphPanel.gameObject.SendMessage("ShowDeleteSelectedConfirm", SendMessageOptions.DontRequireReceiver);
+            _sceneGraphPanel.ShowDeleteSelectedConfirm();
         }
 
         // Only ever looked up on a frame Ctrl+S or Delete is actually pressed, so the find costs
         // nothing otherwise - same reasoning as _zsphereForUndo above.
+        private SceneDocumentController _document;
         private SceneGraphUIBuilder _sceneGraphPanel;
 
         private void HandleBrushSwitchKeys()
