@@ -68,7 +68,7 @@ namespace Sculpting
 
         /// Hover tracking for one handle. uGUI's own Selectable tint only reaches a single
         /// target graphic, and a handle is three graphics (cone, disc, label) whose colours this
-        /// builder already rewrites every frame - so the highlight is applied there, from a flag
+        /// builder already rewrites in Refresh - so the highlight is applied there, from a flag
         /// this sets, rather than fought over with the Button's transition.
         private class ViewGizmoHandle : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
         {
@@ -99,7 +99,7 @@ namespace Sculpting
         private Image _projImage;
         private Text _projText;
 
-        // Scratch for the per-frame depth sort - the seventh entry is the centre cube.
+        // Scratch for Refresh's depth sort - the seventh entry is the centre cube.
         private readonly int[] _order = new int[7];
         private readonly float[] _depth = new float[7];
 
@@ -115,7 +115,40 @@ namespace Sculpting
         {
             if (_canvasRoot == null) BuildUI();
             if (_orbit == null) _orbit = FindFirstObjectByType<CameraOrbitController>();
-            Refresh();
+            if (RefreshInputsChanged()) Refresh();
+        }
+
+        // What Refresh() last drew from. It is a pure function of these, and it rewrites every
+        // handle's position, scale, rotation, colours and sibling order - so re-running it on a
+        // frame where none of them changed only re-dirtied the canvas for an identical picture.
+        private Camera _shownCamera;
+        private Quaternion _shownRotation;
+        private int _shownHoverMask = -1;
+        private bool _shownOrtho;
+        private float _shownPanelWidth = -1f;
+
+        private bool RefreshInputsChanged()
+        {
+            Camera cam = Camera.main;
+            Quaternion rotation = cam != null ? cam.transform.rotation : Quaternion.identity;
+            int hoverMask = 0;
+            for (int i = 0; i < _hovers.Length; i++)
+                if (_hovers[i] != null && _hovers[i].Hovered) hoverMask |= 1 << i;
+            bool ortho = _orbit != null && _orbit.Orthographic;
+            float panelWidth = UIFactory.ResponsivePanelWidth(RightPanelWidth);
+
+            // Equals, not ==: Quaternion == is approximate, and a slow orbit could otherwise
+            // leave the gizmo a hair behind the camera it describes.
+            if (cam == _shownCamera && rotation.Equals(_shownRotation) && hoverMask == _shownHoverMask &&
+                ortho == _shownOrtho && panelWidth.Equals(_shownPanelWidth))
+                return false;
+
+            _shownCamera = cam;
+            _shownRotation = rotation;
+            _shownHoverMask = hoverMask;
+            _shownOrtho = ortho;
+            _shownPanelWidth = panelWidth;
+            return true;
         }
 
         private void BuildUI()
@@ -141,10 +174,10 @@ namespace Sculpting
             gizmoRect.anchorMin = gizmoRect.anchorMax = gizmoRect.pivot = new Vector2(1f, 1f);
             gizmoRect.sizeDelta = new Vector2(GizmoBox, GizmoBox);
             _gizmoRect = gizmoRect;
-            // Positioned below by Refresh() (called at the end of this method, then every
-            // LateUpdate after) - see RepositionForPanel's remarks.
+            // Positioned below by Refresh() (called at the end of this method, then from
+            // LateUpdate whenever what it draws from changes) - see RepositionForPanel's remarks.
 
-            // Everything else in here is depth-sorted every frame; the axis lines are not, they
+            // Everything else in here is depth-sorted on every refresh; the axis lines are not, they
             // just live behind the lot in their own container at sibling index 0. A line to a
             // handle behind the cube reads correctly under it, and a line to one in front reads
             // as emerging from it, so sorting them individually would buy nothing.
@@ -277,8 +310,8 @@ namespace Sculpting
         }
 
         /// Keeps the gizmo clear of SceneGraphUIBuilder's panel as it scales with the window -
-        /// see RightPanelWidth's remarks. Run every frame from Refresh() rather than once at
-        /// build time, since the window can now be resized live.
+        /// see RightPanelWidth's remarks. Run from Refresh() (which re-runs when that width
+        /// changes) rather than once at build time, since the window can now be resized live.
         private void RepositionForPanel()
         {
             if (_gizmoRect == null) return;

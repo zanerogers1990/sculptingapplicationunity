@@ -24,9 +24,6 @@ namespace Sculpting
         // is a visible hitch; four a frame finishes in well under a second of scrolling.
         private const int ThumbnailsPerFrame = 4;
 
-        private static readonly Color ErrorColor = new Color(0.95f, 0.65f, 0.4f);
-        private static readonly Color InfoColor = new Color(0.65f, 0.65f, 0.7f);
-
         private SculptMaterialController _material;
 
         private Toggle _matcapToggle;
@@ -118,7 +115,7 @@ namespace Sculpting
             // rather than switching matcap off behind the user's back.
             _finishMatcapNote = CreateGroup(section, "FinishMatcapNote");
             Text noteText = UIFactory.CreateLabel(_finishMatcapNote.transform, "Matcap is on - it hides these shaders.", 11, FontStyle.Italic);
-            noteText.color = ErrorColor;
+            noteText.color = UIFactory.StatusWarnColor;
             UIFactory.CreateButton(_finishMatcapNote.transform, "Turn Off Matcap", () =>
             {
                 _material.MatcapEnabled = false;
@@ -383,17 +380,17 @@ namespace Sculpting
             if (finish == SurfaceFinish.None)
             {
                 _finishStatus.text = "Off - plain Base Color. Pick a category above.";
-                _finishStatus.color = InfoColor;
+                _finishStatus.color = UIFactory.StatusHintColor;
             }
             else if (matcapShowing)
             {
                 _finishStatus.text = (presetName ?? "Surface shader") + " - hidden while matcap is on.";
-                _finishStatus.color = ErrorColor;
+                _finishStatus.color = UIFactory.StatusWarnColor;
             }
             else
             {
                 _finishStatus.text = (presetName ?? "Surface shader") + " - replaces Base Color.";
-                _finishStatus.color = new Color(0.55f, 0.85f, 0.55f);
+                _finishStatus.color = UIFactory.StatusOkColor;
             }
         }
 
@@ -463,7 +460,7 @@ namespace Sculpting
             {
                 Text empty = UIFactory.CreateLabel(_paletteRoot, "No matcaps found in the Matcaps folder.",
                                                    11, FontStyle.Italic);
-                empty.color = InfoColor;
+                empty.color = UIFactory.StatusHintColor;
                 return;
             }
 
@@ -478,7 +475,7 @@ namespace Sculpting
                 {
                     category = entry.Category;
                     Text heading = UIFactory.CreateLabel(_paletteRoot, category, 11, FontStyle.Bold);
-                    heading.color = InfoColor;
+                    heading.color = UIFactory.StatusHintColor;
                     row = null;
                     inRow = 0;
                 }
@@ -645,17 +642,17 @@ namespace Sculpting
                 if (_material.MatcapEnabled && _material.HasMatcap)
                 {
                     _matcapStatus.text = _material.MatcapName + " - replaces scene lighting.";
-                    _matcapStatus.color = new Color(0.55f, 0.85f, 0.55f);
+                    _matcapStatus.color = UIFactory.StatusOkColor;
                 }
                 else if (_material.MatcapEnabled)
                 {
                     _matcapStatus.text = "Matcap image missing - pick one below.";
-                    _matcapStatus.color = ErrorColor;
+                    _matcapStatus.color = UIFactory.StatusWarnColor;
                 }
                 else
                 {
                     _matcapStatus.text = "Off - lit by the scene lights. Cavity and mask apply either way.";
-                    _matcapStatus.color = InfoColor;
+                    _matcapStatus.color = UIFactory.StatusHintColor;
                 }
             }
 
@@ -707,7 +704,7 @@ namespace Sculpting
         {
             if (_matcapStatus == null) return;
             _matcapStatus.text = message;
-            _matcapStatus.color = ErrorColor;
+            _matcapStatus.color = UIFactory.StatusWarnColor;
         }
     }
 }

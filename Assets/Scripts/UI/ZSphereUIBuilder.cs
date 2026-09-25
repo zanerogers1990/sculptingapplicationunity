@@ -14,11 +14,6 @@ namespace Sculpting
     /// as callbacks, so this class does not depend on the panel.
     public class ZSphereUIBuilder : MonoBehaviour
     {
-        // The Scene panel's status colours (see LatheUIBuilder, which keeps its own copy likewise).
-        private static readonly Color OkColor = new Color(0.55f, 0.85f, 0.55f);
-        private static readonly Color ErrorColor = new Color(0.95f, 0.45f, 0.4f);
-        private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
-
         private SelectionManager _selection;
         private TransformGizmo _gizmo;
         private Action<GizmoMode> _setToolMode;
@@ -326,7 +321,7 @@ namespace Sculpting
                 _zsphereUndoLabel.text = undoLabel == null
                     ? "Rig history empty."
                     : $"Undo (Z): {undoLabel} - {undoDepth} step(s) held.";
-                _zsphereUndoLabel.color = HintColor;
+                _zsphereUndoLabel.color = UIFactory.StatusHintColor;
             }
 
             if (_zsphereAttachLabel != null)
@@ -336,13 +331,13 @@ namespace Sculpting
                     : snap
                         ? $"Attached to {attachName} - clicks land on its surface."
                         : $"Attached to {attachName} - surface snap is off.";
-                _zsphereAttachLabel.color = attachName == null ? HintColor : OkColor;
+                _zsphereAttachLabel.color = attachName == null ? UIFactory.StatusHintColor : UIFactory.StatusOkColor;
             }
 
             if (stickyShowing)
             {
                 _zsphereStatusLabel.text = _zsphereSticky;
-                _zsphereStatusLabel.color = OkColor;
+                _zsphereStatusLabel.color = UIFactory.StatusOkColor;
                 return;
             }
             _zsphereSticky = null;
@@ -353,27 +348,27 @@ namespace Sculpting
                 _zsphereStatusLabel.text = spheres > 0
                     ? $"Rig hidden ({spheres} spheres). Pick ZSpheres in Tool to edit it."
                     : "Pick ZSpheres in Tool (or Add > ZSphere Rig), then click in the viewport.";
-                _zsphereStatusLabel.color = HintColor;
+                _zsphereStatusLabel.color = UIFactory.StatusHintColor;
             }
             else if (spheres == 0)
             {
                 _zsphereStatusLabel.text = "Click in the viewport to place the first sphere - drag to size it.";
-                _zsphereStatusLabel.color = HintColor;
+                _zsphereStatusLabel.color = UIFactory.StatusHintColor;
             }
             else if (error != null)
             {
                 _zsphereStatusLabel.text = error;
-                _zsphereStatusLabel.color = ErrorColor;
+                _zsphereStatusLabel.color = UIFactory.StatusErrorColor;
             }
             else if (triCount > 0)
             {
                 _zsphereStatusLabel.text = $"{spheres} spheres | skin {triCount:N0} tris{(final ? string.Empty : " (live draft)")}";
-                _zsphereStatusLabel.color = OkColor;
+                _zsphereStatusLabel.color = UIFactory.StatusOkColor;
             }
             else
             {
                 _zsphereStatusLabel.text = $"{spheres} spheres.";
-                _zsphereStatusLabel.color = HintColor;
+                _zsphereStatusLabel.color = UIFactory.StatusHintColor;
             }
         }
 

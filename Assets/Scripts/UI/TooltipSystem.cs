@@ -10,13 +10,15 @@ namespace Sculpting
     /// small popup near the cursor explaining what it does; moving the pointer off the control,
     /// the control disabling itself, or the global switch below going off all hide it again.
     ///
-    /// Event-driven for the "wait and show" half (OnPointerEnter/Exit) - only the actually-
-    /// hovered control's own Update needs to run a timer. But OnPointerExit is NOT trusted alone
-    /// to hide it again: uGUI only fires it when the pointer crosses this rect's edge on a frame
-    /// it processes input, which misses a hovered control that scrolls/resizes/reparents out from
+    /// Event-driven for the "wait and show" half (OnPointerEnter/Exit) - only a control the
+    /// pointer is actually over runs a timer, ticked by TooltipSystem's one driver (there are
+    /// hundreds of these, and each having its own Update meant hundreds of engine calls a frame
+    /// that almost all returned at once). But OnPointerExit is NOT trusted alone to hide it
+    /// again: uGUI only fires it when the pointer crosses this rect's edge on a frame it
+    /// processes input, which misses a hovered control that scrolls/resizes/reparents out from
     /// under a stationary cursor (a foldout collapsing above it, a slider's own value-driven
     /// layout change) - the pointer never "moved" so no exit event fires, and the popup would be
-    /// left pointing at empty space. Once shown, Update() below re-checks every frame that the
+    /// left pointing at empty space. Once shown, Tick() below re-checks every frame that the
     /// cursor is still actually within this control's own rect and self-hides the moment it
     /// isn't, independent of whatever uGUI's enter/exit bookkeeping thinks happened.
     public sealed class TooltipTrigger : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
@@ -36,11 +38,13 @@ namespace Sculpting
         {
             _hoverStartTime = Time.unscaledTime;
             _pointerPos = eventData.position;
+            TooltipSystem.Track(this);
         }
 
         public void OnPointerExit(PointerEventData eventData) => EndHover();
 
-        private void Update()
+        /// Once a frame while the pointer is over this control - see TooltipSystem.Track.
+        internal void Tick()
         {
             if (_hoverStartTime < 0f) return;
 
@@ -72,6 +76,7 @@ namespace Sculpting
         {
             _hoverStartTime = -1f;
             _shown = false;
+            TooltipSystem.Untrack(this);
             TooltipSystem.Hide(this);
         }
 
@@ -110,6 +115,49 @@ namespace Sculpting
             var trigger = go.GetComponent<TooltipTrigger>();
             if (trigger == null) trigger = go.AddComponent<TooltipTrigger>();
             trigger.Text = text;
+        }
+
+        // --- Hover timers ----------------------------------------------------------------
+
+        // The triggers the pointer is currently over (nested controls can overlap), ticked once a
+        // frame by one driver instead of every trigger in the UI polling from its own Update.
+        private static readonly System.Collections.Generic.List<TooltipTrigger> _tracked =
+            new System.Collections.Generic.List<TooltipTrigger>();
+        private static TooltipDriver _driver;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetTracking()
+        {
+            _tracked.Clear();
+            _driver = null;
+        }
+
+        internal static void Track(TooltipTrigger trigger)
+        {
+            if (!_tracked.Contains(trigger)) _tracked.Add(trigger);
+            if (_driver == null)
+            {
+                var go = new GameObject("TooltipDriver");
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                _driver = go.AddComponent<TooltipDriver>();
+            }
+        }
+
+        internal static void Untrack(TooltipTrigger trigger) => _tracked.Remove(trigger);
+
+        private sealed class TooltipDriver : MonoBehaviour
+        {
+            private void Update()
+            {
+                // Backwards: a Tick that ends its hover removes that trigger from the list.
+                for (int i = _tracked.Count - 1; i >= 0; i--)
+                {
+                    if (i >= _tracked.Count) continue;
+                    TooltipTrigger trigger = _tracked[i];
+                    if (trigger == null) { _tracked.RemoveAt(i); continue; }
+                    trigger.Tick();
+                }
+            }
         }
 
         // --- Popup box -------------------------------------------------------------------

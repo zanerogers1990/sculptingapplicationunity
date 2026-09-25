@@ -26,11 +26,8 @@ namespace Sculpting
     /// section makes its own top-level foldout in it.
     public class LightingUIBuilder : MonoBehaviour
     {
-        // Same palette the Scene panel's status line uses, so a failure reads as a failure in
-        // both places.
-        private static readonly Color HdriOkColor = new Color(0.55f, 0.85f, 0.55f);
-        private static readonly Color HdriErrorColor = new Color(0.95f, 0.45f, 0.4f);
-        private static readonly Color HdriHintColor = new Color(0.65f, 0.65f, 0.7f);
+        // The HDRI status line uses UIFactory's shared status colours, so a failure reads as a
+        // failure here and on the Scene panel alike; this note colour is Lighting's own.
         private static readonly Color LightingNoteColor = new Color(0.95f, 0.75f, 0.4f);
 
         private Toggle _hdriEnabledToggle, _hdriBackgroundToggle;
@@ -234,7 +231,7 @@ namespace Sculpting
         {
             if (!FileDialog.IsSupported)
             {
-                SetHdriStatus("No file picker available on this platform.", HdriErrorColor);
+                SetHdriStatus("No file picker available on this platform.", UIFactory.StatusErrorColor);
                 return;
             }
 
@@ -282,7 +279,7 @@ namespace Sculpting
                 // Refuse rather than switch to a mode that would silently fall back to the
                 // gradient anyway, and put the toggle back so it never claims a state the
                 // scene is not in.
-                SetHdriStatus("Load an HDRI and switch it on first.", HdriErrorColor);
+                SetHdriStatus("Load an HDRI and switch it on first.", UIFactory.StatusErrorColor);
                 _hdriBackgroundToggle.SetIsOnWithoutNotify(false);
                 return;
             }
@@ -330,9 +327,9 @@ namespace Sculpting
         {
             HdriEnvironmentController hdri = HdriEnvironmentController.Instance;
             if (_hdriFileButtonLabel != null) _hdriFileButtonLabel.text = FileButtonLabel(hdri);
-            Color color = hdri.LastLoadFailed ? HdriErrorColor
-                        : hdri.HasImage ? HdriOkColor
-                        : HdriHintColor;
+            Color color = hdri.LastLoadFailed ? UIFactory.StatusErrorColor
+                        : hdri.HasImage ? UIFactory.StatusOkColor
+                        : UIFactory.StatusHintColor;
             SetHdriStatus(hdri.Status, color);
         }
 

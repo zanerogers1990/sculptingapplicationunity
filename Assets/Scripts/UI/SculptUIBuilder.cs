@@ -22,11 +22,6 @@ namespace Sculpting
         private static readonly Color MirrorYColor = new Color(0.35f, 1f, 0.35f);
         private static readonly Color MirrorZColor = new Color(0.3f, 0.55f, 1f);
 
-        // Symmetry Repair status line: the same green/grey pairing the extract status already
-        // uses for "an action reported success" versus "here is what this section does".
-        private static readonly Color SymmetryOkColor = new Color(0.55f, 0.85f, 0.55f);
-        private static readonly Color SymmetryHintColor = new Color(0.65f, 0.65f, 0.7f);
-
         private Font _font;
         private Text _positiveToggleLabel;
         private Toggle _positiveToggle;
@@ -796,10 +791,10 @@ namespace Sculpting
             CreateLabel(foldout, "Match Up (keeps topology, needs matching halves)", 12, FontStyle.Normal);
             var mirrorRow = CreateRow(foldout);
             Button posToNeg = CreateButton(mirrorRow.transform, "+X to -X",
-                () => SetSymmetryStatus(controller.MakeSymmetric(true), SymmetryOkColor),
+                () => SetSymmetryStatus(controller.MakeSymmetric(true), UIFactory.StatusOkColor),
                 "Nudges the + side's paired vertices to match the - side, keeping topology and mask.");
             Button negToPos = CreateButton(mirrorRow.transform, "-X to +X",
-                () => SetSymmetryStatus(controller.MakeSymmetric(false), SymmetryOkColor),
+                () => SetSymmetryStatus(controller.MakeSymmetric(false), UIFactory.StatusOkColor),
                 "Nudges the - side's paired vertices to match the + side, keeping topology and mask.");
             _symPosToNegLabel = posToNeg.GetComponentInChildren<Text>();
             _symNegToPosLabel = negToPos.GetComponentInChildren<Text>();
@@ -807,22 +802,22 @@ namespace Sculpting
             CreateLabel(foldout, "Cut & Mirror (rebuilds the far side, always works)", 12, FontStyle.Normal);
             var cutRow = CreateRow(foldout);
             Button cutPosToNeg = CreateButton(cutRow.transform, "+X to -X",
-                () => SetSymmetryStatus(controller.MirrorAndWeld(true), SymmetryOkColor),
+                () => SetSymmetryStatus(controller.MirrorAndWeld(true), UIFactory.StatusOkColor),
                 "Deletes the - side and rebuilds it as an exact mirror of the + side.");
             Button cutNegToPos = CreateButton(cutRow.transform, "-X to +X",
-                () => SetSymmetryStatus(controller.MirrorAndWeld(false), SymmetryOkColor),
+                () => SetSymmetryStatus(controller.MirrorAndWeld(false), UIFactory.StatusOkColor),
                 "Deletes the + side and rebuilds it as an exact mirror of the - side.");
             _symCutPosToNegLabel = cutPosToNeg.GetComponentInChildren<Text>();
             _symCutNegToPosLabel = cutNegToPos.GetComponentInChildren<Text>();
 
             CreateButton(foldout, "Symmetry Cleanup (Snap + Weld)",
-                () => SetSymmetryStatus(controller.SymmetryCleanup(), SymmetryOkColor),
+                () => SetSymmetryStatus(controller.SymmetryCleanup(), UIFactory.StatusOkColor),
                 "Snaps near-matching vertices onto the plane and welds seams along it, without moving either side wholesale.");
 
             _symmetryStatusLabel = CreateLabel(foldout,
                 "Check Symmetry reports how many vertices pair across the plane. If most of them " +
                 "don't pair, the halves were built separately - use Cut & Mirror.", 11, FontStyle.Italic);
-            _symmetryStatusLabel.color = SymmetryHintColor;
+            _symmetryStatusLabel.color = UIFactory.StatusHintColor;
 
             RefreshSymmetryAxis();
         }
@@ -942,17 +937,17 @@ namespace Sculpting
             if (!string.IsNullOrEmpty(error))
             {
                 _extractStatusLabel.text = error;
-                _extractStatusLabel.color = new Color(0.95f, 0.65f, 0.4f);
+                _extractStatusLabel.color = UIFactory.StatusWarnColor;
             }
             else if (previewing)
             {
                 _extractStatusLabel.text = $"Preview: {tris:N0} tris. Accept to keep.";
-                _extractStatusLabel.color = new Color(0.55f, 0.85f, 0.55f);
+                _extractStatusLabel.color = UIFactory.StatusOkColor;
             }
             else
             {
                 _extractStatusLabel.text = "Mask a region, then Preview. Accept makes it a new object.";
-                _extractStatusLabel.color = new Color(0.65f, 0.65f, 0.7f);
+                _extractStatusLabel.color = UIFactory.StatusHintColor;
             }
         }
 

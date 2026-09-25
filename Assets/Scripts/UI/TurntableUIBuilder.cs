@@ -14,8 +14,8 @@ namespace Sculpting
     /// itself for the same reason.
     public class TurntableUIBuilder : MonoBehaviour
     {
-        private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
-        private static readonly Color RecordingColor = new Color(0.95f, 0.45f, 0.4f);
+        // Recording reads in the status palette's error red.
+        private static readonly Color RecordingColor = UIFactory.StatusErrorColor;
 
         // Output presets. 1080 on the short side for the three shapes people post turntables in
         // (landscape video, square feed post, vertical reel), plus 4K landscape.
@@ -99,7 +99,7 @@ namespace Sculpting
             }
 
             _loopInfo = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
-            _loopInfo.color = HintColor;
+            _loopInfo.color = UIFactory.StatusHintColor;
 
             Button record = UIFactory.CreateButton(section, "Record 360° Loop", () => _turntable.ToggleLoopRecording(),
                 "Records exactly one revolution starting from the current view, at the spin speed " +
@@ -108,7 +108,7 @@ namespace Sculpting
             _recordLabel = record.GetComponentInChildren<Text>();
 
             _status = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
-            _status.color = HintColor;
+            _status.color = UIFactory.StatusHintColor;
 
             UIFactory.CreateButton(section, "Open Recordings Folder", OpenFolder,
                 "Opens the folder turntable loops and timelapses are saved to.");

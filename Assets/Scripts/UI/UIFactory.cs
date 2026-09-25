@@ -38,6 +38,14 @@ namespace Sculpting
         // already use for their negative/erase polarity.
         public static readonly Color RegionRemoveColor = new Color(1f, 0.3f, 0.3f);
 
+        // Text colours of the one-line status readouts under the panels' actions (save/load,
+        // HDRI, matcaps, symmetry, extract, lathe, ZSpheres, recording): it worked, it failed,
+        // a neutral hint, and a soft warning.
+        public static readonly Color StatusOkColor = new Color(0.55f, 0.85f, 0.55f);
+        public static readonly Color StatusErrorColor = new Color(0.95f, 0.45f, 0.4f);
+        public static readonly Color StatusHintColor = new Color(0.65f, 0.65f, 0.7f);
+        public static readonly Color StatusWarnColor = new Color(0.95f, 0.65f, 0.4f);
+
         private static Font _font;
         public static Font Font => _font != null ? _font : (_font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"));
 
@@ -148,6 +156,9 @@ namespace Sculpting
             var fitter = contentGO.AddComponent<ContentSizeFitter>();
             fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
             fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            // After the fitter, so it reads the height the fitter has just set - see
+            // ContentHeightWatcher.
+            var watcher = contentGO.AddComponent<ContentHeightWatcher>();
 
             var scrollbarGO = new GameObject("Scrollbar", typeof(RectTransform), typeof(Image), typeof(Scrollbar));
             scrollbarGO.transform.SetParent(panelRect, false);
@@ -194,6 +205,7 @@ namespace Sculpting
             sizer.PanelRect = panelRect;
             sizer.ContentRect = contentRect;
             sizer.ReferenceWidth = referenceWidth;
+            watcher.Sizer = sizer;
 
             return contentGO.transform;
         }
@@ -217,12 +229,16 @@ namespace Sculpting
         /// ResponsivePanelWidth, height to the content's natural size capped at the window's own
         /// height (floored at 300 so a near-empty panel, or a very short window, doesn't
         /// collapse to nothing) - the scrolling equivalent of the plain ContentSizeFitter every
-        /// other panel puts directly on itself, which can't cap. Re-measures every frame rather
-        /// than once at construction: foldouts opening/closing and lists like the scene object
-        /// list rebuilding change content height continuously after the panel is first built,
-        /// and the window itself can now be resized or dragged to another monitor live - the
-        /// same cheap per-frame poll idiom SculptUIBuilder/SceneGraphUIBuilder already use for
-        /// their own refresh checks.
+        /// other panel puts directly on itself, which can't cap.
+        ///
+        /// Content height changes continuously after the panel is first built (foldouts opening
+        /// and closing, lists like the scene object list rebuilding), and the window itself can
+        /// be resized or dragged to another monitor live. The window is polled here each frame,
+        /// which is cheap. The content is not: it is followed from inside uGUI's own layout pass
+        /// by ContentHeightWatcher, the moment the content's height is recomputed. This used to
+        /// force a full layout rebuild of the whole panel in every LateUpdate to read the height
+        /// early - over a millisecond a frame for the two side panels, whether anything had
+        /// changed or not.
         private sealed class ScrollPanelHeightController : MonoBehaviour
         {
             public RectTransform PanelRect;
@@ -237,11 +253,37 @@ namespace Sculpting
                 if (Mathf.Abs(PanelRect.sizeDelta.x - width) > 0.5f)
                     PanelRect.sizeDelta = new Vector2(width, PanelRect.sizeDelta.y);
 
-                LayoutRebuilder.ForceRebuildLayoutImmediate(ContentRect);
+                FitHeight();
+            }
+
+            /// Panel height = the content's current height, capped at the window.
+            public void FitHeight()
+            {
+                if (PanelRect == null || ContentRect == null) return;
                 float heightCap = Mathf.Max(300f, Screen.height);
                 float height = Mathf.Min(ContentRect.rect.height, heightCap);
                 if (Mathf.Abs(PanelRect.sizeDelta.y - height) > 0.5f)
                     PanelRect.sizeDelta = new Vector2(PanelRect.sizeDelta.x, height);
+            }
+        }
+
+        /// Sits on a scrolling panel's Content, after its ContentSizeFitter. uGUI calls a layout
+        /// self-controller only when that object's layout is actually being rebuilt, and in
+        /// component order - so SetLayoutVertical here runs exactly when the fitter has just
+        /// given the content a new height, in the same layout pass, and resizes the panel to
+        /// match before anything is drawn. Resizing the panel marks the ScrollRect on it for
+        /// layout, which uGUI appends to the pass already running, so the scrollbar and viewport
+        /// settle in that same frame too - the same frame the old every-frame forced rebuild
+        /// managed, now paid only when the content really changed.
+        private sealed class ContentHeightWatcher : UIBehaviour, ILayoutSelfController
+        {
+            public ScrollPanelHeightController Sizer;
+
+            public void SetLayoutHorizontal() { }
+
+            public void SetLayoutVertical()
+            {
+                if (Sizer != null) Sizer.FitHeight();
             }
         }
 

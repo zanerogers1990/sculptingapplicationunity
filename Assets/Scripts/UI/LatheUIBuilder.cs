@@ -13,10 +13,7 @@ namespace Sculpting
     /// is exactly when its controls are needed.
     public class LatheUIBuilder : MonoBehaviour
     {
-        private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
-        private static readonly Color OkColor = new Color(0.55f, 0.85f, 0.55f);
         private static readonly Color WarnColor = new Color(0.98f, 0.72f, 0.35f);
-        private static readonly Color ErrorColor = new Color(0.95f, 0.45f, 0.4f);
 
         private const float StickySeconds = 5f;
 
@@ -71,7 +68,7 @@ namespace Sculpting
             UIFactory.CreateButton(editRow.transform, "Undo", () => _lathe.Undo(), "Undoes the last profile edit (Z).");
             UIFactory.CreateButton(editRow.transform, "Redo", () => _lathe.Redo(), "Redoes it (Shift+Z).");
             _undoLabel = UIFactory.CreateLabel(section, string.Empty, 10, FontStyle.Italic);
-            _undoLabel.color = HintColor;
+            _undoLabel.color = UIFactory.StatusHintColor;
 
             _loopToggle = UIFactory.CreateToggle(section, "Closed Loop (ring)", _lathe.ClosedLoop,
                 v => _lathe.ClosedLoop = v,
@@ -214,18 +211,18 @@ namespace Sculpting
             if (!_lathe.HasMesh)
             {
                 text = build.Error ?? "No shape yet.";
-                color = HintColor;
+                color = UIFactory.StatusHintColor;
             }
             else
             {
                 string closure = build.Watertight ? "closed solid" : "open surface - ends not closed";
                 text = $"{build.VertexCount:N0} verts | {build.TriangleCount:N0} tris | {closure}" +
                        (_lathe.IsDraft ? " (draft while dragging)" : string.Empty);
-                color = build.Watertight ? OkColor : WarnColor;
+                color = build.Watertight ? UIFactory.StatusOkColor : WarnColor;
                 if (build.SelfIntersecting)
                 {
                     text += "\nThe outline crosses itself, so the surface passes through itself.";
-                    color = ErrorColor;
+                    color = UIFactory.StatusErrorColor;
                 }
                 else if (build.TouchesAxis)
                 {
@@ -245,7 +242,7 @@ namespace Sculpting
                 if (!string.IsNullOrEmpty(_lathe.Status))
                 {
                     SetText(_statusLabel, _lathe.Status);
-                    _statusLabel.color = OkColor;
+                    _statusLabel.color = UIFactory.StatusOkColor;
                     _stickyUntil = Time.unscaledTime + StickySeconds;
                     return;
                 }
@@ -256,7 +253,7 @@ namespace Sculpting
                 ? "Shaping - drag the handles on the outline in the viewport."
                 : "Pick Edit Profile (or Add Primitive > Lathe) to shape a turned solid.";
             SetText(_statusLabel, hint);
-            _statusLabel.color = HintColor;
+            _statusLabel.color = UIFactory.StatusHintColor;
         }
 
         private static void SyncToggle(Toggle toggle, bool value)

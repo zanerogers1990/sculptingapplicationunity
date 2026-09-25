@@ -27,9 +27,6 @@ namespace Sculpting
         // stale line.
         private const float StatusHoldSeconds = 5f;
 
-        private static readonly Color OkColor = new Color(0.55f, 0.85f, 0.55f);
-        private static readonly Color ErrorColor = new Color(0.95f, 0.45f, 0.4f);
-        private static readonly Color HintColor = new Color(0.65f, 0.65f, 0.7f);
         // Object-list text for either half of a live mirror pair (see MirrorLink). The name can't
         // say it: a separate mirror copy is named exactly the same way.
         private static readonly Color LinkedTextColor = new Color(1f, 0.82f, 0.45f);
@@ -40,7 +37,19 @@ namespace Sculpting
         private TransformGizmo _gizmo;
 
         private Transform _listContent;
-        private readonly List<GameObject> _listRows = new List<GameObject>();
+        private readonly List<ListRow> _listRows = new List<ListRow>();
+
+        /// One object's row in the list, kept so a refresh that changes nothing but what the rows
+        /// show (selection, names, visibility, mirror links) can update them in place.
+        private sealed class ListRow
+        {
+            public SculptableMesh Obj;
+            public GameObject Go;
+            public bool Renaming;
+            public Button NameButton;
+            public Text NameText;
+            public Toggle Visible;
+        }
         private int _lastShownSelectionVersion = -1;
 
         private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _zsphereModeImg;
@@ -55,7 +64,7 @@ namespace Sculpting
         private Text _timelapseButtonLabel, _timelapseStatus;
         private bool _timelapseWasRecording;
 
-        private static readonly Color RecordingColor = new Color(0.95f, 0.45f, 0.4f);
+        private static readonly Color RecordingColor = UIFactory.StatusErrorColor;
 
         // Follows the ACTUAL screen mode, not button presses - F11 and Alt+Enter change it too.
         private Text _fullscreenButtonLabel;
@@ -118,7 +127,7 @@ namespace Sculpting
             _document = GetComponent<SceneDocumentController>();
             if (_document == null) _document = gameObject.AddComponent<SceneDocumentController>();
             _document.FallbackPathText = () => _fallbackField != null ? _fallbackField.text : null;
-            _document.Status += (message, ok) => SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
+            _document.Status += (message, ok) => SetStatus(message, ok ? UIFactory.StatusOkColor : UIFactory.StatusErrorColor, hold: ok);
 
             BuildUI();
             RefreshList();
@@ -273,7 +282,7 @@ namespace Sculpting
             _zsphereUI = GetComponent<ZSphereUIBuilder>();
             if (_zsphereUI == null) _zsphereUI = gameObject.AddComponent<ZSphereUIBuilder>();
             _zsphereUI.BuildContent(panel, SetGizmoMode, RefreshToolButtons,
-                (message, ok) => SetStatus(message, ok ? OkColor : ErrorColor, hold: ok));
+                (message, ok) => SetStatus(message, ok ? UIFactory.StatusOkColor : UIFactory.StatusErrorColor, hold: ok));
 
             // Lathe: its own builder, filled into a foldout like the Turntable's and self-installed
             // the same way, since the scene predates it.
@@ -367,7 +376,7 @@ namespace Sculpting
             _timelapseButtonLabel = button.GetComponentInChildren<Text>();
 
             _timelapseStatus = UIFactory.CreateLabel(panel, string.Empty, 11, FontStyle.Italic);
-            _timelapseStatus.color = HintColor;
+            _timelapseStatus.color = UIFactory.StatusHintColor;
 
             RefreshTimelapseSection(true);
         }
@@ -440,9 +449,9 @@ namespace Sculpting
                 new UIFactory.ModalChoice("Add to current scene", () =>
                 {
                     if (_document.AddFromScene(path, out int count, out string error))
-                        SetStatus($"Added {count} object{(count == 1 ? "" : "s")} from {name}", OkColor, hold: true);
+                        SetStatus($"Added {count} object{(count == 1 ? "" : "s")} from {name}", UIFactory.StatusOkColor, hold: true);
                     else
-                        SetStatus("Load failed: " + error, ErrorColor, hold: false);
+                        SetStatus("Load failed: " + error, UIFactory.StatusErrorColor, hold: false);
                 }),
                 new UIFactory.ModalChoice("Replace scene (cannot be undone)", () =>
                 {
@@ -456,11 +465,11 @@ namespace Sculpting
                         // own _statusLabel too (see its remarks), which would otherwise reset
                         // straight back to the default hint right after this line ran.
                         RebuildOtherPanels();
-                        SetStatus("Loaded " + name, OkColor, hold: true);
+                        SetStatus("Loaded " + name, UIFactory.StatusOkColor, hold: true);
                     }
                     else
                     {
-                        SetStatus("Load failed: " + error, ErrorColor, hold: false);
+                        SetStatus("Load failed: " + error, UIFactory.StatusErrorColor, hold: false);
                     }
                 }));
         }
@@ -487,7 +496,7 @@ namespace Sculpting
         private void ShowHint()
         {
             _statusLabel.text = "Import adds a model (.obj, .stl). Load opens a saved scene (.sculpt).";
-            _statusLabel.color = HintColor;
+            _statusLabel.color = UIFactory.StatusHintColor;
             _statusClearAt = -1f;
         }
 
@@ -510,46 +519,93 @@ namespace Sculpting
 
         // -------------------------------------------------------------------------- object list
 
+        /// Brings the object list up to date. Updates the existing rows in place when they are
+        /// still the same objects in the same order; rebuilds them only when that changed.
+        ///
+        /// It used to rebuild every row on every refresh, and a refresh follows every selection
+        /// change - including the one a click on a row makes. So the second click of a
+        /// double-click landed on a freshly built button, a different GameObject from the first,
+        /// and uGUI counts clicks per GameObject: clickCount never reached 2 and double-click to
+        /// rename never fired. Updating in place keeps the clicked button alive between the two.
         private void RefreshList()
         {
-            foreach (GameObject row in _listRows) Destroy(row);
+            if (_selection != null && RowsMatchObjects())
+            {
+                foreach (ListRow row in _listRows) UpdateRow(row);
+                RefreshSelectedObjectControls();
+                return;
+            }
+
+            foreach (ListRow row in _listRows) if (row.Go != null) Destroy(row.Go);
             _listRows.Clear();
             if (_selection == null) return;
 
             foreach (SculptableMesh obj in _selection.AllObjects)
             {
                 if (obj == null) continue;
-                GameObject row = UIFactory.CreateRow(_listContent, 24f);
+                GameObject rowGO = UIFactory.CreateRow(_listContent, 24f);
+                var row = new ListRow { Obj = obj, Go = rowGO, Renaming = obj == _renamingObject };
                 _listRows.Add(row);
 
-                if (obj == _renamingObject)
+                if (row.Renaming)
                 {
-                    InputField renameField = UIFactory.CreateInputField(row.transform, obj.name,
+                    InputField renameField = UIFactory.CreateInputField(rowGO.transform, obj.name,
                         newName => CommitInlineRename(obj, newName));
                     FocusRenameField(renameField);
                 }
                 else
                 {
-                    // Either half of a live mirror pair says so in its text colour and tooltip.
-                    MirrorLink link = obj.LinkedMirror;
-                    SculptableMesh partner = link != null ? link.PartnerOf(obj) : null;
-                    string tooltip = "Click to select, Ctrl+click to add to selection, double-click to rename.";
-                    if (partner != null)
-                        tooltip = $"Mirror-linked with \"{partner.name}\": moving or sculpting either one mirrors onto the other. " + tooltip;
-
-                    Button nameBtn = UIFactory.CreateButton(row.transform, obj.name, () => OnRowClicked(obj), tooltip);
-                    nameBtn.GetComponent<Image>().color = _selection.PrimarySelection == obj ? UIFactory.ActiveColor
-                        : _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
-                    if (partner != null) nameBtn.GetComponentInChildren<Text>().color = LinkedTextColor;
-                    AddDoubleClickHandler(nameBtn.gameObject, () => BeginInlineRename(obj));
+                    row.NameButton = UIFactory.CreateButton(rowGO.transform, obj.name, () => OnRowClicked(obj));
+                    row.NameText = row.NameButton.GetComponentInChildren<Text>();
+                    AddDoubleClickHandler(row.NameButton.gameObject, () => BeginInlineRename(obj));
                 }
 
-                UIFactory.CreateToggle(row.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v),
+                row.Visible = UIFactory.CreateToggle(rowGO.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v),
                     tooltip: "Shows or hides this object in the viewport.");
-                UIFactory.CreateButton(row.transform, "X", () => ShowDeleteConfirm(obj), "Deletes this object (asks to confirm).");
+                UIFactory.CreateButton(rowGO.transform, "X", () => ShowDeleteConfirm(obj), "Deletes this object (asks to confirm).");
+                UpdateRow(row);
             }
 
             RefreshSelectedObjectControls();
+        }
+
+        /// Whether _listRows is still one row per live object, in AllObjects order, each in the
+        /// right state (inline rename or name button).
+        private bool RowsMatchObjects()
+        {
+            int r = 0;
+            foreach (SculptableMesh obj in _selection.AllObjects)
+            {
+                if (obj == null) continue;
+                if (r >= _listRows.Count) return false;
+                ListRow row = _listRows[r++];
+                if (row.Go == null || row.Obj != obj || row.Renaming != (obj == _renamingObject)) return false;
+            }
+            return r == _listRows.Count;
+        }
+
+        /// Everything a row shows about its object: name, selection highlight, mirror link and
+        /// visibility.
+        private void UpdateRow(ListRow row)
+        {
+            SculptableMesh obj = row.Obj;
+            if (row.NameButton != null)
+            {
+                // Either half of a live mirror pair says so in its text colour and tooltip.
+                MirrorLink link = obj.LinkedMirror;
+                SculptableMesh partner = link != null ? link.PartnerOf(obj) : null;
+                string tooltip = "Click to select, Ctrl+click to add to selection, double-click to rename.";
+                if (partner != null)
+                    tooltip = $"Mirror-linked with \"{partner.name}\": moving or sculpting either one mirrors onto the other. " + tooltip;
+
+                row.NameButton.gameObject.name = "Button_" + obj.name;
+                row.NameText.text = obj.name;
+                row.NameText.color = partner != null ? LinkedTextColor : Color.white;
+                row.NameButton.GetComponent<Image>().color = _selection.PrimarySelection == obj ? UIFactory.ActiveColor
+                    : _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
+                TooltipSystem.Attach(row.NameButton.gameObject, tooltip);
+            }
+            if (row.Visible != null) row.Visible.SetIsOnWithoutNotify(obj.Visible);
         }
 
         // ------------------------------------------------------------------ rename and clone
@@ -715,7 +771,7 @@ namespace Sculpting
             if (partner == null)
             {
                 _mirrorNote.text = "Linked copies follow each other's moves\nand sculpting until you finalize.";
-                _mirrorNote.color = HintColor;
+                _mirrorNote.color = UIFactory.StatusHintColor;
                 return;
             }
 
@@ -725,7 +781,7 @@ namespace Sculpting
             string deleted = partner.gameObject.activeInHierarchy ? string.Empty : " (deleted)";
             _mirrorNote.text = $"Linked with \"{partner.name}\"{deleted} across {AxisNames(link.Signs)}.\n" +
                                "Moves and sculpting mirror live.";
-            _mirrorNote.color = OkColor;
+            _mirrorNote.color = UIFactory.StatusOkColor;
         }
 
         private static string AxisNames(Vector3 signs) =>
@@ -839,7 +895,7 @@ namespace Sculpting
 
             bool ok = MeshBooleanTool.Apply(target, others, op, resolution,
                                             hideOthers: true, deleteOthers: deleteOthers, out string message);
-            SetStatus(message, ok ? OkColor : ErrorColor, hold: ok);
+            SetStatus(message, ok ? UIFactory.StatusOkColor : UIFactory.StatusErrorColor, hold: ok);
             RefreshList();
         }
 
