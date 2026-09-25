@@ -19,9 +19,9 @@ namespace Sculpting.IO
         public string unityVersion;
 
         public SculptController.Settings brush;
-        public MaterialSettings material = new MaterialSettings();
+        public SculptMaterialController.Settings material = new SculptMaterialController.Settings();
         public EnvironmentSettings environment = new EnvironmentSettings();
-        public CameraSettings camera = new CameraSettings();
+        public CameraOrbitController.SavedView camera = new CameraOrbitController.SavedView();
 
         public List<ObjectEntry> objects = new List<ObjectEntry>();
 
@@ -65,70 +65,6 @@ namespace Sculpting.IO
             public int mirrorLinkTwin;
             public Vector3 mirrorLinkCenter;
             public Vector3 mirrorLinkSigns;
-        }
-
-        [Serializable]
-        public class MaterialSettings
-        {
-            public Color baseColor = Color.grey;
-            public float metallic;
-            public float smoothness = 0.4f;
-            public float normalStrength;
-            public float normalNoiseScale = 60f;
-            public bool flatShading;
-            // Screen-space cavity (Blender-style ridge/valley). Older files carry the retired
-            // per-vertex tint's cavityEnabled/recessColor/cavityIntensity/cavityRange (and, older
-            // still, peakColor); JsonUtility drops keys it has no member for, so those files load
-            // with these defaults instead of carrying an unrelated on/off state across.
-            public bool screenCavityEnabled = true;
-            public float cavityRidge = 1f;
-            public float cavityValley = 1f;
-
-            // Matcap by file name rather than by path: the image lives in the app's own Matcaps
-            // folder, so a name still resolves on a machine where the app is installed somewhere
-            // else. A name this machine doesn't have falls back to lit shading (see
-            // SculptMaterialController.MatcapName).
-            public bool matcapEnabled;
-            public string matcapName = string.Empty;
-            public float matcapIntensity = 1f;
-            public float matcapTintStrength;
-
-            // Lure plastic by preset id (LurePlasticPresets). Older files have none of these and
-            // load with it off. lureReferenceSize keeps the flakes exactly where they were; 0
-            // re-measures the model.
-            public bool lureEnabled;
-            public string lurePresetId = string.Empty;
-            public float lureFlakeSize = 1f;
-            public float lureFlakeAmount = 1f;
-            public float lureSparkle = 1f;
-            public float lureTranslucency = 1f;
-            public float lureGloss = 0.8f;
-            public float lureReferenceSize;
-
-            // Aged metal finish by preset id (MetalFinishPresets), same scheme as the lure's.
-            // Older files have none of these and load with it off.
-            public bool metalEnabled;
-            public string metalPresetId = string.Empty;
-            public float metalExposure = 1f;
-            public float metalEdgeWear = 1f;
-            public float metalWash = 1f;
-            public float metalDetail = 1f;
-            public float metalPatternSize = 1f;
-            public float metalGloss = 1f;
-            public float metalPatternSeed;
-            public float metalReferenceSize;
-
-            // Sculptor's clay by preset id (ClayPresets), same scheme again. Older files have none
-            // of these and load with it off.
-            public bool clayEnabled;
-            public string clayPresetId = string.Empty;
-            public float clayGloss = 1f;
-            public float clayWetness = 1f;
-            public float claySubsurface = 1f;
-            public float clayRecess = 1f;
-            public float clayDetail = 1f;
-            public float clayGrain = 1f;
-            public float clayReferenceSize;
         }
 
         [Serializable]
@@ -176,17 +112,6 @@ namespace Sculpting.IO
             public float dofFocusDistance, dofAperture;
             public bool colorAdjustmentsEnabled;
             public float saturation, contrast;
-        }
-
-        [Serializable]
-        public class CameraSettings
-        {
-            public bool valid;
-            public float yaw, pitch, distance;
-            public Vector3 pivot;
-            // Added after the first files were written, so it defaults to false and older saves
-            // load as perspective - which is what they were saved from.
-            public bool orthographic;
         }
     }
 }

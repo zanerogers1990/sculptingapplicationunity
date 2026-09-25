@@ -558,5 +558,182 @@ namespace Sculpting
             _material.SetFloat("_MicroFlakeCellSize", preset.MicroSize * size * lureFlakeSize / 0.67f);
             _material.SetFloat("_MicroFlakeDensity", Mathf.Clamp01(preset.MicroDensity * lureFlakeAmount));
         }
+
+        // ------------------------------------------------------------------- save/load state
+
+        /// Every material setting a scene file records, as a flat JsonUtility-serializable block
+        /// (see SceneSerializer) - owned here, like SculptController.Settings, so a new setting is
+        /// remembered by editing this class rather than the serializer as well. Field names and
+        /// initializers are the file format: a key missing from an older file loads with the
+        /// initializer here, so they must not change.
+        [System.Serializable]
+        public class Settings
+        {
+            public Color baseColor = Color.grey;
+            public float metallic;
+            public float smoothness = 0.4f;
+            public float normalStrength;
+            public float normalNoiseScale = 60f;
+            public bool flatShading;
+            // Screen-space cavity (Blender-style ridge/valley). Older files carry the retired
+            // per-vertex tint's cavityEnabled/recessColor/cavityIntensity/cavityRange (and, older
+            // still, peakColor); JsonUtility drops keys it has no member for, so those files load
+            // with these defaults instead of carrying an unrelated on/off state across.
+            public bool screenCavityEnabled = true;
+            public float cavityRidge = 1f;
+            public float cavityValley = 1f;
+
+            // Matcap by file name rather than by path: the image lives in the app's own Matcaps
+            // folder, so a name still resolves on a machine where the app is installed somewhere
+            // else. A name this machine doesn't have falls back to lit shading (see
+            // SculptMaterialController.MatcapName).
+            public bool matcapEnabled;
+            public string matcapName = string.Empty;
+            public float matcapIntensity = 1f;
+            public float matcapTintStrength;
+
+            // Lure plastic by preset id (LurePlasticPresets). Older files have none of these and
+            // load with it off. lureReferenceSize keeps the flakes exactly where they were; 0
+            // re-measures the model.
+            public bool lureEnabled;
+            public string lurePresetId = string.Empty;
+            public float lureFlakeSize = 1f;
+            public float lureFlakeAmount = 1f;
+            public float lureSparkle = 1f;
+            public float lureTranslucency = 1f;
+            public float lureGloss = 0.8f;
+            public float lureReferenceSize;
+
+            // Aged metal finish by preset id (MetalFinishPresets), same scheme as the lure's.
+            // Older files have none of these and load with it off.
+            public bool metalEnabled;
+            public string metalPresetId = string.Empty;
+            public float metalExposure = 1f;
+            public float metalEdgeWear = 1f;
+            public float metalWash = 1f;
+            public float metalDetail = 1f;
+            public float metalPatternSize = 1f;
+            public float metalGloss = 1f;
+            public float metalPatternSeed;
+            public float metalReferenceSize;
+
+            // Sculptor's clay by preset id (ClayPresets), same scheme again. Older files have none
+            // of these and load with it off.
+            public bool clayEnabled;
+            public string clayPresetId = string.Empty;
+            public float clayGloss = 1f;
+            public float clayWetness = 1f;
+            public float claySubsurface = 1f;
+            public float clayRecess = 1f;
+            public float clayDetail = 1f;
+            public float clayGrain = 1f;
+            public float clayReferenceSize;
+        }
+
+        public Settings CaptureSettings()
+        {
+            var s = new Settings();
+            s.baseColor = BaseColor;
+            s.metallic = Metallic;
+            s.smoothness = Smoothness;
+            s.normalStrength = NormalStrength;
+            s.normalNoiseScale = NormalNoiseScale;
+            s.flatShading = FlatShading;
+            s.screenCavityEnabled = CavityEnabled;
+            s.cavityRidge = CavityRidge;
+            s.cavityValley = CavityValley;
+            s.matcapEnabled = MatcapEnabled;
+            s.matcapName = MatcapName;
+            s.matcapIntensity = MatcapIntensity;
+            s.matcapTintStrength = MatcapTintStrength;
+            s.lureEnabled = LureEnabled;
+            s.lurePresetId = LurePresetId;
+            s.lureFlakeSize = LureFlakeSize;
+            s.lureFlakeAmount = LureFlakeAmount;
+            s.lureSparkle = LureSparkle;
+            s.lureTranslucency = LureTranslucency;
+            s.lureGloss = LureGloss;
+            s.lureReferenceSize = LureReferenceSize;
+            s.metalEnabled = MetalEnabled;
+            s.metalPresetId = MetalPresetId;
+            s.metalExposure = MetalExposure;
+            s.metalEdgeWear = MetalEdgeWear;
+            s.metalWash = MetalWash;
+            s.metalDetail = MetalDetail;
+            s.metalPatternSize = MetalPatternSize;
+            s.metalGloss = MetalGloss;
+            s.metalPatternSeed = MetalPatternSeed;
+            s.metalReferenceSize = MetalReferenceSize;
+            s.clayEnabled = ClayEnabled;
+            s.clayPresetId = ClayPresetId;
+            s.clayGloss = ClayGloss;
+            s.clayWetness = ClayWetness;
+            s.claySubsurface = ClaySubsurface;
+            s.clayRecess = ClayRecess;
+            s.clayDetail = ClayDetail;
+            s.clayGrain = ClayGrain;
+            s.clayReferenceSize = ClayReferenceSize;
+            return s;
+        }
+
+        /// Restores a captured block through the public setters, so every clamp and side effect
+        /// runs exactly as for a UI change. The ORDER below is load-bearing - see each remark.
+        public void ApplySettings(Settings s)
+        {
+            BaseColor = s.baseColor;
+            Metallic = s.metallic;
+            Smoothness = s.smoothness;
+            NormalStrength = s.normalStrength;
+            NormalNoiseScale = s.normalNoiseScale;
+            FlatShading = s.flatShading;
+            CavityEnabled = s.screenCavityEnabled;
+            CavityRidge = s.cavityRidge;
+            CavityValley = s.cavityValley;
+            MatcapIntensity = s.matcapIntensity;
+            MatcapTintStrength = s.matcapTintStrength;
+            // Name before the toggle: MatcapEnabled with nothing selected picks the first
+            // matcap in the library, which would override what the file actually asked for.
+            MatcapName = s.matcapName;
+            // ...and only enable if that name actually resolved. MatcapEnabled with nothing
+            // selected falls back to the first matcap in the library, which for a file
+            // naming a matcap this machine doesn't have would silently substitute a
+            // different one - lit shading is the honest answer there.
+            MatcapEnabled = s.matcapEnabled && HasMatcap;
+
+            LureFlakeSize = s.lureFlakeSize;
+            LureFlakeAmount = s.lureFlakeAmount;
+            LureSparkle = s.lureSparkle;
+            LureTranslucency = s.lureTranslucency;
+            LureGloss = s.lureGloss;
+            // Size before the toggle, so enabling doesn't measure a model the file already
+            // measured. Objects are loaded by now, so a 0 here measures the right model.
+            LureReferenceSize = s.lureReferenceSize;
+            if (!string.IsNullOrEmpty(s.lurePresetId)) LurePresetId = s.lurePresetId;
+            LureEnabled = s.lureEnabled;
+
+            MetalExposure = s.metalExposure;
+            MetalEdgeWear = s.metalEdgeWear;
+            MetalWash = s.metalWash;
+            MetalDetail = s.metalDetail;
+            MetalPatternSize = s.metalPatternSize;
+            MetalGloss = s.metalGloss;
+            MetalPatternSeed = s.metalPatternSeed;
+            MetalReferenceSize = s.metalReferenceSize;
+            if (!string.IsNullOrEmpty(s.metalPresetId)) MetalPresetId = s.metalPresetId;
+            // After the lure: switching metal on turns the lure off, switching it off leaves
+            // the lure alone, so a file can't come back with both on.
+            MetalEnabled = s.metalEnabled;
+
+            ClayGloss = s.clayGloss;
+            ClayWetness = s.clayWetness;
+            ClaySubsurface = s.claySubsurface;
+            ClayRecess = s.clayRecess;
+            ClayDetail = s.clayDetail;
+            ClayGrain = s.clayGrain;
+            ClayReferenceSize = s.clayReferenceSize;
+            if (!string.IsNullOrEmpty(s.clayPresetId)) ClayPresetId = s.clayPresetId;
+            // Last, for the same reason as the metal: on turns the others off, off leaves them.
+            ClayEnabled = s.clayEnabled;
+        }
     }
 }

@@ -593,5 +593,42 @@ namespace Sculpting
             Vector3 pos = _pivot + rot * new Vector3(0f, 0f, -back);
             transform.SetPositionAndRotation(pos, rot);
         }
+
+        // ------------------------------------------------------------------- save/load state
+
+        /// The view a scene file records (see SceneSerializer). Field names and initializers are
+        /// the file format - see SculptMaterialController.Settings.
+        [System.Serializable]
+        public class SavedView
+        {
+            public bool valid;
+            public float yaw, pitch, distance;
+            public Vector3 pivot;
+            // Added after the first files were written, so it defaults to false and older saves
+            // load as perspective - which is what they were saved from.
+            public bool orthographic;
+        }
+
+        public SavedView CaptureView()
+        {
+            var v = new SavedView();
+            GetView(out float yaw, out float pitch, out float distance, out Vector3 pivot);
+            v.valid = true;
+            v.yaw = yaw;
+            v.pitch = pitch;
+            v.distance = distance;
+            v.pivot = pivot;
+            v.orthographic = Orthographic;
+            return v;
+        }
+
+        public void ApplyView(SavedView v)
+        {
+            // Projection first: SetView derives the orthographic size from the distance
+            // it is given, so restoring the angles into the wrong projection would frame
+            // the subject at whatever size the previous projection left behind.
+            Orthographic = v.orthographic;
+            SetView(v.yaw, v.pitch, v.distance, v.pivot);
+        }
     }
 }

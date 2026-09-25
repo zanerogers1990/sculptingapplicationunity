@@ -579,49 +579,7 @@ namespace Sculpting.IO
             if (controller != null) data.brush = controller.CaptureSettings();
 
             var mat = UnityEngine.Object.FindFirstObjectByType<SculptMaterialController>();
-            if (mat != null)
-            {
-                data.material.baseColor = mat.BaseColor;
-                data.material.metallic = mat.Metallic;
-                data.material.smoothness = mat.Smoothness;
-                data.material.normalStrength = mat.NormalStrength;
-                data.material.normalNoiseScale = mat.NormalNoiseScale;
-                data.material.flatShading = mat.FlatShading;
-                data.material.screenCavityEnabled = mat.CavityEnabled;
-                data.material.cavityRidge = mat.CavityRidge;
-                data.material.cavityValley = mat.CavityValley;
-                data.material.matcapEnabled = mat.MatcapEnabled;
-                data.material.matcapName = mat.MatcapName;
-                data.material.matcapIntensity = mat.MatcapIntensity;
-                data.material.matcapTintStrength = mat.MatcapTintStrength;
-                data.material.lureEnabled = mat.LureEnabled;
-                data.material.lurePresetId = mat.LurePresetId;
-                data.material.lureFlakeSize = mat.LureFlakeSize;
-                data.material.lureFlakeAmount = mat.LureFlakeAmount;
-                data.material.lureSparkle = mat.LureSparkle;
-                data.material.lureTranslucency = mat.LureTranslucency;
-                data.material.lureGloss = mat.LureGloss;
-                data.material.lureReferenceSize = mat.LureReferenceSize;
-                data.material.metalEnabled = mat.MetalEnabled;
-                data.material.metalPresetId = mat.MetalPresetId;
-                data.material.metalExposure = mat.MetalExposure;
-                data.material.metalEdgeWear = mat.MetalEdgeWear;
-                data.material.metalWash = mat.MetalWash;
-                data.material.metalDetail = mat.MetalDetail;
-                data.material.metalPatternSize = mat.MetalPatternSize;
-                data.material.metalGloss = mat.MetalGloss;
-                data.material.metalPatternSeed = mat.MetalPatternSeed;
-                data.material.metalReferenceSize = mat.MetalReferenceSize;
-                data.material.clayEnabled = mat.ClayEnabled;
-                data.material.clayPresetId = mat.ClayPresetId;
-                data.material.clayGloss = mat.ClayGloss;
-                data.material.clayWetness = mat.ClayWetness;
-                data.material.claySubsurface = mat.ClaySubsurface;
-                data.material.clayRecess = mat.ClayRecess;
-                data.material.clayDetail = mat.ClayDetail;
-                data.material.clayGrain = mat.ClayGrain;
-                data.material.clayReferenceSize = mat.ClayReferenceSize;
-            }
+            if (mat != null) data.material = mat.CaptureSettings();
 
             var light = LightingPresetController.Instance;
             if (light != null)
@@ -676,16 +634,7 @@ namespace Sculpting.IO
             }
 
             var cam = UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>();
-            if (cam != null)
-            {
-                cam.GetView(out float yaw, out float pitch, out float distance, out Vector3 pivot);
-                data.camera.valid = true;
-                data.camera.yaw = yaw;
-                data.camera.pitch = pitch;
-                data.camera.distance = distance;
-                data.camera.pivot = pivot;
-                data.camera.orthographic = cam.Orthographic;
-            }
+            if (cam != null) data.camera = cam.CaptureView();
         }
 
         private static void ApplySettings(SculptSaveData data)
@@ -694,63 +643,7 @@ namespace Sculpting.IO
             if (controller != null && data.brush != null) controller.ApplySettings(data.brush);
 
             var mat = UnityEngine.Object.FindFirstObjectByType<SculptMaterialController>();
-            if (mat != null && data.material != null)
-            {
-                mat.BaseColor = data.material.baseColor;
-                mat.Metallic = data.material.metallic;
-                mat.Smoothness = data.material.smoothness;
-                mat.NormalStrength = data.material.normalStrength;
-                mat.NormalNoiseScale = data.material.normalNoiseScale;
-                mat.FlatShading = data.material.flatShading;
-                mat.CavityEnabled = data.material.screenCavityEnabled;
-                mat.CavityRidge = data.material.cavityRidge;
-                mat.CavityValley = data.material.cavityValley;
-                mat.MatcapIntensity = data.material.matcapIntensity;
-                mat.MatcapTintStrength = data.material.matcapTintStrength;
-                // Name before the toggle: MatcapEnabled with nothing selected picks the first
-                // matcap in the library, which would override what the file actually asked for.
-                mat.MatcapName = data.material.matcapName;
-                // ...and only enable if that name actually resolved. MatcapEnabled with nothing
-                // selected falls back to the first matcap in the library, which for a file
-                // naming a matcap this machine doesn't have would silently substitute a
-                // different one - lit shading is the honest answer there.
-                mat.MatcapEnabled = data.material.matcapEnabled && mat.HasMatcap;
-
-                mat.LureFlakeSize = data.material.lureFlakeSize;
-                mat.LureFlakeAmount = data.material.lureFlakeAmount;
-                mat.LureSparkle = data.material.lureSparkle;
-                mat.LureTranslucency = data.material.lureTranslucency;
-                mat.LureGloss = data.material.lureGloss;
-                // Size before the toggle, so enabling doesn't measure a model the file already
-                // measured. Objects are loaded by now, so a 0 here measures the right model.
-                mat.LureReferenceSize = data.material.lureReferenceSize;
-                if (!string.IsNullOrEmpty(data.material.lurePresetId)) mat.LurePresetId = data.material.lurePresetId;
-                mat.LureEnabled = data.material.lureEnabled;
-
-                mat.MetalExposure = data.material.metalExposure;
-                mat.MetalEdgeWear = data.material.metalEdgeWear;
-                mat.MetalWash = data.material.metalWash;
-                mat.MetalDetail = data.material.metalDetail;
-                mat.MetalPatternSize = data.material.metalPatternSize;
-                mat.MetalGloss = data.material.metalGloss;
-                mat.MetalPatternSeed = data.material.metalPatternSeed;
-                mat.MetalReferenceSize = data.material.metalReferenceSize;
-                if (!string.IsNullOrEmpty(data.material.metalPresetId)) mat.MetalPresetId = data.material.metalPresetId;
-                // After the lure: switching metal on turns the lure off, switching it off leaves
-                // the lure alone, so a file can't come back with both on.
-                mat.MetalEnabled = data.material.metalEnabled;
-
-                mat.ClayGloss = data.material.clayGloss;
-                mat.ClayWetness = data.material.clayWetness;
-                mat.ClaySubsurface = data.material.claySubsurface;
-                mat.ClayRecess = data.material.clayRecess;
-                mat.ClayDetail = data.material.clayDetail;
-                mat.ClayGrain = data.material.clayGrain;
-                mat.ClayReferenceSize = data.material.clayReferenceSize;
-                if (!string.IsNullOrEmpty(data.material.clayPresetId)) mat.ClayPresetId = data.material.clayPresetId;
-                // Last, for the same reason as the metal: on turns the others off, off leaves them.
-                mat.ClayEnabled = data.material.clayEnabled;
-            }
+            if (mat != null && data.material != null) mat.ApplySettings(data.material);
 
             var env = data.environment;
             if (env != null)
@@ -806,17 +699,7 @@ namespace Sculpting.IO
             }
 
             if (data.camera != null && data.camera.valid)
-            {
-                var orbit = UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>();
-                if (orbit != null)
-                {
-                    // Projection first: SetView derives the orthographic size from the distance
-                    // it is given, so restoring the angles into the wrong projection would frame
-                    // the subject at whatever size the previous projection left behind.
-                    orbit.Orthographic = data.camera.orthographic;
-                    orbit.SetView(data.camera.yaw, data.camera.pitch, data.camera.distance, data.camera.pivot);
-                }
-            }
+                UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>()?.ApplyView(data.camera);
         }
 
         // --------------------------------------------------------------------------- helpers
