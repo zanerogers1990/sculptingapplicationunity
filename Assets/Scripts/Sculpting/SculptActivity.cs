@@ -3,6 +3,8 @@ using UnityEngine;
 namespace Sculpting
 {
     /// The single "did the model actually change just now?" signal the timelapse recorder gates on.
+    /// Lives with the sculpting core, not under Timelapse/: the core is what reports it and it
+    /// depends on nothing else, so the timelapse only ever READS it.
     ///
     /// The recorder needs to answer one question every frame - should this frame end up in the
     /// video? - and the honest answer is "only if the sculpt itself moved". Nothing about the
