@@ -767,7 +767,7 @@ namespace Sculpting
         private void HandleClayInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
-            if (overUI) return;
+            if (overUI) { _lastClayStrokeLocal = null; return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
             bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);

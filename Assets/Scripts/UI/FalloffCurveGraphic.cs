@@ -42,9 +42,11 @@ namespace Sculpting
             BrushFalloffCurve curve = Source?.Invoke();
             int version = curve?.Version ?? -1;
             if (curve == _shown && version == _shownVersion) return;
+            // Our own edits bump Version every drag frame; only a different curve (brush switch)
+            // should drop the drag.
+            if (curve != _shown) _dragIndex = -1;
             _shown = curve;
             _shownVersion = version;
-            _dragIndex = -1;
             SetVerticesDirty();
         }
 

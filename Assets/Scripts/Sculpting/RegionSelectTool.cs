@@ -184,7 +184,7 @@ namespace Sculpting
         {
             // Nothing is armed or dragged over a turntable presentation; the mode itself is left
             // as it was, for when the panels come back.
-            if (TurntableController.CleanViewActive) return;
+            if (TurntableController.CleanViewActive) { if (_dragging) CancelDrag(); return; }
 
             HandleModeKeys();
             if (mode == RegionSelectMode.Off) return;
@@ -230,7 +230,8 @@ namespace Sculpting
             kb.digit1Key.wasPressedThisFrame || kb.digit2Key.wasPressedThisFrame ||
             kb.digit3Key.wasPressedThisFrame || kb.digit4Key.wasPressedThisFrame ||
             kb.digit5Key.wasPressedThisFrame || kb.digit6Key.wasPressedThisFrame ||
-            kb.digit7Key.wasPressedThisFrame;
+            kb.digit7Key.wasPressedThisFrame || kb.digit8Key.wasPressedThisFrame ||
+            kb.digit9Key.wasPressedThisFrame || kb.digit0Key.wasPressedThisFrame;
 
         private void HandleDrag()
         {
