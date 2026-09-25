@@ -161,11 +161,8 @@ namespace Sculpting
                 return false;
             }
 
-            if (kb.zKey.wasPressedThisFrame && HandlesUndoKey(shift))
-            {
-                if (shift) RedoRig(); else UndoRig();
-                return true;
-            }
+            // Z is not read here: SculptController.HandleUndoRedoKeys dispatches it, asking
+            // HandlesUndoKey first - see its remarks.
 
             // A toggles the solid skin preview, as in ZBrush - the quickest way to check the real
             // shape and get straight back to the spheres.

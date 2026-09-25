@@ -35,6 +35,11 @@ namespace Sculpting
     ///   SculptController.Input.cs     hotkeys, gauges, pen pressure, Lazy Mouse, the brush cursor
     ///   SculptController.MeshOps.cs   Reset/Remesh, symmetry repair, Export
     ///   SculptController.Settings.cs  settings save/load
+    // Before the default order, so CameraOrbitController (order 0) reads THIS frame's
+    // IsHoveringSculptSurface when deciding whether the wheel zooms or resizes the brush - with
+    // both at 0 the order was unspecified, and on the frame the cursor crossed the surface edge
+    // one notch could do both.
+    [DefaultExecutionOrder(-10)]
     public partial class SculptController : MonoBehaviour
     {
         [Header("References")]

@@ -243,15 +243,15 @@ namespace Sculpting
 
             bool redo = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            // The ZSphere tool keeps its own history for the rig (a scaffold, not a scene object -
-            // see ZSphereController's rig-undo remarks), and takes the key while it is the active
-            // tool and has something left to step through. Asking IT rather than duplicating the
-            // condition here is what guarantees exactly one of the two answers a given press, and
-            // that Z falls back to scene history the moment the rig's own runs out.
+            // This is the ONLY place Z is read. The ZSphere tool keeps its own history for the rig
+            // (a scaffold, not a scene object - see ZSphereController's rig-undo remarks) and the
+            // Lathe tool one for its profile; each takes the press - and performs the step itself -
+            // while it is the active tool and has something left to step through. Asking them in
+            // turn rather than letting each read the key is what guarantees exactly one history
+            // answers a given press, whatever order the components' Updates run in, and that Z
+            // falls back to scene history the moment a tool's own runs out.
             if (_zsphereForUndo == null) _zsphereForUndo = FindFirstObjectByType<ZSphereController>();
             if (_zsphereForUndo != null && _zsphereForUndo.HandlesUndoKey(redo)) return;
-            // The lathe profile likewise (see LatheController's profile-undo remarks). Unlike the
-            // ZSphere check this one also performs the step, since it is the only caller.
             if (_latheForUndo == null) _latheForUndo = FindFirstObjectByType<LatheController>();
             if (_latheForUndo != null && _latheForUndo.HandlesUndoKey(redo)) return;
 

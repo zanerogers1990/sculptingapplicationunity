@@ -15,6 +15,9 @@ namespace Sculpting
     ///
     /// The rig is a scaffold, not a scene object: it is not in SelectionManager or save files,
     /// and it keeps its own undo history. Convert is where the work becomes real geometry.
+    // Before the default order for the same reason as SculptController: CameraOrbitController
+    // (order 0) reads IsHoveringNode to leave the wheel to the rig's resize.
+    [DefaultExecutionOrder(-10)]
     public partial class ZSphereController : MonoBehaviour, IGizmoTargetSource, IGizmoPointerClaim
     {
         public const float MinNodeRadius = 0.005f;

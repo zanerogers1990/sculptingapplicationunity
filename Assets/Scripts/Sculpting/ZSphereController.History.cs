@@ -53,12 +53,22 @@ namespace Sculpting
         private bool HasOpenEdit =>
             _pendingSnapshot != null && (_rig.Version != _pendingVersion || _symmetryX != _pendingSymmetry);
 
-        /// Whether this tool, not the scene-wide history, should answer a Z press. Asked by
-        /// SculptController as well as by our own key handling, so exactly one of them responds.
+        /// Whether this tool, not the scene-wide history, answers a Z press - and if so, answers
+        /// it. Called only by SculptController.HandleUndoRedoKeys, the one place Z is read, so
+        /// exactly one history responds to each press. (This tool used to read Z itself as well,
+        /// which made the answer depend on which component's Update ran first: popping the last
+        /// rig step first left CanUndoRig false by the time SculptController asked, and the same
+        /// press then undid a scene step too.) Same perform-and-report shape as
+        /// LatheController.HandlesUndoKey.
         public bool HandlesUndoKey(bool redo)
         {
             if (Gizmo == null || Gizmo.Mode != GizmoMode.ZSphere) return false;
-            return redo ? CanRedoRig : CanUndoRig;
+            if (!(redo ? CanRedoRig : CanUndoRig)) return false;
+            // Mid-drag the press is swallowed, not acted on, as it always was: stepping the rig
+            // back under a live drag would leave the drag holding start state for nodes that moved.
+            if (_drag != DragKind.None) return true;
+            if (redo) RedoRig(); else UndoRig();
+            return true;
         }
 
         /// Opens an undo step: snapshots now, pushed by CommitRigEdit only if the rig actually
