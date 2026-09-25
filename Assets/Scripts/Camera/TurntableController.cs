@@ -292,7 +292,7 @@ namespace Sculpting
 
             // Typing a name into a panel's text field must not spin the view or hide the panel
             // being typed into.
-            if (IsTypingInField()) return;
+            if (InputFocus.IsTypingInText()) return;
 
             // Tab for the panels, O for "orbit" - T was taken (Trim's region cycle).
             if (kb.tabKey.wasPressedThisFrame && !AnyModifier(kb)) ToggleCleanView();
@@ -306,14 +306,6 @@ namespace Sculpting
 
         private static bool AnyModifier(Keyboard kb) =>
             kb.ctrlKey.isPressed || kb.altKey.isPressed || kb.shiftKey.isPressed;
-
-        private static bool IsTypingInField()
-        {
-            var es = UnityEngine.EventSystems.EventSystem.current;
-            if (es == null || es.currentSelectedGameObject == null) return false;
-            var field = es.currentSelectedGameObject.GetComponent<InputField>();
-            return field != null && field.isFocused;
-        }
 
         private void StepSpin(float dt)
         {

@@ -289,7 +289,7 @@ namespace Sculpting
         {
             var kb = Keyboard.current;
             if (kb == null || !kb.deleteKey.wasPressedThisFrame) return;
-            if (IsTypingInUI()) return;
+            if (InputFocus.IsTypingInText()) return;
             // Also skipped in Mold mode for the same reason: there Delete means "remove the
             // selected pin/sprue/vent" (see MoldController.HandleKeys), and letting both fire
             // would take the model with it.
@@ -306,15 +306,6 @@ namespace Sculpting
         // Only ever looked up on a frame Ctrl+S or Delete is actually pressed, so the find costs
         // nothing otherwise - same reasoning as _zsphereForUndo above.
         private SceneGraphUIBuilder _sceneGraphPanel;
-
-        private static bool IsTypingInUI()
-        {
-            var focused = UnityEngine.EventSystems.EventSystem.current != null
-                ? UnityEngine.EventSystems.EventSystem.current.currentSelectedGameObject : null;
-            if (focused == null) return false;
-            var field = focused.GetComponent<UnityEngine.UI.InputField>();
-            return field != null && field.isFocused;
-        }
 
         private void HandleBrushSwitchKeys()
         {

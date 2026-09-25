@@ -2,7 +2,6 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
-using UnityEngine.UI;
 
 namespace Sculpting
 {
@@ -635,7 +634,7 @@ namespace Sculpting
 
         private bool HandleKeys(Keyboard kb)
         {
-            if (kb == null || IsTypingInUI()) return false;
+            if (kb == null || InputFocus.IsTypingInText()) return false;
 
             if (kb.escapeKey.wasPressedThisFrame)
             {
@@ -659,14 +658,6 @@ namespace Sculpting
             }
 
             return false;
-        }
-
-        private static bool IsTypingInUI()
-        {
-            GameObject focused = EventSystem.current != null ? EventSystem.current.currentSelectedGameObject : null;
-            if (focused == null) return false;
-            var field = focused.GetComponent<InputField>();
-            return field != null && field.isFocused;
         }
     }
 }
