@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
+using UnityEngine.Rendering.Universal;
 
 namespace Sculpting
 {
@@ -42,6 +43,13 @@ namespace Sculpting
         // input where a precise scroll wheel isn't available. Dragging up zooms in, matching
         // Maya's Alt+Ctrl dolly gesture.
         [SerializeField, Range(0.0005f, 0.02f)] private float dragZoomSensitivity = 0.004f;
+        // The three distance limits below are ADAPTIVE: each is per unit of scene size (the
+        // largest side of the visible objects' combined bounds - see UpdateSceneSize), so a
+        // hundred-unit millimetre STL can be zoomed out to see whole, and a tiny model zoomed
+        // in on, exactly as far as the unit startup sphere (size 1, where these are the old
+        // fixed values) always could. Read them through MinPivotDistance/MaxDistance/
+        // MinSurfaceGap, never directly.
+        //
         // Closest the camera may get to the ORBIT PIVOT. Only binds when no surface lies between
         // the camera and the pivot (e.g. zooming in on empty space, or in orthographic, where it
         // is the smallest framing) - otherwise minSurfaceGap does.
@@ -78,7 +86,18 @@ namespace Sculpting
         // sit only _distance (as little as minPivotDistance) from the pivot with its near plane 0.3
         // in front of that, slicing the front off the model. Parking it a fixed distance beyond
         // maxDistance keeps the whole subject in front of the near plane at every zoom level.
+        // Per unit of scene size, like maxDistance.
         private const float OrthoPullback = 5f;
+
+        // See the remarks on minPivotDistance. Never below a floor, so an empty or degenerate
+        // scene can't collapse every limit to zero.
+        private float _sceneSize = 1f;
+        private const float MinSceneSize = 1e-4f;
+
+        private float MinPivotDistance => minPivotDistance * _sceneSize;
+        private float MaxDistance => maxDistance * _sceneSize;
+        private float MinSurfaceGap => minSurfaceGap * _sceneSize;
+        private float OrthoBack => (maxDistance + OrthoPullback) * _sceneSize;
 
         private float _yaw;
         private float _pitch;
@@ -93,11 +112,21 @@ namespace Sculpting
         // The camera's authored near plane - the ceiling for the adaptive one, and what ortho
         // (which parks the camera OrthoPullback behind everything) keeps using.
         private float _defaultNearPlane = 0.3f;
+        // The camera's authored far plane - the floor for the adaptive one (see UpdateFarPlane).
+        private float _defaultFarPlane = 1000f;
+        // The pipeline asset whose shadow distance UpdateShadowDistance is fitting, and the
+        // value it had before - put back in OnDisable.
+        private UniversalRenderPipelineAsset _shadowAsset;
+        private float _authoredShadowDistance;
         private SelectionManager _selection;
 
         private void Start()
         {
-            if (Cam != null) _defaultNearPlane = Cam.nearClipPlane;
+            if (Cam != null)
+            {
+                _defaultNearPlane = Cam.nearClipPlane;
+                _defaultFarPlane = Cam.farClipPlane;
+            }
 
             if (target == null)
             {
@@ -131,7 +160,10 @@ namespace Sculpting
             // Same clamps Update() applies to live input, so a hand-edited or corrupt save
             // can't put the rig somewhere the controls could never have reached.
             _pitch = Mathf.Clamp(pitch, -89f, 89f);
-            _distance = Mathf.Clamp(distance, minPivotDistance, maxDistance);
+            // Re-measured first: a scene load restores its objects before its view, and the
+            // limits from the PREVIOUS scene would clamp a saved far-out view of a big model.
+            UpdateSceneSize();
+            _distance = Mathf.Clamp(distance, MinPivotDistance, MaxDistance);
             _pivot = pivot;
             UpdateTransform();
         }
@@ -210,6 +242,8 @@ namespace Sculpting
             bool altHeld = kb != null && kb.leftAltKey.isPressed;
             bool ctrlHeld = kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
 
+            UpdateSceneSize();
+
             // Measured once, from where the camera sat at the end of last frame: zoom and pan
             // both scale with it, and the near plane is set from it after this frame's move.
             float viewDepth = ViewDepth();
@@ -257,6 +291,36 @@ namespace Sculpting
             AdvanceSnap();
             UpdateTransform();
             UpdateNearPlane(viewDepth);
+            UpdateFarPlane();
+            UpdateShadowDistance();
+        }
+
+        /// Re-measures the scene size every adaptive limit scales by (see minPivotDistance): the
+        /// largest side of the combined world bounds of every visible sculpt object. Hidden ones
+        /// (Boolean cutters, the eye toggle) are left out - they aren't what you're framing.
+        /// Leaves the last size in place when nothing is visible, rather than snapping the
+        /// limits back to a unit scene the moment the last object is hidden.
+        private void UpdateSceneSize()
+        {
+            if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
+            if (_selection == null) return;
+
+            bool any = false;
+            Bounds combined = default;
+            var objects = _selection.AllObjects;
+            for (int i = 0; i < objects.Count; i++)
+            {
+                SculptableMesh obj = objects[i];
+                if (obj == null || !obj.gameObject.activeInHierarchy) continue;
+                var renderer = obj.GetComponent<Renderer>();
+                if (renderer == null || !renderer.enabled) continue;
+                if (any) combined.Encapsulate(renderer.bounds);
+                else { combined = renderer.bounds; any = true; }
+            }
+            if (!any) return;
+
+            Vector3 size = combined.size;
+            _sceneSize = Mathf.Max(Mathf.Max(size.x, size.y, size.z), MinSceneSize);
         }
 
         /// Scales the distance to what the camera is looking at by `factor` (<1 zooms in).
@@ -265,9 +329,14 @@ namespace Sculpting
         /// zoomed through it; with nothing in between it's the pivot, as before.
         private void Zoom(float factor, float viewDepth)
         {
+            // The limits follow the scene size, so they can shrink under a camera that is already
+            // past them (delete the big object, keep the small one). A zoom IN must never be
+            // the thing that yanks it back out to the new maximum - only a zoom out is capped.
+            float upper = factor < 1f ? Mathf.Max(MaxDistance, _distance) : MaxDistance;
+
             if (_orthographic)
             {
-                _distance = Mathf.Clamp(_distance * factor, minPivotDistance, maxDistance);
+                _distance = Mathf.Clamp(_distance * factor, MinPivotDistance, upper);
                 return;
             }
 
@@ -275,8 +344,8 @@ namespace Sculpting
             bool surfaceInFront = viewDepth < _distance;
             // Don't let a zoom-in step carry the camera closer than minSurfaceGap, but never
             // push it back out either if it's already inside that (e.g. after an orbit).
-            if (surfaceInFront && factor < 1f) target = Mathf.Max(target, Mathf.Min(viewDepth, minSurfaceGap));
-            _distance = Mathf.Clamp(_distance + (target - viewDepth), minPivotDistance, maxDistance);
+            if (surfaceInFront && factor < 1f) target = Mathf.Max(target, Mathf.Min(viewDepth, MinSurfaceGap));
+            _distance = Mathf.Clamp(_distance + (target - viewDepth), MinPivotDistance, upper);
         }
 
         /// View-space depth of the nearest visible sculpt surface across a few viewport sample
@@ -321,10 +390,64 @@ namespace Sculpting
         {
             Camera cam = Cam;
             if (cam == null) return;
+            // Ortho parks the camera OrthoBack behind the pivot; for a model much smaller than
+            // the unit sphere that is closer than the authored 0.3, so the near plane shrinks
+            // with it (a tenth of the way there - identical to 0.3 at scene size 1).
             cam.nearClipPlane = _orthographic
-                ? _defaultNearPlane
+                ? Mathf.Min(_defaultNearPlane, OrthoBack * 0.1f)
                 : Mathf.Clamp(viewDepth * NearPlaneFraction, MinNearPlane, _defaultNearPlane);
         }
+
+        /// Keeps the far plane beyond the furthest the rig can park - the ortho position, past
+        /// the maximum zoom - plus the whole scene behind the pivot. The authored plane is the
+        /// floor, so a unit-sized scene keeps it unchanged; a hundred-unit model at a hundred
+        /// times the zoom range would otherwise be clipped away entirely.
+        private void UpdateFarPlane()
+        {
+            Camera cam = Cam;
+            if (cam == null) return;
+            float reach = Mathf.Max(OrthoBack, _distance) + 2f * _sceneSize;
+            cam.farClipPlane = Mathf.Max(_defaultFarPlane, reach * 2f);
+        }
+
+        /// URP's shadow distance, fitted to the view the same way: far enough to reach past the
+        /// back of the scene from wherever the camera sits, so a big model zoomed far out keeps
+        /// its shadows - and, for a model much smaller than the unit sphere, no further than it
+        /// needs, since every metre of shadow distance spends shadow-map resolution. The unit
+        /// scene never needs more than the authored value, so it keeps exactly that.
+        ///
+        /// Snapped to power-of-two steps of the authored value: shadow texel density follows the
+        /// distance, so re-fitting it on every zoom notch would make shadow edges swim.
+        ///
+        /// This writes the pipeline ASSET (there is no per-camera shadow distance), so the
+        /// authored value is captured on first use and put back in OnDisable - leaving Play mode
+        /// must not leave a fitted value in the asset for the next save to write to disk.
+        private void UpdateShadowDistance()
+        {
+            var urp = UniversalRenderPipeline.asset;
+            if (urp == null) return;
+            if (_shadowAsset != urp)
+            {
+                RestoreShadowDistance();
+                _shadowAsset = urp;
+                _authoredShadowDistance = urp.shadowDistance;
+            }
+            if (_authoredShadowDistance <= 0f) return;
+
+            float cameraToPivot = _orthographic ? OrthoBack : _distance;
+            float needed = (cameraToPivot + 2f * _sceneSize) * 1.25f;
+            float fitted = Mathf.Max(_authoredShadowDistance * Mathf.Min(1f, _sceneSize), needed);
+            float snapped = _authoredShadowDistance * Mathf.Pow(2f, Mathf.Ceil(Mathf.Log(fitted / _authoredShadowDistance, 2f)));
+            if (!Mathf.Approximately(urp.shadowDistance, snapped)) urp.shadowDistance = snapped;
+        }
+
+        private void RestoreShadowDistance()
+        {
+            if (_shadowAsset != null) _shadowAsset.shadowDistance = _authoredShadowDistance;
+            _shadowAsset = null;
+        }
+
+        private void OnDisable() => RestoreShadowDistance();
 
         private void AdvanceSnap()
         {
@@ -359,7 +482,7 @@ namespace Sculpting
                 // wheel - which only moves _distance - still zooms.
                 Cam.orthographicSize =
                     Mathf.Max(0.01f, _distance * Mathf.Tan(Cam.fieldOfView * 0.5f * Mathf.Deg2Rad));
-                back = maxDistance + OrthoPullback; // see OrthoPullback
+                back = OrthoBack; // see OrthoPullback
             }
 
             Vector3 pos = _pivot + rot * new Vector3(0f, 0f, -back);

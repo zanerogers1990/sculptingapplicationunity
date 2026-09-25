@@ -87,6 +87,18 @@ namespace Sculpting.IO
             public string matcapName = string.Empty;
             public float matcapIntensity = 1f;
             public float matcapTintStrength;
+
+            // Lure plastic by preset id (LurePlasticPresets). Older files have none of these and
+            // load with it off. lureReferenceSize keeps the flakes exactly where they were; 0
+            // re-measures the model.
+            public bool lureEnabled;
+            public string lurePresetId = string.Empty;
+            public float lureFlakeSize = 1f;
+            public float lureFlakeAmount = 1f;
+            public float lureSparkle = 1f;
+            public float lureTranslucency = 1f;
+            public float lureGloss = 0.8f;
+            public float lureReferenceSize;
         }
 
         [Serializable]

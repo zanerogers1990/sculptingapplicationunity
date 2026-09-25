@@ -22,6 +22,27 @@ Shader "Custom/SculptPBR"
         _MatcapIntensity("Matcap Intensity", Range(0,3)) = 1.0
         _MatcapTintStrength("Matcap Tint By Base Color", Range(0,1)) = 0.0
 
+        // Lure plastic: translucent soft plastic with glitter flakes suspended in it (see
+        // PlasticShade). Driven by LurePlasticPresets through SculptMaterialController; a matcap
+        // still wins over it, since a matcap replaces lighting and this is all about lighting.
+        _PlasticEnabled("Lure Plastic Enabled", Float) = 0
+        _PlasticThinColor("Plastic Thin Color", Color) = (0.8,0.6,0.2,1)
+        _PlasticThickColor("Plastic Thick Color", Color) = (0.3,0.25,0.1,1)
+        _PlasticDepth("Plastic Absorption Depth (world)", Float) = 0.1
+        _PlasticTransmission("Plastic Transmission", Range(0,3)) = 1
+        _PlasticGloss("Plastic Gloss", Range(0,1)) = 0.8
+        _FlakeColorA("Flake Color A (a = weight)", Color) = (0.2,0.5,1,1)
+        _FlakeColorB("Flake Color B (a = weight)", Color) = (0.2,0.5,1,0)
+        _FlakeColorC("Flake Color C (a = weight)", Color) = (0.2,0.5,1,0)
+        _FlakeCellSize("Flake Cell Size (world)", Float) = 0.03
+        _FlakeDensity("Flake Density", Range(0,1)) = 0.4
+        _FlakeShape("Flake Shape (0 hex, 1 square)", Range(0,1)) = 0
+        _FlakeTilt("Flake Tilt", Range(0,2)) = 0.35
+        _FlakeSparkle("Flake Sparkle", Range(0,4)) = 1
+        _MicroFlakeColor("Micro Flake Color", Color) = (0,0,0,1)
+        _MicroFlakeCellSize("Micro Flake Cell Size (world)", Float) = 0.01
+        _MicroFlakeDensity("Micro Flake Density", Range(0,1)) = 0.3
+
         // Darker grey rather than a saturated color - matches ZBrush/Blender/Mudbox's
         // convention of shading masked areas toward grey/black instead of tinting them a
         // color, so the mask overlay doesn't read as "painted" onto the surface.
@@ -73,6 +94,23 @@ Shader "Custom/SculptPBR"
                 half _MatcapEnabled;
                 half _MatcapIntensity;
                 half _MatcapTintStrength;
+                half _PlasticEnabled;
+                half4 _PlasticThinColor;
+                half4 _PlasticThickColor;
+                float _PlasticDepth;
+                half _PlasticTransmission;
+                half _PlasticGloss;
+                half4 _FlakeColorA;
+                half4 _FlakeColorB;
+                half4 _FlakeColorC;
+                float _FlakeCellSize;
+                half _FlakeDensity;
+                half _FlakeShape;
+                half _FlakeTilt;
+                half _FlakeSparkle;
+                half4 _MicroFlakeColor;
+                float _MicroFlakeCellSize;
+                half _MicroFlakeDensity;
             CBUFFER_END
 
             // "Shade Flat" normal from the screen-space derivatives of the interpolated world
@@ -280,7 +318,7 @@ Shader "Custom/SculptPBR"
                 return color;
             }
 
-            half4 PhysicallyShade(Varyings input, float3 normalWS, half3 albedo)
+            InputData BuildInputData(Varyings input, float3 normalWS)
             {
                 InputData inputData = (InputData)0;
                 inputData.positionWS = input.positionWS;
@@ -293,12 +331,16 @@ Shader "Custom/SculptPBR"
                 inputData.bakedGI = SampleSHPixel(half3(0, 0, 0), normalWS);
                 inputData.normalizedScreenSpaceUV = GetNormalizedScreenSpaceUV(input.positionCS);
                 inputData.shadowMask = half4(1, 1, 1, 1);
+                return inputData;
+            }
 
+            half4 PhysicallyShade(InputData inputData, half3 albedo, half metallic, half smoothness)
+            {
                 SurfaceData surfaceData;
                 surfaceData.albedo = albedo;
                 surfaceData.specular = half3(0, 0, 0);
-                surfaceData.metallic = _Metallic;
-                surfaceData.smoothness = _Smoothness;
+                surfaceData.metallic = metallic;
+                surfaceData.smoothness = smoothness;
                 surfaceData.normalTS = half3(0, 0, 1);
                 surfaceData.emission = half3(0, 0, 0);
                 surfaceData.occlusion = 1.0;
@@ -307,6 +349,308 @@ Shader "Custom/SculptPBR"
                 surfaceData.clearCoatSmoothness = 1.0;
 
                 return UniversalFragmentPBR(inputData, surfaceData);
+            }
+
+            // ---- Lure plastic --------------------------------------------------------------
+            //
+            // Soft-plastic fishing lures are a coloured, translucent plastisol with glitter cast
+            // into it. Three things make one read as that rather than as painted clay, and each
+            // has a piece below:
+            //   1. Thin parts (claws, tails) are lighter and more saturated than the thick body,
+            //      because less plastic absorbs the light passing through - PlasticThickness.
+            //   2. Light shines THROUGH the thin parts - the transmission term.
+            //   3. The flakes sit at different depths, catch the light individually, and dim
+            //      through the plastic above them - TraceFlakes + the per-flake lighting.
+
+            // Written by PlasticThicknessPass (ScreenCavityFeature): eye depth of the nearest BACK
+            // face under each pixel, 0 = none. Back minus this fragment's own eye depth is how much
+            // plastic the view ray crosses.
+            TEXTURE2D_FLOAT(_SculptPlasticBackDepth);
+            float4 _SculptPlasticParams;   // x = buffer valid for this camera
+
+            // Rotates the flake lattice off the model's axes, so rows of flakes never line up with
+            // a symmetry plane or a primitive's edges. Orthonormal, so the inverse is the transpose.
+            static const float3x3 FlakeGridRotation = float3x3(
+                 0.36, 0.48, -0.80,
+                -0.80, 0.60,  0.00,
+                 0.48, 0.64,  0.60);
+
+            float3 FlakeHash33(float3 p)
+            {
+                p = frac(p * float3(0.1031, 0.1030, 0.0973));
+                p += dot(p, p.yxz + 33.33);
+                return frac((p.xxy + p.yxx) * p.zyx);
+            }
+
+            struct FlakeHit
+            {
+                float depth;       // world distance below the surface, along the refracted ray
+                half coverage;     // 0..1, antialiased
+                half3 color;
+                float3 normalWS;
+            };
+
+            // Glitter is a flat platelet (hex or square) suspended in the plastic, lying roughly
+            // along the skin the way molding leaves it, with some random tilt. Each lattice cell
+            // holds at most one, sized and placed so it stays inside its cell - which lets a short
+            // march along the refracted view ray test only the cell it is standing in. The ray
+            // hits the platelet's PLANE rather than the surface slicing through it, so a flake
+            // shows its whole face at its true depth and slides with parallax as the model turns.
+            half FlakeLodFade(float footprintInCells)
+            {
+                return saturate(2.0 - 2.5 * footprintInCells);
+            }
+
+            // What the flakes a layer's LOD fade has removed still contribute on average: their
+            // colour, faintly. Mixed into the plastic so glitter too small to draw still tints it -
+            // kept well under the flakes' real coverage, because a flat tint of a bright flake
+            // colour over dark plastic reads far stronger than the same colour broken into specks.
+            half3 FadedFlakeTint(half3 body, half3 flakeColor, float footprint, float cellSize, half density)
+            {
+                if (cellSize <= 1e-6)
+                    return body;
+                half gone = 1.0h - FlakeLodFade(footprint / cellSize);
+                return lerp(body, flakeColor, gone * density * 0.12h);
+            }
+
+            FlakeHit TraceFlakes(float3 originOS, float3 dirOS, float3 normalOS, float3 objectScale, float footprint,
+                                 float cellSize, half density, float seed, bool palette)
+            {
+                FlakeHit hit;
+                hit.depth = 1e20;
+                hit.coverage = 0;
+                hit.color = half3(0, 0, 0);
+                hit.normalWS = float3(0, 1, 0);
+                if (density <= 0.001 || cellSize <= 1e-6)
+                    return hit;
+
+                float3 o = mul(FlakeGridRotation, originOS) / cellSize;
+                float3 d = mul(FlakeGridRotation, dirOS);
+                float3 n = mul(FlakeGridRotation, normalOS);
+                float fp = max(footprint / cellSize, 1e-4);
+                // Once a pixel spans more than about half a cell the individual flakes can't be
+                // resolved, and what's left is the lattice beating against the pixel grid - a
+                // visible checker/moire at a distance. Fade them out there, leaving the plastic.
+                half lodFade = FlakeLodFade(fp);
+                if (lodFade <= 0.0)
+                    return hit;
+
+                float bestT = 1e20;
+                [unroll]
+                for (int i = 0; i < 5; i++)
+                {
+                    float3 cell = floor(o + d * (0.4 * i + 0.05));
+                    float3 h0 = FlakeHash33(cell + seed);
+                    if (h0.x > density) continue;
+
+                    float radius = lerp(0.22, 0.45, h0.y);
+                    float3 h1 = FlakeHash33(cell + seed + 19.19);
+                    float3 centre = cell + radius + h1 * (1.0 - 2.0 * radius);
+                    float3 h2 = FlakeHash33(cell + seed + 47.47);
+                    float3 nf = normalize(n + (h2 * 2.0 - 1.0) * _FlakeTilt);
+
+                    float denom = dot(d, nf);
+                    if (abs(denom) < 0.05) continue;
+                    float t = dot(centre - o, nf) / denom;
+                    if (t < 0.0 || t >= bestT) continue;
+
+                    float3 q = o + d * t - centre;
+                    float3 ta = normalize(cross(nf, abs(nf.y) < 0.95 ? float3(0, 1, 0) : float3(1, 0, 0)));
+                    float3 tb = cross(nf, ta);
+                    float s, c;
+                    sincos(FlakeHash33(cell + seed + 83.83).x * 6.2831853, s, c);
+                    float2 uv = float2(dot(q, ta), dot(q, tb));
+                    float2 a = abs(float2(uv.x * c - uv.y * s, uv.x * s + uv.y * c));
+                    float hexDist = max(a.x * 0.8660254 + a.y * 0.5, a.y);
+                    float squareDist = max(a.x, a.y);
+                    float dist = lerp(hexDist, squareDist, _FlakeShape);
+
+                    // Edge antialiasing over one pixel's footprint, and a flake smaller than a
+                    // pixel faded to roughly its share of it rather than drawn as a full speck -
+                    // otherwise zooming out turns the glitter into crawling noise.
+                    half coverage = saturate((radius - dist) / fp + 0.5) * saturate(2.0 * radius / fp) * lodFade;
+                    if (coverage <= 0.01) continue;
+
+                    bestT = t;
+                    hit.depth = t * cellSize;
+                    hit.coverage = coverage;
+                    // The lattice lives in scaled object space, where only the rotation is left to undo.
+                    hit.normalWS = TransformObjectToWorldDir(mul(nf, FlakeGridRotation) / objectScale);
+                    if (palette)
+                    {
+                        // Colour weights ride in the alpha channels.
+                        half total = max(_FlakeColorA.a + _FlakeColorB.a + _FlakeColorC.a, 1e-4);
+                        half pick = h0.z * total;
+                        hit.color = pick < _FlakeColorA.a ? _FlakeColorA.rgb
+                                  : pick < _FlakeColorA.a + _FlakeColorB.a ? _FlakeColorB.rgb
+                                  : _FlakeColorC.rgb;
+                    }
+                    else
+                    {
+                        hit.color = _MicroFlakeColor.rgb;
+                    }
+                }
+                return hit;
+            }
+
+            struct PlasticLighting
+            {
+                half3 diffuseA;
+                half3 glintA;
+                half3 diffuseB;
+                half3 glintB;
+                half3 backLight;
+                half3 scatter;
+            };
+
+            // A glitter platelet is nearly a mirror: a tight, normalised Blinn-Phong lobe, so each
+            // flake is either catching a light or not - that on/off is the sparkle as the view turns.
+            half FlakeGlint(float3 nf, float3 L, float3 V)
+            {
+                float3 h = normalize(L + V);
+                return (half)(pow(saturate(dot(nf, h)), 160.0) * 8.0);
+            }
+
+            void AccumulatePlasticLight(Light light, float3 N, float3 V, float3 nA, float3 nB,
+                                        inout PlasticLighting acc)
+            {
+                half3 radiance = light.color * light.distanceAttenuation;
+                half3 shadowed = radiance * light.shadowAttenuation;
+                float3 L = light.direction;
+                acc.diffuseA += shadowed * saturate(dot(nA, L));
+                acc.glintA   += shadowed * FlakeGlint(nA, L, V);
+                acc.diffuseB += shadowed * saturate(dot(nB, L));
+                // Pepper flakes are specks, not mirrors - a full-strength glint on each turns the
+                // whole surface into white noise.
+                acc.glintB   += shadowed * FlakeGlint(nB, L, V) * 0.35;
+                // Light entering the far side and leaving toward the eye. Deliberately unshadowed:
+                // the shadow map reports this point as in the model's own shadow, and that is
+                // exactly the light that is passing through it.
+                float3 through = normalize(L + N * 0.35);
+                acc.backLight += radiance * pow(saturate(dot(V, -through)), 3.0);
+                // Light scattered inside the plastic reaches past the shadow line: the extra a
+                // wrapped Lambert gets over the plain one. This is what makes the whole body read
+                // as semi-translucent rather than painted, even where it's too thick to see into.
+                half ndl = dot(N, L);
+                half wrapped = saturate((ndl + 0.6) / 1.6);
+                acc.scatter += radiance * lerp(1.0h, light.shadowAttenuation, 0.5h) * max(wrapped - saturate(ndl), 0.0h);
+            }
+
+            // How much plastic the view ray crosses at this pixel, in world units.
+            float PlasticThickness(Varyings input, float depthScale)
+            {
+                // No buffer for this camera (or nothing behind): treat it as solid body.
+                float thickness = depthScale * 4.0;
+                if (_SculptPlasticParams.x > 0.5)
+                {
+                    float back = LOAD_TEXTURE2D(_SculptPlasticBackDepth, uint2(input.positionCS.xy)).r;
+                    float front = -TransformWorldToView(input.positionWS).z;
+                    // A back face IN FRONT of this surface means an open or intersecting mesh -
+                    // the difference means nothing there, so keep the solid fallback.
+                    if (back > 0.0 && back >= front - depthScale * 0.02)
+                        thickness = max(back - front, 0.0);
+                }
+                return thickness;
+            }
+
+            half3 FlakeRadiance(InputData inputData, half3 color, float3 n, half3 diffuse, half3 glint)
+            {
+                float3 V = inputData.viewDirectionWS;
+                half3 env = GlossyEnvironmentReflection(reflect(-V, n), inputData.positionWS, 0.3h, 1.0h,
+                                                        inputData.normalizedScreenSpaceUV);
+                return color * (diffuse + SampleSH(n)) * 0.7
+                     + color * env * 0.6
+                     + lerp(color, half3(1, 1, 1), 0.3) * glint * _FlakeSparkle;
+            }
+
+            // Colour left after light crosses `distance` of plastic twice (down to a flake and back
+            // up). The thick colour is what the plastic absorbs down to over one absorption depth.
+            half3 PlasticTransmittance(float distance, float depthScale)
+            {
+                return pow(max(_PlasticThickColor.rgb, 1e-3), 2.0 * distance / depthScale);
+            }
+
+            float3 FaceViewer(float3 n, float3 V)
+            {
+                return dot(n, V) < 0.0 ? -n : n;
+            }
+
+            half4 PlasticShade(Varyings input, float3 normalWS, float3 smoothNormalWS, float3 positionOS)
+            {
+                InputData inputData = BuildInputData(input, normalWS);
+                float3 V = inputData.viewDirectionWS;
+                float depthScale = max(_PlasticDepth, 1e-5);
+
+                float thickness = PlasticThickness(input, depthScale);
+                half throughFraction = exp(-thickness / depthScale);
+                half3 body = lerp(_PlasticThickColor.rgb, _PlasticThinColor.rgb, throughFraction);
+
+                // Flakes live in the object's own space scaled to world size, so they stay put on
+                // the model as it moves and keep one size across differently scaled objects. The
+                // smooth normal steers them even under Flat Shading, so a flake doesn't break
+                // along triangle edges.
+                // Per-axis scale (the lengths of the model matrix's columns), so a squashed object
+                // gets round flakes of the same size rather than squashed or shrunken ones.
+                float3 objectScale = float3(
+                    length(float3(UNITY_MATRIX_M[0].x, UNITY_MATRIX_M[1].x, UNITY_MATRIX_M[2].x)),
+                    length(float3(UNITY_MATRIX_M[0].y, UNITY_MATRIX_M[1].y, UNITY_MATRIX_M[2].y)),
+                    length(float3(UNITY_MATRIX_M[0].z, UNITY_MATRIX_M[1].z, UNITY_MATRIX_M[2].z)));
+                float3 originOS = positionOS * objectScale;
+                float3 dirOS = normalize(TransformWorldToObjectDir(refract(-V, smoothNormalWS, 1.0 / 1.5), false) * objectScale);
+                float3 surfaceOS = normalize(TransformWorldToObjectNormal(smoothNormalWS, false) / objectScale);
+                float footprint = length(fwidth(originOS));
+                FlakeHit big = TraceFlakes(originOS, dirOS, surfaceOS, objectScale, footprint,
+                                           _FlakeCellSize, _FlakeDensity, 0.0, true);
+                FlakeHit micro = TraceFlakes(originOS, dirOS, surfaceOS, objectScale, footprint,
+                                             _MicroFlakeCellSize, _MicroFlakeDensity, 131.0, false);
+                half3 paletteMean = (_FlakeColorA.rgb * _FlakeColorA.a + _FlakeColorB.rgb * _FlakeColorB.a
+                                   + _FlakeColorC.rgb * _FlakeColorC.a)
+                                  / max(_FlakeColorA.a + _FlakeColorB.a + _FlakeColorC.a, 1e-4h);
+                body = FadedFlakeTint(body, paletteMean, footprint, _FlakeCellSize, _FlakeDensity);
+                body = FadedFlakeTint(body, _MicroFlakeColor.rgb, footprint, _MicroFlakeCellSize, _MicroFlakeDensity);
+                float3 nBig = FaceViewer(big.normalWS, V);
+                float3 nMicro = FaceViewer(micro.normalWS, V);
+
+                PlasticLighting acc = (PlasticLighting)0;
+                Light mainLight = GetMainLight(inputData.shadowCoord, inputData.positionWS, inputData.shadowMask);
+                AccumulatePlasticLight(mainLight, normalWS, V, nBig, nMicro, acc);
+                #if defined(_ADDITIONAL_LIGHTS)
+                uint pixelLightCount = GetAdditionalLightsCount();
+                #if USE_CLUSTER_LIGHT_LOOP
+                [loop] for (uint lightIndex = 0; lightIndex < min(URP_FP_DIRECTIONAL_LIGHTS_COUNT, MAX_VISIBLE_LIGHTS); lightIndex++)
+                {
+                    CLUSTER_LIGHT_LOOP_SUBTRACTIVE_LIGHT_CHECK
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulatePlasticLight(light, normalWS, V, nBig, nMicro, acc);
+                }
+                #endif
+                LIGHT_LOOP_BEGIN(pixelLightCount)
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulatePlasticLight(light, normalWS, V, nBig, nMicro, acc);
+                LIGHT_LOOP_END
+                #endif
+
+                // Front-to-back: whichever flake is shallower covers the other.
+                half wBig = big.coverage;
+                half wMicro = micro.coverage;
+                if (micro.depth < big.depth) wBig *= 1.0 - wMicro;
+                else                          wMicro *= 1.0 - wBig;
+                half3 tBig = PlasticTransmittance(big.depth, depthScale);
+                half3 tMicro = PlasticTransmittance(micro.depth, depthScale);
+
+                half3 flakes = wBig * tBig * FlakeRadiance(inputData, big.color, nBig, acc.diffuseA, acc.glintA)
+                             + wMicro * tMicro * FlakeRadiance(inputData, micro.color, nMicro, acc.diffuseB, acc.glintB);
+                // A flake blocks the plastic behind it, by as much of it as shows through.
+                half occluded = saturate(wBig * Luminance(tBig) + wMicro * Luminance(tMicro));
+
+                half4 color = PhysicallyShade(inputData, body * (1.0 - occluded), 0.0, _PlasticGloss);
+                half3 glow = _PlasticThinColor.rgb * throughFraction
+                           * (acc.backLight + SampleSH(-normalWS) * 0.6) * _PlasticTransmission;
+                // Scattered light leaves tinted by the plastic it wandered through - between the
+                // surface colour and the thin colour, nearer the surface colour so a thick body keeps its depth.
+                half3 scatter = acc.scatter * lerp(body, _PlasticThinColor.rgb, 0.3h) * _PlasticTransmission * 0.5h;
+                color.rgb += flakes + (glow + scatter) * (1.0 - occluded);
+                return color;
             }
 
             half4 SculptPBRFragment(Varyings input) : SV_Target
@@ -334,8 +678,10 @@ Shader "Custom/SculptPBR"
                 half4 litColor;
                 if (_MatcapEnabled > 0.5)
                     litColor = half4(MatcapShade(normalWS), 1.0);
+                else if (_PlasticEnabled > 0.5)
+                    litColor = PlasticShade(input, normalWS, normalize(input.normalWS), positionOS);
                 else
-                    litColor = PhysicallyShade(input, normalWS, _BaseColor.rgb);
+                    litColor = PhysicallyShade(BuildInputData(input, normalWS), _BaseColor.rgb, _Metallic, _Smoothness);
 
                 // Cavity multiplies the FINISHED colour, as Workbench composites it - over a
                 // matcap's baked lighting or the lit PBR result alike - and before the mask tint,
@@ -411,6 +757,54 @@ Shader "Custom/SculptPBR"
                 // an orthographic camera too.
                 float eyeDepth = -TransformWorldToView(input.positionWS).z;
                 return float4(normalVS, eyeDepth);
+            }
+            ENDHLSL
+        }
+
+        // Feeds PlasticThicknessPass: eye depth of the nearest BACK face, so the lure plastic can
+        // tell a thin claw from a thick body by how much plastic the view ray crosses. Only drawn
+        // while a lure plastic is showing.
+        Pass
+        {
+            Name "SculptPlasticBackDepth"
+            Tags { "LightMode" = "SculptPlasticBackDepth" }
+            Cull Front
+            ZWrite On
+            ZTest LEqual
+
+            HLSLPROGRAM
+            #pragma target 3.5
+            #pragma vertex BackDepthVertex
+            #pragma fragment BackDepthFragment
+            #pragma multi_compile_instancing
+
+            struct Attributes
+            {
+                float4 positionOS : POSITION;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+
+            struct Varyings
+            {
+                float4 positionCS : SV_POSITION;
+                float3 positionWS : TEXCOORD0;
+                UNITY_VERTEX_OUTPUT_STEREO
+            };
+
+            Varyings BackDepthVertex(Attributes input)
+            {
+                Varyings output = (Varyings)0;
+                UNITY_SETUP_INSTANCE_ID(input);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
+                VertexPositionInputs posInputs = GetVertexPositionInputs(input.positionOS.xyz);
+                output.positionCS = posInputs.positionCS;
+                output.positionWS = posInputs.positionWS;
+                return output;
+            }
+
+            float BackDepthFragment(Varyings input) : SV_Target
+            {
+                return -TransformWorldToView(input.positionWS).z;
             }
             ENDHLSL
         }

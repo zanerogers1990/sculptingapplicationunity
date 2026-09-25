@@ -46,7 +46,9 @@ namespace Sculpting
         // value every brush actually reads) follows from it - see SyncScreenSpaceBrushRadius. Off
         // is the old behaviour: a fixed world size that looks bigger the closer you get.
         [SerializeField] private bool screenSpaceBrushSize = true;
-        [SerializeField, Range(MinBrushScreenRadius, MaxBrushScreenRadius)] private float brushScreenRadius = 60f;
+        // Upper bound follows the viewport height at runtime (see MaxBrushScreenRadius), so the
+        // inspector can only enforce the floor.
+        [SerializeField, Min(MinBrushScreenRadius)] private float brushScreenRadius = 60f;
         [SerializeField] private BrushType currentBrush = BrushType.Move;
         [SerializeField] private bool isPositive = true;
         [SerializeField] private bool accumulate = true;
@@ -318,15 +320,48 @@ namespace Sculpting
         // available brush still covered a visibly large patch of the zoomed-in surface. 0.01 matches the floor
         // RebuildSpatialIndex/QueryNear already clamp their own cell size to, so the rest of the
         // brush pipeline was already exercised at this scale.
-        public const float MinBrushRadius = 0.01f;
+        //
+        // The world-space range is ADAPTIVE: these are fractions of the target's size (the
+        // largest side of its local bounds - see UpdateAdaptiveBrushRange), so a millimetre-scale
+        // STL a hundred units long gets a range as usable as the unit startup sphere does. At that
+        // sphere (size 1) they are exactly the old fixed 0.01-8.
+        private const float MinBrushRadiusPerModelSize = 0.01f;
         // Was 2 - too tight once brush size also had to reach across large masked regions (the
         // Pose brush's reach is driven by this same value - see SculptableMesh.SelectPose's
         // effectiveReach), on top of ordinary sculpting on a bigger-than-default figure. See
         // ResizeSensitivity above, scaled to match.
-        public const float MaxBrushRadius = 8f;
+        private const float MaxBrushRadiusPerModelSize = 8f;
         // Screen-space brush size bounds, in pixels of RADIUS. 60 is ZBrush's default Draw Size.
+        // The maximum is ADAPTIVE too: a fraction of the viewport height (600 px at 1080p), so a
+        // 1440p or 4K window isn't capped at a brush that covers a smaller share of the screen.
         public const float MinBrushScreenRadius = 2f;
-        public const float MaxBrushScreenRadius = 600f;
+        private const float MaxBrushScreenRadiusPerViewportHeight = 600f / 1080f;
+        // Bounds on the world radius DERIVED from a screen-space size (SyncScreenSpaceBrushRadius),
+        // also per unit of model size. Deliberately far looser than the world-mode SLIDER's range:
+        // clamping the derived value to that made the ring stop growing once zoomed out and stop
+        // shrinking once zoomed in close (0.01 is ~120 px at a 0.1 view depth), while the pixel
+        // slider still showed plenty of range - the size looked "stuck". The pixel range and the
+        // camera's own zoom limits already bound this; these only guard degenerate values.
+        private const float MinScreenDerivedBrushRadiusPerModelSize = 0.001f;
+        private const float MaxScreenDerivedBrushRadiusPerModelSize = 10000f;
+
+        // Largest side of the target's local bounds - what the adaptive world ranges above scale
+        // by. Brush radii are in the target's LOCAL units (the brushes divide out its scale), so
+        // local bounds are the right measure: a scaled-up transform doesn't change the range.
+        // Refreshed only between strokes (UpdateAdaptiveBrushRange), so a Clay build-up growing
+        // the bounds can't move the range - and clamp the brush - mid-stroke.
+        private float _brushRangeModelSize = 1f;
+
+        public float MinBrushRadius => MinBrushRadiusPerModelSize * _brushRangeModelSize;
+        public float MaxBrushRadius => MaxBrushRadiusPerModelSize * _brushRangeModelSize;
+        public float MaxBrushScreenRadius
+        {
+            get
+            {
+                float viewportHeight = cam != null ? cam.pixelHeight : Screen.height;
+                return Mathf.Max(MinBrushScreenRadius * 2f, viewportHeight * MaxBrushScreenRadiusPerViewportHeight);
+            }
+        }
 
         private bool _isHovering;
         private Vector3 _hoverPoint;
@@ -386,7 +421,18 @@ namespace Sculpting
             set => brushRadius = Mathf.Clamp(value, MinBrushRadius, MaxBrushRadius);
         }
 
-        public bool ScreenSpaceBrushSize { get => screenSpaceBrushSize; set => screenSpaceBrushSize = value; }
+        public bool ScreenSpaceBrushSize
+        {
+            get => screenSpaceBrushSize;
+            set
+            {
+                screenSpaceBrushSize = value;
+                // The screen-derived radius can sit outside the world slider's range - see
+                // MinScreenDerivedBrushRadiusPerModelSize. Pull it back in so the slider shows the
+                // real size.
+                if (!value) BrushRadius = brushRadius;
+            }
+        }
 
         public float BrushScreenRadius
         {
@@ -790,6 +836,7 @@ namespace Sculpting
             HandleDeleteObjectKey();
             UpdatePoseChainVisual();
             UpdatePenPressure();
+            UpdateAdaptiveBrushRange();
             SyncScreenSpaceBrushRadius();
             SyncBrushFalloff();
             HandleSculptInput();

@@ -552,6 +552,14 @@ namespace Sculpting.IO
                 data.material.matcapName = mat.MatcapName;
                 data.material.matcapIntensity = mat.MatcapIntensity;
                 data.material.matcapTintStrength = mat.MatcapTintStrength;
+                data.material.lureEnabled = mat.LureEnabled;
+                data.material.lurePresetId = mat.LurePresetId;
+                data.material.lureFlakeSize = mat.LureFlakeSize;
+                data.material.lureFlakeAmount = mat.LureFlakeAmount;
+                data.material.lureSparkle = mat.LureSparkle;
+                data.material.lureTranslucency = mat.LureTranslucency;
+                data.material.lureGloss = mat.LureGloss;
+                data.material.lureReferenceSize = mat.LureReferenceSize;
             }
 
             var light = LightingPresetController.Instance;
@@ -646,6 +654,17 @@ namespace Sculpting.IO
                 // naming a matcap this machine doesn't have would silently substitute a
                 // different one - lit shading is the honest answer there.
                 mat.MatcapEnabled = data.material.matcapEnabled && mat.HasMatcap;
+
+                mat.LureFlakeSize = data.material.lureFlakeSize;
+                mat.LureFlakeAmount = data.material.lureFlakeAmount;
+                mat.LureSparkle = data.material.lureSparkle;
+                mat.LureTranslucency = data.material.lureTranslucency;
+                mat.LureGloss = data.material.lureGloss;
+                // Size before the toggle, so enabling doesn't measure a model the file already
+                // measured. Objects are loaded by now, so a 0 here measures the right model.
+                mat.LureReferenceSize = data.material.lureReferenceSize;
+                if (!string.IsNullOrEmpty(data.material.lurePresetId)) mat.LurePresetId = data.material.lurePresetId;
+                mat.LureEnabled = data.material.lureEnabled;
             }
 
             var env = data.environment;

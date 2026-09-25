@@ -84,7 +84,172 @@ namespace Sculpting
             UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityValley, v => _material.CavityValley = v,
                 "How much creases and recesses are darkened - 0 leaves them alone.");
 
+            BuildLureSection(UIFactory.CreateFoldoutSection(panel, "Lure Plastic", false));
             BuildMatcapSection(UIFactory.CreateFoldoutSection(panel, "Matcap", false));
+        }
+
+        // ------------------------------------------------------------------ lure plastic
+
+        private const float LureSwatchHeight = 60f;
+
+        private Toggle _lureToggle;
+        private Text _lureStatus;
+        private GameObject _lureMatcapNote;
+        private Slider _lureSizeSlider, _lureAmountSlider, _lureSparkleSlider, _lureTranslucencySlider, _lureGlossSlider;
+        private readonly List<KeyValuePair<string, Image>> _lureButtons = new List<KeyValuePair<string, Image>>();
+        // What the lure controls last showed, so a scene load (which writes the controller
+        // directly) or a matcap toggle elsewhere gets reflected here.
+        private (bool, bool, string, float, float, float, float, float) _shownLureState;
+
+        private void BuildLureSection(Transform section)
+        {
+            // A matcap replaces lighting outright, and lure plastic is all lighting - so while a
+            // matcap is on the plastic can't show. Said here, with the way out one click away,
+            // rather than switching matcap off behind the user's back.
+            var note = new GameObject("LureMatcapNote", typeof(RectTransform));
+            note.transform.SetParent(section, false);
+            var noteLayout = note.AddComponent<VerticalLayoutGroup>();
+            noteLayout.spacing = 4;
+            noteLayout.childControlWidth = true;
+            noteLayout.childControlHeight = true;
+            noteLayout.childForceExpandWidth = true;
+            noteLayout.childForceExpandHeight = false;
+            Text noteText = UIFactory.CreateLabel(note.transform, "Matcap is on - it hides lure plastic.", 11, FontStyle.Italic);
+            noteText.color = ErrorColor;
+            UIFactory.CreateButton(note.transform, "Turn Off Matcap", () =>
+            {
+                _material.MatcapEnabled = false;
+                RefreshMatcapUi();
+                RefreshLureUi();
+            }, "Switch matcap off so the scene lights - and the lure plastic - show.");
+            _lureMatcapNote = note;
+
+            _lureToggle = UIFactory.CreateToggle(section, "Enabled", _material.LureEnabled, v =>
+            {
+                _material.LureEnabled = v;
+                RefreshLureUi();
+            }, tooltip: "Soft-plastic lure look: translucent coloured plastic with glitter flakes. Replaces Base Color, Metallic and Smoothness while on.");
+
+            _lureStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
+
+            _lureButtons.Clear();
+            IReadOnlyList<LurePlasticPreset> presets = LurePlasticPresets.All;
+            Transform row = null;
+            for (int i = 0; i < presets.Count; i++)
+            {
+                if (i % 2 == 0) row = UIFactory.CreateRow(section, LureSwatchHeight).transform;
+                _lureButtons.Add(new KeyValuePair<string, Image>(presets[i].Id, CreateLureButton(row, presets[i])));
+            }
+            if (presets.Count % 2 == 1)
+                new GameObject("Spacer", typeof(RectTransform)).transform.SetParent(row, false);
+
+            UIFactory.CreateLabel(section, "Flake Size", 12, FontStyle.Normal);
+            _lureSizeSlider = UIFactory.CreateSlider(section, 0.25f, 3f, _material.LureFlakeSize, v => _material.LureFlakeSize = v,
+                "Size of the glitter - 1 is the preset's own size.");
+            UIFactory.CreateLabel(section, "Flake Amount", 12, FontStyle.Normal);
+            _lureAmountSlider = UIFactory.CreateSlider(section, 0f, 2f, _material.LureFlakeAmount, v => _material.LureFlakeAmount = v,
+                "How much glitter is packed into the plastic - 0 is clear plastic, 1 is the preset.");
+            UIFactory.CreateLabel(section, "Sparkle", 12, FontStyle.Normal);
+            _lureSparkleSlider = UIFactory.CreateSlider(section, 0f, 3f, _material.LureSparkle, v => _material.LureSparkle = v,
+                "How brightly each flake flashes when it catches a light.");
+            UIFactory.CreateLabel(section, "Translucency", 12, FontStyle.Normal);
+            _lureTranslucencySlider = UIFactory.CreateSlider(section, 0.25f, 3f, _material.LureTranslucency, v => _material.LureTranslucency = v,
+                "How far light gets into the plastic - higher lets thick parts show the lighter edge colour and deeper flakes.");
+            UIFactory.CreateLabel(section, "Gloss", 12, FontStyle.Normal);
+            _lureGlossSlider = UIFactory.CreateSlider(section, 0f, 1f, _material.LureGloss, v => _material.LureGloss = v,
+                "Wetness of the plastic's surface - low is matte, high is a sharp shine.");
+
+            RefreshLureUi();
+        }
+
+        private Image CreateLureButton(Transform parent, LurePlasticPreset preset)
+        {
+            var go = new GameObject("Lure_" + preset.Id, typeof(RectTransform), typeof(Image));
+            go.transform.SetParent(parent, false);
+            var frame = go.GetComponent<Image>();
+            frame.color = UIFactory.InactiveColor;
+            var button = go.AddComponent<Button>();
+            button.targetGraphic = frame;
+            button.onClick.AddListener(() =>
+            {
+                _material.SelectLurePreset(preset.Id);
+                RefreshLureUi();
+            });
+            TooltipSystem.Attach(go, preset.Description);
+
+            var iconGO = new GameObject("Icon", typeof(RectTransform), typeof(Image));
+            iconGO.transform.SetParent(go.transform, false);
+            var iconRect = iconGO.GetComponent<RectTransform>();
+            iconRect.anchorMin = iconRect.anchorMax = new Vector2(0f, 0.5f);
+            iconRect.pivot = new Vector2(0f, 0.5f);
+            iconRect.anchoredPosition = new Vector2(4f, 0f);
+            iconRect.sizeDelta = new Vector2(LureSwatchHeight - 8f, LureSwatchHeight - 8f);
+            Texture2D thumb = LurePlasticPresets.CreateThumbnail(preset);
+            iconGO.GetComponent<Image>().sprite =
+                Sprite.Create(thumb, new Rect(0, 0, thumb.width, thumb.height), new Vector2(0.5f, 0.5f));
+
+            var textGO = new GameObject("Text", typeof(RectTransform));
+            textGO.transform.SetParent(go.transform, false);
+            var textRect = textGO.GetComponent<RectTransform>();
+            textRect.anchorMin = Vector2.zero;
+            textRect.anchorMax = Vector2.one;
+            textRect.offsetMin = new Vector2(LureSwatchHeight, 2f);
+            textRect.offsetMax = new Vector2(-3f, -2f);
+            var text = textGO.AddComponent<Text>();
+            text.font = UIFactory.Font;
+            text.fontSize = 11;
+            text.alignment = TextAnchor.MiddleLeft;
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
+            text.color = Color.white;
+            text.text = preset.Name;
+            text.raycastTarget = false;
+
+            return frame;
+        }
+
+        // A value tuple rather than a formatted string: this is compared every frame.
+        private (bool, bool, string, float, float, float, float, float) LureStateSignature() =>
+            (_material.MatcapEnabled, _material.LureEnabled, _material.LurePresetId, _material.LureFlakeSize,
+             _material.LureFlakeAmount, _material.LureSparkle, _material.LureTranslucency, _material.LureGloss);
+
+        private void RefreshLureUi()
+        {
+            if (_lureToggle == null) return;
+            _shownLureState = LureStateSignature();
+
+            bool matcapShowing = _material.MatcapEnabled && _material.HasMatcap;
+            if (_lureMatcapNote.activeSelf != matcapShowing) _lureMatcapNote.SetActive(matcapShowing);
+
+            _lureToggle.SetIsOnWithoutNotify(_material.LureEnabled);
+            _lureSizeSlider.SetValueWithoutNotify(_material.LureFlakeSize);
+            _lureAmountSlider.SetValueWithoutNotify(_material.LureFlakeAmount);
+            _lureSparkleSlider.SetValueWithoutNotify(_material.LureSparkle);
+            _lureTranslucencySlider.SetValueWithoutNotify(_material.LureTranslucency);
+            _lureGlossSlider.SetValueWithoutNotify(_material.LureGloss);
+
+            foreach (KeyValuePair<string, Image> pair in _lureButtons)
+            {
+                if (pair.Value == null) continue;
+                bool selected = _material.LureEnabled && pair.Key == _material.LurePresetId;
+                pair.Value.color = selected ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            }
+
+            LurePlasticPreset preset = LurePlasticPresets.Find(_material.LurePresetId);
+            if (!_material.LureEnabled)
+            {
+                _lureStatus.text = "Off - pick a colour below.";
+                _lureStatus.color = InfoColor;
+            }
+            else if (matcapShowing)
+            {
+                _lureStatus.text = (preset != null ? preset.Name : "Lure plastic") + " - hidden while matcap is on.";
+                _lureStatus.color = ErrorColor;
+            }
+            else
+            {
+                _lureStatus.text = (preset != null ? preset.Name : "Lure plastic") + " - replaces Base Color.";
+                _lureStatus.color = new Color(0.55f, 0.85f, 0.55f);
+            }
         }
 
         private void BuildMatcapSection(Transform section)
@@ -231,6 +396,11 @@ namespace Sculpting
                 _shownMatcapName = _material.MatcapName;
                 RefreshMatcapUi();
             }
+
+            // Same for lure plastic - and it also has to notice matcap going on or off, which
+            // decides whether the plastic can show at all.
+            if (_lureToggle != null && !LureStateSignature().Equals(_shownLureState))
+                RefreshLureUi();
 
             // The section starts collapsed, so the palette's GameObject starts inactive. Nothing
             // is decoded until it is first opened - opening it is the only signal available that

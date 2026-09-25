@@ -35,10 +35,13 @@ namespace Sculpting
     public class ScreenCavityFeature : ScriptableRendererFeature
     {
         private ScreenCavityPass _pass;
+        // Lure plastic's back-face depth - see PlasticThicknessPass for why it rides along here.
+        private PlasticThicknessPass _thicknessPass;
 
         public override void Create()
         {
             _pass = new ScreenCavityPass { renderPassEvent = RenderPassEvent.AfterRenderingPrePasses };
+            _thicknessPass = new PlasticThicknessPass { renderPassEvent = RenderPassEvent.AfterRenderingPrePasses };
         }
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
@@ -47,6 +50,7 @@ namespace Sculpting
             // SculptPBR (via _SculptCavityParams.x) whether THIS camera's buffer exists. Skipping
             // it would leave the previous camera's flag - and its buffer - bound.
             renderer.EnqueuePass(_pass);
+            renderer.EnqueuePass(_thicknessPass);
         }
 
         private class ScreenCavityPass : ScriptableRenderPass

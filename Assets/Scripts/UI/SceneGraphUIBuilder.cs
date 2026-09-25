@@ -56,6 +56,10 @@ namespace Sculpting
 
         private static readonly Color RecordingColor = new Color(0.95f, 0.45f, 0.4f);
 
+        // Follows the ACTUAL screen mode, not button presses - F11 and Alt+Enter change it too.
+        private Text _fullscreenButtonLabel;
+        private bool _fullscreenWasOn;
+
         // ZSphere blockout section - see BuildZSphereSection. Held as fields only for the parts
         // Update has to keep current: the mode highlight, the toggles that can also change from
         // the viewport (A, undo restoring symmetry), the radius slider, and the status lines.
@@ -197,6 +201,7 @@ namespace Sculpting
 
             RefreshZSphereSection();
             RefreshTimelapseSection(false);
+            RefreshFullscreenButton(false);
 
             if (_selection == null) return;
             // Cheap once-per-frame poll, same idiom SculptUIBuilder already uses for brush
@@ -226,6 +231,10 @@ namespace Sculpting
             UIFactory.CreateButton(panel, "Save", Save, "Saves over the current scene file. Prompts for a location the first time.");
             UIFactory.CreateButton(panel, "Save As...", SaveAs, "Saves the current scene to a new file.");
             UIFactory.CreateButton(panel, "Exit", ShowExitConfirm, "Closes the app. Offers to save first.");
+            var fullscreenButton = UIFactory.CreateButton(panel, "Fullscreen (F11)", FullscreenController.Toggle,
+                "Fills the whole screen, hiding the window's title bar and the taskbar. F11 or Alt+Enter toggles it too.");
+            _fullscreenButtonLabel = fullscreenButton.GetComponentInChildren<Text>();
+            RefreshFullscreenButton(true);
 
             if (!FileDialog.IsSupported)
             {
@@ -372,6 +381,15 @@ namespace Sculpting
             _timelapseStatus.color = HintColor;
 
             RefreshTimelapseSection(true);
+        }
+
+        private void RefreshFullscreenButton(bool force)
+        {
+            if (_fullscreenButtonLabel == null) return;
+            bool on = FullscreenController.IsFullscreen;
+            if (!force && on == _fullscreenWasOn) return;
+            _fullscreenWasOn = on;
+            _fullscreenButtonLabel.text = on ? "Exit Fullscreen (F11)" : "Fullscreen (F11)";
         }
 
         /// Reflects what the recorder is ACTUALLY doing rather than what was last asked of it -

@@ -25,8 +25,9 @@ namespace Sculpting
         // How many world units BrushRadius changes per pixel of horizontal mouse movement
         // while resizing (holding S). Tuned so a full-width drag across a ~1080p window
         // covers roughly the whole MinBrushRadius-MaxBrushRadius range - scale this together
-        // with MaxBrushRadius (same ratio) if that range ever changes again, or a full-width
-        // drag stops reaching the new max.
+        // with MaxBrushRadiusPerModelSize (same ratio) if that range ever changes again, or a
+        // full-width drag stops reaching the new max. Per unit of model size, like that range:
+        // HandleBrushResizeKey multiplies it by _brushRangeModelSize.
         private const float ResizeSensitivity = 0.01f;
         // Half ResizeSensitivity, matching that BrushStrength's range (0.01-1) is about half
         // the width of BrushRadius's (0.01-2) - same "full-width drag covers roughly the whole
@@ -430,7 +431,7 @@ namespace Sculpting
             float deltaX = mouse.position.ReadValue().x - _resizeStartMouseX;
             // In pixels the drag maps one-to-one onto the ring's diameter: half a pixel of radius
             // per pixel of travel.
-            BrushSize = _resizeStartRadius + deltaX * (screenSpaceBrushSize ? 0.5f : ResizeSensitivity);
+            BrushSize = _resizeStartRadius + deltaX * (screenSpaceBrushSize ? 0.5f : ResizeSensitivity * _brushRangeModelSize);
         }
 
         /// Screen-space brush size (see screenSpaceBrushSize): turns BrushScreenRadius into the
@@ -463,7 +464,28 @@ namespace Sculpting
 
             float pixelsPerWorldUnit = ProjectDiameterToScreenPixels(worldPoint, 1f) * 0.5f;
             if (pixelsPerWorldUnit <= 0f) return;
-            BrushRadius = brushScreenRadius / pixelsPerWorldUnit / Mathf.Max(AverageScale(), 1e-6f);
+            // Not through BrushRadius: its clamp is the world-mode slider range - see
+            // MinScreenDerivedBrushRadiusPerModelSize.
+            brushRadius = Mathf.Clamp(brushScreenRadius / pixelsPerWorldUnit / Mathf.Max(AverageScale(), 1e-6f),
+                MinScreenDerivedBrushRadiusPerModelSize * _brushRangeModelSize,
+                MaxScreenDerivedBrushRadiusPerModelSize * _brushRangeModelSize);
+        }
+
+        /// Re-measures what the adaptive size ranges scale by (see MinBrushRadiusPerModelSize and
+        /// MaxBrushScreenRadius) and pulls the active size back inside them - the target changed,
+        /// was trimmed, or the window was resized. Skipped while a mouse button is held, like
+        /// SyncScreenSpaceBrushRadius, so nothing about the brush can change mid-stroke.
+        private void UpdateAdaptiveBrushRange()
+        {
+            if (sculptableMesh == null || sculptableMesh.Mesh == null) return;
+            Mouse mouse = Mouse.current;
+            if (mouse != null && (mouse.leftButton.isPressed || mouse.rightButton.isPressed)) return;
+
+            Vector3 size = sculptableMesh.Mesh.bounds.size;
+            _brushRangeModelSize = Mathf.Max(Mathf.Max(size.x, size.y, size.z), 1e-4f);
+
+            if (screenSpaceBrushSize) BrushScreenRadius = brushScreenRadius;
+            else BrushRadius = brushRadius;
         }
 
         // Holding F enters a strength-adjust mode (instead of sculpting) where horizontal
