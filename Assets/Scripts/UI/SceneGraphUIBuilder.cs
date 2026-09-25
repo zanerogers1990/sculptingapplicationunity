@@ -537,20 +537,16 @@ namespace Sculpting
             _statusClearAt = -1f;
         }
 
-        // Destroys and re-runs the Sculpting Tools panel's Start, plus this panel's own BuildUI,
-        // so every control shows the loaded scene's values rather than the ones it was built
-        // from at startup. This panel can no longer skip rebuilding itself the way the old
-        // separate SaveLoadUIBuilder could: it carries the Studio Lighting/Material/
-        // Presentation sections now (merged in), which DO go stale the same way brush/material/
-        // lighting settings do elsewhere.
-        //
-        // SculptUIBuilder is driven via SendMessage("Start") rather than a direct call, since
-        // this class holds no reference to it and Start is private - the same "invoke a private
-        // MonoBehaviour method without reflection" idiom used elsewhere in this project.
+        // Rebuilds the Sculpting Tools panel, plus this panel's own BuildUI, so every control
+        // shows the loaded scene's values rather than the ones it was built from at startup.
+        // This panel can no longer skip rebuilding itself the way the old separate
+        // SaveLoadUIBuilder could: it carries the Studio Lighting/Material/Presentation sections
+        // now (merged in), which DO go stale the same way brush/material/lighting settings do
+        // elsewhere.
         private void RebuildOtherPanels()
         {
             var sculptBuilder = FindFirstObjectByType<SculptUIBuilder>();
-            if (sculptBuilder != null) sculptBuilder.gameObject.SendMessage("Start", SendMessageOptions.DontRequireReceiver);
+            if (sculptBuilder != null) sculptBuilder.RebuildForLoadedScene();
 
             BuildUI();
             RefreshList();

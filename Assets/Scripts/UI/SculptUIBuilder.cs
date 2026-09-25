@@ -228,6 +228,41 @@ namespace Sculpting
             TooltipSystem.EnsureToggleBuilt();
         }
 
+        /// Rebuilds the panel from the controller's CURRENT values - what a "Replace scene" load
+        /// needs, since it restores brush settings wholesale (see SceneGraphUIBuilder.
+        /// RebuildOtherPanels, the caller).
+        ///
+        /// That used to be a SendMessage("Start") at this whole GameObject, with two problems:
+        /// it re-ran every OTHER component's Start on it too (the view gizmo and both radial
+        /// menus rebuilt themselves for nothing), and it left the change-detection caches below
+        /// holding values from before the load - so any widget whose watched value happened to
+        /// match (the symmetry axis tint and labels, the poly count, the extract status) kept
+        /// showing the default it was just rebuilt with.
+        public void RebuildForLoadedScene()
+        {
+            ResetShownCaches();
+            BuildUI();
+        }
+
+        /// Puts every "last shown" cache back to its never-drawn value, so the next Update
+        /// refreshes each widget unconditionally.
+        private void ResetShownCaches()
+        {
+            _lastShownBrush = (BrushType)(-1);
+            _lastShownMaskMode = false;
+            _lastShownDensity = -1;
+            _lastShownTriCount = -1;
+            _lastShownVertCount = -1;
+            _lastShownSelectionVersion = -1;
+            _lastShownMirrorX = _lastShownMirrorY = _lastShownMirrorZ = _lastShownShowPlanes = false;
+            _mirrorTogglesShown = false;
+            _lastShownSymmetryAxis = -1;
+            _lastShownExtractPreviewing = false;
+            _lastShownExtractTris = -1;
+            _lastShownExtractError = "\0";
+            _nextHistoryRefresh = 0f;
+        }
+
         // Inner strength-circle color - deliberately the same red as SculptController's own
         // NegativeColor (private to that class) rather than reusing BrushCursorColor: the ring
         // keeps its ordinary polarity/Smooth tint while adjusting strength (see
