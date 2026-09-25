@@ -209,6 +209,12 @@ namespace Sculpting
         {
             Keyboard kb = Keyboard.current;
             if (kb == null) return;
+            // A letter typed into a text field is text, not a tool switch.
+            if (InputFocus.IsTypingInText()) return;
+            // Outside Sculpt mode an armed gesture is dropped again on the very next line of
+            // Update, so arming one there did nothing - except that the Mode setter also switches
+            // mask painting off, which a stray H/N/T in ZSphere or Transpose mode used to do.
+            if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt) return;
 
             if (kb.hKey.wasPressedThisFrame)
                 Mode = mode == RegionSelectMode.BoxHide ? RegionSelectMode.LassoHide

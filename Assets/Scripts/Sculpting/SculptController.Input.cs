@@ -236,6 +236,10 @@ namespace Sculpting
             var kb = Keyboard.current;
             if (kb == null || _isResizingBrush || _isAdjustingStrength || _isAdjustingRemeshDensity) return;
             if (!kb.zKey.wasPressedThisFrame) return;
+            // Typing a "z" into a text field is text. Tool modes are NOT excluded here, unlike the
+            // other bare keys: Z is arbitrated between the tools' own histories and the scene's
+            // just below.
+            if (_typingInText) return;
 
             bool redo = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
@@ -308,6 +312,30 @@ namespace Sculpting
         private SceneDocumentController _document;
         private SceneGraphUIBuilder _sceneGraphPanel;
 
+        // Whether bare-key shortcuts may START this frame, refreshed once at the top of Update's
+        // hotkey block (RefreshShortcutGate). Two things take a key away from them: a focused
+        // text field - the key is text for it (typing a name used to remesh on R, swap brushes on
+        // the digits and Shift, and pop the radial menu on Space) - and a tool that owns the
+        // viewport and its own keys (ZSphere, Lathe, Mold), where R would remesh the mesh under
+        // the rig and X toggle its mirror. Only a gesture's START is gated: a hold already under
+        // way still sees its release, so the S/F gauges and the Shift-smooth override can never
+        // be left stuck on.
+        private bool _shortcutKeysBlocked;
+        private bool _typingInText;
+        // The radial menus are sculpt-mode menus - their wedges pick brushes and region tools,
+        // and both of those only act in Sculpt mode - so they also stay shut under
+        // Transpose/Scale, where a pick used to land silently and change nothing on screen.
+        private bool _radialMenusBlocked;
+
+        private void RefreshShortcutGate()
+        {
+            GizmoMode mode = Gizmo != null ? Gizmo.Mode : GizmoMode.Sculpt;
+            bool toolOwnsKeys = mode == GizmoMode.ZSphere || mode == GizmoMode.Lathe || mode == GizmoMode.Mold;
+            _typingInText = InputFocus.IsTypingInText();
+            _shortcutKeysBlocked = toolOwnsKeys || _typingInText;
+            _radialMenusBlocked = _shortcutKeysBlocked || mode != GizmoMode.Sculpt;
+        }
+
         private void HandleBrushSwitchKeys()
         {
             var kb = Keyboard.current;
@@ -328,6 +356,9 @@ namespace Sculpting
             // mouse-move frame stomp the NEWLY-switched-to brush's stored strength with a value
             // computed from the OLD brush's baseline.
             if (_isAdjustingStrength) return;
+
+            // Digits, M and X - see _shortcutKeysBlocked.
+            if (_shortcutKeysBlocked) return;
 
             if (kb.digit1Key.wasPressedThisFrame) CurrentBrush = BrushType.Move;
             else if (kb.digit2Key.wasPressedThisFrame) CurrentBrush = BrushType.Clay;
@@ -380,6 +411,10 @@ namespace Sculpting
             // an override already running when masking was entered still unwinds.
             if (shiftHeld && !_isShiftSmoothActive && _isMaskPaintMode) return;
 
+            // And while typing (Shift is a capital letter there) or inside a tool that owns the
+            // keyboard - see _shortcutKeysBlocked. Release still unwinds, as above.
+            if (shiftHeld && !_isShiftSmoothActive && _shortcutKeysBlocked) return;
+
             if (shiftHeld && !_isShiftSmoothActive)
             {
                 _preShiftBrush = currentBrush;
@@ -412,7 +447,7 @@ namespace Sculpting
 
             // CtrlHeld excluded: Ctrl+S is the save hotkey (see HandleSaveKeys) and must not
             // also drop the brush into resize mode.
-            if (kb.sKey.wasPressedThisFrame && !CtrlHeld)
+            if (kb.sKey.wasPressedThisFrame && !CtrlHeld && !_shortcutKeysBlocked)
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while resizing
                 _isResizingBrush = true;
@@ -499,7 +534,7 @@ namespace Sculpting
             var mouse = Mouse.current;
             if (kb == null || mouse == null) return;
 
-            if (kb.fKey.wasPressedThisFrame)
+            if (kb.fKey.wasPressedThisFrame && !_shortcutKeysBlocked)
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while adjusting strength
                 _isAdjustingStrength = true;
@@ -534,7 +569,8 @@ namespace Sculpting
 
             if (kb.rKey.wasPressedThisFrame)
             {
-                _rKeyDownTime = Time.unscaledTime;
+                // A blocked press never arms, so its release (below) has nothing to remesh.
+                if (!_shortcutKeysBlocked) _rKeyDownTime = Time.unscaledTime;
             }
             else if (_rKeyDownTime >= 0f && kb.rKey.isPressed && !_isAdjustingRemeshDensity
                      && !_isResizingBrush && !_isAdjustingStrength
@@ -589,7 +625,7 @@ namespace Sculpting
             // same guard list HandleShiftSmoothOverride uses, for the same reason: two input
             // modes both scrubbing off mouse position/clicks at once would fight each other.
             if (kb.spaceKey.wasPressedThisFrame && !shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
-                !_isAdjustingRemeshDensity && !RegionSelectActive && !_regionRadialMenuOpen)
+                !_isAdjustingRemeshDensity && !RegionSelectActive && !_regionRadialMenuOpen && !_radialMenusBlocked)
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while the menu is up
                 _radialMenuOpen = true;
@@ -626,7 +662,7 @@ namespace Sculpting
             bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
             if (kb.spaceKey.wasPressedThisFrame && shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
-                !_isAdjustingRemeshDensity && !RegionSelectActive && !_radialMenuOpen)
+                !_isAdjustingRemeshDensity && !RegionSelectActive && !_radialMenuOpen && !_radialMenusBlocked)
             {
                 EndActiveDrags();
                 _regionRadialMenuOpen = true;

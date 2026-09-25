@@ -832,6 +832,9 @@ namespace Sculpting
                 return;
             }
 
+            // Once per frame, before any bare-key shortcut below reads the keyboard - see
+            // _shortcutKeysBlocked.
+            RefreshShortcutGate();
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
             HandleBrushStrengthKey();
