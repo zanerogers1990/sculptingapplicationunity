@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using Sculpting.IO;
 
 namespace Sculpting
 {
@@ -94,6 +95,47 @@ namespace Sculpting
         {
             get => _tonemapping != null ? _tonemapping.mode.value : TonemappingMode.None;
             set { if (_tonemapping != null) { _tonemapping.mode.overrideState = true; _tonemapping.mode.value = value; } }
+        }
+
+        /// Writes this controller's part of a save file's environment block (see SceneSerializer).
+        /// Nothing without a Volume: postAvailable then stays false, and a load of the file leaves
+        /// the post settings alone.
+        public void CaptureEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            if (!HasVolume) return;
+            env.postAvailable = true;
+            env.bloomEnabled = BloomEnabled;
+            env.bloomIntensity = BloomIntensity;
+            env.bloomThreshold = BloomThreshold;
+            env.vignetteEnabled = VignetteEnabled;
+            env.vignetteIntensity = VignetteIntensity;
+            env.vignetteSmoothness = VignetteSmoothness;
+            env.dofEnabled = DofEnabled;
+            env.dofFocusDistance = DofFocusDistance;
+            env.dofAperture = DofAperture;
+            env.colorAdjustmentsEnabled = ColorAdjustmentsEnabled;
+            env.saturation = Saturation;
+            env.contrast = Contrast;
+        }
+
+        /// Restores this controller's part of a save file's environment block. Skipped entirely
+        /// when the file was saved without a Volume - otherwise loading such a file would stamp
+        /// default zeros over a scene that does have one.
+        public void ApplyEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            if (!HasVolume || !env.postAvailable) return;
+            BloomEnabled = env.bloomEnabled;
+            BloomIntensity = env.bloomIntensity;
+            BloomThreshold = env.bloomThreshold;
+            VignetteEnabled = env.vignetteEnabled;
+            VignetteIntensity = env.vignetteIntensity;
+            VignetteSmoothness = env.vignetteSmoothness;
+            DofEnabled = env.dofEnabled;
+            DofFocusDistance = env.dofFocusDistance;
+            DofAperture = env.dofAperture;
+            ColorAdjustmentsEnabled = env.colorAdjustmentsEnabled;
+            Saturation = env.saturation;
+            Contrast = env.contrast;
         }
     }
 }

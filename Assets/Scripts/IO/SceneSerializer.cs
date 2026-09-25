@@ -581,57 +581,22 @@ namespace Sculpting.IO
             var mat = UnityEngine.Object.FindFirstObjectByType<SculptMaterialController>();
             if (mat != null) data.material = mat.CaptureSettings();
 
+            // The environment block is one flat record shared by four controllers; each writes
+            // its own fields.
+            var env = data.environment;
             var light = LightingPresetController.Instance;
-            if (light != null)
-            {
-                data.environment.lightingPreset = light.PresetId;
-                data.environment.lightingFivePoint = light.FivePoint;
-                data.environment.lightingBrightness = light.Brightness;
-                data.environment.lightingRotation = light.Rotation;
-                data.environment.lightingFollowCamera = light.FollowCamera;
-                data.environment.lightingWorldYaw = light.WorldYaw;
-                data.environment.lightingShadows = light.Shadows;
-            }
+            if (light != null) light.CaptureEnvironment(env);
 
             var bg = UnityEngine.Object.FindFirstObjectByType<BackgroundController>();
-            if (bg != null)
-            {
-                data.environment.backgroundMode = (int)bg.Mode;
-                data.environment.backgroundColorA = bg.ColorA;
-                data.environment.backgroundColorB = bg.ColorB;
-                data.environment.gradientBias = bg.GradientBias;
-            }
+            if (bg != null) bg.CaptureEnvironment(env);
 
             // Existing, not Instance: saving a scene that never touched HDRI should not bring a
             // controller into being just to write its defaults.
             var hdri = HdriEnvironmentController.Existing;
-            if (hdri != null)
-            {
-                data.environment.hdriEnabled = hdri.Enabled;
-                data.environment.hdriPath = hdri.Path ?? string.Empty;
-                data.environment.hdriRotation = hdri.Rotation;
-                data.environment.hdriExposure = hdri.Exposure;
-                data.environment.hdriAmbientIntensity = hdri.AmbientIntensity;
-                data.environment.hdriReflectionIntensity = hdri.ReflectionIntensity;
-            }
+            if (hdri != null) hdri.CaptureEnvironment(env);
 
             var post = UnityEngine.Object.FindFirstObjectByType<PostProcessingController>();
-            if (post != null && post.HasVolume)
-            {
-                data.environment.postAvailable = true;
-                data.environment.bloomEnabled = post.BloomEnabled;
-                data.environment.bloomIntensity = post.BloomIntensity;
-                data.environment.bloomThreshold = post.BloomThreshold;
-                data.environment.vignetteEnabled = post.VignetteEnabled;
-                data.environment.vignetteIntensity = post.VignetteIntensity;
-                data.environment.vignetteSmoothness = post.VignetteSmoothness;
-                data.environment.dofEnabled = post.DofEnabled;
-                data.environment.dofFocusDistance = post.DofFocusDistance;
-                data.environment.dofAperture = post.DofAperture;
-                data.environment.colorAdjustmentsEnabled = post.ColorAdjustmentsEnabled;
-                data.environment.saturation = post.Saturation;
-                data.environment.contrast = post.Contrast;
-            }
+            if (post != null) post.CaptureEnvironment(env);
 
             var cam = UnityEngine.Object.FindFirstObjectByType<CameraOrbitController>();
             if (cam != null) data.camera = cam.CaptureView();
@@ -648,54 +613,18 @@ namespace Sculpting.IO
             var env = data.environment;
             if (env != null)
             {
-                LightingPresetController.Instance?.ApplySaved(
-                    env.lightingPreset, env.lightingFivePoint, env.lightingBrightness,
-                    env.lightingRotation, env.lightingFollowCamera, env.lightingWorldYaw,
-                    env.lightingShadows);
+                LightingPresetController.Instance?.ApplyEnvironment(env);
 
                 // HDRI before the background: the background's Hdri mode is only honoured once
                 // an image is actually loaded, so applying it the other way round would silently
                 // fall back to the gradient.
-                if (env.hdriEnabled || !string.IsNullOrEmpty(env.hdriPath))
-                {
-                    HdriEnvironmentController.Instance.ApplySaved(
-                        env.hdriEnabled, env.hdriPath, env.hdriRotation, env.hdriExposure,
-                        env.hdriAmbientIntensity, env.hdriReflectionIntensity);
-                }
-                else
-                {
-                    // A file saved with no HDRI has to switch off one that is currently running,
-                    // otherwise loading it leaves the previous scene's environment lighting on.
-                    HdriEnvironmentController.Existing?.Clear();
-                }
+                HdriEnvironmentController.ApplyEnvironment(env);
 
                 var bg = UnityEngine.Object.FindFirstObjectByType<BackgroundController>();
-                if (bg != null)
-                {
-                    bg.Mode = (BackgroundMode)env.backgroundMode;
-                    bg.ColorA = env.backgroundColorA;
-                    bg.ColorB = env.backgroundColorB;
-                    bg.GradientBias = env.gradientBias;
-                }
+                if (bg != null) bg.ApplyEnvironment(env);
 
-                // Skipped entirely when the file was saved without a Volume - otherwise loading
-                // such a file would stamp default zeros over a scene that does have one.
                 var post = UnityEngine.Object.FindFirstObjectByType<PostProcessingController>();
-                if (post != null && post.HasVolume && env.postAvailable)
-                {
-                    post.BloomEnabled = env.bloomEnabled;
-                    post.BloomIntensity = env.bloomIntensity;
-                    post.BloomThreshold = env.bloomThreshold;
-                    post.VignetteEnabled = env.vignetteEnabled;
-                    post.VignetteIntensity = env.vignetteIntensity;
-                    post.VignetteSmoothness = env.vignetteSmoothness;
-                    post.DofEnabled = env.dofEnabled;
-                    post.DofFocusDistance = env.dofFocusDistance;
-                    post.DofAperture = env.dofAperture;
-                    post.ColorAdjustmentsEnabled = env.colorAdjustmentsEnabled;
-                    post.Saturation = env.saturation;
-                    post.Contrast = env.contrast;
-                }
+                if (post != null) post.ApplyEnvironment(env);
             }
 
             if (data.camera != null && data.camera.valid)

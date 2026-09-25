@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.Rendering;
+using Sculpting.IO;
 
 namespace Sculpting
 {
@@ -139,6 +140,24 @@ namespace Sculpting
             shadows = castShadows;
             Rebuild();
         }
+
+        /// Writes this controller's part of a save file's environment block (see SceneSerializer).
+        public void CaptureEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            env.lightingPreset = PresetId;
+            env.lightingFivePoint = FivePoint;
+            env.lightingBrightness = Brightness;
+            env.lightingRotation = Rotation;
+            env.lightingFollowCamera = FollowCamera;
+            env.lightingWorldYaw = WorldYaw;
+            env.lightingShadows = Shadows;
+        }
+
+        /// Restores this controller's part of a save file's environment block, in one rebuild.
+        public void ApplyEnvironment(SculptSaveData.EnvironmentSettings env) =>
+            ApplySaved(env.lightingPreset, env.lightingFivePoint, env.lightingBrightness,
+                env.lightingRotation, env.lightingFollowCamera, env.lightingWorldYaw,
+                env.lightingShadows);
 
         private Camera Cam => _camera != null ? _camera : (_camera = Camera.main);
 

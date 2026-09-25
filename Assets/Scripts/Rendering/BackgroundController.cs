@@ -1,4 +1,5 @@
 using UnityEngine;
+using Sculpting.IO;
 
 namespace Sculpting
 {
@@ -244,6 +245,26 @@ namespace Sculpting
             if (_skyboxMaterial != null) Destroy(_skyboxMaterial);
             if (_domeMaterial != null) Destroy(_domeMaterial);
             if (_dome != null) Destroy(_dome.gameObject);
+        }
+
+        /// Writes this controller's part of a save file's environment block (see SceneSerializer).
+        public void CaptureEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            env.backgroundMode = (int)Mode;
+            env.backgroundColorA = ColorA;
+            env.backgroundColorB = ColorB;
+            env.gradientBias = GradientBias;
+        }
+
+        /// Restores this controller's part of a save file's environment block. Apply the HDRI's
+        /// part first: the Hdri mode is only honoured once an image is actually loaded, so the
+        /// other order would silently fall back to the gradient.
+        public void ApplyEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            Mode = (BackgroundMode)env.backgroundMode;
+            ColorA = env.backgroundColorA;
+            ColorB = env.backgroundColorB;
+            GradientBias = env.gradientBias;
         }
     }
 }

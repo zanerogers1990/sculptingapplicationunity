@@ -1,6 +1,7 @@
 using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
+using Sculpting.IO;
 
 namespace Sculpting
 {
@@ -328,6 +329,35 @@ namespace Sculpting
 
             _enabled = enabled;
             ApplyAll();
+        }
+
+        /// Writes this controller's part of a save file's environment block (see SceneSerializer).
+        public void CaptureEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            env.hdriEnabled = Enabled;
+            env.hdriPath = Path ?? string.Empty;
+            env.hdriRotation = Rotation;
+            env.hdriExposure = Exposure;
+            env.hdriAmbientIntensity = AmbientIntensity;
+            env.hdriReflectionIntensity = ReflectionIntensity;
+        }
+
+        /// Restores the HDRI part of a save file's environment block. Static because it decides
+        /// whether a controller should exist at all: a file that used an HDRI creates one, and a
+        /// file saved with none switches off one that is currently running - otherwise loading it
+        /// leaves the previous scene's environment lighting on.
+        public static void ApplyEnvironment(SculptSaveData.EnvironmentSettings env)
+        {
+            if (env.hdriEnabled || !string.IsNullOrEmpty(env.hdriPath))
+            {
+                Instance.ApplySaved(
+                    env.hdriEnabled, env.hdriPath, env.hdriRotation, env.hdriExposure,
+                    env.hdriAmbientIntensity, env.hdriReflectionIntensity);
+            }
+            else
+            {
+                Existing?.Clear();
+            }
         }
     }
 }
