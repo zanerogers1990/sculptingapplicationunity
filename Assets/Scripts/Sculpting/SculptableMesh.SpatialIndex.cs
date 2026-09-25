@@ -30,6 +30,7 @@ namespace Sculpting
         private void RebuildTriangleGrid()
         {
             TriangleGridRebuilds++;
+            GeometryVersion++;
             const float TargetTrianglesPerCell = 8f;
             Bounds b = _mesh.bounds;
             float volume = Mathf.Max(b.size.x * b.size.y * b.size.z, 1e-9f);

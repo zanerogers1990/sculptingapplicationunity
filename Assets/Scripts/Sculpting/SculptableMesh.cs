@@ -92,6 +92,13 @@ namespace Sculpting
         /// Vertices in use. Distinct from Vertices.Length - see its remarks.
         public int VertexCount => _vertexCount;
 
+        /// Bumped whenever the positions or topology a raycast would test against may have
+        /// changed - every apply (ApplyVertices, ApplyVerticesLocal) and every triangle-grid
+        /// rebuild. The same cheap "did anything move" poll MaskVersion/VisibilityVersion serve:
+        /// lets a caller that raycasts every frame (CameraOrbitController's depth probe) reuse
+        /// its last answer while nothing it depends on has changed.
+        public int GeometryVersion { get; private set; }
+
         // Vertices and triangle CORNERS actually in use. Everything at or past these is spare
         // capacity. Kept as plain fields (not derived from the arrays) because they are read on
         // the brush hot path and in every bounds guard in this class.

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
@@ -244,11 +245,15 @@ namespace Sculpting
             bool ctrlHeld = kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
             bool shiftHeld = kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed);
 
-            UpdateSceneSize();
+            // Both measurements are pure functions of the scene and camera state, so they re-run
+            // only when that state changed since the last measurement - see CaptureSceneInputs.
+            bool sceneChanged = CaptureSceneInputs();
+            if (sceneChanged) UpdateSceneSize();
 
             // Measured once, from where the camera sat at the end of last frame: zoom and pan
             // both scale with it, and the near plane is set from it after this frame's move.
-            float viewDepth = ViewDepth();
+            if (sceneChanged || CaptureCameraInputs()) _viewDepth = ViewDepth();
+            float viewDepth = _viewDepth;
 
             bool altLeftDrag = altHeld && mouse.leftButton.isPressed;
             bool altShiftPan = altLeftDrag && shiftHeld && !ctrlHeld;
@@ -297,6 +302,102 @@ namespace Sculpting
             UpdateNearPlane(viewDepth);
             UpdateFarPlane();
             UpdateShadowDistance();
+        }
+
+        // ------------------------------------------------------------- measurement inputs
+        //
+        // UpdateSceneSize and ViewDepth used to run in full every frame: a renderer-bounds walk
+        // over every object, and five raycasts through SelectionManager - each of which also forced
+        // a triangle-grid catch-up on every object it tested (see SculptableMesh.RaycastMesh). Both
+        // depend only on the inputs captured below, so they now re-run only when one of those
+        // changed: the same answers, with nothing to do on a frame where nothing moved.
+        //
+        // Compared with Equals (exact), not ==, which Unity makes approximate for vectors and
+        // matrices - a camera nudged by less than that tolerance would otherwise keep a stale depth.
+        private struct ObjectInputs
+        {
+            public SculptableMesh Obj;
+            public bool Active, RendererEnabled, Visible;
+            public int Geometry, Visibility;
+            public Matrix4x4 Matrix;
+
+            public bool SameAs(in ObjectInputs o) =>
+                Obj == o.Obj && Active == o.Active && RendererEnabled == o.RendererEnabled && Visible == o.Visible &&
+                Geometry == o.Geometry && Visibility == o.Visibility && Matrix.Equals(o.Matrix);
+        }
+
+        private List<ObjectInputs> _measuredObjects = new List<ObjectInputs>();
+        private List<ObjectInputs> _capturedObjects = new List<ObjectInputs>();
+        private bool _haveMeasuredScene;
+
+        private Matrix4x4 _measuredRigToWorld, _measuredCamToWorld, _measuredProjection;
+        private float _measuredDistance;
+        private bool _measuredOrthographic;
+        private bool _haveMeasuredCamera;
+        private float _viewDepth;
+
+        /// Captures what the scene size and the depth probe read from the scene, and reports
+        /// whether it differs from the last capture. Always "changed" without a SelectionManager,
+        /// so the measurements behave exactly as they did (both are no-ops then anyway).
+        private bool CaptureSceneInputs()
+        {
+            if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
+            if (_selection == null) return true;
+
+            _capturedObjects.Clear();
+            var objects = _selection.AllObjects;
+            for (int i = 0; i < objects.Count; i++)
+            {
+                SculptableMesh obj = objects[i];
+                if (obj == null) { _capturedObjects.Add(default); continue; }
+                var renderer = obj.GetComponent<Renderer>();
+                _capturedObjects.Add(new ObjectInputs
+                {
+                    Obj = obj,
+                    Active = obj.gameObject.activeInHierarchy,
+                    RendererEnabled = renderer != null && renderer.enabled,
+                    Visible = obj.Visible,
+                    Geometry = obj.GeometryVersion,
+                    Visibility = obj.VisibilityVersion,
+                    Matrix = obj.transform.localToWorldMatrix,
+                });
+            }
+
+            bool changed = !_haveMeasuredScene || _capturedObjects.Count != _measuredObjects.Count;
+            for (int i = 0; !changed && i < _capturedObjects.Count; i++)
+                changed = !_capturedObjects[i].SameAs(_measuredObjects[i]);
+            if (!changed) return false;
+
+            (_measuredObjects, _capturedObjects) = (_capturedObjects, _measuredObjects);
+            _haveMeasuredScene = true;
+            return true;
+        }
+
+        /// The camera-side inputs of ViewDepth: where it looks from, its projection (the probe
+        /// rays come from ViewportPointToRay), and the distance it caps at.
+        private bool CaptureCameraInputs()
+        {
+            Camera cam = Cam;
+            if (cam == null) return true;
+
+            // This rig's transform (the probe measures depth along it) and the camera's own
+            // (the rays start there) - the same object unless Cam fell back to Camera.main.
+            Matrix4x4 rigToWorld = transform.localToWorldMatrix;
+            Matrix4x4 camToWorld = cam.transform.localToWorldMatrix;
+            Matrix4x4 projection = cam.projectionMatrix;
+            bool changed = !_haveMeasuredCamera || !rigToWorld.Equals(_measuredRigToWorld) ||
+                           !camToWorld.Equals(_measuredCamToWorld) ||
+                           !projection.Equals(_measuredProjection) || !_distance.Equals(_measuredDistance) ||
+                           _orthographic != _measuredOrthographic;
+            if (!changed) return false;
+
+            _measuredRigToWorld = rigToWorld;
+            _measuredCamToWorld = camToWorld;
+            _measuredProjection = projection;
+            _measuredDistance = _distance;
+            _measuredOrthographic = _orthographic;
+            _haveMeasuredCamera = true;
+            return true;
         }
 
         /// Re-measures the scene size every adaptive limit scales by (see minPivotDistance): the

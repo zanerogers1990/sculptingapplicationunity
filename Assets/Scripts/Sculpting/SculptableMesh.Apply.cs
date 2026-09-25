@@ -30,6 +30,7 @@ namespace Sculpting
             // Remesh, Trim, boolean subtract, mirror and the masked transforms take, and the
             // timelapse would otherwise sit paused through all of them.
             SculptActivity.ReportEdit(this);
+            GeometryVersion++;
 
             _mesh.vertices = _workingVertices;
             // Always derived from the full topology, never Mesh.RecalculateNormals().
@@ -403,6 +404,10 @@ namespace Sculpting
 
         private void ApplyDirtyVertexList()
         {
+            // Before the drift filter: the positions have already been written, filtered or not,
+            // and raycasts read the working positions directly.
+            if (_dirtyVertexList.Count > 0) GeometryVersion++;
+
             // Before the drift filter below trims the list, and outside the profiler scope: a linked
             // mirror half has to receive every reported position (only its own filter knows what it
             // has already uploaded), and its apply is its own cost, not this one's.
