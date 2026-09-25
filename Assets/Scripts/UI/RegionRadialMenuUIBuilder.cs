@@ -41,14 +41,12 @@ namespace Sculpting
 
         private static readonly Color HoverColor = new Color(0.4f, 0.75f, 1f);
 
-        // Same three colors SculptUIBuilder tints the drag marquee/crosshair with (see its own
-        // remarks) - duplicated rather than shared across files for the same reason the icon
-        // rasterizer below is: this project has no shared UI-constants file, and every *UIBuilder
-        // is already self-contained. Kept numerically identical on purpose, so a wedge's icon
-        // tint matches the crosshair color the moment that tool is armed.
-        private static readonly Color RegionHideActiveColor = new Color(0.3f, 0.75f, 0.8f);
-        private static readonly Color MaskActiveColor = new Color(0.95f, 0.65f, 0.15f);
-        private static readonly Color RegionTrimActiveColor = new Color(0.95f, 0.35f, 0.3f);
+        // The same colors the HUD tints the drag marquee/crosshair with (UIFactory's shared
+        // palette), so a wedge's icon tint matches the crosshair color the moment that tool is
+        // armed.
+        private static readonly Color RegionHideActiveColor = UIFactory.RegionHideActiveColor;
+        private static readonly Color MaskActiveColor = UIFactory.MaskActiveColor;
+        private static readonly Color RegionTrimActiveColor = UIFactory.RegionTrimActiveColor;
 
         private readonly struct RegionToolDef
         {

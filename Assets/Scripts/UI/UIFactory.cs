@@ -17,6 +17,27 @@ namespace Sculpting
         public static readonly Color ActiveColor = new Color(0.25f, 0.55f, 0.95f);
         public static readonly Color InactiveColor = new Color(0.2f, 0.2f, 0.22f);
 
+        // Shared by the Sculpting Tools panel's Mask button, the HUD's region marquee/crosshair
+        // (SculptHudOverlay) and the region radial menu, which each used to carry their own copy.
+        //
+        // Distinct from ActiveColor since mask-paint mode is orthogonal to brush selection (which
+        // brush is "current" still matters for when you exit mask mode) - a different color keeps
+        // the two kinds of highlight from reading as the same kind of state.
+        public static readonly Color MaskActiveColor = new Color(0.95f, 0.65f, 0.15f);
+        // Region tools (see RegionSelectTool). The hide gestures get their own teal rather than
+        // sharing MaskActiveColor: hiding and masking are different kinds of state that happen to
+        // share a gesture, and one armed-tool color for both would make it easy to draw a box
+        // expecting one and get the other. The mask gestures DO share MaskActiveColor, since they
+        // edit exactly what the Mask button edits.
+        public static readonly Color RegionHideActiveColor = new Color(0.3f, 0.75f, 0.8f);
+        // Trim gets a third colour again, and a warning-coloured one: hiding and masking are both
+        // reversible with a click, and trimming DELETES geometry. An armed tool that can take a
+        // chunk out of the model on the next drag should not look like the two that cannot.
+        public static readonly Color RegionTrimActiveColor = new Color(0.95f, 0.35f, 0.3f);
+        // The marquee's tint while the drag would REMOVE (show/unmask) - the same red the brushes
+        // already use for their negative/erase polarity.
+        public static readonly Color RegionRemoveColor = new Color(1f, 0.3f, 0.3f);
+
         private static Font _font;
         public static Font Font => _font != null ? _font : (_font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf"));
 
@@ -277,6 +298,66 @@ namespace Sculpting
                 slider.onValueChanged = listeners;
             }
             slider.SetValueWithoutNotify(value);
+        }
+
+        /// A slider 20px tall with a 14px handle - the Sculpting Tools panel's size (UIFactory's own
+        /// CreateSlider is larger), also used by the HUD's remesh density gauge.
+        public static Slider CreateCompactSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange, string tooltip = null)
+        {
+            var sliderGO = new GameObject("Slider", typeof(RectTransform));
+            sliderGO.transform.SetParent(parent, false);
+            sliderGO.AddComponent<LayoutElement>().preferredHeight = 20;
+            var slider = sliderGO.AddComponent<Slider>();
+
+            var bgGO = new GameObject("Background", typeof(RectTransform), typeof(Image));
+            bgGO.transform.SetParent(sliderGO.transform, false);
+            var bgRect = bgGO.GetComponent<RectTransform>();
+            bgRect.anchorMin = new Vector2(0, 0.25f);
+            bgRect.anchorMax = new Vector2(1, 0.75f);
+            bgRect.sizeDelta = Vector2.zero;
+            bgGO.GetComponent<Image>().color = new Color(0.15f, 0.15f, 0.17f);
+
+            var fillAreaGO = new GameObject("Fill Area", typeof(RectTransform));
+            fillAreaGO.transform.SetParent(sliderGO.transform, false);
+            var fillAreaRect = fillAreaGO.GetComponent<RectTransform>();
+            fillAreaRect.anchorMin = new Vector2(0, 0.25f);
+            fillAreaRect.anchorMax = new Vector2(1, 0.75f);
+            fillAreaRect.offsetMin = new Vector2(5, 0);
+            fillAreaRect.offsetMax = new Vector2(-5, 0);
+
+            var fillGO = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+            fillGO.transform.SetParent(fillAreaGO.transform, false);
+            fillGO.GetComponent<Image>().color = new Color(0.3f, 0.6f, 1f);
+            var fillRect = fillGO.GetComponent<RectTransform>();
+            fillRect.anchorMin = new Vector2(0, 0);
+            fillRect.anchorMax = new Vector2(0, 1);
+            fillRect.sizeDelta = new Vector2(10, 0);
+
+            var handleAreaGO = new GameObject("Handle Slide Area", typeof(RectTransform));
+            handleAreaGO.transform.SetParent(sliderGO.transform, false);
+            var handleAreaRect = handleAreaGO.GetComponent<RectTransform>();
+            handleAreaRect.anchorMin = new Vector2(0, 0);
+            handleAreaRect.anchorMax = new Vector2(1, 1);
+            handleAreaRect.offsetMin = new Vector2(10, 0);
+            handleAreaRect.offsetMax = new Vector2(-10, 0);
+
+            var handleGO = new GameObject("Handle", typeof(RectTransform), typeof(Image));
+            handleGO.transform.SetParent(handleAreaGO.transform, false);
+            handleGO.GetComponent<Image>().color = Color.white;
+            var handleRect = handleGO.GetComponent<RectTransform>();
+            handleRect.sizeDelta = new Vector2(14, 14);
+
+            slider.targetGraphic = handleGO.GetComponent<Image>();
+            slider.fillRect = fillRect;
+            slider.handleRect = handleRect;
+            slider.direction = Slider.Direction.LeftToRight;
+            slider.minValue = min;
+            slider.maxValue = max;
+            slider.value = defaultVal;
+            slider.onValueChanged.AddListener(v => onChange(v));
+
+            TooltipSystem.Attach(sliderGO, tooltip);
+            return slider;
         }
 
         public static Slider CreateSlider(Transform parent, float min, float max, float defaultVal, Action<float> onChange, string tooltip = null)
