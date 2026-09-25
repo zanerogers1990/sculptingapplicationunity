@@ -45,12 +45,6 @@ namespace Sculpting
 
         private bool _envDirty;
         private float _lastBakeTime = -999f;
-        private bool _environmentOverridden;
-        private AmbientMode _savedAmbientMode;
-        private float _savedAmbientIntensity;
-        private DefaultReflectionMode _savedReflectionMode;
-        private float _savedReflectionIntensity;
-        private Material _savedSkybox;
 
         /// Finds the controller, creating it if the scene has none. Never returns null.
         public static HdriEnvironmentController Instance
@@ -58,7 +52,10 @@ namespace Sculpting
             get
             {
                 if (_instance == null) _instance = FindFirstObjectByType<HdriEnvironmentController>();
-                if (_instance == null)
+                // Self-installs in Play mode only, like LightingPresetController.Instance: an editor
+                // tool inspecting this property must not be able to leave a stray GameObject in
+                // the scene.
+                if (_instance == null && Application.isPlaying)
                 {
                     var go = new GameObject("HdriEnvironment");
                     _instance = go.AddComponent<HdriEnvironmentController>();
@@ -154,7 +151,7 @@ namespace Sculpting
                 float v = Mathf.Clamp(value, 0f, 3f);
                 if (Mathf.Approximately(_ambientIntensity, v)) return;
                 _ambientIntensity = v;
-                if (IsActive) RenderSettings.ambientIntensity = v;
+                if (IsActive) ApplyEnvironmentSettings(rebake: false);
             }
         }
 
@@ -167,7 +164,7 @@ namespace Sculpting
                 float v = Mathf.Clamp01(value);
                 if (Mathf.Approximately(_reflectionIntensity, v)) return;
                 _reflectionIntensity = v;
-                if (IsActive) RenderSettings.reflectionIntensity = v;
+                if (IsActive) ApplyEnvironmentSettings(rebake: false);
             }
         }
 
@@ -231,45 +228,27 @@ namespace Sculpting
             m.SetFloat("_Exposure", _exposure);
         }
 
-        /// Re-points the environment settings and asks the background to re-evaluate which
-        /// skybox and clear mode it should be using.
+        /// Asks the two owners of the environment to re-resolve it now that this HDRI's state
+        /// changed. This controller writes no RenderSettings itself: the skybox slot is
+        /// BackgroundController's, and ambient/reflection are LightingPresetController's (see
+        /// ApplyEnvironmentLighting), each deciding between this HDRI and its own settings.
         private void ApplyAll()
         {
             PushMaterialProperties();
 
-            if (IsActive)
-            {
-                if (!_environmentOverridden)
-                {
-                    // Remembered so turning the HDRI back off restores the scene's own lighting
-                    // settings rather than leaving Skybox-mode ambient over a gradient sky.
-                    _savedAmbientMode = RenderSettings.ambientMode;
-                    _savedAmbientIntensity = RenderSettings.ambientIntensity;
-                    _savedReflectionMode = RenderSettings.defaultReflectionMode;
-                    _savedReflectionIntensity = RenderSettings.reflectionIntensity;
-                    _savedSkybox = RenderSettings.skybox;
-                    _environmentOverridden = true;
-                }
-                RenderSettings.ambientMode = AmbientMode.Skybox;
-                RenderSettings.ambientIntensity = _ambientIntensity;
-                RenderSettings.defaultReflectionMode = DefaultReflectionMode.Skybox;
-                RenderSettings.reflectionIntensity = _reflectionIntensity;
-            }
-            else if (_environmentOverridden)
-            {
-                RenderSettings.ambientMode = _savedAmbientMode;
-                RenderSettings.ambientIntensity = _savedAmbientIntensity;
-                RenderSettings.defaultReflectionMode = _savedReflectionMode;
-                RenderSettings.reflectionIntensity = _savedReflectionIntensity;
-                RenderSettings.skybox = _savedSkybox;
-                _environmentOverridden = false;
-            }
-
+            // Skybox slot first: the environment bake reads whatever skybox is in it.
             var background = FindFirstObjectByType<BackgroundController>();
             if (background != null) background.Refresh();
 
+            // Switching ON is baked by Update's throttled pass, as before. Switching OFF is baked
+            // at once, as it was when the preset controller took the ambient back.
+            ApplyEnvironmentSettings(rebake: !IsActive);
+
             _envDirty = true;
         }
+
+        private static void ApplyEnvironmentSettings(bool rebake) =>
+            LightingPresetController.Instance?.ApplyEnvironmentLighting(rebake);
 
         private void Update()
         {
@@ -287,14 +266,16 @@ namespace Sculpting
 
         private void OnDestroy()
         {
-            if (_environmentOverridden)
+            // Hand the environment back to the preset and the background, the same as switching
+            // off. Found, never created: during a scene teardown either may already be gone.
+            bool wasActive = IsActive;
+            _enabled = false;
+            if (wasActive)
             {
-                RenderSettings.ambientMode = _savedAmbientMode;
-                RenderSettings.ambientIntensity = _savedAmbientIntensity;
-                RenderSettings.defaultReflectionMode = _savedReflectionMode;
-                RenderSettings.reflectionIntensity = _savedReflectionIntensity;
-                RenderSettings.skybox = _savedSkybox;
-                _environmentOverridden = false;
+                var background = FindFirstObjectByType<BackgroundController>();
+                if (background != null) background.Refresh();
+                var lighting = FindFirstObjectByType<LightingPresetController>();
+                if (lighting != null) lighting.ApplyEnvironmentLighting(rebake: false);
             }
             ReleaseTexture();
             if (_skyboxMaterial != null) Destroy(_skyboxMaterial);

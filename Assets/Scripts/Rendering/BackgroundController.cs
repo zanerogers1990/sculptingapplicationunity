@@ -32,6 +32,14 @@ namespace Sculpting
         private Camera _camera;
         private BackgroundMode _lastColorMode = BackgroundMode.Gradient;
         [System.NonSerialized] private Material _skyboxMaterial;
+        // The last skybox in the lighting slot that was NOT the HDRI's - what the slot goes back
+        // to when the HDRI switches off in Flat mode (Gradient re-assigns its own). The scene's
+        // authored skybox until the gradient is first used. Owning this here, rather than the HDRI
+        // snapshotting and restoring the slot itself, is what keeps this the slot's only writer.
+        // Deliberately NOT [NonSerialized]: a mid-Play recompile should keep it (Unity carries
+        // private reference fields across the reload), where a rebuild-if-null would lose the
+        // scene's authored skybox for good.
+        private Material _nonHdriSkybox;
         [System.NonSerialized] private Material _domeMaterial;
         [System.NonSerialized] private Transform _dome;
 
@@ -69,6 +77,7 @@ namespace Sculpting
         private void Awake()
         {
             _camera = Camera.main;
+            _nonHdriSkybox = RenderSettings.skybox;
             if (mode != BackgroundMode.Hdri) _lastColorMode = mode;
             Apply();
         }
@@ -113,6 +122,13 @@ namespace Sculpting
                 // change just because the backdrop was set to a solid colour.
                 PushGradientProperties(SkyboxMaterial);
                 RenderSettings.skybox = SkyboxMaterial;
+                _nonHdriSkybox = SkyboxMaterial;
+            }
+            else if (hdri != null && RenderSettings.skybox == hdri.SkyboxMaterial)
+            {
+                // Flat, with the HDRI just switched off: put back the skybox it displaced - the
+                // gradient's, or the scene's own if the gradient was never used.
+                RenderSettings.skybox = _nonHdriSkybox;
             }
 
             // --- what the camera shows ---------------------------------------------------

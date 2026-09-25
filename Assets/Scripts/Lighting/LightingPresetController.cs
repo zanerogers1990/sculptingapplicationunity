@@ -149,6 +149,7 @@ namespace Sculpting
         private void Awake()
         {
             if (_instance == null) _instance = this;
+            _sceneReflectionMode = RenderSettings.defaultReflectionMode;
             Rebuild();
         }
 
@@ -156,11 +157,12 @@ namespace Sculpting
         {
             if (_rig == null || _lights == null || AnyLightMissing()) Rebuild();
 
-            // The HDRI owns the ambient while it is on (see ApplyAmbient). Switching it off
-            // restores whatever ambient was in place when it switched on - which may be an
-            // earlier preset's - so the current one is put back the moment it lets go.
+            // The HDRI hands the environment back through ApplyEnvironmentLighting whenever it
+            // switches off. This catches the one way it can stop being active WITHOUT switching:
+            // a mid-Play recompile drops its [NonSerialized] texture, and IsActive quietly goes
+            // false with nothing announcing it.
             bool hdri = HdriActive;
-            if (_hdriWasActive && !hdri) ApplyAmbient();
+            if (_hdriWasActive && !hdri) ApplyEnvironmentLighting(rebake: true);
             _hdriWasActive = hdri;
 
             if (followCamera) UpdateOrientation();
@@ -253,26 +255,59 @@ namespace Sculpting
             }
         }
 
-        /// Trilight ambient from the preset, scaled by Brightness. Skipped while an HDRI is on:
-        /// the HDRI's whole job is to be the environment light, and the preset's lights still
-        /// shape the form on top of it.
+        /// Trilight ambient from the preset, scaled by Brightness - after a preset/brightness
+        /// change. Skipped while an HDRI is on: the HDRI's whole job is to be the environment
+        /// light, and the preset's lights still shape the form on top of it.
         private void ApplyAmbient()
         {
             if (HdriActive) return;
-            LightingPreset preset = Current;
+            ApplyEnvironmentLighting(rebake: true);
+        }
 
-            RenderSettings.ambientMode = AmbientMode.Trilight;
-            RenderSettings.ambientIntensity = 1f;
-            // Scaled in LINEAR space - multiplying the gamma values would make Brightness act
-            // on the ambient far more steeply than on the lights.
-            RenderSettings.ambientSkyColor = ScaleLinear(preset.AmbientSky, brightness);
-            RenderSettings.ambientEquatorColor = ScaleLinear(preset.AmbientEquator, brightness);
-            RenderSettings.ambientGroundColor = ScaleLinear(preset.AmbientGround, brightness);
-            RenderSettings.reflectionIntensity = preset.Reflection;
+        /// The ONE writer of the environment-lighting RenderSettings: ambient mode, intensity and
+        /// colours, and the default reflection's mode and intensity. (The skybox slot they are
+        /// baked from is BackgroundController's.) Two things can own them - this preset's
+        /// trilight, or an active HDRI - and deciding which in one place is what stops them
+        /// fighting. They used to reconcile by the HDRI snapshotting the settings when it
+        /// switched on and restoring them when it switched off, which put back whatever EARLIER
+        /// preset had been current then, and this class noticing the switch-off a frame later to
+        /// put its own back (a frame of stale ambient, and a second environment bake).
+        ///
+        /// Called by HdriEnvironmentController whenever it turns on or off or its intensities
+        /// change. `rebake` re-renders the ambient probe and default reflection from the new
+        /// settings; the HDRI passes false where it bakes on its own throttled schedule.
+        public void ApplyEnvironmentLighting(bool rebake)
+        {
+            HdriEnvironmentController hdri = HdriEnvironmentController.Existing;
+            if (hdri != null && hdri.IsActive)
+            {
+                RenderSettings.ambientMode = AmbientMode.Skybox;
+                RenderSettings.ambientIntensity = hdri.AmbientIntensity;
+                RenderSettings.defaultReflectionMode = DefaultReflectionMode.Skybox;
+                RenderSettings.reflectionIntensity = hdri.ReflectionIntensity;
+            }
+            else
+            {
+                LightingPreset preset = Current;
+                RenderSettings.ambientMode = AmbientMode.Trilight;
+                RenderSettings.ambientIntensity = 1f;
+                // Scaled in LINEAR space - multiplying the gamma values would make Brightness act
+                // on the ambient far more steeply than on the lights.
+                RenderSettings.ambientSkyColor = ScaleLinear(preset.AmbientSky, brightness);
+                RenderSettings.ambientEquatorColor = ScaleLinear(preset.AmbientEquator, brightness);
+                RenderSettings.ambientGroundColor = ScaleLinear(preset.AmbientGround, brightness);
+                RenderSettings.reflectionIntensity = preset.Reflection;
+                // The preset has no opinion on the reflection SOURCE; the scene's own is put back
+                // in case an HDRI had switched it to Skybox.
+                RenderSettings.defaultReflectionMode = _sceneReflectionMode;
+            }
             // Re-evaluates the ambient probe (and default reflection) from the new settings;
             // without it the shaders keep sampling whatever SH was there before.
-            DynamicGI.UpdateEnvironment();
+            if (rebake) DynamicGI.UpdateEnvironment();
         }
+
+        // The scene's authored reflection source, captured before anything here writes one.
+        private DefaultReflectionMode _sceneReflectionMode;
 
         private static Color ScaleLinear(Color gamma, float scale) => (gamma.linear * scale).gamma;
 
