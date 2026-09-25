@@ -331,7 +331,7 @@ namespace Sculpting
                 if (sqrDist > radiusSqr) continue;
 
                 float weight = CarveFalloff(1f - Mathf.Sqrt(sqrDist) * invRadius) * (1f - mask[i])
-                    * FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
 
                 Vector3 start = mesh.StrokeStartPosition(i);
                 SplitCarveFrame(start - localPoint, localNormal, dirLocal,

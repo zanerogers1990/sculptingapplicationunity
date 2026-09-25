@@ -30,7 +30,7 @@ namespace Sculpting
         /// drag - even once later deltas are queried against a point far outside this
         /// radius. Returns an invalid (empty) selection if nothing was in range.
         /// frontFacingOnly/cameraLocalPos gate the grab the same way every other brush's
-        /// footprint is gated (see SculptController.FrontFacingWeight) - a vertex whose own
+        /// footprint is gated (see BrushMath.FrontFacingWeight) - a vertex whose own
         /// normal faces away from the camera never enters the selection at all, so a Move drag
         /// on one side of a thin fold can't also drag the far side along with it.
         ///
@@ -58,7 +58,7 @@ namespace Sculpting
                 // SAME helper every other brush uses: the old hard test gave the grabbed region a
                 // sawtooth edge wherever the silhouette crossed it, so a drag tore at exactly the
                 // thin, strongly-curved geometry this option exists to protect.
-                smooth *= SculptController.FrontFacingWeight(
+                smooth *= BrushMath.FrontFacingWeight(
                     frontFacingOnly, _workingNormals[i], _workingVertices[i], cameraLocalPos);
                 if (smooth <= 0f) continue;
                 indices.Add(i);

@@ -421,7 +421,7 @@ namespace Sculpting
                 // ClayWeightJob.Execute sets out - the plane measures the surface, the mask only
                 // says which of its vertices may move.
                 float planeW = ClayFalloff(t01, effectiveEdgeSoftness) // flat plateau, edge-only taper - see clayEdgeSoftness
-                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 weights[ci] = planeW * (1f - mask[i]);
 
                 plane.Add(p * planeW, n * planeW, planeW);

@@ -588,7 +588,7 @@ namespace Sculpting
             }
             else if (_dragKind == HandleKind.Rotate)
             {
-                if (SculptController.RayPlaneIntersect(ray, _dragPivot, _dragAxisWorld, out Vector3 hit))
+                if (VectorMath.RayPlaneIntersect(ray, _dragPivot, _dragAxisWorld, out Vector3 hit))
                     _dragStartValue = AngleOnPlane(hit, _dragPivot, _dragAxisWorld);
             }
 
@@ -741,7 +741,7 @@ namespace Sculpting
 
         private void DragRotate(Ray ray)
         {
-            if (!SculptController.RayPlaneIntersect(ray, _dragPivot, _dragAxisWorld, out Vector3 hit)) return;
+            if (!VectorMath.RayPlaneIntersect(ray, _dragPivot, _dragAxisWorld, out Vector3 hit)) return;
             float current = AngleOnPlane(hit, _dragPivot, _dragAxisWorld);
             float deltaAngle = Mathf.DeltaAngle(_dragStartValue, current);
 
@@ -854,7 +854,7 @@ namespace Sculpting
 
         private static float ProjectRayOntoAxis(Ray ray, Vector3 pivot, Vector3 axisWorld, Vector3 planeNormal)
         {
-            if (!SculptController.RayPlaneIntersect(ray, pivot, planeNormal, out Vector3 hit)) return 0f;
+            if (!VectorMath.RayPlaneIntersect(ray, pivot, planeNormal, out Vector3 hit)) return 0f;
             return Vector3.Dot(hit - pivot, axisWorld);
         }
 

@@ -229,7 +229,7 @@ namespace Sculpting
 
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
                 weights[ci] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
-                    * FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
                 anyInRange = true;
             }
             if (!anyInRange) return;

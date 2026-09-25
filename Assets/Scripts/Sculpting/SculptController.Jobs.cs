@@ -313,7 +313,7 @@ namespace Sculpting
 
                 float t01 = 1f - dist / BrushRadius;
                 float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index])
-                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
+                    * BrushMath.FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
                 if (weight <= 0f) { AppliedOut[index] = 0; return; }
 
                 if (Accumulate)
@@ -410,7 +410,7 @@ namespace Sculpting
             if (dist > s.BrushRadius) return false;
 
             float weight = CarveFalloff(1f - dist / s.BrushRadius) * (1f - mask)
-                * FrontFacingWeight(s.FrontFacingOnly, normal, pos, cameraLocalPos);
+                * BrushMath.FrontFacingWeight(s.FrontFacingOnly, normal, pos, cameraLocalPos);
 
             SplitCarveFrame(start - localPoint, localNormal, dirLocal,
                 out float startNormal, out float startAlong, out Vector3 startAcross);
@@ -480,67 +480,6 @@ namespace Sculpting
             Vector3 tangential = offset - normal * alongNormal;
             alongDir = Vector3.Dot(tangential, dir);
             across = tangential - dir * alongDir;
-        }
-
-        // Shared by every brush's weight computation, multiplied in alongside the mask term
-        // right next to it (MaskIn / sculptableMesh.Mask) - see frontFacingOnly's remarks for
-        // what this is for. A vertex counts as front-facing when its OWN mesh normal points at
-        // least partly back toward the camera; compared per-vertex against the camera's actual
-        // local-space position rather than one shared view direction, so the test stays correct
-        // up close, where a sculpt's own scale can be comparable to the camera's distance from
-        // it. Plain float/Vector3 math (like ClayFalloff below), so Burst inlines it into a
-        // job's Execute exactly the same way.
-        /// How wide the accept/reject transition is, as the cosine of the angle between a vertex's
-        /// normal and its own direction to the camera - so ~11.5 degrees either side of edge-on.
-        ///
-        /// The gate used to be a bare `dot > 0`, which is a 0/1 step, and a step is what made this
-        /// option visibly chew up thin, strongly-curved geometry - an ear above all. Adjacent
-        /// vertices on a remeshed surface do not share a normal (Surface Nets places one vertex per
-        /// cell, so the output is genuinely bumpy at the cell scale - see
-        /// SculptableMesh.EncodeCavityAt), so wherever the silhouette runs through a footprint the
-        /// step hands neighbouring vertices full strength and none at all. That is a sawtooth
-        /// written straight into the surface, and it reads exactly as one ear coming out jagged and
-        /// faceted while the other is smooth.
-        ///
-        /// A ramp costs the option nothing it is actually for. A vertex on the FAR wall of a fin
-        /// points away from the camera, lands at cosine <= 0, and is still rejected outright; only
-        /// the sliver of surface within a few degrees of edge-on - where "is this the near wall or
-        /// the far one" genuinely has no sharp answer - gets a partial weight instead of a coin
-        /// flip.
-        private const float SilhouetteBand = 0.2f;
-
-        // Shared by every brush's weight computation, multiplied in alongside the mask term
-        // right next to it (MaskIn / sculptableMesh.Mask) - see frontFacingOnly's remarks for
-        // what this is for. A vertex counts as front-facing when its OWN mesh normal points at
-        // least partly back toward the camera; compared per-vertex against the camera's actual
-        // local-space position rather than one shared view direction, so the test stays correct
-        // up close, where a sculpt's own scale can be comparable to the camera's distance from
-        // it. Plain float/Vector3 math (like ClayFalloff below), so Burst inlines it into a
-        // job's Execute exactly the same way.
-        //
-        // cameraLocalPos is the CURRENT DAB's viewpoint, which for a mirrored dab is the reflected
-        // camera - see SculptController._dabCameraLocal.
-        // internal, not private: SculptableMesh.SelectGrab needs the identical rule (Move picks its
-        // vertex set once on mouse-down instead of running a per-frame weight loop), and a second
-        // copy of a silhouette ramp is exactly the kind of thing that drifts out of step.
-        internal static float FrontFacingWeight(bool frontFacingOnly, Vector3 normalLocal, Vector3 posLocal, Vector3 cameraLocalPos)
-        {
-            if (!frontFacingOnly) return 1f;
-
-            Vector3 toCamera = cameraLocalPos - posLocal;
-            float d = Vector3.Dot(normalLocal, toCamera);
-            if (d <= 0f) return 0f; // facing away - rejected exactly as before
-
-            // Comparing squared keeps the square root off the overwhelming majority of candidates:
-            // anything comfortably front-facing clears this without one, and only the narrow
-            // silhouette band pays for the cosine it actually needs. (Squaring is monotonic here
-            // because d > 0 at this point.)
-            float bandSqr = SilhouetteBand * SilhouetteBand * toCamera.sqrMagnitude;
-            if (d * d >= bandSqr) return 1f;
-
-            float cos = d / Mathf.Sqrt(toCamera.sqrMagnitude);
-            float t = cos / SilhouetteBand;
-            return t * t * (3f - 2f * t); // smoothstep
         }
 
         // Clay's own radial falloff (see clayEdgeSoftness remarks) - full weight through the
@@ -665,7 +604,7 @@ namespace Sculpting
             // about which surface this stroke is on (the near wall of a fin, not the far one),
             // so a plane measured across both walls would be the wrong surface.
             planeW = ClayFalloff(t01, edgeSoftness)
-                * FrontFacingWeight(frontFacingOnly, normal, pos, cameraLocalPos);
+                * BrushMath.FrontFacingWeight(frontFacingOnly, normal, pos, cameraLocalPos);
             return planeW * (1f - mask);
         }
 
@@ -890,7 +829,7 @@ namespace Sculpting
                 if (dist > BrushRadius) { WeightsOut[index] = 0f; return; }
                 float t01 = 1f - dist / BrushRadius;
                 WeightsOut[index] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index]) // smoothstep, masked-out
-                    * FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
+                    * BrushMath.FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
             }
         }
 
@@ -1004,11 +943,11 @@ namespace Sculpting
                     if (d < sqrDist)
                     {
                         sqrDist = d;
-                        facing = FrontFacingWeight(FrontFacingOnly, NormalsIn[ci], p, CentreCameras[c]);
+                        facing = BrushMath.FrontFacingWeight(FrontFacingOnly, NormalsIn[ci], p, CentreCameras[c]);
                     }
                     else if (d == sqrDist && FrontFacingOnly)
                     {
-                        facing = Mathf.Max(facing, FrontFacingWeight(true, NormalsIn[ci], p, CentreCameras[c]));
+                        facing = Mathf.Max(facing, BrushMath.FrontFacingWeight(true, NormalsIn[ci], p, CentreCameras[c]));
                     }
                 }
                 if (sqrDist > RelaxRadius * RelaxRadius) { WeightsOut[ci] = 0f; return; }

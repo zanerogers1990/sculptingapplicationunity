@@ -26,5 +26,20 @@ namespace Sculpting
             float inv = 1f / Mathf.Sqrt(sqr);
             return new Vector3(v.x * inv, v.y * inv, v.z * inv);
         }
+
+        /// Where `ray` crosses the plane through `planePoint` with normal `planeNormal`, if it does so
+        /// in front of the ray's origin. Shared by the Move/Pose/Snake Hook drags and TransformGizmo's
+        /// axis-constrained handles, so both drag with the same technique.
+        public static bool RayPlaneIntersect(Ray ray, Vector3 planePoint, Vector3 planeNormal, out Vector3 point)
+        {
+            float denom = Vector3.Dot(ray.direction, planeNormal);
+            if (Mathf.Abs(denom) < 1e-6f) { point = default; return false; }
+
+            float dist = Vector3.Dot(planePoint - ray.origin, planeNormal) / denom;
+            if (dist < 0f) { point = default; return false; }
+
+            point = ray.origin + ray.direction * dist;
+            return true;
+        }
     }
 }

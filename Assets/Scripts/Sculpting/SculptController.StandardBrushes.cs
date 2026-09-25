@@ -91,7 +91,7 @@ namespace Sculpting
                 if (dist > Settings.BrushRadius) { AppliedOut[index] = 0; return; }
 
                 float weight = DirectionalFalloff(dist / Settings.BrushRadius, Settings.Plateau) * (1f - MaskIn[index])
-                    * FrontFacingWeight(Settings.FrontFacingOnly, NormalsIn[index], pos, Settings.CameraLocalPos);
+                    * BrushMath.FrontFacingWeight(Settings.FrontFacingOnly, NormalsIn[index], pos, Settings.CameraLocalPos);
                 if (weight <= 0f) { AppliedOut[index] = 0; return; }
 
                 PositionsOut[index] = DirectionalStep(pos, StrokeStartIn[index], weight, Direction, Settings);
@@ -183,7 +183,7 @@ namespace Sculpting
                 if (sqrDist > radiusSqr) continue;
 
                 float weight = DirectionalFalloff(Mathf.Sqrt(sqrDist) * invRadius, s.Plateau) * (1f - mask[i])
-                    * FrontFacingWeight(s.FrontFacingOnly, normals[i], p, s.CameraLocalPos);
+                    * BrushMath.FrontFacingWeight(s.FrontFacingOnly, normals[i], p, s.CameraLocalPos);
                 if (weight <= 0f) continue;
 
                 mesh.RecordUndoBeforeIfNeeded(i);
@@ -218,7 +218,7 @@ namespace Sculpting
                 if (!mouse.leftButton.isPressed) { EndSnakeDrag(); return; }
 
                 Ray dragRay = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-                if (RayPlaneIntersect(dragRay, _snakeTipWorld, _snakePlaneNormal, out Vector3 current))
+                if (VectorMath.RayPlaneIntersect(dragRay, _snakeTipWorld, _snakePlaneNormal, out Vector3 current))
                 {
                     Vector3 worldDelta = current - _snakeTipWorld;
                     if (worldDelta.sqrMagnitude > 1e-12f) ApplySnakeHook(worldDelta);
@@ -299,7 +299,7 @@ namespace Sculpting
 
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
                 float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i])
-                    * FrontFacingWeight(frontFacingOnly, normals[i], p, _dabCameraLocal);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, _dabCameraLocal);
                 if (weight <= 0f) continue;
 
                 mesh.RecordUndoBeforeIfNeeded(i);

@@ -480,11 +480,11 @@ namespace Sculpting
                     if (d < sqrDist)
                     {
                         sqrDist = d;
-                        facing = FrontFacingWeight(frontFacingOnly, normals[i], p, _relaxCentreCameras[c]);
+                        facing = BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, _relaxCentreCameras[c]);
                     }
                     else if (d == sqrDist && frontFacingOnly)
                     {
-                        facing = Mathf.Max(facing, FrontFacingWeight(true, normals[i], p, _relaxCentreCameras[c]));
+                        facing = Mathf.Max(facing, BrushMath.FrontFacingWeight(true, normals[i], p, _relaxCentreCameras[c]));
                     }
                 }
                 if (sqrDist > relaxRadiusSqr) { weights[ci] = 0f; continue; }

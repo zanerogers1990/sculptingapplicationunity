@@ -73,7 +73,7 @@ namespace Sculpting
                 }
 
                 Ray dragRay = cam.ScreenPointToRay(mouse.position.ReadValue());
-                if (RayPlaneIntersect(dragRay, _dragPlanePoint, _dragPlaneNormal, out Vector3 current))
+                if (VectorMath.RayPlaneIntersect(dragRay, _dragPlanePoint, _dragPlaneNormal, out Vector3 current))
                 {
                     Vector3 worldDelta = current - _lastDragPoint;
                     if (worldDelta.sqrMagnitude > 1e-12f)
@@ -163,7 +163,7 @@ namespace Sculpting
                 }
 
                 Ray dragRay = cam.ScreenPointToRay(mouse.position.ReadValue());
-                if (RayPlaneIntersect(dragRay, _poseDragPlanePoint, _poseDragPlaneNormal, out Vector3 current))
+                if (VectorMath.RayPlaneIntersect(dragRay, _poseDragPlanePoint, _poseDragPlaneNormal, out Vector3 current))
                 {
                     // Unlike Move, this reads the CURRENT drag point fresh off the plane rather
                     // than accumulating a delta - ApplyPoseDelta re-derives every vertex from

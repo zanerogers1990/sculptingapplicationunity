@@ -143,7 +143,7 @@ namespace Sculpting
                 Vector3 n = normals[i];
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
                 float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
-                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 if (weight <= 0f) continue;
 
                 mesh.RecordUndoBeforeIfNeeded(i);
@@ -313,7 +313,7 @@ namespace Sculpting
                 // ClayFalloff at full edge softness - the quintic ApplyFlattenBrushLocalJob gets from
                 // ClayWeightJob. Was a cubic smoothstep, left behind when ClayFalloff went quintic.
                 float planeW = ClayFalloff(t01, 1f)
-                    * FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
+                    * BrushMath.FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 weights[ci] = planeW * (1f - mask[i]); // masked-out vertices hold still
 
                 // StrokeStartPosition, not verts[i] - see ApplyFlattenBrushLocal on why the

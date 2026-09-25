@@ -405,20 +405,5 @@ namespace Sculpting
             EndPoseDrag();
             EndSnakeDrag();
         }
-
-        // internal (not private) so TransformGizmo can reuse the exact same axis-constrained
-        // drag technique Move-brush dragging already uses, for its own Move/Scale handles - no
-        // .asmdef boundary in this project, so internal is enough without a public API change.
-        internal static bool RayPlaneIntersect(Ray ray, Vector3 planePoint, Vector3 planeNormal, out Vector3 point)
-        {
-            float denom = Vector3.Dot(ray.direction, planeNormal);
-            if (Mathf.Abs(denom) < 1e-6f) { point = default; return false; }
-
-            float dist = Vector3.Dot(planePoint - ray.origin, planeNormal) / denom;
-            if (dist < 0f) { point = default; return false; }
-
-            point = ray.origin + ray.direction * dist;
-            return true;
-        }
     }
 }
