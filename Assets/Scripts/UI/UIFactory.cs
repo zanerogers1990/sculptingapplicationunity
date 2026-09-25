@@ -343,6 +343,118 @@ namespace Sculpting
             return btn;
         }
 
+        /// A dropdown made from CreateDropdown. The option list opens INLINE under the button,
+        /// pushing the panel's content down, rather than as a floating overlay: these panels
+        /// scroll and clip, and an inline list can't end up drawn outside or behind them.
+        public sealed class InlineDropdown
+        {
+            internal string[] Options;
+            internal Text Label;
+            internal GameObject List;
+            internal Image[] Items;
+
+            public int Value { get; private set; }
+
+            public void SetValueWithoutNotify(int index)
+            {
+                Value = Mathf.Clamp(index, 0, Options.Length - 1);
+                Label.text = Options[Value];
+                for (int i = 0; i < Items.Length; i++)
+                    Items[i].color = i == Value ? ActiveColor : InactiveColor;
+            }
+
+            public void Close() => List.SetActive(false);
+        }
+
+        public static InlineDropdown CreateDropdown(Transform parent, string[] options, int value, Action<int> onChange,
+                                              string tooltip = null)
+        {
+            var root = new GameObject("Dropdown", typeof(RectTransform));
+            root.transform.SetParent(parent, false);
+            var rootLayout = root.AddComponent<VerticalLayoutGroup>();
+            rootLayout.spacing = 2;
+            rootLayout.childControlWidth = true;
+            rootLayout.childControlHeight = true;
+            rootLayout.childForceExpandWidth = true;
+            rootLayout.childForceExpandHeight = false;
+
+            var dropdown = new InlineDropdown { Options = options, Items = new Image[options.Length] };
+
+            var headerGO = new GameObject("Header", typeof(RectTransform), typeof(Image));
+            headerGO.transform.SetParent(root.transform, false);
+            var headerImage = headerGO.GetComponent<Image>();
+            headerImage.color = new Color(0.15f, 0.15f, 0.17f);
+            headerGO.AddComponent<LayoutElement>().preferredHeight = 26;
+            var headerButton = headerGO.AddComponent<Button>();
+            headerButton.targetGraphic = headerImage;
+
+            Text MakeText(Transform owner, TextAnchor anchor, Vector2 offsetMin, Vector2 offsetMax)
+            {
+                var textGO = new GameObject("Text", typeof(RectTransform));
+                textGO.transform.SetParent(owner, false);
+                var rect = textGO.GetComponent<RectTransform>();
+                rect.anchorMin = Vector2.zero;
+                rect.anchorMax = Vector2.one;
+                rect.offsetMin = offsetMin;
+                rect.offsetMax = offsetMax;
+                var t = textGO.AddComponent<Text>();
+                t.font = Font;
+                t.fontSize = 12;
+                t.alignment = anchor;
+                t.color = Color.white;
+                t.raycastTarget = false;
+                return t;
+            }
+
+            dropdown.Label = MakeText(headerGO.transform, TextAnchor.MiddleLeft, new Vector2(8, 0), new Vector2(-22, 0));
+            // Plain ASCII, like the foldout headers - LegacyRuntime.ttf may lack triangle glyphs.
+            Text arrow = MakeText(headerGO.transform, TextAnchor.MiddleRight, Vector2.zero, new Vector2(-8, 0));
+
+            var listGO = new GameObject("List", typeof(RectTransform), typeof(Image));
+            listGO.transform.SetParent(root.transform, false);
+            listGO.GetComponent<Image>().color = new Color(0.1f, 0.1f, 0.12f);
+            var listLayout = listGO.AddComponent<VerticalLayoutGroup>();
+            listLayout.padding = new RectOffset(3, 3, 3, 3);
+            listLayout.spacing = 2;
+            listLayout.childControlWidth = true;
+            listLayout.childControlHeight = true;
+            listLayout.childForceExpandWidth = true;
+            listLayout.childForceExpandHeight = false;
+            dropdown.List = listGO;
+
+            void SetOpen(bool open)
+            {
+                listGO.SetActive(open);
+                arrow.text = open ? "^" : "v";
+            }
+
+            for (int i = 0; i < options.Length; i++)
+            {
+                int index = i;
+                var itemGO = new GameObject("Option_" + options[i], typeof(RectTransform), typeof(Image));
+                itemGO.transform.SetParent(listGO.transform, false);
+                var itemImage = itemGO.GetComponent<Image>();
+                itemGO.AddComponent<LayoutElement>().preferredHeight = 24;
+                var itemButton = itemGO.AddComponent<Button>();
+                itemButton.targetGraphic = itemImage;
+                MakeText(itemGO.transform, TextAnchor.MiddleLeft, new Vector2(8, 0), Vector2.zero).text = options[i];
+                itemButton.onClick.AddListener(() =>
+                {
+                    SetOpen(false);
+                    dropdown.SetValueWithoutNotify(index);
+                    onChange(index);
+                });
+                dropdown.Items[i] = itemImage;
+            }
+
+            headerButton.onClick.AddListener(() => SetOpen(!listGO.activeSelf));
+            dropdown.SetValueWithoutNotify(value);
+            SetOpen(false);
+
+            TooltipSystem.Attach(headerGO, tooltip);
+            return dropdown;
+        }
+
         public static Toggle CreateToggle(Transform parent, string label, bool defaultVal, Action<bool> onChange, Color? checkColor = null, string tooltip = null)
         {
             var go = new GameObject("Toggle_" + label, typeof(RectTransform));

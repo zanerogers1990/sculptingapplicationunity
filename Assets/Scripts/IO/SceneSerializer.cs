@@ -560,6 +560,25 @@ namespace Sculpting.IO
                 data.material.lureTranslucency = mat.LureTranslucency;
                 data.material.lureGloss = mat.LureGloss;
                 data.material.lureReferenceSize = mat.LureReferenceSize;
+                data.material.metalEnabled = mat.MetalEnabled;
+                data.material.metalPresetId = mat.MetalPresetId;
+                data.material.metalExposure = mat.MetalExposure;
+                data.material.metalEdgeWear = mat.MetalEdgeWear;
+                data.material.metalWash = mat.MetalWash;
+                data.material.metalDetail = mat.MetalDetail;
+                data.material.metalPatternSize = mat.MetalPatternSize;
+                data.material.metalGloss = mat.MetalGloss;
+                data.material.metalPatternSeed = mat.MetalPatternSeed;
+                data.material.metalReferenceSize = mat.MetalReferenceSize;
+                data.material.clayEnabled = mat.ClayEnabled;
+                data.material.clayPresetId = mat.ClayPresetId;
+                data.material.clayGloss = mat.ClayGloss;
+                data.material.clayWetness = mat.ClayWetness;
+                data.material.claySubsurface = mat.ClaySubsurface;
+                data.material.clayRecess = mat.ClayRecess;
+                data.material.clayDetail = mat.ClayDetail;
+                data.material.clayGrain = mat.ClayGrain;
+                data.material.clayReferenceSize = mat.ClayReferenceSize;
             }
 
             var light = LightingPresetController.Instance;
@@ -665,6 +684,30 @@ namespace Sculpting.IO
                 mat.LureReferenceSize = data.material.lureReferenceSize;
                 if (!string.IsNullOrEmpty(data.material.lurePresetId)) mat.LurePresetId = data.material.lurePresetId;
                 mat.LureEnabled = data.material.lureEnabled;
+
+                mat.MetalExposure = data.material.metalExposure;
+                mat.MetalEdgeWear = data.material.metalEdgeWear;
+                mat.MetalWash = data.material.metalWash;
+                mat.MetalDetail = data.material.metalDetail;
+                mat.MetalPatternSize = data.material.metalPatternSize;
+                mat.MetalGloss = data.material.metalGloss;
+                mat.MetalPatternSeed = data.material.metalPatternSeed;
+                mat.MetalReferenceSize = data.material.metalReferenceSize;
+                if (!string.IsNullOrEmpty(data.material.metalPresetId)) mat.MetalPresetId = data.material.metalPresetId;
+                // After the lure: switching metal on turns the lure off, switching it off leaves
+                // the lure alone, so a file can't come back with both on.
+                mat.MetalEnabled = data.material.metalEnabled;
+
+                mat.ClayGloss = data.material.clayGloss;
+                mat.ClayWetness = data.material.clayWetness;
+                mat.ClaySubsurface = data.material.claySubsurface;
+                mat.ClayRecess = data.material.clayRecess;
+                mat.ClayDetail = data.material.clayDetail;
+                mat.ClayGrain = data.material.clayGrain;
+                mat.ClayReferenceSize = data.material.clayReferenceSize;
+                if (!string.IsNullOrEmpty(data.material.clayPresetId)) mat.ClayPresetId = data.material.clayPresetId;
+                // Last, for the same reason as the metal: on turns the others off, off leaves them.
+                mat.ClayEnabled = data.material.clayEnabled;
             }
 
             var env = data.environment;

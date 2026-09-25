@@ -43,6 +43,50 @@ Shader "Custom/SculptPBR"
         _MicroFlakeCellSize("Micro Flake Cell Size (world)", Float) = 0.01
         _MicroFlakeDensity("Micro Flake Density", Range(0,1)) = 0.3
 
+        // Aged metal: a bare metal with a coat over it (rust, verdigris, paint) that collects in
+        // recesses and wears off raised edges, plus a dark wash pooled in the deepest recesses
+        // (see MetalShade). Driven by MetalFinishPresets through SculptMaterialController.
+        _MetalEnabled("Aged Metal Enabled", Float) = 0
+        _MetalColor("Bare Metal Color", Color) = (0.3,0.31,0.34,1)
+        _MetalSmoothness("Bare Metal Smoothness", Range(0,1)) = 0.55
+        _MetalMetallic("Bare Metal Metallic", Range(0,1)) = 0.85
+        _CoatColorA("Coat Color A", Color) = (0.66,0.4,0.12,1)
+        _CoatColorB("Coat Color B", Color) = (0.36,0.17,0.06,1)
+        _CoatMetallic("Coat Metallic", Range(0,1)) = 0
+        _CoatSmoothness("Coat Smoothness", Range(0,1)) = 0.2
+        _WashColor("Wash Color", Color) = (0.09,0.05,0.03,1)
+        _MetalWash("Wash Strength", Range(0,1)) = 0.7
+        _MetalCoverage("Coat Coverage", Range(0,1.5)) = 0.6
+        _MetalEdgeWear("Edge Wear", Range(0,1.5)) = 0.8
+        _MetalPatchSize("Coat Patch Size (world)", Float) = 0.2
+        _MetalPatternOffset("Coat Pattern Offset (patch widths)", Vector) = (0,0,0,0)
+        _MetalPatchContrast("Coat Patch Contrast", Range(0.5,10)) = 4
+        _MetalPatchAmount("Coat Patchiness", Range(0,1)) = 1
+        _MetalCoatCurvature("Coat Follows Recesses", Range(0,3)) = 0.4
+        _MetalGrainSize("Grain Size (world)", Float) = 0.01
+        _MetalGrain("Grain Strength", Range(0,1)) = 0.4
+        _MetalDetail("Detail Contrast", Range(0.1,4)) = 1
+
+        // Sculptor's oil clay (Chavant / Monster Clay / plasteline): a satin, slightly waxy
+        // surface with a thin wet highlight on top, a little light bleeding past the shadow line,
+        // darker and richer in the recesses (see ClayShade). Driven by ClayPresets through
+        // SculptMaterialController.
+        _ClayEnabled("Clay Enabled", Float) = 0
+        _ClayColor("Clay Color", Color) = (0.55,0.28,0.16,1)
+        _ClayRecessColor("Clay Recess Color", Color) = (0.25,0.1,0.05,1)
+        _ClayScatterColor("Clay Scatter Color", Color) = (0.9,0.35,0.18,1)
+        _ClaySmoothness("Clay Sheen Smoothness", Range(0,1)) = 0.45
+        _ClayWetness("Clay Wet Highlight", Range(0,3)) = 0.5
+        _ClayWetPower("Clay Wet Highlight Sharpness", Float) = 300
+        _ClaySubsurface("Clay Subsurface", Range(0,3)) = 0.5
+        _ClayRecess("Clay Recess Depth", Range(0,3)) = 0.7
+        _ClayRidge("Clay Ridge Burnish", Range(0,2)) = 0.3
+        _ClayMottle("Clay Mottle", Range(0,1)) = 0.08
+        _ClayMottleSize("Clay Mottle Size (world)", Float) = 0.2
+        _ClayGrain("Clay Grain", Range(0,3)) = 0.3
+        _ClayGrainSize("Clay Grain Size (world)", Float) = 0.006
+        _ClayDetail("Clay Detail Contrast", Range(0.1,4)) = 1
+
         // Darker grey rather than a saturated color - matches ZBrush/Blender/Mudbox's
         // convention of shading masked areas toward grey/black instead of tinting them a
         // color, so the mask overlay doesn't read as "painted" onto the surface.
@@ -111,6 +155,41 @@ Shader "Custom/SculptPBR"
                 half4 _MicroFlakeColor;
                 float _MicroFlakeCellSize;
                 half _MicroFlakeDensity;
+                half _MetalEnabled;
+                half4 _MetalColor;
+                half _MetalSmoothness;
+                half _MetalMetallic;
+                half4 _CoatColorA;
+                half4 _CoatColorB;
+                half _CoatMetallic;
+                half _CoatSmoothness;
+                half4 _WashColor;
+                half _MetalWash;
+                half _MetalCoverage;
+                half _MetalEdgeWear;
+                float _MetalPatchSize;
+                float4 _MetalPatternOffset;
+                half _MetalPatchContrast;
+                half _MetalPatchAmount;
+                half _MetalCoatCurvature;
+                float _MetalGrainSize;
+                half _MetalGrain;
+                half _MetalDetail;
+                half _ClayEnabled;
+                half4 _ClayColor;
+                half4 _ClayRecessColor;
+                half4 _ClayScatterColor;
+                half _ClaySmoothness;
+                half _ClayWetness;
+                float _ClayWetPower;
+                half _ClaySubsurface;
+                half _ClayRecess;
+                half _ClayRidge;
+                half _ClayMottle;
+                float _ClayMottleSize;
+                half _ClayGrain;
+                float _ClayGrainSize;
+                half _ClayDetail;
             CBUFFER_END
 
             // "Shade Flat" normal from the screen-space derivatives of the interpolated world
@@ -214,9 +293,9 @@ Shader "Custom/SculptPBR"
                 return lerp(nxy0, nxy1, f.z);
             }
 
-            float3 PerturbNormal(float3 normalWS, float3 positionOS)
+            // Bumps normalWS by the gradient of value noise at p (in noise space), `strength` deep.
+            float3 PerturbNormalAt(float3 normalWS, float3 p, float strength)
             {
-                float3 p = positionOS * _NormalNoiseScale;
                 float e = 0.05;
                 float h0 = ValueNoise3D(p);
                 float hx = ValueNoise3D(p + float3(e, 0, 0));
@@ -226,7 +305,12 @@ Shader "Custom/SculptPBR"
 
                 float3 n = normalize(normalWS);
                 float3 tangentialGrad = grad - n * dot(grad, n);
-                return normalize(n - tangentialGrad * _NormalStrength);
+                return normalize(n - tangentialGrad * strength);
+            }
+
+            float3 PerturbNormal(float3 normalWS, float3 positionOS)
+            {
+                return PerturbNormalAt(normalWS, positionOS * _NormalNoiseScale, _NormalStrength);
             }
 
             // Workbench's soft clamp: linear for small curvature, easing into a ceiling of
@@ -334,7 +418,8 @@ Shader "Custom/SculptPBR"
                 return inputData;
             }
 
-            half4 PhysicallyShade(InputData inputData, half3 albedo, half metallic, half smoothness)
+            half4 PhysicallyShade(InputData inputData, half3 albedo, half metallic, half smoothness,
+                                  half occlusion = 1.0h)
             {
                 SurfaceData surfaceData;
                 surfaceData.albedo = albedo;
@@ -343,7 +428,7 @@ Shader "Custom/SculptPBR"
                 surfaceData.smoothness = smoothness;
                 surfaceData.normalTS = half3(0, 0, 1);
                 surfaceData.emission = half3(0, 0, 0);
-                surfaceData.occlusion = 1.0;
+                surfaceData.occlusion = occlusion;
                 surfaceData.alpha = 1.0;
                 surfaceData.clearCoatMask = 0.0;
                 surfaceData.clearCoatSmoothness = 1.0;
@@ -570,6 +655,15 @@ Shader "Custom/SculptPBR"
                 return pow(max(_PlasticThickColor.rgb, 1e-3), 2.0 * distance / depthScale);
             }
 
+            // Lengths of the model matrix's columns: the object's scale along each of its own axes.
+            float3 ObjectAxisScale()
+            {
+                return float3(
+                    length(float3(UNITY_MATRIX_M[0].x, UNITY_MATRIX_M[1].x, UNITY_MATRIX_M[2].x)),
+                    length(float3(UNITY_MATRIX_M[0].y, UNITY_MATRIX_M[1].y, UNITY_MATRIX_M[2].y)),
+                    length(float3(UNITY_MATRIX_M[0].z, UNITY_MATRIX_M[1].z, UNITY_MATRIX_M[2].z)));
+            }
+
             float3 FaceViewer(float3 n, float3 V)
             {
                 return dot(n, V) < 0.0 ? -n : n;
@@ -589,12 +683,9 @@ Shader "Custom/SculptPBR"
                 // the model as it moves and keep one size across differently scaled objects. The
                 // smooth normal steers them even under Flat Shading, so a flake doesn't break
                 // along triangle edges.
-                // Per-axis scale (the lengths of the model matrix's columns), so a squashed object
-                // gets round flakes of the same size rather than squashed or shrunken ones.
-                float3 objectScale = float3(
-                    length(float3(UNITY_MATRIX_M[0].x, UNITY_MATRIX_M[1].x, UNITY_MATRIX_M[2].x)),
-                    length(float3(UNITY_MATRIX_M[0].y, UNITY_MATRIX_M[1].y, UNITY_MATRIX_M[2].y)),
-                    length(float3(UNITY_MATRIX_M[0].z, UNITY_MATRIX_M[1].z, UNITY_MATRIX_M[2].z)));
+                // Per-axis scale, so a squashed object gets round flakes of the same size rather
+                // than squashed or shrunken ones.
+                float3 objectScale = ObjectAxisScale();
                 float3 originOS = positionOS * objectScale;
                 float3 dirOS = normalize(TransformWorldToObjectDir(refract(-V, smoothNormalWS, 1.0 / 1.5), false) * objectScale);
                 float3 surfaceOS = normalize(TransformWorldToObjectNormal(smoothNormalWS, false) / objectScale);
@@ -653,6 +744,189 @@ Shader "Custom/SculptPBR"
                 return color;
             }
 
+            // ---- Aged metal ----------------------------------------------------------------
+            //
+            // Antiqued, rusted, verdigris and washed finishes on cast or painted sculpture are all
+            // the same three layers, and what sells them is WHERE each layer ends up:
+            //   1. Bare metal, polished bright on the raised edges that get handled or dry-brushed.
+            //   2. A coat (rust, verdigris, paint, black oxide) in broad patches, thickest in recesses.
+            //   3. A dark wash pooled in the deepest recesses.
+
+            // -1 (deep recess) .. +1 (sharp ridge), from the mesh's own curvature: SculptableMesh
+            // writes a soft-saturated, one-ring-smoothed mean curvature into vertex colour .b
+            // (0.5 = the model's average, higher = more concave). Measured on the geometry rather
+            // than on screen, so the wash stays exactly where it is as the camera orbits or zooms -
+            // as real paint does - and follows the sculpt live as strokes recompute it.
+            // `detail` rescales it before re-saturating: how much relief counts as a groove.
+            half SurfaceConvexity(Varyings input, half detail)
+            {
+                half s = 1.0h - 2.0h * (half)input.color.b;
+                // Undo the soft saturation (s = x / (1 + |x|)), scale, and apply it again.
+                half x = s / max(1.0h - abs(s), 0.02h) * detail;
+                return x / (1.0h + abs(x));
+            }
+
+            half MetalConvexity(Varyings input)
+            {
+                return SurfaceConvexity(input, _MetalDetail);
+            }
+
+            // Three octaves of value noise, stretched to roughly fill 0..1 - plain value-noise fBm
+            // piles up around 0.5, which would give every patch the same soft edge.
+            float MetalFbm(float3 p)
+            {
+                float sum = ValueNoise3D(p) * 0.5;
+                sum += ValueNoise3D(p * 2.03 + 17.1) * 0.25;
+                sum += ValueNoise3D(p * 4.11 + 31.7) * 0.125;
+                return saturate((sum / 0.875 - 0.5) * 1.8 + 0.5);
+            }
+
+            half4 MetalShade(Varyings input, float3 normalWS, float3 positionOS)
+            {
+                // Pattern in the object's own space at world size, like the lure flakes: it stays on
+                // the model as it moves and keeps one size across differently scaled objects.
+                float3 p = positionOS * ObjectAxisScale();
+                float footprint = length(fwidth(p));
+
+                half cv = MetalConvexity(input);
+                // The offset slides the model through the noise, which moves every blotch at once.
+                float3 patchP = p / max(_MetalPatchSize, 1e-5) + _MetalPatternOffset.xyz;
+                half patches = (half)MetalFbm(patchP);
+                half tint = (half)MetalFbm(patchP * 2.7 + 41.7);
+                // Grain finer than a pixel is only shimmer - fade it out as it gets there.
+                float grainSize = max(_MetalGrainSize, 1e-6);
+                half grainLod = saturate(1.5h - (half)(footprint / grainSize));
+                half grain = (half)ValueNoise3D(p / grainSize + 7.3);
+
+                // Worn to bare metal along the ridges, broken up by the patches so it isn't a
+                // perfect outline around every edge.
+                half wear = saturate(smoothstep(0.1h, 0.55h, cv) * _MetalEdgeWear * (0.55h + 0.9h * patches));
+                // The coat covers wherever the patch noise sits under the coverage level, and
+                // recesses hold more of it than raised areas. Patchiness and Follows Recesses set
+                // the balance: rust is mostly patches, a blackened antique almost purely recesses.
+                half coatLevel = _MetalCoverage - cv * _MetalCoatCurvature;
+                half patchLevel = lerp(0.5h, patches, _MetalPatchAmount);
+                half coat = saturate((coatLevel - patchLevel) * _MetalPatchContrast + 0.5h) * (1.0h - wear);
+                half wash = smoothstep(0.03h, 0.6h, -cv) * _MetalWash;
+
+                half3 coatColor = lerp(_CoatColorA.rgb, _CoatColorB.rgb,
+                                       saturate((tint - 0.5h) * 2.5h + 0.5h - cv * 0.5h));
+                coatColor *= lerp(1.0h, lerp(0.7h, 1.2h, grain), _MetalGrain * grainLod);
+                half3 metalColor = _MetalColor.rgb * lerp(0.88h, 1.08h, tint);
+
+                half3 albedo = lerp(metalColor, coatColor, coat);
+                half metallic = lerp(_MetalMetallic, _CoatMetallic, coat);
+                half smoothness = lerp(_MetalSmoothness, _CoatSmoothness, coat);
+                albedo = lerp(albedo, _WashColor.rgb, wash);
+                metallic *= 1.0h - wash;
+                smoothness *= 1.0h - 0.35h * wash;
+
+                // Pitted where coated, much less on the polished metal.
+                half bump = _MetalGrain * grainLod * lerp(0.25h, 1.0h, coat);
+                if (bump > 0.001h)
+                    normalWS = PerturbNormalAt(normalWS, p / grainSize, bump * 0.6h);
+
+                return PhysicallyShade(BuildInputData(input, normalWS), albedo, metallic, smoothness,
+                                       1.0h - 0.5h * wash);
+            }
+
+            // ---- Sculptor's clay -----------------------------------------------------------
+            //
+            // Oil-based modelling clay (Chavant, Monster Clay, plasteline) under studio light
+            // reads as clay rather than grey plastic through four things:
+            //   1. A satin sheen - broad and soft, the waxy binder - from the ordinary PBR lobe.
+            //   2. A thin wet highlight riding on top of it: the greasy film that makes worked clay
+            //      glint along every tool stroke. Its own sharp lobe, lit on the grain-bumped normal
+            //      so it breaks up the way a worked surface does instead of sitting there as a dot.
+            //   3. Light bleeding a little past the shadow line, tinted - strongly for terracotta,
+            //      barely at all for grey - the wrapped-Lambert excess, as in the lure plastic.
+            //   4. Recesses darker AND richer in colour than the flats; raised forms a touch lighter
+            //      and glossier where tools and fingers burnish them.
+
+            struct ClayLighting
+            {
+                half3 wet;
+                half3 scatter;
+            };
+
+            void AccumulateClayLight(Light light, float3 N, float3 V, inout ClayLighting acc)
+            {
+                half3 radiance = light.color * light.distanceAttenuation;
+                float3 L = light.direction;
+                half ndl = dot(N, L);
+                // Normalised Blinn-Phong, Schlick fresnel from a dielectric's 4%: sharp enough to
+                // read as a film of wet, energy-kept so the sharpness dial doesn't change brightness.
+                float3 H = normalize(L + V);
+                float spec = pow(saturate(dot(N, H)), _ClayWetPower) * (_ClayWetPower + 8.0) / 8.0;
+                half fresnel = 0.04h + 0.96h * pow(1.0h - saturate(dot(V, H)), 5.0h);
+                acc.wet += radiance * light.shadowAttenuation * ((half)spec * fresnel * saturate(ndl));
+                // Scattered light gets a little past the terminator and softens self-shadowing;
+                // half-shadowed only, like the plastic's, since it's light travelling inside.
+                half wrapped = saturate((ndl + 0.5h) / 1.5h);
+                acc.scatter += radiance * lerp(1.0h, light.shadowAttenuation, 0.6h) * max(wrapped - saturate(ndl), 0.0h);
+            }
+
+            half4 ClayShade(Varyings input, float3 normalWS, float3 positionOS)
+            {
+                // Object space at world size, like the metal's pattern: stays on the model, one
+                // size across differently scaled objects.
+                float3 p = positionOS * ObjectAxisScale();
+                float footprint = length(fwidth(p));
+                half cv = SurfaceConvexity(input, _ClayDetail);
+
+                // Clay is never one flat colour - batches mix unevenly and worked areas smear
+                // together - so a broad, faint drift in tone.
+                half mottle = (half)MetalFbm(p / max(_ClayMottleSize, 1e-5));
+                half3 albedo = _ClayColor.rgb * (1.0h + (mottle - 0.5h) * 2.0h * _ClayMottle);
+
+                half recess = saturate(smoothstep(0.0h, 0.45h, -cv) * _ClayRecess);
+                half ridge = smoothstep(0.1h, 0.6h, cv) * _ClayRidge;
+                albedo = lerp(albedo, _ClayRecessColor.rgb, recess);
+                albedo *= 1.0h + 0.25h * ridge;
+                half smoothness = saturate(_ClaySmoothness + 0.15h * ridge - 0.2h * recess);
+
+                // Fine grit in the clay body, faded out before it gets smaller than a pixel.
+                float grainSize = max(_ClayGrainSize, 1e-6);
+                half grain = _ClayGrain * saturate(1.5h - (half)(footprint / grainSize));
+                if (grain > 0.001h)
+                {
+                    normalWS = PerturbNormalAt(normalWS, p / grainSize, grain * 0.12h);
+                    half speck = (half)ValueNoise3D(p / grainSize * 1.7 + 11.3);
+                    albedo *= lerp(1.0h, lerp(0.9h, 1.06h, speck), saturate(grain));
+                }
+
+                InputData inputData = BuildInputData(input, normalWS);
+                half4 color = PhysicallyShade(inputData, albedo, 0.0h, smoothness, 1.0h - 0.6h * recess);
+
+                float3 V = inputData.viewDirectionWS;
+                ClayLighting acc = (ClayLighting)0;
+                Light mainLight = GetMainLight(inputData.shadowCoord, inputData.positionWS, inputData.shadowMask);
+                AccumulateClayLight(mainLight, normalWS, V, acc);
+                #if defined(_ADDITIONAL_LIGHTS)
+                uint pixelLightCount = GetAdditionalLightsCount();
+                #if USE_CLUSTER_LIGHT_LOOP
+                [loop] for (uint lightIndex = 0; lightIndex < min(URP_FP_DIRECTIONAL_LIGHTS_COUNT, MAX_VISIBLE_LIGHTS); lightIndex++)
+                {
+                    CLUSTER_LIGHT_LOOP_SUBTRACTIVE_LIGHT_CHECK
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulateClayLight(light, normalWS, V, acc);
+                }
+                #endif
+                LIGHT_LOOP_BEGIN(pixelLightCount)
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulateClayLight(light, normalWS, V, acc);
+                LIGHT_LOOP_END
+                #endif
+
+                // The wet film thins out in the recesses - that's where the tools didn't drag it.
+                color.rgb += acc.wet * _ClayWetness * (1.0h - 0.7h * recess)
+                           + acc.scatter * _ClayScatterColor.rgb * _ClaySubsurface;
+                // Recesses see less of the lights as well as less sky: occlusion above only
+                // reaches the ambient term, which leaves a crease under a key light looking flat.
+                color.rgb *= 1.0h - 0.35h * recess;
+                return color;
+            }
+
             half4 SculptPBRFragment(Varyings input) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
@@ -680,6 +954,10 @@ Shader "Custom/SculptPBR"
                     litColor = half4(MatcapShade(normalWS), 1.0);
                 else if (_PlasticEnabled > 0.5)
                     litColor = PlasticShade(input, normalWS, normalize(input.normalWS), positionOS);
+                else if (_MetalEnabled > 0.5)
+                    litColor = MetalShade(input, normalWS, positionOS);
+                else if (_ClayEnabled > 0.5)
+                    litColor = ClayShade(input, normalWS, positionOS);
                 else
                     litColor = PhysicallyShade(BuildInputData(input, normalWS), _BaseColor.rgb, _Metallic, _Smoothness);
 

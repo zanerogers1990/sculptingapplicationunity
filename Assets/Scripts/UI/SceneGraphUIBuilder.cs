@@ -44,6 +44,7 @@ namespace Sculpting
         private int _lastShownSelectionVersion = -1;
 
         private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _zsphereModeImg;
+        private GizmoMode _lastShownToolMode = GizmoMode.Sculpt;
         private Button _joinButton;
         private Button _subtractButton, _unionButton, _intersectButton;
         private GameObject _confirmModalGO;
@@ -201,6 +202,16 @@ namespace Sculpting
 
             RefreshZSphereSection();
             RefreshTimelapseSection(false);
+
+            // Tools switch modes on their own too (ZSphere Convert and Lathe Create drop into
+            // Sculpt, the Lathe section arms itself), so the highlight follows the gizmo rather
+            // than only this panel's own clicks.
+            GizmoMode shownMode = _gizmo != null ? _gizmo.Mode : GizmoMode.Sculpt;
+            if (shownMode != _lastShownToolMode)
+            {
+                _lastShownToolMode = shownMode;
+                RefreshToolButtons();
+            }
             RefreshFullscreenButton(false);
 
             if (_selection == null) return;
@@ -261,6 +272,10 @@ namespace Sculpting
             GameObject addRow3 = UIFactory.CreateRow(panel, 26f);
             UIFactory.CreateButton(addRow3.transform, "ZSphere Rig", StartZSphereRig,
                 "Starts a jointed skeleton of spheres you can pose and grow, then convert into a sculptable mesh - good for blocking out a figure from scratch.");
+            // The lathe is the same kind of entry: a way to start a model, which becomes geometry
+            // at Create. Its controls open in the Lathe section below.
+            UIFactory.CreateButton(addRow3.transform, "Lathe", StartLathe,
+                "Shapes a turned solid - a vase, bowl, bottle, knob or ring - by dragging its outline, like clay on a wheel.");
 
             UIFactory.CreateLabel(panel, "Objects (click=select, Ctrl+click=multi)", 12, FontStyle.Normal);
             var listGO = new GameObject("ObjectList", typeof(RectTransform));
@@ -291,6 +306,12 @@ namespace Sculpting
                 "Edits the selected object's ZSphere rig, if it has one.").GetComponent<Image>();
 
             BuildZSphereSection(panel);
+
+            // Lathe: its own builder, filled into a foldout like the Turntable's and self-installed
+            // the same way, since the scene predates it.
+            var lathe = FindFirstObjectByType<LatheUIBuilder>();
+            if (lathe == null) lathe = gameObject.AddComponent<LatheUIBuilder>();
+            lathe.BuildContent(UIFactory.CreateFoldoutSection(panel, "Lathe (Turned Solids)", false));
 
             UIFactory.CreateLabel(panel, "Mirror Selected Across Sphere", 13, FontStyle.Normal);
             GameObject mirrorRow = UIFactory.CreateRow(panel, 22f);
@@ -416,6 +437,15 @@ namespace Sculpting
         }
 
         private void Spawn(PrimitiveShapeType type) => _spawner?.SpawnPrimitive(type);
+
+        /// Arms the lathe. Its first activation seats a starting shape beside the scene and centres
+        /// the view on it (see LatheController.StartNewShape); later ones pick up the profile where
+        /// it was left.
+        private void StartLathe()
+        {
+            LatheController.Install();
+            SetGizmoMode(GizmoMode.Lathe);
+        }
 
         /// Arms the ZSphere tool and drops the first sphere in the middle of the view. Reports
         /// through the ZSphere section's own status line rather than the panel's, since that is

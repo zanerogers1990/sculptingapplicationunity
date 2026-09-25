@@ -1695,12 +1695,22 @@ namespace Sculpting
             // surface, which the shader renders as a solid peak colour rather than the neutral
             // it should be. Now a smooth ball sits at ~0.5 (neutral), while a crease or ridge,
             // whose curvature departs sharply from the body it sits on, still swings hard.
-            float normalized = Mathf.Clamp((smoothed - _cavityMean) * CavitySensitivity, -1f, 1f);
+            float departure = smoothed - _cavityMean;
+            float normalized = Mathf.Clamp(departure * CavitySensitivity, -1f, 1f);
             float encoded = 0.5f + normalized * 0.5f;
-            // .r = cavity, .g = mask (see _mask remarks) - .b mirrors .r, unused by the shader
-            // today but harmless to keep populated in case something else ever samples it.
-            _cavityColors[i] = new Color(encoded, _mask[i], encoded, 1f);
+            // .b is the same measure for SculptPBR's aged-metal wash and wear, soft-saturated
+            // (x / (1 + |x|)) instead of clamped: .r's clamp flattens a shallow recess and a deep
+            // groove to the same value, and the wash needs to tell those apart.
+            float soft = departure * WashSensitivity;
+            soft /= 1f + Mathf.Abs(soft);
+            // .r = cavity (unused by the shader since the screen-space cavity), .g = mask (see _mask).
+            _cavityColors[i] = new Color(encoded, _mask[i], 0.5f + soft * 0.5f, 1f);
         }
+
+        // Scales the dimensionless curvature for .b. A detail whose radius of curvature is 2.5%
+        // of the object's half-size lands halfway to saturation; broad body curvature stays
+        // near neutral while carved grooves and crests span most of the range.
+        private const float WashSensitivity = 1f / 40f;
 
         /// Paints (amount > 0) or erases (amount < 0) mask over a local-space brush footprint -
         /// does not move any vertex or touch normals/bounds/the triangle-raycast grid, just the

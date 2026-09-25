@@ -245,6 +245,10 @@ namespace Sculpting
             // that Z falls back to scene history the moment the rig's own runs out.
             if (_zsphereForUndo == null) _zsphereForUndo = FindFirstObjectByType<ZSphereController>();
             if (_zsphereForUndo != null && _zsphereForUndo.HandlesUndoKey(redo)) return;
+            // The lathe profile likewise (see LatheController's profile-undo remarks). Unlike the
+            // ZSphere check this one also performs the step, since it is the only caller.
+            if (_latheForUndo == null) _latheForUndo = FindFirstObjectByType<LatheController>();
+            if (_latheForUndo != null && _latheForUndo.HandlesUndoKey(redo)) return;
 
             if (redo) Redo(); else Undo();
         }
@@ -252,6 +256,7 @@ namespace Sculpting
         // Only ever looked up on a frame Z is actually pressed, so the find costs nothing in a
         // scene that has no ZSphereController at all.
         private ZSphereController _zsphereForUndo;
+        private LatheController _latheForUndo;
 
         // Ctrl+S / Ctrl+Shift+S, matching the quick-save/save-as split most creative software
         // uses (see SceneGraphUIBuilder.Save/SaveAs). Routed via SendMessage rather than a
@@ -288,7 +293,9 @@ namespace Sculpting
             // Also skipped in Mold mode for the same reason: there Delete means "remove the
             // selected pin/sprue/vent" (see MoldController.HandleKeys), and letting both fire
             // would take the model with it.
-            if (Gizmo != null && (Gizmo.Mode == GizmoMode.ZSphere || Gizmo.Mode == GizmoMode.Mold)) return;
+            // And in Lathe mode, where Delete removes the selected profile point.
+            if (Gizmo != null && (Gizmo.Mode == GizmoMode.ZSphere || Gizmo.Mode == GizmoMode.Mold ||
+                                  Gizmo.Mode == GizmoMode.Lathe)) return;
 
             if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
             if (_sceneGraphPanel == null) return;

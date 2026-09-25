@@ -6,7 +6,8 @@ using UnityEngine.Rendering.Universal;
 namespace Sculpting
 {
     /// Alt+left-drag orbits the camera around a pivot (mirrors the navigation scheme of most
-    /// sculpting apps); middle-drag pans; scroll zooms, unless the cursor is over the
+    /// sculpting apps); middle-drag or Alt+Shift+left-drag pans (the latter for styluses whose
+    /// barrel button is hard to find); scroll zooms, unless the cursor is over the
     /// sculptable surface (SculptController takes the wheel there to resize the brush instead)
     /// or over a UI panel (scrolling a panel's own scrollbar shouldn't also zoom the view
     /// underneath it). Ctrl+Alt+left-drag zooms too (drag-based alternative for stylus/trackpad
@@ -241,6 +242,7 @@ namespace Sculpting
             var kb = Keyboard.current;
             bool altHeld = kb != null && kb.leftAltKey.isPressed;
             bool ctrlHeld = kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
+            bool shiftHeld = kb != null && (kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed);
 
             UpdateSceneSize();
 
@@ -248,13 +250,15 @@ namespace Sculpting
             // both scale with it, and the near plane is set from it after this frame's move.
             float viewDepth = ViewDepth();
 
-            IsUserOrbiting = altHeld && !ctrlHeld && mouse.leftButton.isPressed;
+            bool altLeftDrag = altHeld && mouse.leftButton.isPressed;
+            bool altShiftPan = altLeftDrag && shiftHeld && !ctrlHeld;
+            IsUserOrbiting = altLeftDrag && !ctrlHeld && !shiftHeld;
 
-            if (altHeld && ctrlHeld && mouse.leftButton.isPressed)
+            if (altLeftDrag && ctrlHeld)
             {
                 Zoom(Mathf.Max(0.1f, 1f - delta.y * dragZoomSensitivity), viewDepth);
             }
-            else if (altHeld && mouse.leftButton.isPressed)
+            else if (IsUserOrbiting)
             {
                 // Orbiting is the one input that fights a running snap over the same two
                 // values, so it takes them over. Pan and zoom move the pivot and the distance
@@ -265,7 +269,7 @@ namespace Sculpting
                 _pitch = Mathf.Clamp(_pitch, -89f, 89f);
             }
 
-            if (mouse.middleButton.isPressed)
+            if (mouse.middleButton.isPressed || altShiftPan)
             {
                 // Grab-style: the surface at viewDepth tracks the cursor exactly. A fixed world
                 // step per pixel (the old 0.01, which matched this at the default ~10-unit

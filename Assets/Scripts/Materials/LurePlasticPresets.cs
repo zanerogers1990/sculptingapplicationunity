@@ -92,6 +92,31 @@ namespace Sculpting
                 FlakeDensity = 0.4f, FlakeSize = 0.013f, FlakeShape = 1f,
                 MicroColor = new Color(0.85f, 0.16f, 0.08f), MicroDensity = 0.35f, MicroSize = 0.0035f,
             },
+            new LurePlasticPreset
+            {
+                Id = "watermelon_red_flake", Name = "Watermelon Red Flake",
+                Description = "Pale translucent watermelon green with red and black flake.",
+                ThinColor = new Color(0.68f, 0.82f, 0.52f), ThickColor = new Color(0.36f, 0.49f, 0.27f),
+                Depth = 0.07f, Transmission = 1.0f,
+                FlakeA = new Color(0.95f, 0.35f, 0.35f, 0.6f),
+                FlakeB = new Color(0.03f, 0.04f, 0.03f, 0.4f),
+                FlakeC = new Color(0f, 0f, 0f, 0f),
+                // Between square and hex - the photo's flake reads as rough squarish chips.
+                FlakeDensity = 0.35f, FlakeSize = 0.013f, FlakeShape = 0.5f,
+                MicroColor = new Color(0.12f, 0.20f, 0.10f), MicroDensity = 0.08f, MicroSize = 0.004f,
+            },
+            new LurePlasticPreset
+            {
+                Id = "red_flake", Name = "Red Flake",
+                Description = "Red plastisol with gold, black and silver flake.",
+                ThinColor = new Color(0.95f, 0.28f, 0.20f), ThickColor = new Color(0.50f, 0.05f, 0.06f),
+                Depth = 0.06f, Transmission = 0.9f,
+                FlakeA = new Color(1.00f, 0.80f, 0.30f, 0.45f),
+                FlakeB = new Color(0.03f, 0.03f, 0.03f, 0.30f),
+                FlakeC = new Color(0.85f, 0.87f, 0.92f, 0.25f),
+                FlakeDensity = 0.5f, FlakeSize = 0.012f, FlakeShape = 0f,
+                MicroColor = new Color(0.30f, 0.02f, 0.03f), MicroDensity = 0.25f, MicroSize = 0.004f,
+            },
         };
 
         public static IReadOnlyList<LurePlasticPreset> All => _all;

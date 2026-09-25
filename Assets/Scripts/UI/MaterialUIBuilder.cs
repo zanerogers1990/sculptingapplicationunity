@@ -8,8 +8,8 @@ using Sculpting.IO;
 namespace Sculpting
 {
     /// Builds the "Material" section: base PBR sliders (color, metallic, smoothness, normal
-    /// detail), the screen-space cavity (Ridge/Valley), and the matcap palette, all wired
-    /// directly to SculptMaterialController.
+    /// detail), the screen-space cavity (Ridge/Valley), the Surface Shader presets (lure plastic,
+    /// aged metal, sculptor's clay) and the matcap palette, all wired directly to SculptMaterialController.
     ///
     /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
     /// with Studio Lighting and Presentation into one panel with three collapsible headers, and
@@ -84,98 +84,222 @@ namespace Sculpting
             UIFactory.CreateSlider(cavity, 0f, 2f, _material.CavityValley, v => _material.CavityValley = v,
                 "How much creases and recesses are darkened - 0 leaves them alone.");
 
-            BuildLureSection(UIFactory.CreateFoldoutSection(panel, "Lure Plastic", false));
+            BuildFinishSection(UIFactory.CreateFoldoutSection(panel, "Surface Shader", false));
             BuildMatcapSection(UIFactory.CreateFoldoutSection(panel, "Matcap", false));
         }
 
-        // ------------------------------------------------------------------ lure plastic
+        // ------------------------------------------------------------------ surface shader
 
-        private const float LureSwatchHeight = 60f;
+        private const float SwatchHeight = 60f;
+        private static readonly string[] FinishOptions = { "None (Base Color)", "Lure Plastic", "Metal", "Clay" };
 
-        private Toggle _lureToggle;
-        private Text _lureStatus;
-        private GameObject _lureMatcapNote;
+        private UIFactory.InlineDropdown _finishDropdown;
+        private Text _finishStatus;
+        private GameObject _finishMatcapNote;
+        private GameObject _lureGroup, _metalGroup, _clayGroup;
         private Slider _lureSizeSlider, _lureAmountSlider, _lureSparkleSlider, _lureTranslucencySlider, _lureGlossSlider;
+        private Slider _metalExposureSlider, _metalWearSlider, _metalWashSlider, _metalDetailSlider, _metalPatternSlider, _metalGlossSlider, _metalSeedSlider;
+        private Slider _clayGlossSlider, _clayWetSlider, _claySubsurfaceSlider, _clayRecessSlider, _clayDetailSlider, _clayGrainSlider;
         private readonly List<KeyValuePair<string, Image>> _lureButtons = new List<KeyValuePair<string, Image>>();
-        // What the lure controls last showed, so a scene load (which writes the controller
-        // directly) or a matcap toggle elsewhere gets reflected here.
-        private (bool, bool, string, float, float, float, float, float) _shownLureState;
+        private readonly List<KeyValuePair<string, Image>> _metalButtons = new List<KeyValuePair<string, Image>>();
+        private readonly List<KeyValuePair<string, Image>> _clayButtons = new List<KeyValuePair<string, Image>>();
+        // What the section last showed, so a scene load (which writes the controller directly)
+        // or a matcap toggle elsewhere gets reflected here. Value tuples rather than a formatted
+        // string: this is compared every frame.
+        private ((bool, SurfaceFinish, string, string, string), (float, float, float, float, float),
+                 (float, float, float, float, float, float, float), (float, float, float, float, float, float)) _shownFinishState;
 
-        private void BuildLureSection(Transform section)
+        /// One section for every shader that replaces plain Base Color shading, grouped by
+        /// category in a dropdown: pick the category, then a swatch within it.
+        private void BuildFinishSection(Transform section)
         {
-            // A matcap replaces lighting outright, and lure plastic is all lighting - so while a
-            // matcap is on the plastic can't show. Said here, with the way out one click away,
+            // A matcap replaces lighting outright, and every finish here is lighting - so while a
+            // matcap is on none of them can show. Said here, with the way out one click away,
             // rather than switching matcap off behind the user's back.
-            var note = new GameObject("LureMatcapNote", typeof(RectTransform));
-            note.transform.SetParent(section, false);
-            var noteLayout = note.AddComponent<VerticalLayoutGroup>();
-            noteLayout.spacing = 4;
-            noteLayout.childControlWidth = true;
-            noteLayout.childControlHeight = true;
-            noteLayout.childForceExpandWidth = true;
-            noteLayout.childForceExpandHeight = false;
-            Text noteText = UIFactory.CreateLabel(note.transform, "Matcap is on - it hides lure plastic.", 11, FontStyle.Italic);
+            _finishMatcapNote = CreateGroup(section, "FinishMatcapNote");
+            Text noteText = UIFactory.CreateLabel(_finishMatcapNote.transform, "Matcap is on - it hides these shaders.", 11, FontStyle.Italic);
             noteText.color = ErrorColor;
-            UIFactory.CreateButton(note.transform, "Turn Off Matcap", () =>
+            UIFactory.CreateButton(_finishMatcapNote.transform, "Turn Off Matcap", () =>
             {
                 _material.MatcapEnabled = false;
                 RefreshMatcapUi();
-                RefreshLureUi();
-            }, "Switch matcap off so the scene lights - and the lure plastic - show.");
-            _lureMatcapNote = note;
+                RefreshFinishUi();
+            }, "Switch matcap off so the scene lights - and the surface shader - show.");
 
-            _lureToggle = UIFactory.CreateToggle(section, "Enabled", _material.LureEnabled, v =>
+            _finishDropdown = UIFactory.CreateDropdown(section, FinishOptions, (int)_material.Finish, i =>
             {
-                _material.LureEnabled = v;
-                RefreshLureUi();
-            }, tooltip: "Soft-plastic lure look: translucent coloured plastic with glitter flakes. Replaces Base Color, Metallic and Smoothness while on.");
+                _material.Finish = (SurfaceFinish)i;
+                RefreshFinishUi();
+            }, "Shader category. Lure Plastic is translucent soft plastic with glitter; Metal is rust, patina, washes and antiqued metals; Clay is sculptor's oil clay - grey plasteline, terracotta and more.");
 
-            _lureStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
+            _finishStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
 
-            _lureButtons.Clear();
-            IReadOnlyList<LurePlasticPreset> presets = LurePlasticPresets.All;
-            Transform row = null;
-            for (int i = 0; i < presets.Count; i++)
-            {
-                if (i % 2 == 0) row = UIFactory.CreateRow(section, LureSwatchHeight).transform;
-                _lureButtons.Add(new KeyValuePair<string, Image>(presets[i].Id, CreateLureButton(row, presets[i])));
-            }
-            if (presets.Count % 2 == 1)
-                new GameObject("Spacer", typeof(RectTransform)).transform.SetParent(row, false);
-
-            UIFactory.CreateLabel(section, "Flake Size", 12, FontStyle.Normal);
-            _lureSizeSlider = UIFactory.CreateSlider(section, 0.25f, 3f, _material.LureFlakeSize, v => _material.LureFlakeSize = v,
-                "Size of the glitter - 1 is the preset's own size.");
-            UIFactory.CreateLabel(section, "Flake Amount", 12, FontStyle.Normal);
-            _lureAmountSlider = UIFactory.CreateSlider(section, 0f, 2f, _material.LureFlakeAmount, v => _material.LureFlakeAmount = v,
-                "How much glitter is packed into the plastic - 0 is clear plastic, 1 is the preset.");
-            UIFactory.CreateLabel(section, "Sparkle", 12, FontStyle.Normal);
-            _lureSparkleSlider = UIFactory.CreateSlider(section, 0f, 3f, _material.LureSparkle, v => _material.LureSparkle = v,
-                "How brightly each flake flashes when it catches a light.");
-            UIFactory.CreateLabel(section, "Translucency", 12, FontStyle.Normal);
-            _lureTranslucencySlider = UIFactory.CreateSlider(section, 0.25f, 3f, _material.LureTranslucency, v => _material.LureTranslucency = v,
-                "How far light gets into the plastic - higher lets thick parts show the lighter edge colour and deeper flakes.");
-            UIFactory.CreateLabel(section, "Gloss", 12, FontStyle.Normal);
-            _lureGlossSlider = UIFactory.CreateSlider(section, 0f, 1f, _material.LureGloss, v => _material.LureGloss = v,
-                "Wetness of the plastic's surface - low is matte, high is a sharp shine.");
-
-            RefreshLureUi();
+            BuildLureGroup(section);
+            BuildMetalGroup(section);
+            BuildClayGroup(section);
+            RefreshFinishUi();
         }
 
-        private Image CreateLureButton(Transform parent, LurePlasticPreset preset)
+        private void BuildLureGroup(Transform section)
         {
-            var go = new GameObject("Lure_" + preset.Id, typeof(RectTransform), typeof(Image));
+            _lureGroup = CreateGroup(section, "LurePlastic");
+            Transform group = _lureGroup.transform;
+
+            _lureButtons.Clear();
+            foreach (LurePlasticPreset preset in LurePlasticPresets.All)
+                _lureButtons.Add(new KeyValuePair<string, Image>(preset.Id, null));
+            BuildSwatchGrid(group, LurePlasticPresets.All.Count, i =>
+            {
+                LurePlasticPreset p = LurePlasticPresets.All[i];
+                Image frame = CreateSwatchButton(p.Id, p.Name, p.Description, LurePlasticPresets.CreateThumbnail(p), () =>
+                {
+                    _material.SelectLurePreset(p.Id);
+                    RefreshFinishUi();
+                });
+                _lureButtons[i] = new KeyValuePair<string, Image>(p.Id, frame);
+                return frame.transform;
+            });
+
+            UIFactory.CreateLabel(group, "Flake Size", 12, FontStyle.Normal);
+            _lureSizeSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.LureFlakeSize, v => _material.LureFlakeSize = v,
+                "Size of the glitter - 1 is the preset's own size.");
+            UIFactory.CreateLabel(group, "Flake Amount", 12, FontStyle.Normal);
+            _lureAmountSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.LureFlakeAmount, v => _material.LureFlakeAmount = v,
+                "How much glitter is packed into the plastic - 0 is clear plastic, 1 is the preset.");
+            UIFactory.CreateLabel(group, "Sparkle", 12, FontStyle.Normal);
+            _lureSparkleSlider = UIFactory.CreateSlider(group, 0f, 3f, _material.LureSparkle, v => _material.LureSparkle = v,
+                "How brightly each flake flashes when it catches a light.");
+            UIFactory.CreateLabel(group, "Translucency", 12, FontStyle.Normal);
+            _lureTranslucencySlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.LureTranslucency, v => _material.LureTranslucency = v,
+                "How far light gets into the plastic - higher lets thick parts show the lighter edge colour and deeper flakes.");
+            UIFactory.CreateLabel(group, "Gloss", 12, FontStyle.Normal);
+            _lureGlossSlider = UIFactory.CreateSlider(group, 0f, 1f, _material.LureGloss, v => _material.LureGloss = v,
+                "Wetness of the plastic's surface - low is matte, high is a sharp shine.");
+        }
+
+        private void BuildMetalGroup(Transform section)
+        {
+            _metalGroup = CreateGroup(section, "Metal");
+            Transform group = _metalGroup.transform;
+
+            _metalButtons.Clear();
+            foreach (MetalFinishPreset preset in MetalFinishPresets.All)
+                _metalButtons.Add(new KeyValuePair<string, Image>(preset.Id, null));
+            BuildSwatchGrid(group, MetalFinishPresets.All.Count, i =>
+            {
+                MetalFinishPreset p = MetalFinishPresets.All[i];
+                Image frame = CreateSwatchButton(p.Id, p.Name, p.Description, MetalFinishPresets.CreateThumbnail(p), () =>
+                {
+                    _material.SelectMetalPreset(p.Id);
+                    RefreshFinishUi();
+                });
+                _metalButtons[i] = new KeyValuePair<string, Image>(p.Id, frame);
+                return frame.transform;
+            });
+
+            UIFactory.CreateLabel(group, "Exposed Metal", 12, FontStyle.Normal);
+            _metalExposureSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.MetalExposure, v => _material.MetalExposure = v,
+                "How much bare metal shows through the rust / patina / paint in blotches - 1 is the preset, 0 is almost fully coated, 2 mostly bare.");
+            UIFactory.CreateLabel(group, "Edge Wear", 12, FontStyle.Normal);
+            _metalWearSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.MetalEdgeWear, v => _material.MetalEdgeWear = v,
+                "How far raised edges and high points are worn or dry-brushed back to bright metal.");
+            UIFactory.CreateLabel(group, "Wash", 12, FontStyle.Normal);
+            _metalWashSlider = UIFactory.CreateSlider(group, 0f, 1.5f, _material.MetalWash, v => _material.MetalWash = v,
+                "How dark the wash pooled in the recesses is - 0 leaves recesses the coat colour.");
+            UIFactory.CreateLabel(group, "Detail Contrast", 12, FontStyle.Normal);
+            _metalDetailSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.MetalDetail, v => _material.MetalDetail = v,
+                "How strongly the carving drives wash and wear - low keeps them to the sharpest grooves and edges, high spreads them over gentler relief.");
+            UIFactory.CreateLabel(group, "Pattern Size", 12, FontStyle.Normal);
+            _metalPatternSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.MetalPatternSize, v => _material.MetalPatternSize = v,
+                "Size of the coat's patches and grain - 1 is the preset's own size.");
+            UIFactory.CreateLabel(group, "Pattern Shift", 12, FontStyle.Normal);
+            _metalSeedSlider = UIFactory.CreateSlider(group, 0f, 1f, _material.MetalPatternSeed, v => _material.MetalPatternSeed = v,
+                "Moves the blotches around the model - drag to slide them, or Shuffle for a new layout.");
+            UIFactory.CreateButton(group, "Shuffle Pattern", () =>
+            {
+                _material.ShuffleMetalPattern();
+                RefreshFinishUi();
+            }, "Jump to a random blotch layout.");
+            UIFactory.CreateLabel(group, "Gloss", 12, FontStyle.Normal);
+            _metalGlossSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.MetalGloss, v => _material.MetalGloss = v,
+                "Shine of the metal and coat - 1 is the preset, 0 is fully matte.");
+        }
+
+        private void BuildClayGroup(Transform section)
+        {
+            _clayGroup = CreateGroup(section, "Clay");
+            Transform group = _clayGroup.transform;
+
+            _clayButtons.Clear();
+            foreach (ClayPreset preset in ClayPresets.All)
+                _clayButtons.Add(new KeyValuePair<string, Image>(preset.Id, null));
+            BuildSwatchGrid(group, ClayPresets.All.Count, i =>
+            {
+                ClayPreset p = ClayPresets.All[i];
+                Image frame = CreateSwatchButton(p.Id, p.Name, p.Description, ClayPresets.CreateThumbnail(p), () =>
+                {
+                    _material.SelectClayPreset(p.Id);
+                    RefreshFinishUi();
+                });
+                _clayButtons[i] = new KeyValuePair<string, Image>(p.Id, frame);
+                return frame.transform;
+            });
+
+            UIFactory.CreateLabel(group, "Sheen", 12, FontStyle.Normal);
+            _clayGlossSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.ClayGloss, v => _material.ClayGloss = v,
+                "The clay's satin sheen - 1 is the preset, 0 is dry and chalky, 2 polished.");
+            UIFactory.CreateLabel(group, "Wet Highlights", 12, FontStyle.Normal);
+            _clayWetSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.ClayWetness, v => _material.ClayWetness = v,
+                "The sharp greasy glints worked oil clay gets along every stroke - 0 turns them off.");
+            UIFactory.CreateLabel(group, "Subsurface Glow", 12, FontStyle.Normal);
+            _claySubsurfaceSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.ClaySubsurface, v => _material.ClaySubsurface = v,
+                "Warm light bleeding just past the shadow edge, as light does inside real clay - strongest on the terracottas.");
+            UIFactory.CreateLabel(group, "Recess Depth", 12, FontStyle.Normal);
+            _clayRecessSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.ClayRecess, v => _material.ClayRecess = v,
+                "How dark and rich the creases and folds go - 0 keeps one flat colour.");
+            UIFactory.CreateLabel(group, "Detail Contrast", 12, FontStyle.Normal);
+            _clayDetailSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.ClayDetail, v => _material.ClayDetail = v,
+                "How much relief counts as a recess - low keeps the dark colour to the deepest creases, high spreads it over gentle forms.");
+            UIFactory.CreateLabel(group, "Grain", 12, FontStyle.Normal);
+            _clayGrainSlider = UIFactory.CreateSlider(group, 0f, 3f, _material.ClayGrain, v => _material.ClayGrain = v,
+                "Fine grit in the clay's surface, shading only - 0 is perfectly smooth.");
+        }
+
+        private static GameObject CreateGroup(Transform parent, string name)
+        {
+            var go = new GameObject(name, typeof(RectTransform));
             go.transform.SetParent(parent, false);
+            var layout = go.AddComponent<VerticalLayoutGroup>();
+            layout.spacing = 4;
+            layout.childControlWidth = true;
+            layout.childControlHeight = true;
+            layout.childForceExpandWidth = true;
+            layout.childForceExpandHeight = false;
+            return go;
+        }
+
+        /// Two swatches per row; `create(i)` builds swatch i (unparented) and returns it.
+        private static void BuildSwatchGrid(Transform parent, int count, Func<int, Transform> create)
+        {
+            Transform row = null;
+            for (int i = 0; i < count; i++)
+            {
+                if (i % 2 == 0) row = UIFactory.CreateRow(parent, SwatchHeight).transform;
+                create(i).SetParent(row, false);
+            }
+            if (count % 2 == 1)
+                new GameObject("Spacer", typeof(RectTransform)).transform.SetParent(row, false);
+        }
+
+        private static Image CreateSwatchButton(string id, string name, string description, Texture2D thumb, Action onClick)
+        {
+            var go = new GameObject("Swatch_" + id, typeof(RectTransform), typeof(Image));
             var frame = go.GetComponent<Image>();
             frame.color = UIFactory.InactiveColor;
             var button = go.AddComponent<Button>();
             button.targetGraphic = frame;
-            button.onClick.AddListener(() =>
-            {
-                _material.SelectLurePreset(preset.Id);
-                RefreshLureUi();
-            });
-            TooltipSystem.Attach(go, preset.Description);
+            button.onClick.AddListener(() => onClick());
+            TooltipSystem.Attach(go, description);
 
             var iconGO = new GameObject("Icon", typeof(RectTransform), typeof(Image));
             iconGO.transform.SetParent(go.transform, false);
@@ -183,8 +307,7 @@ namespace Sculpting
             iconRect.anchorMin = iconRect.anchorMax = new Vector2(0f, 0.5f);
             iconRect.pivot = new Vector2(0f, 0.5f);
             iconRect.anchoredPosition = new Vector2(4f, 0f);
-            iconRect.sizeDelta = new Vector2(LureSwatchHeight - 8f, LureSwatchHeight - 8f);
-            Texture2D thumb = LurePlasticPresets.CreateThumbnail(preset);
+            iconRect.sizeDelta = new Vector2(SwatchHeight - 8f, SwatchHeight - 8f);
             iconGO.GetComponent<Image>().sprite =
                 Sprite.Create(thumb, new Rect(0, 0, thumb.width, thumb.height), new Vector2(0.5f, 0.5f));
 
@@ -193,7 +316,7 @@ namespace Sculpting
             var textRect = textGO.GetComponent<RectTransform>();
             textRect.anchorMin = Vector2.zero;
             textRect.anchorMax = Vector2.one;
-            textRect.offsetMin = new Vector2(LureSwatchHeight, 2f);
+            textRect.offsetMin = new Vector2(SwatchHeight, 2f);
             textRect.offsetMax = new Vector2(-3f, -2f);
             var text = textGO.AddComponent<Text>();
             text.font = UIFactory.Font;
@@ -201,55 +324,84 @@ namespace Sculpting
             text.alignment = TextAnchor.MiddleLeft;
             text.horizontalOverflow = HorizontalWrapMode.Wrap;
             text.color = Color.white;
-            text.text = preset.Name;
+            text.text = name;
             text.raycastTarget = false;
 
             return frame;
         }
 
-        // A value tuple rather than a formatted string: this is compared every frame.
-        private (bool, bool, string, float, float, float, float, float) LureStateSignature() =>
-            (_material.MatcapEnabled, _material.LureEnabled, _material.LurePresetId, _material.LureFlakeSize,
-             _material.LureFlakeAmount, _material.LureSparkle, _material.LureTranslucency, _material.LureGloss);
+        private ((bool, SurfaceFinish, string, string, string), (float, float, float, float, float),
+                 (float, float, float, float, float, float, float), (float, float, float, float, float, float)) FinishStateSignature() =>
+            ((_material.MatcapEnabled, _material.Finish, _material.LurePresetId, _material.MetalPresetId, _material.ClayPresetId),
+             (_material.LureFlakeSize, _material.LureFlakeAmount, _material.LureSparkle, _material.LureTranslucency, _material.LureGloss),
+             (_material.MetalExposure, _material.MetalEdgeWear, _material.MetalWash, _material.MetalDetail,
+              _material.MetalPatternSize, _material.MetalGloss, _material.MetalPatternSeed),
+             (_material.ClayGloss, _material.ClayWetness, _material.ClaySubsurface, _material.ClayRecess,
+              _material.ClayDetail, _material.ClayGrain));
 
-        private void RefreshLureUi()
+        private void RefreshFinishUi()
         {
-            if (_lureToggle == null) return;
-            _shownLureState = LureStateSignature();
+            if (_finishDropdown == null) return;
+            _shownFinishState = FinishStateSignature();
 
             bool matcapShowing = _material.MatcapEnabled && _material.HasMatcap;
-            if (_lureMatcapNote.activeSelf != matcapShowing) _lureMatcapNote.SetActive(matcapShowing);
+            if (_finishMatcapNote.activeSelf != matcapShowing) _finishMatcapNote.SetActive(matcapShowing);
 
-            _lureToggle.SetIsOnWithoutNotify(_material.LureEnabled);
+            SurfaceFinish finish = _material.Finish;
+            _finishDropdown.SetValueWithoutNotify((int)finish);
+            if (_lureGroup.activeSelf != (finish == SurfaceFinish.LurePlastic)) _lureGroup.SetActive(finish == SurfaceFinish.LurePlastic);
+            if (_metalGroup.activeSelf != (finish == SurfaceFinish.Metal)) _metalGroup.SetActive(finish == SurfaceFinish.Metal);
+            if (_clayGroup.activeSelf != (finish == SurfaceFinish.Clay)) _clayGroup.SetActive(finish == SurfaceFinish.Clay);
+
             _lureSizeSlider.SetValueWithoutNotify(_material.LureFlakeSize);
             _lureAmountSlider.SetValueWithoutNotify(_material.LureFlakeAmount);
             _lureSparkleSlider.SetValueWithoutNotify(_material.LureSparkle);
             _lureTranslucencySlider.SetValueWithoutNotify(_material.LureTranslucency);
             _lureGlossSlider.SetValueWithoutNotify(_material.LureGloss);
+            _metalExposureSlider.SetValueWithoutNotify(_material.MetalExposure);
+            _metalWearSlider.SetValueWithoutNotify(_material.MetalEdgeWear);
+            _metalWashSlider.SetValueWithoutNotify(_material.MetalWash);
+            _metalDetailSlider.SetValueWithoutNotify(_material.MetalDetail);
+            _metalPatternSlider.SetValueWithoutNotify(_material.MetalPatternSize);
+            _metalGlossSlider.SetValueWithoutNotify(_material.MetalGloss);
+            _metalSeedSlider.SetValueWithoutNotify(_material.MetalPatternSeed);
+            _clayGlossSlider.SetValueWithoutNotify(_material.ClayGloss);
+            _clayWetSlider.SetValueWithoutNotify(_material.ClayWetness);
+            _claySubsurfaceSlider.SetValueWithoutNotify(_material.ClaySubsurface);
+            _clayRecessSlider.SetValueWithoutNotify(_material.ClayRecess);
+            _clayDetailSlider.SetValueWithoutNotify(_material.ClayDetail);
+            _clayGrainSlider.SetValueWithoutNotify(_material.ClayGrain);
 
-            foreach (KeyValuePair<string, Image> pair in _lureButtons)
-            {
-                if (pair.Value == null) continue;
-                bool selected = _material.LureEnabled && pair.Key == _material.LurePresetId;
-                pair.Value.color = selected ? UIFactory.ActiveColor : UIFactory.InactiveColor;
-            }
+            HighlightSwatches(_lureButtons, finish == SurfaceFinish.LurePlastic ? _material.LurePresetId : null);
+            HighlightSwatches(_metalButtons, finish == SurfaceFinish.Metal ? _material.MetalPresetId : null);
+            HighlightSwatches(_clayButtons, finish == SurfaceFinish.Clay ? _material.ClayPresetId : null);
 
-            LurePlasticPreset preset = LurePlasticPresets.Find(_material.LurePresetId);
-            if (!_material.LureEnabled)
+            string presetName = finish == SurfaceFinish.LurePlastic ? LurePlasticPresets.Find(_material.LurePresetId)?.Name
+                              : finish == SurfaceFinish.Metal ? MetalFinishPresets.Find(_material.MetalPresetId)?.Name
+                              : finish == SurfaceFinish.Clay ? ClayPresets.Find(_material.ClayPresetId)?.Name
+                              : null;
+            if (finish == SurfaceFinish.None)
             {
-                _lureStatus.text = "Off - pick a colour below.";
-                _lureStatus.color = InfoColor;
+                _finishStatus.text = "Off - plain Base Color. Pick a category above.";
+                _finishStatus.color = InfoColor;
             }
             else if (matcapShowing)
             {
-                _lureStatus.text = (preset != null ? preset.Name : "Lure plastic") + " - hidden while matcap is on.";
-                _lureStatus.color = ErrorColor;
+                _finishStatus.text = (presetName ?? "Surface shader") + " - hidden while matcap is on.";
+                _finishStatus.color = ErrorColor;
             }
             else
             {
-                _lureStatus.text = (preset != null ? preset.Name : "Lure plastic") + " - replaces Base Color.";
-                _lureStatus.color = new Color(0.55f, 0.85f, 0.55f);
+                _finishStatus.text = (presetName ?? "Surface shader") + " - replaces Base Color.";
+                _finishStatus.color = new Color(0.55f, 0.85f, 0.55f);
             }
+        }
+
+        private static void HighlightSwatches(List<KeyValuePair<string, Image>> buttons, string selectedId)
+        {
+            foreach (KeyValuePair<string, Image> pair in buttons)
+                if (pair.Value != null)
+                    pair.Value.color = pair.Key == selectedId ? UIFactory.ActiveColor : UIFactory.InactiveColor;
         }
 
         private void BuildMatcapSection(Transform section)
@@ -397,10 +549,10 @@ namespace Sculpting
                 RefreshMatcapUi();
             }
 
-            // Same for lure plastic - and it also has to notice matcap going on or off, which
-            // decides whether the plastic can show at all.
-            if (_lureToggle != null && !LureStateSignature().Equals(_shownLureState))
-                RefreshLureUi();
+            // Same for the surface shaders - and they also have to notice matcap going on or off,
+            // which decides whether they can show at all.
+            if (_finishDropdown != null && !FinishStateSignature().Equals(_shownFinishState))
+                RefreshFinishUi();
 
             // The section starts collapsed, so the palette's GameObject starts inactive. Nothing
             // is decoded until it is first opened - opening it is the only signal available that

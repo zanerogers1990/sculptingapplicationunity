@@ -2,6 +2,9 @@ using UnityEngine;
 
 namespace Sculpting
 {
+    /// The Surface Shader categories that replace plain Base Color shading. At most one is on.
+    public enum SurfaceFinish { None, LurePlastic, Metal, Clay }
+
     /// Assigns a runtime instance of the Custom/SculptPBR shader to the sculpted mesh and
     /// exposes its parameters (base PBR sliders, a procedural normal-detail strength, matcap,
     /// and the screen-space cavity) so they're editable live from the Material UI panel
@@ -56,6 +59,40 @@ namespace Sculpting
         // lattice is scaled by it, so a live value would make the glitter crawl as the model is
         // sculpted. Serialized (hidden) so a mid-Play recompile keeps the same flakes.
         [SerializeField, HideInInspector] private float lureReferenceSize;
+
+        // Aged metal (see MetalFinishPresets / SculptPBR's MetalShade): rust, patina, washes and
+        // antiqued metals. Another Surface Shader category next to lure plastic - at most one
+        // category is on. Sliders are adjustments on top of the preset (1 = as the preset has it),
+        // same as the lure's.
+        [SerializeField] private bool metalEnabled = false;
+        [SerializeField] private string metalPresetId = "rust";
+        // How much bare metal shows through the coat in blotches - 1 is the preset, higher more.
+        [SerializeField, Range(0f, 2f)] private float metalExposure = 1f;
+        [SerializeField, Range(0f, 2f)] private float metalEdgeWear = 1f;
+        [SerializeField, Range(0f, 1.5f)] private float metalWash = 1f;
+        [SerializeField, Range(0.25f, 3f)] private float metalDetail = 1f;
+        [SerializeField, Range(0.25f, 3f)] private float metalPatternSize = 1f;
+        [SerializeField, Range(0f, 2f)] private float metalGloss = 1f;
+        // Where the blotches fall: a position along a path through the patch noise. Sliding it
+        // drifts the blotches across the model; Shuffle jumps it somewhere random.
+        [SerializeField, Range(0f, 1f)] private float metalPatternSeed = 0f;
+        // Same frozen-at-pick model size as lureReferenceSize, for the same reason: the coat's
+        // patches and grain scale with it, and a live value would crawl while sculpting.
+        [SerializeField, HideInInspector] private float metalReferenceSize;
+
+        // Sculptor's clay (see ClayPresets / SculptPBR's ClayShade): grey plasteline, terracotta
+        // and friends - the third Surface Shader category, exclusive with the other two. Sliders
+        // are adjustments on top of the preset (1 = as the preset has it).
+        [SerializeField] private bool clayEnabled = false;
+        [SerializeField] private string clayPresetId = "terracotta";
+        [SerializeField, Range(0f, 2f)] private float clayGloss = 1f;
+        [SerializeField, Range(0f, 2f)] private float clayWetness = 1f;
+        [SerializeField, Range(0f, 2f)] private float claySubsurface = 1f;
+        [SerializeField, Range(0f, 2f)] private float clayRecess = 1f;
+        [SerializeField, Range(0.25f, 3f)] private float clayDetail = 1f;
+        [SerializeField, Range(0f, 3f)] private float clayGrain = 1f;
+        // Frozen-at-pick model size, as metalReferenceSize: the grain and mottling scale with it.
+        [SerializeField, HideInInspector] private float clayReferenceSize;
 
         private Material _material;
         [System.NonSerialized] private Texture2D _matcapTexture;
@@ -121,6 +158,7 @@ namespace Sculpting
             set
             {
                 lureEnabled = value && LurePlasticPresets.Find(lurePresetId) != null;
+                if (lureEnabled) { metalEnabled = false; clayEnabled = false; }
                 if (lureEnabled && lureReferenceSize <= 0f) lureReferenceSize = MeasureReferenceSize();
                 Push();
             }
@@ -146,8 +184,136 @@ namespace Sculpting
             if (LurePlasticPresets.Find(id) == null) return;
             lurePresetId = id;
             lureEnabled = true;
+            metalEnabled = false;
+            clayEnabled = false;
             lureReferenceSize = MeasureReferenceSize();
             Push();
+        }
+
+        public bool MetalEnabled
+        {
+            get => metalEnabled;
+            set
+            {
+                metalEnabled = value && MetalFinishPresets.Find(metalPresetId) != null;
+                if (metalEnabled) { lureEnabled = false; clayEnabled = false; }
+                if (metalEnabled && metalReferenceSize <= 0f) metalReferenceSize = MeasureReferenceSize();
+                Push();
+            }
+        }
+
+        /// Id of the selected MetalFinishPreset; an unknown one switches the finish off.
+        public string MetalPresetId
+        {
+            get => metalPresetId;
+            set
+            {
+                metalPresetId = value ?? string.Empty;
+                if (MetalFinishPresets.Find(metalPresetId) == null) metalEnabled = false;
+                Push();
+            }
+        }
+
+        /// Picks a metal finish and turns it on - a palette click. Re-measures the model, like
+        /// SelectLurePreset.
+        public void SelectMetalPreset(string id)
+        {
+            if (MetalFinishPresets.Find(id) == null) return;
+            metalPresetId = id;
+            metalEnabled = true;
+            lureEnabled = false;
+            clayEnabled = false;
+            metalReferenceSize = MeasureReferenceSize();
+            Push();
+        }
+
+        public float MetalExposure { get => metalExposure; set { metalExposure = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float MetalEdgeWear { get => metalEdgeWear; set { metalEdgeWear = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float MetalWash { get => metalWash; set { metalWash = Mathf.Clamp(value, 0f, 1.5f); Push(); } }
+        public float MetalDetail { get => metalDetail; set { metalDetail = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
+        public float MetalPatternSize { get => metalPatternSize; set { metalPatternSize = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
+        public float MetalGloss { get => metalGloss; set { metalGloss = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float MetalPatternSeed { get => metalPatternSeed; set { metalPatternSeed = Mathf.Clamp01(value); Push(); } }
+
+        /// A random blotch layout - the Shuffle button.
+        public void ShuffleMetalPattern() => MetalPatternSeed = Random.value;
+
+        /// See metalReferenceSize; settable for the .sculpt loader, 0 means "measure it".
+        public float MetalReferenceSize
+        {
+            get => metalReferenceSize;
+            set { metalReferenceSize = Mathf.Max(0f, value); Push(); }
+        }
+
+        public bool ClayEnabled
+        {
+            get => clayEnabled;
+            set
+            {
+                clayEnabled = value && ClayPresets.Find(clayPresetId) != null;
+                if (clayEnabled) { lureEnabled = false; metalEnabled = false; }
+                if (clayEnabled && clayReferenceSize <= 0f) clayReferenceSize = MeasureReferenceSize();
+                Push();
+            }
+        }
+
+        /// Id of the selected ClayPreset; an unknown one switches the finish off.
+        public string ClayPresetId
+        {
+            get => clayPresetId;
+            set
+            {
+                clayPresetId = value ?? string.Empty;
+                if (ClayPresets.Find(clayPresetId) == null) clayEnabled = false;
+                Push();
+            }
+        }
+
+        /// Picks a clay and turns it on - a palette click. Re-measures the model, like
+        /// SelectLurePreset.
+        public void SelectClayPreset(string id)
+        {
+            if (ClayPresets.Find(id) == null) return;
+            clayPresetId = id;
+            clayEnabled = true;
+            lureEnabled = false;
+            metalEnabled = false;
+            clayReferenceSize = MeasureReferenceSize();
+            Push();
+        }
+
+        public float ClayGloss { get => clayGloss; set { clayGloss = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float ClayWetness { get => clayWetness; set { clayWetness = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float ClaySubsurface { get => claySubsurface; set { claySubsurface = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float ClayRecess { get => clayRecess; set { clayRecess = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float ClayDetail { get => clayDetail; set { clayDetail = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
+        public float ClayGrain { get => clayGrain; set { clayGrain = Mathf.Clamp(value, 0f, 3f); Push(); } }
+
+        /// See clayReferenceSize; settable for the .sculpt loader, 0 means "measure it".
+        public float ClayReferenceSize
+        {
+            get => clayReferenceSize;
+            set { clayReferenceSize = Mathf.Max(0f, value); Push(); }
+        }
+
+        /// Which Surface Shader category is on - the Material panel's dropdown. Choosing a
+        /// category turns on its last-picked preset.
+        public SurfaceFinish Finish
+        {
+            get => lureEnabled ? SurfaceFinish.LurePlastic
+                 : metalEnabled ? SurfaceFinish.Metal
+                 : clayEnabled ? SurfaceFinish.Clay
+                 : SurfaceFinish.None;
+            set
+            {
+                switch (value)
+                {
+                    case SurfaceFinish.LurePlastic: LureEnabled = true; break;
+                    case SurfaceFinish.Metal: MetalEnabled = true; break;
+                    case SurfaceFinish.Clay: ClayEnabled = true; break;
+                    default: lureEnabled = false; metalEnabled = false; clayEnabled = false; Push(); break;
+                }
+            }
         }
 
         public float LureFlakeSize { get => lureFlakeSize; set { lureFlakeSize = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
@@ -288,7 +454,77 @@ namespace Sculpting
             _material.SetFloat("_MatcapTintStrength", matcapTintStrength);
 
             PushLurePlastic(useMatcap);
+            PushMetal();
+            PushClay();
         }
+
+        private void PushClay()
+        {
+            ClayPreset preset = ClayPresets.Find(clayPresetId);
+            bool on = clayEnabled && preset != null;
+            _material.SetFloat("_ClayEnabled", on ? 1f : 0f);
+            if (!on) return;
+
+            if (clayReferenceSize <= 0f) clayReferenceSize = MeasureReferenceSize();
+            float size = clayReferenceSize;
+            _material.SetColor("_ClayColor", preset.Color);
+            _material.SetColor("_ClayRecessColor", preset.RecessColor);
+            _material.SetColor("_ClayScatterColor", preset.ScatterColor);
+            _material.SetFloat("_ClaySmoothness", Mathf.Clamp01(preset.Smoothness * clayGloss));
+            // Gloss also takes the wet film with it: a matte clay has no wet shine either.
+            _material.SetFloat("_ClayWetness", preset.Wetness * clayWetness * Mathf.Min(clayGloss, 1f));
+            _material.SetFloat("_ClayWetPower", preset.WetSharpness);
+            _material.SetFloat("_ClaySubsurface", preset.Subsurface * claySubsurface);
+            _material.SetFloat("_ClayRecess", preset.RecessDepth * clayRecess);
+            _material.SetFloat("_ClayRidge", preset.RidgeBurnish);
+            _material.SetFloat("_ClayMottle", preset.Mottle);
+            _material.SetFloat("_ClayMottleSize", preset.MottleSize * size);
+            _material.SetFloat("_ClayGrain", preset.Grain * clayGrain);
+            _material.SetFloat("_ClayGrainSize", preset.GrainSize * size);
+            _material.SetFloat("_ClayDetail", clayDetail);
+        }
+
+        private void PushMetal()
+        {
+            MetalFinishPreset preset = MetalFinishPresets.Find(metalPresetId);
+            bool on = metalEnabled && preset != null;
+            _material.SetFloat("_MetalEnabled", on ? 1f : 0f);
+            if (!on) return;
+
+            if (metalReferenceSize <= 0f) metalReferenceSize = MeasureReferenceSize();
+            float size = metalReferenceSize;
+            _material.SetColor("_MetalColor", preset.MetalColor);
+            _material.SetFloat("_MetalSmoothness", Mathf.Clamp01(preset.MetalSmoothness * metalGloss));
+            _material.SetFloat("_MetalMetallic", preset.MetalMetallic);
+            _material.SetColor("_CoatColorA", preset.CoatA);
+            _material.SetColor("_CoatColorB", preset.CoatB);
+            _material.SetFloat("_CoatMetallic", preset.CoatMetallic);
+            _material.SetFloat("_CoatSmoothness", Mathf.Clamp01(preset.CoatSmoothness * metalGloss));
+            _material.SetColor("_WashColor", preset.WashColor);
+            _material.SetFloat("_MetalWash", Mathf.Clamp01(preset.Wash * metalWash));
+            // Additive rather than a multiplier on the preset's coverage, so the slider has the same
+            // reach on a thinly coated finish (gold, 0.25) as on a heavily coated one (patina, 0.8).
+            _material.SetFloat("_MetalCoverage", preset.Coverage - (metalExposure - 1f) * ExposureReach);
+            _material.SetFloat("_MetalEdgeWear", preset.EdgeWear * metalEdgeWear);
+            _material.SetFloat("_MetalPatchSize", preset.PatchSize * size * metalPatternSize);
+            _material.SetFloat("_MetalPatchContrast", preset.PatchContrast);
+            _material.SetFloat("_MetalPatchAmount", preset.Patchiness);
+            _material.SetFloat("_MetalCoatCurvature", preset.FollowsRecesses);
+            _material.SetFloat("_MetalGrain", preset.Grain);
+            _material.SetFloat("_MetalGrainSize", preset.GrainSize * size * metalPatternSize);
+            _material.SetFloat("_MetalDetail", metalDetail);
+            _material.SetVector("_MetalPatternOffset", PatternPath * (metalPatternSeed * PatternPathLength));
+        }
+
+        // Coverage shift at each end of the Exposed Metal slider: enough to take any preset from
+        // almost fully coated to mostly bare.
+        private const float ExposureReach = 0.6f;
+        // The seed slider walks this far through the patch noise, in patch widths: plenty of
+        // distinct layouts end to end, while a small drag still moves the blotches a fraction of
+        // their size, so it reads as drifting rather than jumping. Off-axis, so the walk doesn't
+        // run along a row of the noise lattice.
+        private const float PatternPathLength = 40f;
+        private static readonly Vector4 PatternPath = new Vector3(0.53f, 0.29f, 0.80f).normalized;
 
         private void PushLurePlastic(bool matcapShowing)
         {

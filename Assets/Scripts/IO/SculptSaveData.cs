@@ -99,6 +99,31 @@ namespace Sculpting.IO
             public float lureTranslucency = 1f;
             public float lureGloss = 0.8f;
             public float lureReferenceSize;
+
+            // Aged metal finish by preset id (MetalFinishPresets), same scheme as the lure's.
+            // Older files have none of these and load with it off.
+            public bool metalEnabled;
+            public string metalPresetId = string.Empty;
+            public float metalExposure = 1f;
+            public float metalEdgeWear = 1f;
+            public float metalWash = 1f;
+            public float metalDetail = 1f;
+            public float metalPatternSize = 1f;
+            public float metalGloss = 1f;
+            public float metalPatternSeed;
+            public float metalReferenceSize;
+
+            // Sculptor's clay by preset id (ClayPresets), same scheme again. Older files have none
+            // of these and load with it off.
+            public bool clayEnabled;
+            public string clayPresetId = string.Empty;
+            public float clayGloss = 1f;
+            public float clayWetness = 1f;
+            public float claySubsurface = 1f;
+            public float clayRecess = 1f;
+            public float clayDetail = 1f;
+            public float clayGrain = 1f;
+            public float clayReferenceSize;
         }
 
         [Serializable]

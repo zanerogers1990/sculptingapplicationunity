@@ -19,6 +19,9 @@ namespace Sculpting
         /// Mold mode: MoldController owns the mouse for placing pins, sprues and vents on the
         /// parting surface, and pushes its own targets to the gizmo for dragging them (and the
         /// parting surface itself) around.
-        Mold
+        Mold,
+        /// Lathe mode: LatheController owns the mouse for shaping a profile curve that is revolved
+        /// into a solid, live, until Create bakes it into a sculptable object.
+        Lathe
     }
 }
