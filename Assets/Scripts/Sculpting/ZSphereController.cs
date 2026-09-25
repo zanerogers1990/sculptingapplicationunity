@@ -18,7 +18,7 @@ namespace Sculpting
     // Before the default order for the same reason as SculptController: CameraOrbitController
     // (order 0) reads IsHoveringNode to leave the wheel to the rig's resize.
     [DefaultExecutionOrder(-10)]
-    public partial class ZSphereController : MonoBehaviour, IGizmoTargetSource, IGizmoPointerClaim
+    public partial class ZSphereController : MonoBehaviour, IGizmoTargetSource, IGizmoPointerClaim, IMirrorPlaneExtentProvider
     {
         public const float MinNodeRadius = 0.005f;
         public const float MaxNodeRadius = 5f;
@@ -144,8 +144,12 @@ namespace Sculpting
             RefreshSkin();
         }
 
+        // Shares object mirror planes (see WorldExtentForPlaneAt).
+        private void OnEnable() => MirrorController.RegisterPlaneExtentProvider(this);
+
         private void OnDisable()
         {
+            MirrorController.UnregisterPlaneExtentProvider(this);
             IsHoveringNode = false;
             // Committed rather than dropped: the edit has already happened to the rig, and
             // throwing its snapshot away would leave it permanently un-undoable.

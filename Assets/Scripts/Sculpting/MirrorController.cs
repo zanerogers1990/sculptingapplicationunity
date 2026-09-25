@@ -3,6 +3,15 @@ using UnityEngine;
 
 namespace Sculpting
 {
+    /// Something other than the mesh that can share a mirror plane and wants the drawn plane big
+    /// enough to cover it - see MirrorController.RegisterPlaneExtentProvider.
+    public interface IMirrorPlaneExtentProvider
+    {
+        /// World-space half-size to cover for a mirror plane through `planeOrigin`, or 0 when
+        /// this provider does not share that plane.
+        float WorldExtentForPlaneAt(Vector3 planeOrigin);
+    }
+
     /// Adds up to three axes of local-space mirroring to sculpting brushes: each enabled
     /// axis reflects every brush stroke through the sculptable mesh's local origin, and
     /// any combination can be active at once (e.g. X+Y mirrors a stroke into all four
@@ -98,34 +107,46 @@ namespace Sculpting
             // rig suppresses its own quad when this one is up - see ZSphereController.
             // UpdateSymmetryPlane), and a blockout is routinely grown well past the sphere it was
             // started from. Sizing to the mesh alone left the plane as a small card floating
-            // inside a much larger rig, which is no more use than not drawing it.
-            float rigExtent = 0f;
-            ZSphereController zsphere = ZSphere;
-            if (zsphere != null)
+            // inside a much larger rig, which is no more use than not drawing it. The rig reaches
+            // this through the provider list rather than this class looking it up: a per-object
+            // component should not know about a tool.
+            float sharedWorld = 0f;
+            for (int i = 0; i < s_planeExtentProviders.Count; i++)
+                sharedWorld = Mathf.Max(sharedWorld, s_planeExtentProviders[i].WorldExtentForPlaneAt(transform.position));
+
+            float sharedExtent = 0f;
+            if (sharedWorld > 0f)
             {
-                float world = zsphere.WorldExtentForPlaneAt(transform.position);
-                if (world > 0f)
-                {
-                    // The rig measures in world units while this quad is a child of a transform
-                    // that may be scaled, and localScale is read in THAT transform's units.
-                    Vector3 s = transform.lossyScale;
-                    float scale = Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
-                    rigExtent = world / Mathf.Max(scale, 1e-6f);
-                }
+                // Providers measure in world units while this quad is a child of a transform
+                // that may be scaled, and localScale is read in THAT transform's units.
+                Vector3 s = transform.lossyScale;
+                float scale = Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z)));
+                sharedExtent = sharedWorld / Mathf.Max(scale, 1e-6f);
             }
 
-            float extent = Mathf.Max(meshExtent, rigExtent);
+            float extent = Mathf.Max(meshExtent, sharedExtent);
             if (extent <= 0f) return 2f;
             return Mathf.Max(0.01f, extent) * 2f * PlanePadding;
         }
 
-        // Resolved lazily and cached, the same idiom SculptController uses for its own scene
-        // lookups - PlaneSize runs per visible plane per frame, and FindFirstObjectByType on that
-        // path would be a scene scan for a reference that never changes. Re-resolves while null so
-        // a rig controller that appears later is still picked up.
-        private ZSphereController _zsphere;
-        private ZSphereController ZSphere =>
-            _zsphere != null ? _zsphere : (_zsphere = FindFirstObjectByType<ZSphereController>());
+        // Everything registered to share mirror planes - see IMirrorPlaneExtentProvider. Providers
+        // add themselves while enabled, so PlaneSize (per visible plane, per frame) walks a short
+        // list instead of scanning the scene. The old lazy FindFirstObjectByType re-ran that scan
+        // every frame in a scene with no rig controller at all, since it re-resolved while null.
+        private static readonly List<IMirrorPlaneExtentProvider> s_planeExtentProviders = new List<IMirrorPlaneExtentProvider>();
+
+        public static void RegisterPlaneExtentProvider(IMirrorPlaneExtentProvider provider)
+        {
+            if (provider != null && !s_planeExtentProviders.Contains(provider)) s_planeExtentProviders.Add(provider);
+        }
+
+        public static void UnregisterPlaneExtentProvider(IMirrorPlaneExtentProvider provider) =>
+            s_planeExtentProviders.Remove(provider);
+
+        // Enter Play Mode without a domain reload keeps statics; a provider from the last session
+        // would be a destroyed object.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetProviders() => s_planeExtentProviders.Clear();
 
         private Transform CreatePlane(string name, Color color, Quaternion localRotation)
         {
