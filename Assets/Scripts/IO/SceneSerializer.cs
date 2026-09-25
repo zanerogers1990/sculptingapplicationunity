@@ -16,7 +16,7 @@ namespace Sculpting.IO
     /// FORMAT (.sculpt) - a JSON header followed by raw binary geometry:
     ///
     ///     magic   "SCLPTSV\0"      8 bytes ASCII
-    ///     version int32            FormatVersion below
+    ///     version int32            1, or 2 when any object carries a hidden block (below)
     ///     jsonLen int32            byte length of the UTF8 JSON that follows
     ///     json    byte[jsonLen]    SculptSaveData (settings + per-object metadata)
     ///     then, per object, in the same order as SculptSaveData.objects:
@@ -24,6 +24,13 @@ namespace Sculpting.IO
     ///         normals   float32[vertexCount * 3]
     ///         triangles int32[triangleIndexCount]
     ///         mask      float32[vertexCount]        (only when entry.hasMask)
+    ///         hidden    uint8[triangleIndexCount/3] (only when entry.hasHidden; 1 = hidden)
+    ///
+    /// Why the version only moves for the hidden block: a build that predates it ignores the
+    /// unknown hasHidden JSON field, skips reading the block, and would then read every later
+    /// object's geometry out of the wrong bytes. Marking exactly those files v2 makes such a build
+    /// refuse them cleanly ("newer format"), while every file with nothing hidden stays v1 and
+    /// opens in either.
     ///
     /// The split is the point. Settings churn constantly and want JsonUtility's tolerance for
     /// added/removed fields; geometry never changes shape and would be ~10x larger and far
@@ -32,7 +39,10 @@ namespace Sculpting.IO
     /// calls, which matters at those sizes.
     public static class SceneSerializer
     {
-        private const int FormatVersion = 1;
+        /// The newest format this build reads - see the FORMAT remarks for when a file is
+        /// written as v2 rather than BaseFormatVersion.
+        private const int FormatVersion = 2;
+        private const int BaseFormatVersion = 1;
         private static readonly byte[] Magic = Encoding.ASCII.GetBytes("SCLPTSV\0");
 
         public const string FileExtension = ".sculpt";
@@ -46,9 +56,10 @@ namespace Sculpting.IO
         // ------------------------------------------------------------------------------ save
 
         /// Returns true on success. On failure `error` explains why and NOTHING has been written
-        /// over the target - the file is built in memory and only committed once every object
-        /// has been read successfully, so a mid-save failure can't leave a truncated file where
-        /// a good one used to be.
+        /// over the target: the file is built in memory, written in full to a temporary file
+        /// beside it, and only then swapped into place - so neither a failure while gathering the
+        /// objects nor one while writing (a full disk, a yanked drive) can leave a truncated file
+        /// where a good one used to be.
         public static bool Save(string path, out string error)
         {
             error = null;
@@ -67,7 +78,8 @@ namespace Sculpting.IO
 
                 // Geometry is staged here rather than streamed straight to disk, so a failure
                 // partway through leaves the existing file untouched (see remarks above).
-                var geometry = new List<byte[]>(meshes.Count * 4);
+                var geometry = new List<byte[]>(meshes.Count * 5);
+                int writeVersion = BaseFormatVersion;
 
                 foreach (SculptableMesh m in meshes)
                 {
@@ -124,6 +136,16 @@ namespace Sculpting.IO
                     geometry.Add(IntArrayToBytes(tris));
                     if (entry.hasMask) geometry.Add(FloatArrayToBytes(mask));
 
+                    // Box/lasso-hidden regions are part of the document too - without this a load
+                    // brought every hidden polygon back.
+                    bool[] hidden = m.HiddenTrianglesExact();
+                    entry.hasHidden = hidden != null && hidden.Length == tris.Length / 3;
+                    if (entry.hasHidden)
+                    {
+                        geometry.Add(BoolArrayToBytes(hidden));
+                        writeVersion = FormatVersion;
+                    }
+
                     data.objects.Add(entry);
                 }
 
@@ -134,14 +156,28 @@ namespace Sculpting.IO
                 string dir = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
-                using (var w = new BinaryWriter(fs))
+                string temp = path + ".tmp";
+                try
                 {
-                    w.Write(Magic);
-                    w.Write(FormatVersion);
-                    w.Write(json.Length);
-                    w.Write(json);
-                    foreach (byte[] block in geometry) w.Write(block);
+                    using (var fs = new FileStream(temp, FileMode.Create, FileAccess.Write))
+                    {
+                        using (var w = new BinaryWriter(fs, Encoding.UTF8, leaveOpen: true))
+                        {
+                            w.Write(Magic);
+                            w.Write(writeVersion);
+                            w.Write(json.Length);
+                            w.Write(json);
+                            foreach (byte[] block in geometry) w.Write(block);
+                        }
+                        // On disk, not just in the OS cache, before the swap below makes this the file.
+                        fs.Flush(flushToDisk: true);
+                    }
+                    CommitTempFile(temp, path);
+                }
+                finally
+                {
+                    // Only still there if something above failed - the original is untouched then.
+                    if (File.Exists(temp)) File.Delete(temp);
                 }
 
                 return true;
@@ -150,6 +186,27 @@ namespace Sculpting.IO
             {
                 error = e.Message;
                 return false;
+            }
+        }
+
+        /// Moves the fully written `temp` over `path`. File.Replace swaps it in as a single
+        /// rename, so at every moment `path` holds either the old file or the new one in full.
+        private static void CommitTempFile(string temp, string path)
+        {
+            if (!File.Exists(path))
+            {
+                File.Move(temp, path);
+                return;
+            }
+            try
+            {
+                File.Replace(temp, path, null);
+            }
+            catch (PlatformNotSupportedException)
+            {
+                // No atomic replace on this platform: the temp file is already complete on disk,
+                // so a copy over the target is still far safer than the old write-in-place.
+                File.Copy(temp, path, overwrite: true);
             }
         }
 
@@ -180,7 +237,7 @@ namespace Sculpting.IO
 
             var created = new List<SculptableMesh>(file.Meshes.Count);
             for (int i = 0; i < file.Data.objects.Count; i++)
-                created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Data.objects[i].name));
+                created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Hidden[i], file.Data.objects[i].name));
             RestoreMirrorLinks(file.Data.objects, created);
 
             ApplySettings(file.Data);
@@ -227,7 +284,7 @@ namespace Sculpting.IO
             {
                 string name = UniqueName(file.Data.objects[i].name, takenNames);
                 takenNames.Add(name);
-                created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], name));
+                created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Hidden[i], name));
             }
             RestoreMirrorLinks(file.Data.objects, created);
 
@@ -250,6 +307,7 @@ namespace Sculpting.IO
             public SculptSaveData Data;
             public List<Mesh> Meshes;
             public List<float[]> Masks;
+            public List<bool[]> Hidden;
         }
 
         private static bool ReadFile(string path, out ParsedFile file, out string error)
@@ -265,6 +323,7 @@ namespace Sculpting.IO
 
                 SculptSaveData data;
                 var masks = new List<float[]>();
+                var hidden = new List<bool[]>();
 
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
                 using (var r = new BinaryReader(fs))
@@ -290,6 +349,7 @@ namespace Sculpting.IO
                         Vector3[] normals = ReadVector3Array(r, entry.vertexCount);
                         int[] tris = ReadIntArray(r, entry.triangleIndexCount);
                         masks.Add(entry.hasMask ? ReadFloatArray(r, entry.vertexCount) : null);
+                        hidden.Add(entry.hasHidden ? ReadBoolArray(r, entry.triangleIndexCount / 3) : null);
 
                         var mesh = new Mesh { name = entry.name };
                         // Must be set before the vertex buffer is populated, and is required
@@ -303,7 +363,7 @@ namespace Sculpting.IO
                     }
                 }
 
-                file = new ParsedFile { Data = data, Meshes = meshes, Masks = masks };
+                file = new ParsedFile { Data = data, Meshes = meshes, Masks = masks, Hidden = hidden };
                 return true;
             }
             catch (EndOfStreamException)
@@ -388,7 +448,7 @@ namespace Sculpting.IO
 
         /// `name` is passed separately rather than read off `entry` because Import may have had
         /// to uniquify it against names already in the scene (see UniqueName).
-        private static SculptableMesh CreateObject(SculptSaveData.ObjectEntry entry, Mesh mesh, float[] mask, string name)
+        private static SculptableMesh CreateObject(SculptSaveData.ObjectEntry entry, Mesh mesh, float[] mask, bool[] hidden, string name)
         {
             SculptableMesh sculptable = CreateSculptable(mesh, name, entry.position, entry.rotation, entry.scale);
 
@@ -399,6 +459,7 @@ namespace Sculpting.IO
             mirror.ShowPlanes = entry.showMirrorPlanes;
 
             if (mask != null) sculptable.SetMask(mask);
+            if (hidden != null) sculptable.RestoreHiddenTriangles(hidden);
             if (!entry.visible) sculptable.SetVisible(false);
 
             return sculptable;
@@ -808,6 +869,13 @@ namespace Sculpting.IO
             return FloatArrayToBytes(floats);
         }
 
+        private static byte[] BoolArrayToBytes(bool[] a)
+        {
+            var bytes = new byte[a.Length];
+            for (int i = 0; i < a.Length; i++) bytes[i] = a[i] ? (byte)1 : (byte)0;
+            return bytes;
+        }
+
         private static byte[] FloatArrayToBytes(float[] a)
         {
             var bytes = new byte[a.Length * sizeof(float)];
@@ -830,6 +898,14 @@ namespace Sculpting.IO
             byte[] bytes = r.ReadBytes(byteCount);
             if (bytes.Length != byteCount) throw new EndOfStreamException();
             return bytes;
+        }
+
+        private static bool[] ReadBoolArray(BinaryReader r, int count)
+        {
+            byte[] bytes = ReadExactly(r, count);
+            var a = new bool[count];
+            for (int i = 0; i < count; i++) a[i] = bytes[i] != 0;
+            return a;
         }
 
         private static float[] ReadFloatArray(BinaryReader r, int count)

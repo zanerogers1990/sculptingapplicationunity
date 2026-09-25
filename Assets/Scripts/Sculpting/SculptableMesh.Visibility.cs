@@ -49,6 +49,23 @@ namespace Sculpting
         /// _workingTriangles holds - see Triangles.
         public int TriangleCount => _workingTriangles != null ? _cornerCount / 3 : 0;
 
+        /// The per-triangle hidden flags trimmed to the current triangle count, or null when
+        /// nothing is hidden - what a save file records (see SceneSerializer).
+        public bool[] HiddenTrianglesExact() =>
+            _anyHidden && _hiddenTriangles != null ? CloneExact(_hiddenTriangles, TriangleCount) : null;
+
+        /// Puts back hidden flags read from a save file, with NO undo entry - loading a scene is
+        /// not an edit, and the history it would join was just cleared (or, for an import, is
+        /// about other objects). Ignored when the flag count does not match this mesh's
+        /// triangle count, since flags for a different topology would hide the wrong polygons.
+        public void RestoreHiddenTriangles(bool[] hidden)
+        {
+            if (hidden == null || _workingTriangles == null || hidden.Length != TriangleCount) return;
+            EnsureVisibilityBuffer();
+            Array.Copy(hidden, _hiddenTriangles, hidden.Length);
+            RefreshVisibility();
+        }
+
         /// True if this vertex sits strictly inside a hidden region (see _hiddenVertices).
         public bool IsVertexHidden(int index) =>
             _anyHidden && _hiddenVertices != null && index >= 0 && index < _vertexCount && _hiddenVertices[index];

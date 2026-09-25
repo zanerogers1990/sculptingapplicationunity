@@ -53,6 +53,11 @@ namespace Sculpting.IO
             /// costs no mask block at all. Checked instead of inferring from vertexCount.
             public bool hasMask;
 
+            /// True when some of this object's triangles were box/lasso-hidden, in which case a
+            /// per-triangle hidden block follows its mask (see SceneSerializer's FORMAT remarks -
+            /// a file with any such block is written as format v2).
+            public bool hasHidden;
+
             /// Set only on the ORIGINAL half of a live mirror pair (see MirrorLink): the index into
             /// `objects` of its twin, and the plane the two mirror across. The twin's own entry
             /// records nothing, so a load can never form the same pair twice.

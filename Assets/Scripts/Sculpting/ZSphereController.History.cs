@@ -250,15 +250,12 @@ namespace Sculpting
             worldPoint = default;
             if (_attachTarget == null || !SnapToSurface) return false;
 
-            Collider collider = _attachTarget.GetComponent<Collider>();
-            if (collider == null) return false;
-
-            // The body may have been moved by the gizmo this frame, and the physics copy of its
-            // collider only catches up at the next physics step.
-            Physics.SyncTransforms();
-            if (!collider.Raycast(ray, out RaycastHit hit, 10000f)) return false;
-            worldPoint = hit.point;
-            return true;
+            // The mesh's own raycast, not its MeshCollider: the collider is deliberately never
+            // re-cooked while sculpting (see SculptableMesh.useMeshCollider's remarks), so it has the
+            // pre-sculpt shape and spheres snapped to a surface that was no longer there. This is
+            // the same live test the brushes use - current vertices, hidden regions skipped, and
+            // the transform read directly, so a gizmo move this frame needs no physics sync.
+            return _attachTarget.RaycastMesh(ray, 10000f, out worldPoint, out _);
         }
     }
 }
