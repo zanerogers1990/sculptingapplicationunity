@@ -24,10 +24,17 @@ namespace Sculpting
     /// Split across partial files by concern:
     ///   SculptController.cs           serialized settings, public API, lifecycle, selection sync,
     ///                                 and the brush dispatch in HandleSculptInput
-    ///   SculptController.Brushes.cs   each brush's input handler, stroke pacing and apply paths
+    ///   SculptController.Brushes.cs   shared brush plumbing: dirty set, effective strengths, the
+    ///                                 standard-brush dispatch, stroke-end commit
+    ///   SculptController.MirroredDabs.cs  the per-mirror-sign dab walk
+    ///   SculptController.{Clay, SurfaceRelax, Carve, Smooth, InflateFlatten, MovePose,
+    ///                     MaskPaint, StandardBrushes}.cs  one brush (family) each
+    ///   SculptController.Strokes.cs   distance-spaced dab pacing
+    ///   SculptController.DabProgram.cs  batched Clay/Crease dab programs
     ///   SculptController.Jobs.cs      Burst jobs, their shared math, and the native scratch
     ///   SculptController.Input.cs     hotkeys, gauges, pen pressure, Lazy Mouse, the brush cursor
-    ///   SculptController.Settings.cs  settings save/load, Reset/Remesh, symmetry repair, Export
+    ///   SculptController.MeshOps.cs   Reset/Remesh, symmetry repair, Export
+    ///   SculptController.Settings.cs  settings save/load
     public partial class SculptController : MonoBehaviour
     {
         [Header("References")]
