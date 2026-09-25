@@ -26,6 +26,25 @@ namespace Sculpting
             ReplaceGeometry(result.Vertices, result.Normals, result.Triangles, result.Bounds);
         }
 
+        /// Remesh as one undo step: a full snapshot first, so Z steps back to the pre-remesh
+        /// shape. What every user-facing Remesh wants; plain Remesh is for callers that manage
+        /// history themselves.
+        public void RemeshUndoable(int resolution)
+        {
+            SnapshotForUndo();
+            Remesh(resolution);
+        }
+
+        /// ReplaceMesh as one undo step: a full snapshot of the current geometry first, so Z
+        /// steps the object back to it. Every topology-changing tool (Trim, Boolean, Join, the
+        /// symmetry welds) wants exactly this pair; plain ReplaceMesh is for callers that manage
+        /// history themselves. Same ownership rules as ReplaceMesh.
+        public void ReplaceMeshUndoable(Mesh newMesh)
+        {
+            SnapshotForUndo();
+            ReplaceMesh(newMesh);
+        }
+
         /// Swaps in geometry the caller already holds as arrays, without a Mesh in between.
         ///
         /// This is what Remesh actually needs. Going through a Mesh meant the remesher wrote

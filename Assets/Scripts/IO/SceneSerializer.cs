@@ -420,33 +420,14 @@ namespace Sculpting.IO
             }
         }
 
-        /// Turns a bare Mesh into a fully live, sculptable scene object. Public because model
-        /// import (see ImportAny) needs the identical construction sequence, and getting that
-        /// sequence wrong fails in a confusing way rather than an obvious one.
+        /// Turns a bare Mesh into a fully live, sculptable scene object - see
+        /// SceneObjectFactory.Create, the construction sequence every creation path shares. Kept
+        /// as the serializer's own entry point for load and model import (see ImportAny).
         ///
         /// TAKES OWNERSHIP of `mesh` and destroys it once the object has copied it (see
         /// SculptableMesh.AddOwning) - pass a mesh built for this call, not one you keep using.
-        public static SculptableMesh CreateSculptable(Mesh mesh, string name, Vector3 position, Quaternion rotation, Vector3 scale)
-        {
-            var go = new GameObject(name);
-            go.transform.SetPositionAndRotation(position, rotation);
-            go.transform.localScale = scale;
-
-            // Order matters: SculptableMesh.Awake() reads meshFilter.sharedMesh and instantiates
-            // it, so the mesh has to be in place BEFORE the component is added (AddComponent
-            // runs Awake synchronously). Same sequencing PrimitiveSpawner relies on, which gets
-            // it for free from GameObject.CreatePrimitive.
-            go.AddComponent<MeshFilter>().sharedMesh = mesh;
-            go.AddComponent<MeshRenderer>();
-
-            var sculptable = SculptableMesh.AddOwning(go, mesh);
-            go.AddComponent<MirrorController>();
-
-            UnityEngine.Object.FindFirstObjectByType<SculptMaterialController>()
-                ?.ApplyTo(go.GetComponent<Renderer>());
-
-            return sculptable;
-        }
+        public static SculptableMesh CreateSculptable(Mesh mesh, string name, Vector3 position, Quaternion rotation, Vector3 scale) =>
+            SceneObjectFactory.Create(mesh, name, position, rotation, scale);
 
         // ------------------------------------------------------------------- model import
 

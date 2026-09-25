@@ -160,21 +160,12 @@ namespace Sculpting
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            var go = new GameObject(ObjectNaming.Unique(_previewSource.name + " Extract"),
-                                    typeof(MeshFilter), typeof(MeshRenderer));
             // Same transform as the source, because MeshExtractor works entirely in the source's
-            // local space - so the shell lands exactly where the preview showed it.
-            go.transform.SetPositionAndRotation(srcT.position, srcT.rotation);
-            go.transform.localScale = srcT.localScale;
-            go.GetComponent<MeshFilter>().sharedMesh = mesh;
-
-            // AddComponent runs SculptableMesh.Awake synchronously, so the object is fully built
-            // (working buffers, adjacency, blank mask) by the time this returns - the same
-            // guarantee PrimitiveSpawner/MeshMirror/MeshCloner all rely on.
-            SculptableMesh extracted = SculptableMesh.AddOwning(go, mesh);
-            go.AddComponent<MirrorController>();
-
-            FindFirstObjectByType<SculptMaterialController>()?.ApplyTo(go.GetComponent<Renderer>());
+            // local space - so the shell lands exactly where the preview showed it. The object is
+            // fully built (working buffers, adjacency, blank mask) by the time this returns - the
+            // same guarantee PrimitiveSpawner/MeshMirror/MeshCloner all rely on.
+            SculptableMesh extracted = SceneObjectFactory.Create(mesh, ObjectNaming.Unique(_previewSource.name + " Extract"),
+                srcT.position, srcT.rotation, srcT.localScale);
 
             EndPreview();
             Selection?.Select(extracted, false);

@@ -18,8 +18,7 @@ namespace Sculpting
         public void Remesh()
         {
             if (sculptableMesh == null) return;
-            sculptableMesh.SnapshotForUndo();
-            sculptableMesh.Remesh(remeshResolution);
+            sculptableMesh.RemeshUndoable(remeshResolution);
         }
 
         /// Live symmetry report for the selected object - pairs found, centreline size, and how

@@ -88,10 +88,9 @@ namespace Sculpting
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            // Same convention as every other topology-changing call site (Remesh, Join, Boolean):
-            // a full snapshot first, so Z steps the object back to its pre-trim shape.
-            target.SnapshotForUndo();
-            target.ReplaceMesh(mesh);
+            // One undo step, like every other topology-changing call site (Remesh, Join, Boolean):
+            // Z steps the object back to its pre-trim shape.
+            target.ReplaceMeshUndoable(mesh);
 
             // Reported as before -> after plus the cut face's own share, rather than as "removed
             // N": the face is filled at the density of the surface around it, so a big cut can

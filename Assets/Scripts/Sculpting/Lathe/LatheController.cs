@@ -542,13 +542,9 @@ namespace Sculpting
             }
 
             Mesh mesh = LatheMeshBuilder.ToMesh(result);
-            var go = new GameObject(ObjectNaming.Unique("Lathe"), typeof(MeshFilter), typeof(MeshRenderer));
-            go.transform.SetPositionAndRotation(_root.TransformPoint(new Vector3(0f, centreY, 0f)), Quaternion.identity);
-            go.GetComponent<MeshFilter>().sharedMesh = mesh;
-
-            SculptableMesh sculptable = SculptableMesh.AddOwning(go, mesh);
-            go.AddComponent<MirrorController>();
-            FindFirstObjectByType<SculptMaterialController>()?.ApplyTo(go.GetComponent<Renderer>());
+            SculptableMesh sculptable = SceneObjectFactory.Create(mesh, ObjectNaming.Unique("Lathe"),
+                _root.TransformPoint(new Vector3(0f, centreY, 0f)), Quaternion.identity, Vector3.one);
+            GameObject go = sculptable.gameObject;
 
             Selection?.Select(sculptable, false);
             // Straight into sculpting what was just made.

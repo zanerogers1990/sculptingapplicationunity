@@ -62,12 +62,11 @@ namespace Sculpting
             combined.CombineMeshes(instances.ToArray(), mergeSubMeshes: true, useMatrices: true);
             foreach (Mesh m in scratchMeshes) Object.Destroy(m);
 
-            // SnapshotForUndo before the topology-changing ReplaceMesh, same convention every
-            // other Remesh/Reset call site in this codebase follows - doesn't undo the whole
-            // Join (the other GameObjects are gone for good), but does let the survivor's
-            // existing Z/Shift+Z undo step back to its pre-join single-object shape.
-            survivor.SnapshotForUndo();
-            survivor.ReplaceMesh(combined);
+            // Undoable replace, same as every other Remesh/Reset call site in this codebase -
+            // doesn't undo the whole Join (the other GameObjects are gone for good), but does
+            // let the survivor's existing Z/Shift+Z undo step back to its pre-join single-object
+            // shape.
+            survivor.ReplaceMeshUndoable(combined);
 
             SelectionManager selection = Object.FindFirstObjectByType<SelectionManager>();
             for (int i = 1; i < objects.Count; i++)
@@ -82,8 +81,7 @@ namespace Sculpting
 
             if (remeshAfter && controller != null)
             {
-                survivor.SnapshotForUndo();
-                survivor.Remesh(controller.RemeshResolution);
+                survivor.RemeshUndoable(controller.RemeshResolution);
             }
 
             return survivor;

@@ -213,8 +213,6 @@ namespace Sculpting
                                              out keptTriangles, out discardedTriangles))
                 return false;
 
-            mesh.SnapshotForUndo();
-
             var rebuilt = new Mesh();
             // Same threshold the rest of this file uses - a 16-bit index buffer silently wraps
             // past 65k vertices instead of failing loudly.
@@ -224,7 +222,7 @@ namespace Sculpting
             rebuilt.RecalculateNormals();
             rebuilt.RecalculateBounds();
 
-            mesh.ReplaceMesh(rebuilt);
+            mesh.ReplaceMeshUndoable(rebuilt);
             vertexCount = newVerts.Length;
             return true;
         }
@@ -272,12 +270,11 @@ namespace Sculpting
 
             if (snappedCount == 0 && !didWeld) return true; // already clean - nothing committed
 
-            mesh.SnapshotForUndo();
-
             if (!didWeld)
             {
                 // Snapping alone moved geometry, so the mesh still has to be pushed even though
                 // no vertex was merged.
+                mesh.SnapshotForUndo();
                 System.Array.Copy(working, live, live.Length);
                 mesh.ApplyVertices();
                 return true;
@@ -294,7 +291,7 @@ namespace Sculpting
             welded.RecalculateNormals();
             welded.RecalculateBounds();
 
-            mesh.ReplaceMesh(welded);
+            mesh.ReplaceMeshUndoable(welded);
             return true;
         }
 

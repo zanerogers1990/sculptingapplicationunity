@@ -71,11 +71,7 @@ namespace Sculpting
             go.transform.position = spawnPos;
             go.transform.localScale = Vector3.one * size;
 
-            SculptableMesh sculptable = go.AddComponent<SculptableMesh>();
-            go.AddComponent<MirrorController>();
-
-            SculptMaterialController materialController = FindFirstObjectByType<SculptMaterialController>();
-            materialController?.ApplyTo(go.GetComponent<Renderer>());
+            SculptableMesh sculptable = SceneObjectFactory.MakeSculptableShared(go);
 
             Selection?.Select(sculptable, false);
             return sculptable;

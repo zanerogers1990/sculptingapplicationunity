@@ -43,16 +43,11 @@ namespace Sculpting
             else mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            var go = new GameObject(name, typeof(MeshFilter), typeof(MeshRenderer));
-            go.transform.SetPositionAndRotation(position, rotation);
-            go.transform.localScale = source.transform.localScale;
-            go.GetComponent<MeshFilter>().sharedMesh = mesh;
-
-            // AddComponent runs SculptableMesh.Awake synchronously, so everything below this
-            // line is operating on a fully built copy (see PrimitiveSpawner, which relies on the
-            // same guarantee).
-            SculptableMesh copy = SculptableMesh.AddOwning(go, mesh);
-            var copyMirror = go.AddComponent<MirrorController>();
+            // Fully built by the time this returns (AddComponent runs SculptableMesh.Awake
+            // synchronously), so everything below operates on a live copy (see PrimitiveSpawner,
+            // which relies on the same guarantee).
+            SculptableMesh copy = SceneObjectFactory.Create(mesh, name, position, rotation, source.transform.localScale);
+            var copyMirror = copy.GetComponent<MirrorController>();
 
             // Valid for a mirrored copy too: its local frame is the source's reflected, and every
             // symmetry plane runs through the origin along an axis the reflection only negates, so
@@ -71,9 +66,6 @@ namespace Sculpting
             // usable with masked Transpose right away instead of silently losing the masking
             // work that set it up.
             copy.SetMask(source.MaskExact());
-
-            SculptMaterialController materialController = Object.FindFirstObjectByType<SculptMaterialController>();
-            materialController?.ApplyTo(go.GetComponent<Renderer>());
 
             SelectionManager selection = Object.FindFirstObjectByType<SelectionManager>();
             selection?.Select(copy, false);

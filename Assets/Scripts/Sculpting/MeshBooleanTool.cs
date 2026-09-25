@@ -95,10 +95,9 @@ namespace Sculpting
                 return false;
             }
 
-            // Same convention as every other topology-changing call site (Remesh, Join): a full
-            // snapshot first, so Z steps the target back to its pre-boolean shape.
-            target.SnapshotForUndo();
-            target.ReplaceMesh(result);
+            // One undo step, like every other topology-changing call site (Remesh, Join): Z steps
+            // the target back to its pre-boolean shape.
+            target.ReplaceMeshUndoable(result);
 
             SelectionManager selection = Object.FindFirstObjectByType<SelectionManager>();
             int affected = 0;

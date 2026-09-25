@@ -251,14 +251,8 @@ namespace Sculpting
             skin.vertices = verts;
             skin.RecalculateBounds();
 
-            var go = new GameObject(ObjectNaming.Unique("ZSphere Mesh"), typeof(MeshFilter), typeof(MeshRenderer));
-            go.transform.SetPositionAndRotation(_rigRoot.TransformPoint(centre), _rigRoot.rotation);
-            go.transform.localScale = _rigRoot.lossyScale;
-            go.GetComponent<MeshFilter>().sharedMesh = skin;
-
-            SculptableMesh sculptable = SculptableMesh.AddOwning(go, skin);
-            go.AddComponent<MirrorController>();
-            FindFirstObjectByType<SculptMaterialController>()?.ApplyTo(go.GetComponent<Renderer>());
+            SculptableMesh sculptable = SceneObjectFactory.Create(skin, ObjectNaming.Unique("ZSphere Mesh"),
+                _rigRoot.TransformPoint(centre), _rigRoot.rotation, _rigRoot.lossyScale);
 
             bool clearedRig = !KeepRigOnConvert;
             if (clearedRig) ClearRigInternal();
