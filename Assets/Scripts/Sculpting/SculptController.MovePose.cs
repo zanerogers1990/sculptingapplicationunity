@@ -57,6 +57,70 @@ namespace Sculpting
         // latter, which is the other half of why the first version read as barely-there.
         private const float PoseChainWidthFactor = 0.03f;
 
+        // Numbers each Move/Pose drag, so an observer can tell one drag from the next - see
+        // ActiveGrabDragId.
+        private int _grabDragSerial;
+
+        private SculptableMesh _grabDragTarget;
+
+        // The target's GeometryVersion when the drag started and right after its latest apply,
+        // and whether anything else has moved the target's geometry since the drag started.
+        private int _grabDragStartVersion;
+        private int _grabDragAppliedVersion;
+        private bool _grabDragForeignEdit;
+
+        /// Non-zero while a Move or Pose drag is running, and different for every drag.
+        public int ActiveGrabDragId => _isMoveDragging || _isPoseDragging ? _grabDragSerial : 0;
+
+        /// The object the drag in ActiveGrabDragId is moving.
+        public SculptableMesh ActiveGrabDragTarget => ActiveGrabDragId != 0 ? _grabDragTarget : null;
+
+        /// The target's GeometryVersion when the current drag started.
+        public int GrabDragStartVersion => _grabDragStartVersion;
+
+        /// True while every change to the target's geometry since the drag started was the drag
+        /// itself. Move and Pose pick their vertices once, on the click, and move exactly those
+        /// every frame after it, so while this holds nothing on the target has moved since
+        /// GrabDragStartVersion except the vertices NearestGrabbedDepth reads. CameraOrbitController
+        /// relies on that to bound its near plane without raycasting geometry that is moving under
+        /// the cursor - see its UpdateViewDepth. Anything else touching the target mid-drag (an
+        /// undo, a symmetry op) turns this off for the rest of the drag.
+        public bool GrabDragIsOnlyEdit =>
+            ActiveGrabDragId != 0 && !_grabDragForeignEdit && _grabDragTarget != null &&
+            _grabDragTarget == sculptableMesh && _grabDragTarget.GeometryVersion == _grabDragAppliedVersion;
+
+        /// The smallest depth along worldForward from worldOrigin of every vertex the current
+        /// Move/Pose drag moves (all mirrored selections), or +infinity when no drag is running.
+        public float NearestGrabbedDepth(Vector3 worldOrigin, Vector3 worldForward)
+        {
+            float nearest = float.PositiveInfinity;
+            SculptableMesh target = ActiveGrabDragTarget;
+            if (target == null) return nearest;
+            if (_isMoveDragging && _grabSelections != null)
+                foreach (var (selection, _) in _grabSelections)
+                    nearest = Mathf.Min(nearest, target.NearestViewDepth(selection.Indices, worldOrigin, worldForward));
+            if (_isPoseDragging && _poseSelections != null)
+                foreach (var (selection, _) in _poseSelections)
+                    nearest = Mathf.Min(nearest, target.NearestViewDepth(selection.Indices, worldOrigin, worldForward));
+            return nearest;
+        }
+
+        private void BeginGrabDragTracking()
+        {
+            _grabDragTarget = sculptableMesh;
+            _grabDragSerial++;
+            if (_grabDragSerial == 0) _grabDragSerial = 1;
+            _grabDragStartVersion = _grabDragAppliedVersion = sculptableMesh.GeometryVersion;
+            _grabDragForeignEdit = false;
+        }
+
+        /// Called around each drag apply with the target's version from just before it.
+        private void RecordGrabDragApply(int versionBefore)
+        {
+            if (versionBefore != _grabDragAppliedVersion || sculptableMesh != _grabDragTarget) _grabDragForeignEdit = true;
+            _grabDragAppliedVersion = sculptableMesh.GeometryVersion;
+        }
+
         // Grabs whatever's under the cursor on mouse-down and drags it with the cursor's
         // world-space movement along a camera-facing plane through the grab point, instead of
         // re-raycasting the mesh every frame. That's what makes it keep tracking once the
@@ -79,6 +143,7 @@ namespace Sculpting
                     if (worldDelta.sqrMagnitude > 1e-12f)
                     {
                         Vector3 localDelta = sculptableMesh.transform.InverseTransformVector(worldDelta);
+                        int versionBefore = sculptableMesh.GeometryVersion;
                         BeginDirtyVertices();
                         foreach (var (selection, sign) in _grabSelections)
                         {
@@ -88,6 +153,7 @@ namespace Sculpting
                         }
                         MarkPositionMirrorStale();
                         FlushDirtyVertices();
+                        RecordGrabDragApply(versionBefore);
                     }
                     _lastDragPoint = current;
                 }
@@ -132,6 +198,7 @@ namespace Sculpting
             _grabSelections = selections;
 
             _isMoveDragging = true;
+            BeginGrabDragTracking();
             _dragPlanePoint = hitPoint;
             _dragPlaneNormal = -cam.transform.forward;
             _lastDragPoint = hitPoint;
@@ -171,6 +238,7 @@ namespace Sculpting
                     // onto (see its remarks for why that's the more robust choice for a
                     // rotation-based deform).
                     Vector3 localCurrent = sculptableMesh.transform.InverseTransformPoint(current);
+                    int versionBefore = sculptableMesh.GeometryVersion;
                     BeginDirtyVertices();
                     foreach (var (selection, sign) in _poseSelections)
                     {
@@ -180,6 +248,7 @@ namespace Sculpting
                     }
                     MarkPositionMirrorStale();
                     FlushDirtyVertices();
+                    RecordGrabDragApply(versionBefore);
                 }
 
                 _isHovering = true;
@@ -228,6 +297,7 @@ namespace Sculpting
             }
 
             _isPoseDragging = true;
+            BeginGrabDragTracking();
             _poseDragPlanePoint = hitPoint;
             _poseDragPlaneNormal = -cam.transform.forward;
 

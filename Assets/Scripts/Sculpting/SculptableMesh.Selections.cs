@@ -141,6 +141,32 @@ namespace Sculpting
             }
         }
 
+        /// The smallest positive depth along worldForward from worldOrigin - the camera's view
+        /// depth - of the given vertices at their current positions, or +infinity for none.
+        /// Vertices at or behind the origin are skipped, as the camera's depth probe skips hits
+        /// behind it. One dot product per vertex: depth(p) = dot(M p + t - origin, f) =
+        /// dot(p, M^T f) + dot(t - origin, f), so the transform is folded into the axis once.
+        public float NearestViewDepth(int[] indices, Vector3 worldOrigin, Vector3 worldForward)
+        {
+            float nearest = float.PositiveInfinity;
+            if (indices == null || _workingVertices == null) return nearest;
+
+            Matrix4x4 m = transform.localToWorldMatrix;
+            Vector3 axis = m.transpose.MultiplyVector(worldForward);
+            Vector3 translation = m.GetColumn(3);
+            float offset = Vector3.Dot(translation - worldOrigin, worldForward);
+            float behind = -offset;
+
+            Vector3[] vertices = _workingVertices;
+            for (int i = 0; i < indices.Length; i++)
+            {
+                Vector3 p = vertices[indices[i]];
+                float d = p.x * axis.x + p.y * axis.y + p.z * axis.z;
+                if (d > behind && d < nearest) nearest = d;
+            }
+            return nearest + offset;
+        }
+
         // ------------------------------------------------------------------------ Pose brush
 
         /// A temporary FK-style chain built once at Pose-drag start (see SelectPose) and

@@ -252,7 +252,8 @@ namespace Sculpting
 
             // Measured once, from where the camera sat at the end of last frame: zoom and pan
             // both scale with it, and the near plane is set from it after this frame's move.
-            if (sceneChanged || CaptureCameraInputs()) _viewDepth = ViewDepth();
+            bool cameraChanged = CaptureCameraInputs();
+            UpdateViewDepth(sceneChanged, cameraChanged);
             float viewDepth = _viewDepth;
 
             bool altLeftDrag = altHeld && mouse.leftButton.isPressed;
@@ -321,19 +322,33 @@ namespace Sculpting
             public int Geometry, Visibility;
             public Matrix4x4 Matrix;
 
-            public bool SameAs(in ObjectInputs o) =>
+            public bool SameAs(in ObjectInputs o) => Geometry == o.Geometry && SameExceptGeometry(o);
+
+            public bool SameExceptGeometry(in ObjectInputs o) =>
                 Obj == o.Obj && Active == o.Active && RendererEnabled == o.RendererEnabled && Visible == o.Visible &&
-                Geometry == o.Geometry && Visibility == o.Visibility && Matrix.Equals(o.Matrix);
+                Visibility == o.Visibility && Matrix.Equals(o.Matrix);
         }
 
         private List<ObjectInputs> _measuredObjects = new List<ObjectInputs>();
         private List<ObjectInputs> _capturedObjects = new List<ObjectInputs>();
         private bool _haveMeasuredScene;
+        // Set by CaptureSceneInputs when the only thing that changed was one object's geometry:
+        // that object. Null for no change, or for any other kind of change.
+        private SculptableMesh _onlyGeometryChanged;
+
+        // The Move/Pose drag the current depth is bounded for (0 = none, the depth is a full
+        // probe) and the full probe that bound started from - see UpdateViewDepth.
+        private SculptController _sculpt;
+        private int _boundDragId;
+        private float _probedViewDepth;
+        private readonly List<ObjectInputs> _probedObjects = new List<ObjectInputs>();
 
         private Matrix4x4 _measuredRigToWorld, _measuredCamToWorld, _measuredProjection;
         private float _measuredDistance;
         private bool _measuredOrthographic;
         private bool _haveMeasuredCamera;
+        // Set by CaptureCameraInputs: something other than the clip planes changed.
+        private bool _cameraMoved;
         private float _viewDepth;
 
         /// Captures what the scene size and the depth probe read from the scene, and reports
@@ -341,6 +356,7 @@ namespace Sculpting
         /// so the measurements behave exactly as they did (both are no-ops then anyway).
         private bool CaptureSceneInputs()
         {
+            _onlyGeometryChanged = null;
             if (_selection == null) _selection = FindFirstObjectByType<SelectionManager>();
             if (_selection == null) return true;
 
@@ -364,10 +380,20 @@ namespace Sculpting
             }
 
             bool changed = !_haveMeasuredScene || _capturedObjects.Count != _measuredObjects.Count;
-            for (int i = 0; !changed && i < _capturedObjects.Count; i++)
-                changed = !_capturedObjects[i].SameAs(_measuredObjects[i]);
+            bool otherChange = changed;
+            SculptableMesh geometryOnly = null;
+            for (int i = 0; !otherChange && i < _capturedObjects.Count; i++)
+            {
+                if (_capturedObjects[i].SameAs(_measuredObjects[i])) continue;
+                changed = true;
+                if (geometryOnly == null && _capturedObjects[i].SameExceptGeometry(_measuredObjects[i]))
+                    geometryOnly = _capturedObjects[i].Obj;
+                else
+                    otherChange = true;
+            }
             if (!changed) return false;
 
+            if (!otherChange) _onlyGeometryChanged = geometryOnly;
             (_measuredObjects, _capturedObjects) = (_capturedObjects, _measuredObjects);
             _haveMeasuredScene = true;
             return true;
@@ -378,17 +404,25 @@ namespace Sculpting
         private bool CaptureCameraInputs()
         {
             Camera cam = Cam;
-            if (cam == null) return true;
+            if (cam == null) { _cameraMoved = true; return true; }
 
             // This rig's transform (the probe measures depth along it) and the camera's own
             // (the rays start there) - the same object unless Cam fell back to Camera.main.
             Matrix4x4 rigToWorld = transform.localToWorldMatrix;
             Matrix4x4 camToWorld = cam.transform.localToWorldMatrix;
             Matrix4x4 projection = cam.projectionMatrix;
-            bool changed = !_haveMeasuredCamera || !rigToWorld.Equals(_measuredRigToWorld) ||
+            // Whether the probe rays themselves moved - everything but the clip planes. This
+            // controller writes those planes every frame from the depth it measures, so on their
+            // own they don't make a drag's depth bound stale (see UpdateViewDepth): the rays run
+            // along the same lines, only starting at a different point along them. Rows 0, 1 and 3
+            // of a projection (field of view, aspect, lens shift, ortho size) hold no near or far.
+            _cameraMoved = !_haveMeasuredCamera || !rigToWorld.Equals(_measuredRigToWorld) ||
                            !camToWorld.Equals(_measuredCamToWorld) ||
-                           !projection.Equals(_measuredProjection) || !_distance.Equals(_measuredDistance) ||
-                           _orthographic != _measuredOrthographic;
+                           !projection.GetRow(0).Equals(_measuredProjection.GetRow(0)) ||
+                           !projection.GetRow(1).Equals(_measuredProjection.GetRow(1)) ||
+                           !projection.GetRow(3).Equals(_measuredProjection.GetRow(3)) ||
+                           !_distance.Equals(_measuredDistance) || _orthographic != _measuredOrthographic;
+            bool changed = _cameraMoved || !projection.Equals(_measuredProjection);
             if (!changed) return false;
 
             _measuredRigToWorld = rigToWorld;
@@ -398,6 +432,56 @@ namespace Sculpting
             _measuredOrthographic = _orthographic;
             _haveMeasuredCamera = true;
             return true;
+        }
+
+        /// Brings _viewDepth up to date: a full ViewDepth probe when anything it reads changed,
+        /// except during a Move or Pose drag that is the only thing moving anything.
+        ///
+        /// The probe raycasts, and a raycast first brings the object's triangle grid up to date
+        /// with every vertex moved since it was last read. Move and Pose deliberately never read it
+        /// mid-drag, so that the grid catches up once, after release - but the probe read it every
+        /// frame, which cost more than a third again of a wide Move drag's own apply at 2.4M tris.
+        /// So during such a drag the depth is instead bounded: the smaller of the probe from just
+        /// before the drag and the nearest grabbed vertex. The near plane only ever moves toward
+        /// the lens from where it was when the drag began, and every grabbed vertex stays in
+        /// front of it - so pulling geometry at the camera can't slice it open, and nothing the
+        /// drag doesn't move can be cut that wasn't already before it. (A triangle only partly
+        /// grabbed is no nearer than its nearest corner, and each corner is one or the other.)
+        /// Anything else changing - the camera moving, another object, any other edit to this one -
+        /// goes back to the full probe, and so does the end of the drag. The clip planes alone
+        /// changing does not: they are this controller's own output (see _cameraMoved).
+        private void UpdateViewDepth(bool sceneChanged, bool cameraChanged)
+        {
+            if (_sculpt == null) _sculpt = FindFirstObjectByType<SculptController>();
+            int dragId = _sculpt != null ? _sculpt.ActiveGrabDragId : 0;
+            bool boundEnded = _boundDragId != 0 && dragId != _boundDragId;
+            if (!sceneChanged && !cameraChanged && !boundEnded) return;
+
+            bool onlyDragMoved = !sceneChanged ||
+                                 (_onlyGeometryChanged != null && _onlyGeometryChanged == _sculpt.ActiveGrabDragTarget);
+            if (!_cameraMoved && !boundEnded && dragId != 0 && !_orthographic && Cam != null && onlyDragMoved &&
+                _sculpt.GrabDragIsOnlyEdit && (_boundDragId == dragId || ProbeSawDragStart()))
+            {
+                float grabbed = _sculpt.NearestGrabbedDepth(transform.position, transform.forward);
+                _viewDepth = Mathf.Min(_probedViewDepth, grabbed);
+                _boundDragId = dragId;
+                return;
+            }
+
+            _viewDepth = _probedViewDepth = ViewDepth();
+            _probedObjects.Clear();
+            _probedObjects.AddRange(_measuredObjects);
+            _boundDragId = 0;
+        }
+
+        /// Whether the last full probe measured the drag target exactly as the drag found it - so
+        /// that every change since the probe is the drag's own.
+        private bool ProbeSawDragStart()
+        {
+            SculptableMesh target = _sculpt.ActiveGrabDragTarget;
+            for (int i = 0; i < _probedObjects.Count; i++)
+                if (_probedObjects[i].Obj == target) return _probedObjects[i].Geometry == _sculpt.GrabDragStartVersion;
+            return false;
         }
 
         /// Re-measures the scene size every adaptive limit scales by (see minPivotDistance): the
