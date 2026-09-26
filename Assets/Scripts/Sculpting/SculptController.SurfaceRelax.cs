@@ -67,9 +67,9 @@ namespace Sculpting
         /// sphere at a 0.25 brush radius this pass alone accounted for 52.8ms of a 61.1ms Clay dab
         /// - 86% of it. It now takes the same Burst path Smooth does (and stays inside the ring -
         /// see RelaxRadiusFactor).
-        // The centres of every dab this frame placed, across every mirror sign - the input to the
+        // The centres of every dab this frame placed, across every symmetric copy - the input to the
         // one batched relax pass that runs after them (see ApplySurfaceRelaxBatched). Reused
-        // between frames rather than reallocated; ClayMaxDabsPerFrame x 8 mirror signs bounds it.
+        // between frames rather than reallocated; ClayMaxDabsPerFrame x the symmetry group bounds it.
         private readonly List<Vector3> _relaxCentres = new List<Vector3>();
 
         // How many dabs the frame placed (NOT counting mirror signs - a mirrored dab is the same
@@ -179,8 +179,9 @@ namespace Sculpting
         private const int MaxRelaxFrameBudget = 4;
 
         // Ceiling on how many centres the weight pass measures each candidate against. The pass is
-        // O(candidates x centres), and a frame that banked a long cursor jump with all three mirror
-        // axes enabled could otherwise reach ClayMaxDabsPerFrame x 8 of them.
+        // O(candidates x centres), and a frame that banked a long cursor jump under symmetry could
+        // otherwise reach ClayMaxDabsPerFrame x the symmetry group's size (8 for three mirror axes,
+        // far more with radial symmetry) of them.
         private const int MaxRelaxCentres = 48;
 
         /// Drops centres that add nothing, and returns how far a dropped centre can be from the
@@ -200,13 +201,32 @@ namespace Sculpting
 
             float separation = Mathf.Max(brushRadius * ClayDabSpacingFraction, 1e-6f);
             float applied = 0f;
+            // Thinning only merges centres seen from the same viewpoint, so the best it can do is
+            // one centre per viewpoint - and radial symmetry gives every copy its own, up to
+            // SymmetryGroup.MaxRadialCount times the mirror signs, which can exceed the cap. Once
+            // the separation spans every centre a further pass cannot merge anything more, so stop
+            // there rather than doubling forever.
+            float span = RelaxCentreSpan();
             while (_relaxCentres.Count > MaxRelaxCentres)
             {
                 ThinRelaxCentres(separation);
                 applied = separation;
-                separation *= 2f; // always terminates: doubling eventually leaves a single centre
+                if (separation > span) break;
+                separation *= 2f;
             }
             return applied;
+        }
+
+        /// The diagonal of the centres' bounding box: no two centres are further apart.
+        private float RelaxCentreSpan()
+        {
+            Vector3 min = Vector3.positiveInfinity, max = Vector3.negativeInfinity;
+            for (int i = 0; i < _relaxCentres.Count; i++)
+            {
+                min = Vector3.Min(min, _relaxCentres[i]);
+                max = Vector3.Max(max, _relaxCentres[i]);
+            }
+            return _relaxCentres.Count > 0 ? (max - min).magnitude : 0f;
         }
 
         /// Greedy in-place thin: keeps a centre only if it is at least `separation` from every
@@ -232,8 +252,8 @@ namespace Sculpting
                     // the two halves were relaxed from different directions. Thinning per viewpoint
                     // also keeps the over-budget pass below symmetric: each mirror sign's centres are
                     // thinned among themselves, in the same dab order, so they thin identically.
-                    // Still terminates - each viewpoint's group collapses to one centre at worst,
-                    // and there are at most eight.
+                    // Each viewpoint's group collapses to one centre at worst - see
+                    // CompactRelaxCentres for when that is still more than the cap.
                     if (_relaxCentreCameras[k] != viewpoint) continue;
                     covered = true;
                     break;

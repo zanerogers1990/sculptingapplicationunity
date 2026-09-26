@@ -78,11 +78,11 @@ namespace Sculpting
 
         private void ApplySmoothDabLocal(Vector3 localPoint, float dt)
         {
-            // Order-symmetric near a mirror plane - see MirroredDabWalk. Smooth also reads one ring
-            // past its footprint, which MirrorInteractionMargin covers.
+            // Order-symmetric near a mirror plane or radial axis - see MirroredDabWalk. Smooth also
+            // reads one ring past its footprint, which MirrorInteractionMargin covers.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
-            while (NextMirroredDab(ref dabs, out Vector3 sign))
-                ApplySmoothBrushLocal(Vector3.Scale(localPoint, sign), dt);
+            while (NextMirroredDab(ref dabs, out SymmetryOp op))
+                ApplySmoothBrushLocal(op.Apply(localPoint), dt);
         }
 
         private void ApplySmoothBrushLocal(Vector3 localPoint, float dt)
@@ -228,7 +228,7 @@ namespace Sculpting
                 if (sqrDist > radiusSqr) { weights[ci] = 0f; continue; }
 
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
-                weights[ci] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
+                weights[ci] = BrushFalloff.Smoothstep(t01) * (1f - mask[i]) // smoothstep, masked-out
                     * BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, cameraLocalPos);
                 anyInRange = true;
             }

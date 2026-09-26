@@ -9,7 +9,7 @@ namespace Sculpting
     ///
     /// Deliberately NOT consulted by brush strokes. Mirrored sculpting reflects the brush
     /// POSITION and re-runs the falloff on whatever vertices it finds there (see
-    /// MirrorController.GetMirrorSigns and SculptController's seven apply sites). That approach
+    /// MirrorController.GetSymmetry and SculptController's apply sites). That approach
     /// never fails and never goes stale, which a map on the hot path could not promise - it would
     /// have to be rebuilt after every Remesh, Join, Extract and mask-transform, and a map that
     /// silently fell out of date would move the WRONG vertices, which is a far worse failure than

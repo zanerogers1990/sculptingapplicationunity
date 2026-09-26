@@ -312,7 +312,7 @@ namespace Sculpting
                 if (dist > BrushRadius) { AppliedOut[index] = 0; return; }
 
                 float t01 = 1f - dist / BrushRadius;
-                float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index])
+                float weight = BrushFalloff.Smoothstep(t01) * (1f - MaskIn[index])
                     * BrushMath.FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
                 if (weight <= 0f) { AppliedOut[index] = 0; return; }
 
@@ -450,6 +450,7 @@ namespace Sculpting
         /// BrushFalloff) replaces it.
         private static float CarveFalloff(float t01)
         {
+            t01 = BrushFalloff.Shift(t01);
             float s = t01 * t01 * (3f - 2f * t01);
             return BrushFalloff.Apply(t01, s * s * s);
         }
@@ -487,8 +488,11 @@ namespace Sculpting
         // outer edge band. Shared by ClayWeightJob (Burst) and ApplyClayBrushLocalManaged so
         // both brush paths build an identical flat-topped profile; plain float math, so Burst
         // can inline it into the job same as any other method call.
-        private static float ClayFalloff(float t01, float edgeSoftness) =>
-            BrushFalloff.Apply(t01, ClayFalloffBuiltIn(t01, edgeSoftness)); // a custom curve replaces it
+        private static float ClayFalloff(float t01, float edgeSoftness)
+        {
+            t01 = BrushFalloff.Shift(t01);
+            return BrushFalloff.Apply(t01, ClayFalloffBuiltIn(t01, edgeSoftness)); // a custom curve replaces it
+        }
 
         private static float ClayFalloffBuiltIn(float t01, float edgeSoftness)
         {
@@ -828,7 +832,7 @@ namespace Sculpting
                 float dist = Vector3.Distance(pos, LocalPoint);
                 if (dist > BrushRadius) { WeightsOut[index] = 0f; return; }
                 float t01 = 1f - dist / BrushRadius;
-                WeightsOut[index] = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - MaskIn[index]) // smoothstep, masked-out
+                WeightsOut[index] = BrushFalloff.Smoothstep(t01) * (1f - MaskIn[index]) // smoothstep, masked-out
                     * BrushMath.FrontFacingWeight(FrontFacingOnly, NormalsIn[index], pos, CameraLocalPos);
             }
         }

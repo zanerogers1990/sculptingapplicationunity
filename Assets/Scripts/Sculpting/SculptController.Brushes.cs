@@ -384,12 +384,12 @@ namespace Sculpting
         private void ApplyMirroredDabLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt,
             Action<Vector3, Vector3, bool, float> applyBrushLocal)
         {
-            // Order-symmetric near a mirror plane - see MirroredDabWalk.
+            // Order-symmetric near a mirror plane or radial axis - see MirroredDabWalk.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
-            while (NextMirroredDab(ref dabs, out Vector3 sign))
+            while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
-                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                applyBrushLocal(Vector3.Scale(localPoint, sign), mirroredNormal, positive, dt);
+                Vector3 mirroredNormal = op.Apply(localNormal).normalized;
+                applyBrushLocal(op.Apply(localPoint), mirroredNormal, positive, dt);
             }
         }
 

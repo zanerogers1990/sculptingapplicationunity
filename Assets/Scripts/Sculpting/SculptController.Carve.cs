@@ -206,17 +206,17 @@ namespace Sculpting
 
         private void ApplyCarveDab(Vector3 localPoint, bool positive)
         {
-            // Order-symmetric near a mirror plane - see MirroredDabWalk.
+            // Order-symmetric near a mirror plane or radial axis - see MirroredDabWalk.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
-            while (NextMirroredDab(ref dabs, out Vector3 sign))
+            while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
-                Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
-                Vector3 mirroredNormal = Vector3.Scale(_carveStrokeNormal, sign).normalized;
-                // Mirror the stroke frame the same way Clay mirrors its frozen tip axes, rather
-                // than rebuilding it from the mirrored normal - keeps a mirrored groove exactly
-                // as stable as the primary one. Scaling by a sign vector preserves length, so
-                // the direction stays unit without a re-normalize.
-                Vector3 mirroredDir = Vector3.Scale(_carveStrokeDir, sign);
+                Vector3 mirroredPoint = op.Apply(localPoint);
+                Vector3 mirroredNormal = op.Apply(_carveStrokeNormal).normalized;
+                // Map the stroke frame the same way Clay maps its frozen tip axes, rather than
+                // rebuilding it from the mapped normal - keeps a mirrored or radial groove exactly
+                // as stable as the primary one. A symmetry op is orthogonal and preserves length,
+                // so the direction stays unit without a re-normalize.
+                Vector3 mirroredDir = op.Apply(_carveStrokeDir);
                 ApplyCarveDabLocal(mirroredPoint, mirroredNormal, mirroredDir, positive);
             }
         }

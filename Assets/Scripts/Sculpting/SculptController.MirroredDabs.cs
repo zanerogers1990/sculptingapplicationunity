@@ -4,11 +4,13 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// The mirrored-dab walk: one brush dab repeated at every mirror sign, with the per-sign
-    /// camera, flip mask and tangent frame, and the ordering that keeps mirrored halves bit-exact.
+    /// The symmetric-dab walk: one brush dab repeated under every element of the object's
+    /// symmetry group (mirror reflections and radial rotations - see SymmetryGroup), with the
+    /// per-element camera and tangent frame, and the ordering that keeps symmetric copies equal:
+    /// bit-exact for mirrors, to rounding for rotations.
     public partial class SculptController
     {
-        /// The mirror sign list for the CURRENT target, off the reference SyncSelectionTarget
+        /// The symmetry group for the CURRENT target, off the reference SyncSelectionTarget
         /// already resolved once this frame.
         ///
         /// Every brush apply site used to reach this through the Mirror property, which resolves
@@ -17,22 +19,18 @@ namespace Sculpting
         /// property's self-healing AddComponent path is still the fallback for a target that
         /// genuinely has no MirrorController, and the result is written back to the cached field so
         /// that only ever happens once per such target rather than once per dab.
-        private List<Vector3> MirrorSigns()
+        private SymmetryGroup Symmetry()
         {
             if (mirrorController == null) mirrorController = Mirror;
-            return mirrorController != null ? mirrorController.GetMirrorSigns() : IdentityMirrorSigns;
+            return mirrorController != null ? mirrorController.GetSymmetry() : SymmetryGroup.Trivial;
         }
 
-        // Stand-in for a target with no MirrorController at all (Mirror returns null only when
-        // there is no target). One unmirrored stroke, which is what "no mirroring" means.
-        private static readonly List<Vector3> IdentityMirrorSigns = new List<Vector3> { Vector3.one };
-
-        /// The camera's local-space position, reflected through the same mirror plane(s) as the dab
-        /// currently being applied. Every brush's mirror loop sets it once per sign (see
-        /// BeginMirroredDab) and every Front Facing Only test downstream reads it instead of
-        /// re-deriving the raw camera position, so a mirrored dab is judged from the mirrored
-        /// viewpoint. Identity sign leaves it as the real camera, which is what an unmirrored
-        /// session sees.
+        /// The camera's local-space position, mapped through the same symmetry op (mirror plane(s),
+        /// radial rotation) as the dab currently being applied. Every brush's symmetry loop sets it
+        /// once per op (see BeginMirroredDab) and every Front Facing Only test downstream reads it
+        /// instead of re-deriving the raw camera position, so a mirrored or rotated dab is judged
+        /// from the mirrored or rotated viewpoint. The identity leaves it as the real camera, which
+        /// is what an unmirrored session sees.
         ///
         /// Front Facing Only asks "is this vertex facing the viewer", and a MIRRORED dab is not
         /// being viewed from where the real camera is - it is the same stroke seen from the mirrored
@@ -51,29 +49,26 @@ namespace Sculpting
         /// everything facing away from its OWN viewpoint, which is the whole point of the setting.
         private Vector3 _dabCameraLocal;
 
-        /// Points the per-dab frame at one mirror sign. Call once per sign, before applying that
-        /// sign's dab - the mirror loops below all do, including the identity sign, so no apply path
-        /// can read a viewpoint left behind by the previous dab.
-        private void BeginMirroredDab(Vector3 sign)
+        /// Points the per-dab frame at one element of the symmetry group. Call once per element,
+        /// before applying that element's dab - the loops below all do, including the identity, so
+        /// no apply path can read a viewpoint left behind by the previous dab.
+        private void BeginMirroredDab(SymmetryGroup group, int index)
         {
-            _dabCameraLocal = Vector3.Scale(
-                sculptableMesh.transform.InverseTransformPoint(cam.transform.position), sign);
-            _dabFlipMask = FlipMaskOf(sign);
+            _dabOpIndex = index;
+            _dabOp = group[index];
+            _dabCameraLocal = _dabOp.Apply(sculptableMesh.transform.InverseTransformPoint(cam.transform.position));
         }
 
-        /// Which axes the dab being applied is reflected across: bit 0 X, bit 1 Y, bit 2 Z. 0 - the
-        /// default, and what a path called without a mirror loop sees - is the unmirrored dab.
-        /// Set by BeginMirroredDab alongside _dabCameraLocal, for the same reason: anything a dab
-        /// derives from a DIRECTION has to be reflected with it, not rebuilt on the far side.
-        private int _dabFlipMask;
+        /// The symmetry op the dab being applied is mapped through, and its index in the group.
+        /// Identity - the default, and what a path called without a symmetry loop sees - is the
+        /// stroke the user actually made. Set by BeginMirroredDab alongside _dabCameraLocal, for
+        /// the same reason: anything a dab derives from a DIRECTION has to be mapped with it, not
+        /// rebuilt on the far side.
+        private SymmetryOp _dabOp = SymmetryOp.Identity;
 
-        private static int FlipMaskOf(Vector3 sign) =>
-            (sign.x < 0f ? 1 : 0) | (sign.y < 0f ? 2 : 0) | (sign.z < 0f ? 4 : 0);
+        private int _dabOpIndex;
 
-        private static Vector3 SignOfFlipMask(int mask) =>
-            new Vector3((mask & 1) != 0 ? -1f : 1f, (mask & 2) != 0 ? -1f : 1f, (mask & 4) != 0 ? -1f : 1f);
-
-        /// BuildTangentBasis for the dab being applied, reflected along with it.
+        /// BuildTangentBasis for the dab being applied, mapped (reflected, rotated) along with it.
         ///
         /// BuildTangentBasis crosses the normal with a FIXED world axis, and a reflection does not
         /// commute with that: fed a mirrored normal it hands back a frame whose tangent points the
@@ -84,64 +79,99 @@ namespace Sculpting
         /// radii from the plane (SymmetryDriftTests). Building the frame from the normal reflected
         /// back to the primary side, then reflecting the frame forward, gives the mirrored dab the
         /// mirror image of the primary frame exactly, so it samples the stamp at identical
-        /// coordinates. The primary dab (mask 0) is unchanged bit for bit.
+        /// coordinates. The primary dab (the identity) is unchanged bit for bit. A rotation does not
+        /// commute with the fixed axis either, so a radial copy gets the ROTATED primary frame the
+        /// same way, and its stamp turns with it instead of staying locked to world axes.
         private void BuildDabTangentBasis(Vector3 normal, out Vector3 tangent, out Vector3 bitangent) =>
-            DabTangentBasis(normal, _dabFlipMask, out tangent, out bitangent);
+            DabTangentBasis(normal, _dabOp, out tangent, out bitangent);
 
-        /// BuildDabTangentBasis for an explicit flip mask - what a batched dab program uses, since it
-        /// runs after _dabFlipMask has moved on (see SculptController.DabProgram).
-        private static void DabTangentBasis(Vector3 normal, int flipMask, out Vector3 tangent, out Vector3 bitangent)
+        /// BuildDabTangentBasis for an explicit op - what a batched dab program uses, since it runs
+        /// after _dabOp has moved on (see SculptController.DabProgram).
+        private static void DabTangentBasis(Vector3 normal, SymmetryOp op, out Vector3 tangent, out Vector3 bitangent)
         {
-            if (flipMask == 0)
+            if (op.IsIdentity)
             {
                 BuildTangentBasis(normal, out tangent, out bitangent);
                 return;
             }
 
-            Vector3 sign = SignOfFlipMask(flipMask);
-            BuildTangentBasis(Vector3.Scale(normal, sign), out tangent, out bitangent);
-            tangent = Vector3.Scale(tangent, sign);
-            bitangent = Vector3.Scale(bitangent, sign);
+            BuildTangentBasis(op.ApplyInverse(normal), out tangent, out bitangent);
+            tangent = op.Apply(tangent);
+            bitangent = op.Apply(bitangent);
         }
 
         // ------------------------------------------------------------ order-symmetric mirrored dabs
 
-        /// A dab closer than this many of its own reach to a mirror plane is treated as able to see
-        /// its mirror image's output. 1 would be exact for dabs that only read and write inside their
-        /// reach; the rest covers Smooth reading one ring of neighbours past its footprint, and a
-        /// dab's own displacement carrying a vertex over the boundary mid-frame.
+        /// A dab closer than this many of its own reach to a mirror plane (or its radial copy) is
+        /// treated as able to see its copy's output. 1 would be exact for dabs that only read and
+        /// write inside their reach; the rest covers Smooth reading one ring of neighbours past its
+        /// footprint, and a dab's own displacement carrying a vertex over the boundary mid-frame.
         private const float MirrorInteractionMargin = 1.5f;
 
-        /// Walks the mirror signs for one dab (see BeginMirroredDabs / NextMirroredDab).
+        /// Walks the symmetry group for one dab (see BeginMirroredDabs / NextMirroredDab).
         ///
-        /// Far from every mirror plane this is exactly the old loop - each sign once, in MirrorSigns
-        /// order. Where a plane runs through the footprint the order is not innocent: the signs are
-        /// applied one after another against the live vertex array, so the second dab reads positions
-        /// (fits its plane, measures "deepest carve so far", weighs by distance) through vertices the
-        /// first one has just moved, while the first saw the untouched surface. The two halves were
-        /// given different operations, always in the same order, so the difference did not average
-        /// out - it accumulated stroke after stroke into the "one side slowly becomes different" drift.
-        /// Measured on a bitwise-symmetric sphere a third of a radius off the plane: mirror error of
-        /// 65% of the stroke's own displacement for Inflate, 12% for Clay (Accumulate), 8% for Dam
-        /// Standard, with centreline vertices pushed well off the plane (SymmetryDriftTests).
+        /// Far from every mirror plane and radial axis this is exactly the old loop - each element
+        /// once, in group order. Where copies' footprints meet the order is not innocent: the copies
+        /// are applied one after another against the live vertex array, so the second dab reads
+        /// positions (fits its plane, measures "deepest carve so far", weighs by distance) through
+        /// vertices the first one has just moved, while the first saw the untouched surface. The
+        /// copies were given different operations, always in the same order, so the difference did
+        /// not average out - it accumulated stroke after stroke into the "one side slowly becomes
+        /// different" drift. Measured on a bitwise-symmetric sphere a third of a radius off the
+        /// plane: mirror error of 65% of the stroke's own displacement for Inflate, 12% for Clay
+        /// (Accumulate), 8% for Dam Standard, with centreline vertices pushed well off the plane
+        /// (SymmetryDriftTests). Radial copies near their axis meet in exactly the same way.
         ///
-        /// There, every ordering that the mirror group maps onto another is applied - each from the
-        /// same starting surface, restored in between - and the results are averaged. Reflecting the
-        /// model only permutes those orderings, so the average is mirror-symmetric by construction,
-        /// while each ordering is still the existing brush behaviour (including the doubled strength a
-        /// dab centred ON the plane has always had), so no brush changes character. Signs whose
-        /// footprints cannot meet are grouped apart and never repeated: one X plane through the dab
-        /// costs two applications of the pair instead of one, and only for dabs that near the plane.
+        /// There, the copies that can meet form a subgroup H (see SymmetryGroup.
+        /// InteractingSubgroup); copies in different cosets of it never meet and are walked apart.
+        /// Within a coset c H, ordering o applies c h_o h_0, c h_o h_1, ... - left-multiplying the
+        /// group's own enumeration - each from the same starting surface, restored in between, and
+        /// the results are averaged. A symmetry of the model maps that SET of orderings onto itself,
+        /// so the average is symmetric by construction, while each ordering is still the existing
+        /// brush behaviour (including the doubled strength a dab centred ON a plane has always had),
+        /// so no brush changes character. One X plane through the dab costs two applications of the
+        /// pair instead of one, and only for dabs that near the plane. For a mirror-only group this
+        /// is the same sequence of signs the walk has always produced.
+        ///
+        /// Averaging costs orderings^2 applications, which a mirror group can afford (at most 8 of
+        /// 8, and only where three planes meet) but radial symmetry cannot: near its axis EVERY
+        /// copy meets its neighbours, so a large brush there paid 36 applications per dab for 6
+        /// repeats - measured 52ms a frame for Clay and 202ms for Inflate at 330k triangles, against
+        /// 16ms and 29ms applied once each. Applying one ordering instead (rotated from dab to dab)
+        /// was fast but left 1-8% of a stroke's displacement between sectors near the axis, which
+        /// Inflate then amplified through the normals to 166% at the pole with 8 repeats.
+        ///
+        /// So a group with rotations in it is walked Simultaneously instead: every copy of the
+        /// coset is applied to the SAME starting surface, restored in between, and the displacements
+        /// are combined - a sum, which does not care about order, so it is symmetric by construction
+        /// at the plain walk's cost. Where copies do not overlap that sum is exactly the plain walk.
+        /// Where they do, a sum would stack them (Crease carving N times as deep at the pole), so
+        /// the sum is divided by the copies' multiplicity - how many of them sit on top of each
+        /// other (see CopyMultiplicity): N coincident copies at the pole act as exactly one dab,
+        /// profile and all, rather than piling up N-fold the way sequential radial symmetry does in
+        /// other sculpting apps. One scalar for the whole coset, so it cannot favour a copy.
+        ///
+        /// Dividing each VERTEX by the number of copies covering it was tried first. It turned N
+        /// coincident dabs into a flat-topped mesa with a cliff where the coverage fell below one,
+        /// and Inflate amplified float noise on that cliff to 4% of the stroke at the pole.
         private struct MirroredDabWalk
         {
             public Vector3 Point;
             public float Reach;
+            public SymmetryGroup Group;
             public bool Symmetric;
-            public int Index, Count;              // plain walk over MirrorSigns
-            public int Near, Far;                 // flip bits whose planes do / do not reach the footprint
-            public int Group, GroupCount;         // current coset of the far flips
-            public int Ordering, Step, Orderings; // orderings over the near flips, and position in one
+            /// Every copy applied once to the same surface, combined by multiplicity - see above. Set
+            /// for any group with rotations; mirror-only groups keep the averaged orderings, bit for bit.
+            public bool Simultaneous;
+            public int Index, Count;              // plain walk over the group
+            public int Coset, CosetCount;         // current coset of the interacting subgroup
+            public int Ordering, Step, Orderings; // orderings over the subgroup, and position in one
         }
+
+        // The interacting subgroup and its coset representatives for the walk in progress. Walks
+        // never nest - each runs to completion inside one dab - so one pair serves them all.
+        private readonly List<int> _walkSubgroup = new List<int>(8);
+        private readonly List<int> _walkCosets = new List<int>(8);
 
         private readonly List<int> _mirrorGroupVertices = new List<int>();
 
@@ -157,39 +187,38 @@ namespace Sculpting
         /// (Clay's relax centres) must be recorded once, on the first ordering only.
         private bool _mirrorRepeatOrdering;
 
-        /// `reach` is the widest radius the brush's per-sign apply reads or writes vertices within.
+        /// `reach` is the widest radius the brush's per-copy apply reads or writes vertices within.
         private MirroredDabWalk BeginMirroredDabs(Vector3 localPoint, float reach)
         {
-            List<Vector3> signs = MirrorSigns();
-            var walk = new MirroredDabWalk { Point = localPoint, Reach = reach, Index = -1, Count = signs.Count, Step = -1 };
-            if (signs.Count <= 1) return walk;
+            SymmetryGroup group = Symmetry();
+            var walk = new MirroredDabWalk
+            {
+                Point = localPoint, Reach = reach, Group = group, Index = -1, Count = group.Count, Step = -1,
+            };
+            if (group.Count <= 1) return walk;
 
-            int active = 0;
-            for (int k = 0; k < signs.Count; k++) active |= FlipMaskOf(signs[k]);
-            float limit = reach * MirrorInteractionMargin;
-            int near = 0;
-            if ((active & 1) != 0 && Mathf.Abs(localPoint.x) < limit) near |= 1;
-            if ((active & 2) != 0 && Mathf.Abs(localPoint.y) < limit) near |= 2;
-            if ((active & 4) != 0 && Mathf.Abs(localPoint.z) < limit) near |= 4;
-            if (near == 0) return walk;
+            // Two copies interact when they land within twice the margin of each other - for a
+            // mirror, when the dab is within the margin of the plane.
+            group.InteractingSubgroup(localPoint, 2f * reach * MirrorInteractionMargin, _walkSubgroup);
+            if (_walkSubgroup.Count <= 1) return walk;
+            group.CosetRepresentatives(_walkSubgroup, _walkCosets);
 
             walk.Symmetric = true;
-            walk.Near = near;
-            walk.Far = active & ~near;
-            walk.Orderings = 1 << BitCount(near);
-            walk.GroupCount = 1 << BitCount(walk.Far);
+            walk.Orderings = _walkSubgroup.Count;
+            walk.CosetCount = _walkCosets.Count;
+            walk.Simultaneous = group.RadialCount > 1;
             return walk;
         }
 
-        /// Advances the walk and points the per-dab frame at the next sign (BeginMirroredDab).
-        private bool NextMirroredDab(ref MirroredDabWalk walk, out Vector3 sign)
+        /// Advances the walk and points the per-dab frame at the next copy (BeginMirroredDab).
+        private bool NextMirroredDab(ref MirroredDabWalk walk, out SymmetryOp op)
         {
             if (!walk.Symmetric)
             {
                 _mirrorRepeatOrdering = false;
-                if (++walk.Index >= walk.Count) { sign = Vector3.one; return false; }
-                sign = MirrorSigns()[walk.Index];
-                BeginMirroredDab(sign);
+                if (++walk.Index >= walk.Count) { op = SymmetryOp.Identity; return false; }
+                BeginMirroredDab(walk.Group, walk.Index);
+                op = _dabOp;
                 return true;
             }
 
@@ -197,6 +226,27 @@ namespace Sculpting
             {
                 walk.Step = 0;
                 BeginMirrorGroup(ref walk);
+            }
+            else if (walk.Simultaneous)
+            {
+                // Each copy's displacement is banked and the surface put back for the next one.
+                AccumulateMirrorOrdering();
+                if (++walk.Step < walk.Orderings)
+                {
+                    RestoreMirrorGroup();
+                }
+                else
+                {
+                    CommitMirrorGroup(1f / CopyMultiplicity(walk));
+                    walk.Step = 0;
+                    if (++walk.Coset == walk.CosetCount)
+                    {
+                        _mirrorRepeatOrdering = false;
+                        op = SymmetryOp.Identity;
+                        return false;
+                    }
+                    BeginMirrorGroup(ref walk);
+                }
             }
             else if (++walk.Step == walk.Orderings)
             {
@@ -208,28 +258,31 @@ namespace Sculpting
                 }
                 else
                 {
-                    CommitMirrorGroup(walk.Orderings);
+                    // Exact for a mirror group (a power of two).
+                    CommitMirrorGroup(1f / walk.Orderings);
                     walk.Ordering = 0;
-                    if (++walk.Group == walk.GroupCount)
+                    if (++walk.Coset == walk.CosetCount)
                     {
                         _mirrorRepeatOrdering = false;
-                        sign = Vector3.one;
+                        op = SymmetryOp.Identity;
                         return false;
                     }
                     BeginMirrorGroup(ref walk);
                 }
             }
 
-            // Ordering o applies near-flips h_o ^ h_0, h_o ^ h_1, ... - one row of the group's own
-            // table, which is what makes the SET of orderings map onto itself under any reflection.
+            // Ordering o applies c h_o h_0, c h_o h_1, ... - one row of the subgroup's own table,
+            // which is what makes the SET of orderings map onto itself under any symmetry. The
+            // simultaneous walk only ever runs ordering 0 (h_0 is the identity): c h_0, c h_1, ...
             _mirrorRepeatOrdering = walk.Ordering > 0;
-            sign = SignOfFlipMask(NthSubmask(walk.Far, walk.Group)
-                                  ^ NthSubmask(walk.Near, walk.Ordering) ^ NthSubmask(walk.Near, walk.Step));
-            BeginMirroredDab(sign);
+            SymmetryGroup group = walk.Group;
+            int h = group.Product(_walkSubgroup[walk.Ordering], _walkSubgroup[walk.Step]);
+            BeginMirroredDab(group, group.Product(_walkCosets[walk.Coset], h));
+            op = _dabOp;
             return true;
         }
 
-        /// Snapshots every vertex the current group's dabs can write, before the first of them runs.
+        /// Snapshots every vertex the current coset's dabs can write, before the first of them runs.
         private void BeginMirrorGroup(ref MirroredDabWalk walk)
         {
             // Recording a batched program (see SculptController.DabProgram): every vertex takes its
@@ -245,10 +298,11 @@ namespace Sculpting
             int generation = ++_mirrorGroupGeneration;
             _mirrorGroupVertices.Clear();
 
-            int far = NthSubmask(walk.Far, walk.Group);
+            SymmetryGroup group = walk.Group;
+            int representative = _walkCosets[walk.Coset];
             for (int h = 0; h < walk.Orderings; h++)
             {
-                Vector3 centre = Vector3.Scale(walk.Point, SignOfFlipMask(far ^ NthSubmask(walk.Near, h)));
+                Vector3 centre = group[group.Product(representative, _walkSubgroup[h])].Apply(walk.Point);
                 // The spatial grid's shared buffer - consumed fully before the next query.
                 List<int> found = sculptableMesh.QueryNear(centre, walk.Reach);
                 for (int k = 0; k < found.Count; k++)
@@ -289,37 +343,43 @@ namespace Sculpting
             MarkPositionMirrorStale();
         }
 
-        /// Writes the average of every ordering's displacement. Deltas rather than positions, so a
-        /// vertex no ordering touched gets its own position back bit for bit.
-        private void CommitMirrorGroup(int orderings)
+        /// Writes each vertex's snapshot plus its summed displacement times `scale`: 1 / orderings
+        /// for the averaged walk, 1 / multiplicity for the simultaneous one. Deltas rather than
+        /// positions, so a vertex no copy touched gets its own position back bit for bit.
+        private void CommitMirrorGroup(float scale)
         {
-            if (_dabProgramRecording) { RecordDabOp(DabOpKind.Commit, 1f / orderings); return; }
+            if (_dabProgramRecording) { RecordDabOp(DabOpKind.Commit, scale); return; }
             Vector3[] verts = sculptableMesh.Vertices;
-            float inv = 1f / orderings; // a power of two, so exact
             for (int u = 0; u < _mirrorGroupVertices.Count; u++)
-                verts[_mirrorGroupVertices[u]] = _mirrorGroupBefore[u] + _mirrorGroupDeltaSum[u] * inv;
+                verts[_mirrorGroupVertices[u]] = _mirrorGroupBefore[u] + _mirrorGroupDeltaSum[u] * scale;
             MarkPositionMirrorStale();
         }
 
-        private static int BitCount(int value)
+        /// How many copies of the dab sit on top of each other, for the simultaneous walk (see
+        /// MirroredDabWalk): each copy of the coset counts by how much of its footprint it shares
+        /// with the first one - the overlap fraction of two discs of the dab's reach - so the
+        /// result is N when all N copies coincide (the dab on the axis), 1 when none overlap, and
+        /// moves smoothly between as the dab travels off the axis. Copy k is |p - h_k p| from the
+        /// first whichever coset it is in (the symmetries are rigid), so every copy and every coset
+        /// gets the same number.
+        private float CopyMultiplicity(in MirroredDabWalk walk)
         {
-            int count = 0;
-            for (; value != 0; value &= value - 1) count++;
-            return count;
+            double multiplicity = 0.0;
+            for (int h = 0; h < walk.Orderings; h++)
+            {
+                float separation = (walk.Point - walk.Group[_walkSubgroup[h]].Apply(walk.Point)).magnitude;
+                multiplicity += DiscOverlapFraction(separation / (2f * walk.Reach));
+            }
+            return (float)System.Math.Max(1.0, multiplicity);
         }
 
-        /// The k-th subset of `mask`'s bits, counting in binary over those bits (k's bit 0 selects
-        /// the lowest set bit of mask, and so on). Gives every group a fixed enumeration.
-        private static int NthSubmask(int mask, int k)
+        /// Shared area of two equal discs whose centres are `u` diameters apart, as a fraction of
+        /// one disc: 1 at u = 0, 0 from u = 1.
+        private static double DiscOverlapFraction(double u)
         {
-            int result = 0, bit = 0;
-            for (int axis = 0; axis < 3; axis++)
-            {
-                if ((mask & (1 << axis)) == 0) continue;
-                if ((k & (1 << bit)) != 0) result |= 1 << axis;
-                bit++;
-            }
-            return result;
+            if (u >= 1.0) return 0.0;
+            if (u <= 0.0) return 1.0;
+            return 2.0 / System.Math.PI * (System.Math.Acos(u) - u * System.Math.Sqrt(1.0 - u * u));
         }
     }
 }

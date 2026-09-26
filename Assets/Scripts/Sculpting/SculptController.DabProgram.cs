@@ -38,12 +38,14 @@ namespace Sculpting
             public Vector3 Dir;      // Crease: stroke direction. Clay: the frozen tip tangent.
             public Vector3 Aux;      // Clay: the frozen tip bitangent.
             public Vector3 Camera;   // the dab's viewpoint - see _dabCameraLocal
-            public float Scale;      // Commit: 1 / orderings. Clay Apply: the dab's dt.
-            public int FlipMask;     // Apply: which mirror side the dab is on - see _dabFlipMask
+            public float Scale;      // Commit: the scale on the summed deltas (see CommitMirrorGroup). Clay Apply: the dab's dt.
+            public int Side;         // Apply: which symmetric copy the dab is (its group index) - see _dabOpIndex
+            public SymmetryOp Op;    // Apply: that copy's op - see _dabOp
         }
 
-        /// One mirror side's dabs, for ClayProgramJob's lookup. Every dab of a side lies on the
-        /// straight segment First..Last (they are interpolated between two frame hits, then mirrored).
+        /// One symmetric copy's dabs (a "side" - one element of the symmetry group), for
+        /// ClayProgramJob's lookup. Every dab of a side lies on the straight segment First..Last
+        /// (they are interpolated between two frame hits, then mapped through the side's op).
         private struct DabSide
         {
             public bool Active;
@@ -60,7 +62,7 @@ namespace Sculpting
 
         // Every vertex any recorded dab can reach, deduped by generation stamp (same scheme as
         // DirtyVertexSet), in "slot" order - the index every native array of the program uses.
-        // Gathered with ONE query per mirror side, a sphere around all of that side's dab centres,
+        // Gathered with ONE query per symmetric side, a sphere around all of that side's dab centres,
         // rather than one per dab: a frame's dabs lie on the straight segment between two frame
         // hits and overlap each other by ~90%, so twenty footprint queries cost far more than the
         // job they feed. The sphere is a superset, and the jobs' own radius tests do the exact
@@ -70,8 +72,10 @@ namespace Sculpting
         private readonly List<int> _dabUnion = new List<int>();
         private int[] _dabUnionStamp;
         private int _dabUnionGeneration;
-        private readonly DabSide[] _dabSides = new DabSide[8];
-        private readonly float[] _dabSideExtents = new float[8];
+        // One per element of the current symmetry group - see EnsureDabSides.
+        private DabSide[] _dabSides = new DabSide[8];
+        private float[] _dabSideExtents = new float[8];
+        private int _dabSideCount;
 
         private NativeArray<DabSide> _nativeDabSides;
         private NativeArray<float> _nativeDabWeights;
@@ -114,19 +118,24 @@ namespace Sculpting
             _dabProgram.Add(new DabOp
             {
                 Kind = DabOpKind.Apply, Point = point, Normal = normal, Dir = dir, Aux = aux,
-                Camera = _dabCameraLocal, Scale = scale, FlipMask = _dabFlipMask,
+                Camera = _dabCameraLocal, Scale = scale, Side = _dabOpIndex, Op = _dabOp,
             });
         }
 
-        /// Fills _dabUnion - see its remarks - and _dabSides. One sphere per mirror side, never one
-        /// around everything: mirrored dabs sit on opposite sides of the model, and a sphere around
-        /// both would take in the whole thing between them.
+        /// Fills _dabUnion - see its remarks - and _dabSides. One sphere per symmetric side, never
+        /// one around everything: mirrored and radial copies sit on different sides of the model,
+        /// and a sphere around them all would take in the whole thing between them.
         private void GatherDabUnion(float reach)
         {
+            int sideCount = 1;
+            for (int k = 0; k < _dabProgram.Count; k++)
+                if (_dabProgram[k].Kind == DabOpKind.Apply) sideCount = Mathf.Max(sideCount, _dabProgram[k].Side + 1);
+            EnsureDabSides(sideCount);
+
             int generation = _dabUnionGeneration;
             int[] stamp = _dabUnionStamp;
             float[] extents = _dabSideExtents;
-            for (int flip = 0; flip < 8; flip++)
+            for (int flip = 0; flip < sideCount; flip++)
             {
                 _dabSides[flip] = default;
                 Vector3 min = Vector3.positiveInfinity, max = Vector3.negativeInfinity;
@@ -135,7 +144,7 @@ namespace Sculpting
                 for (int k = 0; k < _dabProgram.Count; k++)
                 {
                     DabOp op = _dabProgram[k];
-                    if (op.Kind != DabOpKind.Apply || op.FlipMask != flip) continue;
+                    if (op.Kind != DabOpKind.Apply || op.Side != flip) continue;
                     min = Vector3.Min(min, op.Point);
                     max = Vector3.Max(max, op.Point);
                     if (!any) first = op.Point;
@@ -149,7 +158,7 @@ namespace Sculpting
                 for (int k = 0; k < _dabProgram.Count; k++)
                 {
                     DabOp op = _dabProgram[k];
-                    if (op.Kind != DabOpKind.Apply || op.FlipMask != flip) continue;
+                    if (op.Kind != DabOpKind.Apply || op.Side != flip) continue;
                     extent = Mathf.Max(extent, Vector3.Distance(op.Point, centre));
                 }
                 extents[flip] = extent;
@@ -180,19 +189,29 @@ namespace Sculpting
             while (merged)
             {
                 merged = false;
-                for (int a = 0; a < 8; a++)
-                for (int b = a + 1; b < 8; b++)
+                for (int a = 0; a < sideCount; a++)
+                for (int b = a + 1; b < sideCount; b++)
                 {
                     if (!_dabSides[a].Active || !_dabSides[b].Active) continue;
                     if (_dabSides[a].Component == _dabSides[b].Component) continue;
                     float gap = Vector3.Distance(_dabSides[a].Centre, _dabSides[b].Centre) - extents[a] - extents[b];
                     if (gap > 4f * reach) continue;
                     int from = _dabSides[b].Component, to = _dabSides[a].Component;
-                    for (int f = 0; f < 8; f++)
+                    for (int f = 0; f < sideCount; f++)
                         if (_dabSides[f].Component == from) _dabSides[f].Component = to;
                     merged = true;
                 }
             }
+        }
+
+        /// Sizes the side tables for a symmetry group of `count` elements (8 covers every mirror
+        /// combination; radial symmetry can need more).
+        private void EnsureDabSides(int count)
+        {
+            _dabSideCount = count;
+            if (_dabSides.Length >= count) return;
+            _dabSides = new DabSide[count];
+            _dabSideExtents = new float[count];
         }
 
         private void UploadDabProgram()
@@ -336,14 +355,16 @@ namespace Sculpting
                 _nativeDabBucketKeys = new NativeArray<float>(sideSlots, Allocator.Persistent);
                 _nativeDabBucketSlots = new NativeArray<int>(sideSlots, Allocator.Persistent);
             }
-            if (!_nativeDabSides.IsCreated)
+            if (!_nativeDabSides.IsCreated || _nativeDabSides.Length < _dabSideCount)
             {
-                _nativeDabSides = new NativeArray<DabSide>(8, Allocator.Persistent);
-                _nativeDabBucketStarts = new NativeArray<int>(8 * (MaxDabBuckets + 1), Allocator.Persistent);
+                DisposeDabSideTables();
+                int sides = Mathf.Max(8, _dabSideCount);
+                _nativeDabSides = new NativeArray<DabSide>(sides, Allocator.Persistent);
+                _nativeDabBucketStarts = new NativeArray<int>(sides * (MaxDabBuckets + 1), Allocator.Persistent);
                 _nativeDabBucketCursor = new NativeArray<int>(MaxDabBuckets, Allocator.Persistent);
-                _nativeDabBucketMin = new NativeArray<float>(8, Allocator.Persistent);
-                _nativeDabBucketWidth = new NativeArray<float>(8, Allocator.Persistent);
-                _nativeDabBucketCount = new NativeArray<int>(8 * 2, Allocator.Persistent); // count, list base
+                _nativeDabBucketMin = new NativeArray<float>(sides, Allocator.Persistent);
+                _nativeDabBucketWidth = new NativeArray<float>(sides, Allocator.Persistent);
+                _nativeDabBucketCount = new NativeArray<int>(sides * 2, Allocator.Persistent); // count, list base
                 _nativeDabStats = new NativeArray<float>(2, Allocator.Persistent);
             }
         }
@@ -365,10 +386,10 @@ namespace Sculpting
             sculptableMesh.CopyStrokeStartPositions(_dabUnion, _nativeStrokeStart);
             UploadDabProgram();
             int activeSides = 0;
-            for (int f = 0; f < 8; f++) if (_dabSides[f].Active) activeSides++;
+            for (int f = 0; f < _dabSideCount; f++) if (_dabSides[f].Active) activeSides++;
             EnsureDabWorkCapacity(count, activeSides);
             NativeArray<DabSide> sides = _nativeDabSides;
-            for (int f = 0; f < 8; f++) sides[f] = _dabSides[f];
+            for (int f = 0; f < _dabSideCount; f++) sides[f] = _dabSides[f];
             EnsureAlphaNative(); // read only with useAlpha, but the job needs a valid array either way
 
             // Same values ApplyClayBrushLocalJob computes per dab; none of them change within a frame
@@ -391,6 +412,7 @@ namespace Sculpting
                 Program = _nativeDabProgram,
                 ProgramLength = _dabProgram.Count,
                 Sides = _nativeDabSides,
+                SideCount = _dabSideCount,
                 Positions = _nativePositionsOut,
                 AppliedOut = _nativeAppliedOut,
                 Weights = _nativeDabWeights,
@@ -480,9 +502,10 @@ namespace Sculpting
             public NativeArray<int> BucketCursor;
             public NativeArray<float> BucketMin;
             public NativeArray<float> BucketWidth;
-            public NativeArray<int> BucketInfo; // [f] bucket count, [8 + f] base of side f's slot list
+            public NativeArray<int> BucketInfo; // [f] bucket count, [SideCount + f] base of side f's slot list
             public NativeArray<float> Stats;    // [0] fallback dabs, [1] largest move this frame
             public int ProgramLength;
+            public int SideCount;
             public int SlotCount;
             public float Reach;
             public float EffectiveRadius;
@@ -504,11 +527,27 @@ namespace Sculpting
                     AppliedOut[s] = 0;
                     GroupStamp[s] = 0;
                 }
+                // Component by component: which slots lie within reach of the component's segments is
+                // worked out once (into Weights, free until the first dab) and shared by each of its
+                // sides, rather than re-tested per side against every side of the component - which
+                // was quadratic in the side count, and radial symmetry near its axis puts every side
+                // in one component.
                 int listBase = 0;
-                for (int f = 0; f < 8; f++)
+                for (int f = 0; f < SideCount; f++)
                 {
-                    BucketInfo[8 + f] = listBase;
-                    if (BuildBuckets(f, listBase)) listBase += SlotCount;
+                    BucketInfo[f] = 0;
+                    BucketInfo[SideCount + f] = 0;
+                }
+                for (int c = 0; c < SideCount; c++)
+                {
+                    if (!MarkComponent(c)) continue;
+                    for (int f = 0; f < SideCount; f++)
+                    {
+                        if (!Sides[f].Active || Sides[f].Component != c) continue;
+                        BucketInfo[SideCount + f] = listBase;
+                        BuildBuckets(f, listBase);
+                        listBase += SlotCount;
+                    }
                 }
                 Stats[0] = 0f;
 
@@ -556,29 +595,43 @@ namespace Sculpting
                 Stats[1] = maxMoved;
             }
 
-            /// Builds side f's slot list (see the job's remarks) at BucketSlots[listBase..], counting-
-            /// sorted into buckets along its axis. Buckets are a quarter of the reach wide, widened for
-            /// a side so long it would need more than MaxDabBuckets. False for an inactive side.
-            private bool BuildBuckets(int f, int listBase)
+            /// Flags in Weights (1 / 0) every slot within reach of a segment of any side in component
+            /// c, by frame-start position. False when no active side belongs to c.
+            private bool MarkComponent(int c)
             {
-                DabSide side = Sides[f];
-                BucketInfo[f] = 0;
-                if (!side.Active) return false;
+                bool any = false;
+                for (int f = 0; f < SideCount && !any; f++) any = Sides[f].Active && Sides[f].Component == c;
+                if (!any) return false;
 
                 float capsuleSqr = Reach * Reach * 1.0001f; // a hair over, never under
+                for (int s = 0; s < SlotCount; s++)
+                {
+                    Vector3 p = PositionsStart[s];
+                    bool inside = false;
+                    for (int g = 0; g < SideCount && !inside; g++)
+                    {
+                        DabSide other = Sides[g];
+                        if (!other.Active || other.Component != c) continue;
+                        inside = SqrDistanceToSegment(p, other.First, other.Last) <= capsuleSqr;
+                    }
+                    Weights[s] = inside ? 1f : 0f;
+                }
+                return true;
+            }
+
+            /// Builds side f's slot list (see the job's remarks) at BucketSlots[listBase..], counting-
+            /// sorted into buckets along its axis: the slots MarkComponent flagged for f's component.
+            /// Buckets are a quarter of the reach wide, widened for a side so long it would need more
+            /// than MaxDabBuckets.
+            private void BuildBuckets(int f, int listBase)
+            {
+                DabSide side = Sides[f];
                 float min = float.MaxValue, max = float.MinValue;
                 int included = 0;
                 for (int s = 0; s < SlotCount; s++)
                 {
                     Vector3 p = PositionsStart[s];
-                    bool inside = false;
-                    for (int g = 0; g < 8 && !inside; g++)
-                    {
-                        DabSide other = Sides[g];
-                        if (!other.Active || other.Component != side.Component) continue;
-                        inside = SqrDistanceToSegment(p, other.First, other.Last) <= capsuleSqr;
-                    }
-                    if (!inside)
+                    if (Weights[s] == 0f)
                     {
                         BucketKeys[listBase + s] = float.NaN;
                         continue;
@@ -589,7 +642,7 @@ namespace Sculpting
                     max = Mathf.Max(max, key);
                     included++;
                 }
-                if (included == 0) return true;
+                if (included == 0) return;
 
                 int starts = f * (MaxDabBuckets + 1);
                 float width = Mathf.Max(Mathf.Max(Reach * 0.25f, 1e-6f), (max - min) / (MaxDabBuckets - 1));
@@ -614,7 +667,6 @@ namespace Sculpting
                     if (float.IsNaN(key)) continue;
                     BucketSlots[listBase + BucketCursor[BucketOf(key, min, width, buckets)]++] = s;
                 }
-                return true;
             }
 
             private static int BucketOf(float key, float min, float width, int buckets) =>
@@ -641,12 +693,12 @@ namespace Sculpting
                 }
                 else
                 {
-                    int f = op.FlipMask;
+                    int f = op.Side;
                     DabSide side = Sides[f];
                     int buckets = BucketInfo[f];
                     if (!side.Active || buckets == 0) return;
 
-                    listBase = BucketInfo[8 + f];
+                    listBase = BucketInfo[SideCount + f];
                     int starts = f * (MaxDabBuckets + 1);
                     float min = BucketMin[f];
                     float width = BucketWidth[f];
@@ -672,7 +724,7 @@ namespace Sculpting
 
                 Vector3 planeOrigin = plane.Origin;
                 Vector3 planeNormal = plane.NormalOr(op.Normal);
-                DabTangentBasis(planeNormal, op.FlipMask, out Vector3 tangent, out Vector3 bitangent);
+                DabTangentBasis(planeNormal, op.Op, out Vector3 tangent, out Vector3 bitangent);
 
                 // Pass 2: displacement.
                 for (int j = lo; j < hi; j++)
@@ -721,6 +773,12 @@ namespace Sculpting
             if (_nativeDabProgram.IsCreated) _nativeDabProgram.Dispose();
             DisposeDabWork();
             DisposeDabSideLists();
+            DisposeDabSideTables();
+            _dabProgramRecording = false;
+        }
+
+        private void DisposeDabSideTables()
+        {
             if (_nativeDabSides.IsCreated) _nativeDabSides.Dispose();
             if (_nativeDabBucketStarts.IsCreated) _nativeDabBucketStarts.Dispose();
             if (_nativeDabBucketCursor.IsCreated) _nativeDabBucketCursor.Dispose();
@@ -728,7 +786,6 @@ namespace Sculpting
             if (_nativeDabBucketWidth.IsCreated) _nativeDabBucketWidth.Dispose();
             if (_nativeDabBucketCount.IsCreated) _nativeDabBucketCount.Dispose();
             if (_nativeDabStats.IsCreated) _nativeDabStats.Dispose();
-            _dabProgramRecording = false;
         }
     }
 }

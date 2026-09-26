@@ -34,6 +34,8 @@ namespace Sculpting
         // the width of BrushRadius's (0.01-2) - same "full-width drag covers roughly the whole
         // range" feel, scaled to the smaller range.
         private const float StrengthAdjustSensitivity = 0.00125f;
+        // Focal Shift spans -1..1, so the same 800 px of travel covers its whole range.
+        private const float FocalAdjustSensitivity = 0.0025f;
         // Same "full-width drag covers roughly the whole range" tuning, for RemeshResolution's
         // 4-4096 span - see HandleRemeshDensityKey. Scaled up with the range so a full-width
         // drag still spans it rather than stopping partway.
@@ -91,6 +93,12 @@ namespace Sculpting
         private float _strengthAdjustStartMouseX;
         // Same freeze-in-place reasoning as _resizeAnchorScreenPos above, for the F-drag.
         private Vector2 _strengthAdjustAnchorScreenPos;
+
+        // Same pattern again for the D-drag (see HandleFocalShiftKey).
+        private bool _isAdjustingFocalShift;
+        private float _focalAdjustStartValue;
+        private float _focalAdjustStartMouseX;
+        private Vector2 _focalAdjustAnchorScreenPos;
 
         // Same S-drag pattern again (see HandleRemeshDensityKey), but gated behind a hold
         // threshold rather than starting the instant R goes down - R already has a meaning on a
@@ -166,6 +174,8 @@ namespace Sculpting
         }
 
         public bool IsAdjustingStrength => _isAdjustingStrength;
+        /// True while D is held - the HUD brightens the inner falloff ring for the duration.
+        public bool IsAdjustingFocalShift => _isAdjustingFocalShift;
 
         /// True while the R-hold gauge is armed - SculptUIBuilder reads this to know when to
         /// show the density label/slider, and UpdateBrushCursor reads it to suppress the
@@ -191,6 +201,11 @@ namespace Sculpting
         public float BrushCursorScreenDiameter => _brushCursorScreenDiameter;
         public Color BrushCursorColor => _brushCursorColor;
         public bool BrushCursorDashed => _brushCursorDashed;
+        /// The inner ring, as a fraction of the brush radius: where the current brush's
+        /// effective falloff (built-in or custom curve, after Focal Shift) drops to half weight.
+        /// Negative while the brush has no radial falloff to show (Pose).
+        public float BrushCursorFalloffRadius01 => _brushCursorFalloffRadius01;
+        private float _brushCursorFalloffRadius01 = 0.5f;
 
         // The Lazy Mouse rope, for the tether line SculptUIBuilder draws while a stabilized
         // stroke is running (ZBrush/Nomad both draw the same thing). Without it the stabilizer
@@ -234,7 +249,7 @@ namespace Sculpting
         private void HandleUndoRedoKeys()
         {
             var kb = Keyboard.current;
-            if (kb == null || _isResizingBrush || _isAdjustingStrength || _isAdjustingRemeshDensity) return;
+            if (kb == null || _isResizingBrush || _isAdjustingStrength || _isAdjustingFocalShift || _isAdjustingRemeshDensity) return;
             if (!kb.zKey.wasPressedThisFrame) return;
             // Typing a "z" into a text field is text. Tool modes are NOT excluded here, unlike the
             // other bare keys: Z is arbitrated between the tools' own histories and the scene's
@@ -355,7 +370,7 @@ namespace Sculpting
             // doesn't need this same guard), so switching brushes mid-drag would let the next
             // mouse-move frame stomp the NEWLY-switched-to brush's stored strength with a value
             // computed from the OLD brush's baseline.
-            if (_isAdjustingStrength) return;
+            if (_isAdjustingStrength || _isAdjustingFocalShift) return;
 
             // Digits, M and X - see _shortcutKeysBlocked.
             if (_shortcutKeysBlocked) return;
@@ -393,7 +408,7 @@ namespace Sculpting
         // during the resize gauge for the same reason other input handlers are.
         private void HandleShiftSmoothOverride(Keyboard kb)
         {
-            if (_isResizingBrush || _isAdjustingStrength || _isAdjustingRemeshDensity) return;
+            if (_isResizingBrush || _isAdjustingStrength || _isAdjustingFocalShift || _isAdjustingRemeshDensity) return;
             bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
             // Shift means "act on everything outside the region" while a region gesture is armed
@@ -553,6 +568,37 @@ namespace Sculpting
             BrushStrength = _strengthAdjustStartValue + deltaX * StrengthAdjustSensitivity;
         }
 
+        // Holding D scrubs Focal Shift the same way - S, D and F side by side for size, falloff
+        // and strength (ZBrush's O is taken by the turntable here). Dragging right always grows
+        // the inner ring: harder, so the focal shift goes DOWN. In mask mode the same gesture
+        // edits MaskHardness, which is what the inner ring shows there.
+        private void HandleFocalShiftKey()
+        {
+            var kb = Keyboard.current;
+            var mouse = Mouse.current;
+            if (kb == null || mouse == null) return;
+
+            if (kb.dKey.wasPressedThisFrame && !CtrlHeld && !_shortcutKeysBlocked
+                && !_isResizingBrush && !_isAdjustingStrength)
+            {
+                EndActiveDrags();
+                _isAdjustingFocalShift = true;
+                _focalAdjustStartValue = _isMaskPaintMode ? maskHardness : FocalShift;
+                _focalAdjustStartMouseX = mouse.position.ReadValue().x;
+                _focalAdjustAnchorScreenPos = mouse.position.ReadValue();
+            }
+            else if (_isAdjustingFocalShift && !kb.dKey.isPressed)
+            {
+                _isAdjustingFocalShift = false;
+            }
+
+            if (!_isAdjustingFocalShift) return;
+
+            float deltaX = mouse.position.ReadValue().x - _focalAdjustStartMouseX;
+            if (_isMaskPaintMode) MaskHardness = _focalAdjustStartValue + deltaX * FocalAdjustSensitivity * 0.5f;
+            else FocalShift = _focalAdjustStartValue - deltaX * FocalAdjustSensitivity;
+        }
+
         // R is dual-purpose: a plain tap still fires the old immediate Remesh() at whatever
         // resolution is already set, but holding it past RemeshHoldThreshold instead arms a
         // density gauge - same S/F-drag feel as the two handlers above (horizontal mouse
@@ -573,7 +619,7 @@ namespace Sculpting
                 if (!_shortcutKeysBlocked) _rKeyDownTime = Time.unscaledTime;
             }
             else if (_rKeyDownTime >= 0f && kb.rKey.isPressed && !_isAdjustingRemeshDensity
-                     && !_isResizingBrush && !_isAdjustingStrength
+                     && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingFocalShift
                      && Time.unscaledTime - _rKeyDownTime >= RemeshHoldThreshold)
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while adjusting density
@@ -624,7 +670,7 @@ namespace Sculpting
             // Suppressed while another drag gauge or a region gesture already owns the mouse -
             // same guard list HandleShiftSmoothOverride uses, for the same reason: two input
             // modes both scrubbing off mouse position/clicks at once would fight each other.
-            if (kb.spaceKey.wasPressedThisFrame && !shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
+            if (kb.spaceKey.wasPressedThisFrame && !shiftHeld && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingFocalShift &&
                 !_isAdjustingRemeshDensity && !RegionSelectActive && !_regionRadialMenuOpen && !_radialMenusBlocked)
             {
                 EndActiveDrags(); // don't leave a grab mid-drag while the menu is up
@@ -661,7 +707,7 @@ namespace Sculpting
 
             bool shiftHeld = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            if (kb.spaceKey.wasPressedThisFrame && shiftHeld && !_isResizingBrush && !_isAdjustingStrength &&
+            if (kb.spaceKey.wasPressedThisFrame && shiftHeld && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingFocalShift &&
                 !_isAdjustingRemeshDensity && !RegionSelectActive && !_radialMenuOpen && !_radialMenusBlocked)
             {
                 EndActiveDrags();
@@ -750,7 +796,7 @@ namespace Sculpting
         {
             var mouse = Mouse.current;
             IsHoveringSculptSurface = mouse != null && _isHovering && !_isOverUI
-                && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingRemeshDensity;
+                && !_isResizingBrush && !_isAdjustingStrength && !_isAdjustingFocalShift && !_isAdjustingRemeshDensity;
             if (!IsHoveringSculptSurface) return;
 
             float scroll = mouse.scroll.ReadValue().y;
@@ -882,6 +928,7 @@ namespace Sculpting
                     // it, see LazyMouseTetherActive.
                     Vector2 screenPos = _isResizingBrush ? _resizeAnchorScreenPos
                         : _isAdjustingStrength ? _strengthAdjustAnchorScreenPos
+                        : _isAdjustingFocalShift ? _focalAdjustAnchorScreenPos
                         : _lazyMouseActive ? _lazyMouseScreenPos
                         : mouse.position.ReadValue();
                     Vector3 worldPoint;
@@ -909,6 +956,7 @@ namespace Sculpting
                         // ring rather than shrinking past legibility - the projected size is
                         // otherwise unbounded in both directions.
                         _brushCursorScreenDiameter = Mathf.Max(diameterPx, MinCursorScreenDiameterPx);
+                        _brushCursorFalloffRadius01 = FalloffHalfWeightRadius01();
 
                         // Smooth gets its own blue/dashed look (see SmoothColor/
                         // BrushCursorDashed) since it has no add/subtract polarity at all -
@@ -953,6 +1001,54 @@ namespace Sculpting
             _showRegionCrosshair = false;
             for (int i = 0; i < _poseChainLines.Count; i++)
                 if (_poseChainLines[i] != null) _poseChainLines[i].gameObject.SetActive(false);
+        }
+
+        private const int FalloffRingSamples = 64;
+
+        /// Walks the current brush's weight outward from the centre and returns the first
+        /// distance (fraction of the radius) where it falls to one half. Half weight rather than
+        /// "where the falloff starts": a smoothstep is only at full weight at the very centre, so
+        /// that circle would be a dot whatever the setting, while the half-weight radius moves
+        /// with every falloff control there is - and at Focal Shift 0 on the default smoothstep it
+        /// sits at half the radius, where ZBrush's inner circle does.
+        ///
+        /// Evaluates the very functions the brushes call, reading the same active table
+        /// (SyncBrushFalloff ran earlier this frame), so the ring cannot drift from the stroke.
+        private float FalloffHalfWeightRadius01()
+        {
+            // PaintMask: full weight inside hardness * radius, then a smoothstep across the rest,
+            // which is at half weight exactly halfway across that band.
+            if (_isMaskPaintMode) return maskHardness + (1f - maskHardness) * 0.5f;
+            // Pose rotates a chain; its radius only picks where the chain ends.
+            if (currentBrush == BrushType.Pose) return -1f;
+
+            float prevD = 0f, prevW = BrushWeightAt(1f);
+            if (prevW <= 0.5f) return 0f;
+            for (int i = 1; i <= FalloffRingSamples; i++)
+            {
+                float d = i / (float)FalloffRingSamples;
+                float w = BrushWeightAt(1f - d);
+                if (w <= 0.5f)
+                    return Mathf.Lerp(prevD, d, Mathf.InverseLerp(prevW, w, 0.5f));
+                prevD = d;
+                prevW = w;
+            }
+            return 1f;
+        }
+
+        /// The current brush's falloff weight at t01 (1 centre, 0 edge), without mask or
+        /// front-facing terms - each case is the call that brush's own weight loop makes.
+        private float BrushWeightAt(float t01)
+        {
+            switch (currentBrush)
+            {
+                case BrushType.Clay: return ClayFalloff(t01, EffectiveClayEdgeSoftness);
+                case BrushType.Flatten: return ClayFalloff(t01, 1f);
+                case BrushType.Crease: return CarveFalloff(t01);
+                case BrushType.Standard: return DirectionalFalloff(1f - t01, 0f);
+                case BrushType.Layer: return DirectionalFalloff(1f - t01, LayerPlateau);
+                default: return BrushFalloff.Smoothstep(t01); // Move, Smooth, Inflate, SnakeHook
+            }
         }
 
         // Measures how many screen pixels `worldRadius` covers at `worldCenter` by projecting

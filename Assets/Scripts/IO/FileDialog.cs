@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
 
 namespace Sculpting.IO
 {
@@ -34,29 +36,79 @@ namespace Sculpting.IO
         /// `extensions` are bare, without dots (e.g. "sculpt", "obj").
         public static string OpenFile(string title, string startDirectory, params string[] extensions)
         {
+            BeginModal();
+            try
+            {
 #if UNITY_EDITOR
-            // The Editor panel takes ONE comma-separated extension list per filter entry, so
-            // every accepted type is offered as a single "All Supported" row.
-            string joined = string.Join(",", extensions);
-            string chosen = UnityEditor.EditorUtility.OpenFilePanel(title, startDirectory, joined);
-            return string.IsNullOrEmpty(chosen) ? null : chosen;
+                // The Editor panel takes ONE comma-separated extension list per filter entry, so
+                // every accepted type is offered as a single "All Supported" row.
+                string joined = string.Join(",", extensions);
+                string chosen = UnityEditor.EditorUtility.OpenFilePanel(title, startDirectory, joined);
+                return string.IsNullOrEmpty(chosen) ? null : chosen;
 #else
-            if (!IsSupported) return null;
-            return WindowsOpenFile(title, startDirectory, extensions);
+                if (!IsSupported) return null;
+                return WindowsOpenFile(title, startDirectory, extensions);
 #endif
+            }
+            finally { EndModal(); }
         }
 
         /// Returns the chosen path, or null if cancelled/unavailable. `defaultName` is the
         /// filename the dialog opens pre-filled with.
         public static string SaveFile(string title, string startDirectory, string defaultName, string extension)
         {
+            BeginModal();
+            try
+            {
 #if UNITY_EDITOR
-            string chosen = UnityEditor.EditorUtility.SaveFilePanel(title, startDirectory, defaultName, extension);
-            return string.IsNullOrEmpty(chosen) ? null : chosen;
+                string chosen = UnityEditor.EditorUtility.SaveFilePanel(title, startDirectory, defaultName, extension);
+                return string.IsNullOrEmpty(chosen) ? null : chosen;
 #else
-            if (!IsSupported) return null;
-            return WindowsSaveFile(title, startDirectory, defaultName, extension);
+                if (!IsSupported) return null;
+                return WindowsSaveFile(title, startDirectory, defaultName, extension);
 #endif
+            }
+            finally { EndModal(); }
+        }
+
+        // ------------------------------------------------------------------ stale input guard
+
+        // Both dialog routes are modal and block the main thread, but the OS keeps delivering
+        // the mouse/keyboard input aimed at the dialog to Unity's input queue - the click on
+        // Save, Enter, the letters of a typed file name. Once the dialog returns, the Input
+        // System would process all of it as if it happened in the app: the Save click lands
+        // on the button that opened the dialog (the cursor position Unity last saw) and
+        // opens it a second time, Enter re-submits that still-selected button, and letters
+        // fire hotkeys (O starts the turntable) or a leaked press becomes a viewport drag.
+        //
+        // So every keyboard/pointer event processed from the moment a dialog opens through the
+        // first full frame after it closes is swallowed. Nothing a person does in that window
+        // was meant for the app - they were looking at the dialog.
+        private static int _swallowInputThroughFrame = -1;
+
+        private static void BeginModal()
+        {
+            // -= first so a domain reload (or a Play entered without one) can't stack listeners.
+            InputSystem.onEvent -= SwallowDialogInput;
+            InputSystem.onEvent += SwallowDialogInput;
+            _swallowInputThroughFrame = int.MaxValue;
+        }
+
+        private static void EndModal()
+        {
+            // The rest of this frame plus the next one, whose input update drains everything
+            // the OS queued while the dialog was up.
+            _swallowInputThroughFrame = Time.frameCount + 1;
+
+            // Key releases were swallowed too, so a shortcut that opened the dialog (Ctrl+S)
+            // would otherwise stay held forever and block every "no modifier" hotkey.
+            if (Keyboard.current != null) InputSystem.ResetDevice(Keyboard.current);
+        }
+
+        private static void SwallowDialogInput(InputEventPtr eventPtr, InputDevice device)
+        {
+            if (Time.frameCount > _swallowInputThroughFrame) return;
+            if (device is Keyboard || device is Pointer) eventPtr.handled = true;
         }
 
         // ------------------------------------------------------------------ Windows native
@@ -96,6 +148,11 @@ namespace Sculpting.IO
 
         [DllImport("comdlg32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool GetSaveFileNameW(ref OpenFileNameW ofn);
+
+        // The app's own window, set as the dialog's owner so Windows disables it while the
+        // dialog is up (truly modal: it can't be clicked, and the dialog stays on top of it).
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetActiveWindow();
 
         private const int OfnFileMustExist = 0x00001000;
         private const int OfnPathMustExist = 0x00000800;
@@ -145,6 +202,7 @@ namespace Sculpting.IO
                 var ofn = new OpenFileNameW
                 {
                     structSize = Marshal.SizeOf(typeof(OpenFileNameW)),
+                    hwndOwner = GetActiveWindow(),
                     filter = filterPtr,
                     file = fileBuffer,
                     maxFile = MaxPathChars,

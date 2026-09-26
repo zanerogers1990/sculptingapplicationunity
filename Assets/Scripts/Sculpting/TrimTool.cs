@@ -49,10 +49,11 @@ namespace Sculpting
             string lastError = null;
             long trianglesBefore = tris.Length / 3;
 
-            foreach (Vector3 sign in MirrorSigns(target, removeCovered))
+            SymmetryGroup symmetry = Symmetry(target, removeCovered);
+            for (int k = 0; k < symmetry.Count; k++)
             {
                 MeshTrimmer.Result result = MeshTrimmer.Trim(
-                    verts, tris, mvp, modelToView, viewport, sign, region, removeCovered);
+                    verts, tris, mvp, modelToView, viewport, symmetry[k], region, removeCovered);
 
                 if (!result.Success)
                 {
@@ -104,8 +105,8 @@ namespace Sculpting
             return true;
         }
 
-        // Symmetry is applied by running one whole cut per mirror sign, rather than by widening
-        // the coverage test to "covered under ANY mirror". Each pass then has a single, well
+        // Symmetry is applied by running one whole cut per symmetry op (mirror / radial copy),
+        // rather than by widening the coverage test to "covered under ANY copy". Each pass then has a single, well
         // defined swept surface, which is what the cap has to be built on - a test that answered
         // for two prisms at once would leave the cap with no coherent surface to follow where
         // they meet.
@@ -113,15 +114,11 @@ namespace Sculpting
         // Only for the cut-away direction. Sequential passes REMOVE the union of the mirrored
         // shapes, which is exactly right there; for a crop they would keep only the intersection,
         // which is the opposite of what mirroring should mean, so a crop runs unmirrored.
-        private static IEnumerable<Vector3> MirrorSigns(SculptableMesh target, bool removeCovered)
+        private static SymmetryGroup Symmetry(SculptableMesh target, bool removeCovered)
         {
-            if (!removeCovered) { yield return Vector3.one; yield break; }
-
+            if (!removeCovered) return SymmetryGroup.Trivial;
             var mirror = target.GetComponent<MirrorController>();
-            List<Vector3> signs = mirror != null ? mirror.GetMirrorSigns() : null;
-            if (signs == null || signs.Count == 0) { yield return Vector3.one; yield break; }
-
-            for (int i = 0; i < signs.Count; i++) yield return signs[i];
+            return mirror != null ? mirror.GetSymmetry() : SymmetryGroup.Trivial;
         }
     }
 }

@@ -24,6 +24,7 @@ namespace Sculpting.Tests
         private const BindingFlags AnyMember =
             BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
         private const int FramesPerStroke = 90;
+        private const int RadialFrames = 10;
         private const float FrameDt = 1f / 60f;
         // The stroke loops around this cone about the view axis, on the camera-facing side.
         private const float LoopHalfAngleDegrees = 28f;
@@ -95,6 +96,32 @@ namespace Sculpting.Tests
         {
             var timing = RunStroke(brush, radius, travel, mirrorX, surfaceRelax: null);
             Report($"{brush,-7} r={radius:F2} travel={travel:F1}r mirrorX={(mirrorX ? "on " : "off")}", timing);
+        }
+
+        /// Radial symmetry about the view (Z) axis, which the stroke loop circles: with the large
+        /// brush every copy's footprint meets its neighbours', so the simultaneous path of the
+        /// symmetric dab walk (apply, bank, restore per copy - see SculptController.MirroredDabWalk)
+        /// runs on every dab.
+        [Test]
+        public void RadialStroke([Values("Clay", "Crease", "Inflate")] string brush,
+            [Values(0.05f, 0.15f)] float radius,
+            [Values(6, 8, 12, 16)] int count)
+        {
+            _mirror.Radial = true;
+            _mirror.RadialAxisChoice = RadialAxis.Z;
+            _mirror.RadialCount = count;
+            try
+            {
+                // Short, and run a case or two at a time: an early design that applied
+                // orderings^2 copies per dab near the axis cost hundreds of milliseconds a frame
+                // here, and a full 90-frame run of every case once froze the machine for minutes.
+                var timing = RunStroke(brush, radius, 2f, false, surfaceRelax: null, frames: RadialFrames);
+                Report($"{brush,-7} r={radius:F2} radial={count,2}", timing);
+            }
+            finally
+            {
+                _mirror.Radial = false;
+            }
         }
 
         /// How far ONE pass of each brush moves the surface at the default strength, in brush radii,
@@ -199,11 +226,12 @@ namespace Sculpting.Tests
         private struct StrokeTiming
         {
             public double StartMs, MeanMs, P95Ms, WorstMs, ReleaseMs;
-            public int Hits, GridRebuilds, Collections;
+            public int Hits, Frames, GridRebuilds, Collections;
             public float MaxDisplacement;
         }
 
-        private StrokeTiming RunStroke(string brush, float radius, float travel, bool mirrorX, float? surfaceRelax)
+        private StrokeTiming RunStroke(string brush, float radius, float travel, bool mirrorX, float? surfaceRelax,
+            int frames = FramesPerStroke)
         {
             RestoreGeometry();
             _mirror.MirrorX = mirrorX;
@@ -215,7 +243,7 @@ namespace Sculpting.Tests
             ResetStrokeContinuity();
 
             var sw = new Stopwatch();
-            var frameMs = new List<double>(FramesPerStroke);
+            var frameMs = new List<double>(frames);
             double startMs = 0;
             int hits = 0;
             Camera camera = _cameraObject.GetComponent<Camera>();
@@ -234,7 +262,7 @@ namespace Sculpting.Tests
 
             float travelPerFrame = travel * radius;
             float loopRadius = 0.5f * Mathf.Sin(LoopHalfAngleDegrees * Mathf.Deg2Rad);
-            for (int frame = 0; frame < FramesPerStroke; frame++)
+            for (int frame = 0; frame < frames; frame++)
             {
                 float angle = frame * travelPerFrame / loopRadius;
                 Vector3 target = LoopPoint(angle);
@@ -272,6 +300,7 @@ namespace Sculpting.Tests
                 WorstMs = frameMs[frameMs.Count - 1],
                 ReleaseMs = releaseMs,
                 Hits = hits,
+                Frames = frames,
                 GridRebuilds = _sculptable.TriangleGridRebuilds - rebuildsBefore,
                 MaxDisplacement = MaxDisplacement(),
                 Collections = GC.CollectionCount(0) - collectionsBefore,
@@ -347,9 +376,9 @@ namespace Sculpting.Tests
         {
             TestContext.Out.WriteLine(
                 $"[BENCH] tris={_sculptable.TriangleCount} {label} | frame mean {t.MeanMs:F2}ms p95 {t.P95Ms:F2}ms " +
-                $"worst {t.WorstMs:F2}ms | start {t.StartMs:F1}ms release {t.ReleaseMs:F1}ms | hits {t.Hits}/{FramesPerStroke} " +
+                $"worst {t.WorstMs:F2}ms | start {t.StartMs:F1}ms release {t.ReleaseMs:F1}ms | hits {t.Hits}/{t.Frames} " +
                 $"| triGridRebuilds {t.GridRebuilds} GCs {t.Collections} maxDisp {t.MaxDisplacement:F3}");
-            Assert.That(t.Hits, Is.GreaterThan(FramesPerStroke / 2), "The stroke mostly missed the mesh - the numbers mean nothing.");
+            Assert.That(t.Hits, Is.GreaterThan(t.Frames / 2), "The stroke mostly missed the mesh - the numbers mean nothing.");
         }
 
         // ------------------------------------------------------------------------ reflection

@@ -95,6 +95,11 @@ namespace Sculpting
             }
         }
 
+        /// Create hands the new object radial symmetry around the axis it was revolved about, so
+        /// sculpting on it is repeated all the way round (see MirrorController.Radial). Not a mesh
+        /// setting - the build is unaffected.
+        public bool RadialSymmetryOnCreate { get; set; }
+
         /// The profile closes on itself - a ring or torus. Part of the shape, so undoable.
         public bool ClosedLoop
         {
@@ -545,6 +550,13 @@ namespace Sculpting
             SculptableMesh sculptable = SceneObjectFactory.Create(mesh, ObjectNaming.Unique("Lathe"),
                 _root.TransformPoint(new Vector3(0f, centreY, 0f)), Quaternion.identity, Vector3.one);
             GameObject go = sculptable.gameObject;
+
+            // The revolve axis is the object's local Y through its pivot (identity rotation, pivot
+            // on the axis - above), which is exactly where radial symmetry about Y sits. Set
+            // explicitly rather than trusting MirrorController's default to stay Y.
+            var symmetry = go.GetComponent<MirrorController>();
+            symmetry.RadialAxisChoice = RadialAxis.Y;
+            symmetry.Radial = RadialSymmetryOnCreate;
 
             Selection?.Select(sculptable, false);
             // Straight into sculpting what was just made.

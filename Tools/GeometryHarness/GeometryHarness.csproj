@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Offline test harness for the pure-geometry code in Assets/Scripts/Geometry.
+
+    Compiles the LIVE source files (linked, not copied) against a small UnityEngine shim, so
+    geometry algorithms can be tested and benchmarked in about a second without the editor.
+    LangVersion is pinned to Unity's C# 9 so syntax Unity can't compile fails here too.
+
+      dotnet run -c Release                  run every suite
+      dotnet run -c Release polymesh perf    run the named suites
+      dotnet run -c Release [suites] -obj out   also write OBJ output under ./out
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Optimize>true</Optimize>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <NoWarn>CS0162;CS0414;CS0649;CS0168;CS0219</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Shim\**\*.cs" />
+    <Compile Include="Harness\**\*.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\QuadRemesh\**\*.cs" LinkBase="live\QuadRemesh" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\VectorMath.cs" Link="live\VectorMath.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\EdgeKeyComparer.cs" Link="live\EdgeKeyComparer.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\MeshRemesher.cs" Link="live\MeshRemesher.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\SparseRemesher.cs" Link="live\SparseRemesher.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\SurfaceNetsTopology.cs" Link="live\SurfaceNetsTopology.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\SignedDistanceField.cs" Link="live\SignedDistanceField.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\DualContourSolver.cs" Link="live\DualContourSolver.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\MeshGeometryBuffer.cs" Link="live\MeshGeometryBuffer.cs" />
+    <Compile Include="..\..\Assets\Scripts\Geometry\ParallelPass.cs" Link="live\ParallelPass.cs" />
+  </ItemGroup>
+</Project>

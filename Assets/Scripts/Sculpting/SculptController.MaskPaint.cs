@@ -89,8 +89,9 @@ namespace Sculpting
 
         private void PlaceMaskDab(Vector3 localPoint, Vector3 localNormal)
         {
-            foreach (Vector3 sign in MirrorSigns())
-                sculptableMesh.PaintMask(Vector3.Scale(localPoint, sign), brushRadius, _maskDabAmount, maskHardness);
+            SymmetryGroup symmetry = Symmetry();
+            for (int k = 0; k < symmetry.Count; k++)
+                sculptableMesh.PaintMask(symmetry[k].Apply(localPoint), brushRadius, _maskDabAmount, maskHardness);
         }
     }
 }

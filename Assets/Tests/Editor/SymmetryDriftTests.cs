@@ -89,7 +89,7 @@ namespace Sculpting.Tests
             TestReflection.SetField(_sculptable, "useMeshCollider", false);
             if (_sculptable.Vertices == null) TestReflection.Invoke(_sculptable, "Awake");
             // Edit mode runs no Awake for it either, so it never builds its plane quads - only
-            // GetMirrorSigns is needed.
+            // GetSymmetry is needed.
             _mirror = _meshObject.AddComponent<MirrorController>();
 
             _cameraObject = new GameObject("SymmetryDriftCamera") { hideFlags = HideFlags.HideAndDontSave };

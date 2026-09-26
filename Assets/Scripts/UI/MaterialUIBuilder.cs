@@ -9,7 +9,7 @@ namespace Sculpting
 {
     /// Builds the "Material" section: base PBR sliders (color, metallic, smoothness, normal
     /// detail), the screen-space cavity (Ridge/Valley), the Surface Shader presets (lure plastic,
-    /// aged metal, sculptor's clay) and the matcap palette, all wired directly to SculptMaterialController.
+    /// aged metal, sculptor's clay, carved wood) and the matcap palette, all wired directly to SculptMaterialController.
     ///
     /// No longer builds its own canvas - StudioPanelUIBuilder merges this section together
     /// with Studio Lighting and Presentation into one panel with three collapsible headers, and
@@ -88,23 +88,28 @@ namespace Sculpting
         // ------------------------------------------------------------------ surface shader
 
         private const float SwatchHeight = 60f;
-        private static readonly string[] FinishOptions = { "None (Base Color)", "Lure Plastic", "Metal", "Clay" };
+        private static readonly string[] FinishOptions = { "None (Base Color)", "Lure Plastic", "Metal", "Clay", "Wood" };
+        private static readonly string[] GrainAxisOptions = { "Grain: Vertical", "Grain: Left-Right", "Grain: Front-Back" };
 
         private UIFactory.InlineDropdown _finishDropdown;
         private Text _finishStatus;
         private GameObject _finishMatcapNote;
-        private GameObject _lureGroup, _metalGroup, _clayGroup;
+        private GameObject _lureGroup, _metalGroup, _clayGroup, _woodGroup;
         private Slider _lureSizeSlider, _lureAmountSlider, _lureSparkleSlider, _lureTranslucencySlider, _lureGlossSlider;
         private Slider _metalExposureSlider, _metalWearSlider, _metalWashSlider, _metalDetailSlider, _metalPatternSlider, _metalGlossSlider, _metalSeedSlider;
         private Slider _clayGlossSlider, _clayWetSlider, _claySubsurfaceSlider, _clayRecessSlider, _clayDetailSlider, _clayGrainSlider;
+        private Slider _woodGrainSlider, _woodScaleSlider, _woodSeedSlider, _woodWearSlider, _woodPatinaSlider, _woodDetailSlider, _woodSheenSlider, _woodCracksSlider;
+        private UIFactory.InlineDropdown _woodAxisDropdown;
         private readonly List<KeyValuePair<string, Image>> _lureButtons = new List<KeyValuePair<string, Image>>();
         private readonly List<KeyValuePair<string, Image>> _metalButtons = new List<KeyValuePair<string, Image>>();
         private readonly List<KeyValuePair<string, Image>> _clayButtons = new List<KeyValuePair<string, Image>>();
+        private readonly List<KeyValuePair<string, Image>> _woodButtons = new List<KeyValuePair<string, Image>>();
         // What the section last showed, so a scene load (which writes the controller directly)
         // or a matcap toggle elsewhere gets reflected here. Value tuples rather than a formatted
         // string: this is compared every frame.
-        private ((bool, SurfaceFinish, string, string, string), (float, float, float, float, float),
-                 (float, float, float, float, float, float, float), (float, float, float, float, float, float)) _shownFinishState;
+        private ((bool, SurfaceFinish, string, string, string, string, WoodGrainAxis), (float, float, float, float, float),
+                 (float, float, float, float, float, float, float), (float, float, float, float, float, float),
+                 (float, float, float, float, float, float, float, float)) _shownFinishState;
 
         /// One section for every shader that replaces plain Base Color shading, grouped by
         /// category in a dropdown: pick the category, then a swatch within it.
@@ -127,13 +132,14 @@ namespace Sculpting
             {
                 _material.Finish = (SurfaceFinish)i;
                 RefreshFinishUi();
-            }, "Shader category. Lure Plastic is translucent soft plastic with glitter; Metal is rust, patina, washes and antiqued metals; Clay is sculptor's oil clay - grey plasteline, terracotta and more.");
+            }, "Shader category. Lure Plastic is translucent soft plastic with glitter; Metal is rust, patina, washes and antiqued metals; Clay is sculptor's oil clay - grey plasteline, terracotta and more; Wood is carved, waxed wood with grain, worn edges and patina.");
 
             _finishStatus = UIFactory.CreateLabel(section, string.Empty, 11, FontStyle.Italic);
 
             BuildLureGroup(section);
             BuildMetalGroup(section);
             BuildClayGroup(section);
+            BuildWoodGroup(section);
             RefreshFinishUi();
         }
 
@@ -262,6 +268,62 @@ namespace Sculpting
                 "Fine grit in the clay's surface, shading only - 0 is perfectly smooth.");
         }
 
+        private void BuildWoodGroup(Transform section)
+        {
+            _woodGroup = CreateGroup(section, "Wood");
+            Transform group = _woodGroup.transform;
+
+            _woodButtons.Clear();
+            foreach (WoodPreset preset in WoodPresets.All)
+                _woodButtons.Add(new KeyValuePair<string, Image>(preset.Id, null));
+            BuildSwatchGrid(group, WoodPresets.All.Count, i =>
+            {
+                WoodPreset p = WoodPresets.All[i];
+                Image frame = CreateSwatchButton(p.Id, p.Name, p.Description, WoodPresets.CreateThumbnail(p), () =>
+                {
+                    _material.SelectWoodPreset(p.Id);
+                    RefreshFinishUi();
+                });
+                _woodButtons[i] = new KeyValuePair<string, Image>(p.Id, frame);
+                return frame.transform;
+            });
+
+            _woodAxisDropdown = UIFactory.CreateDropdown(group, GrainAxisOptions, (int)_material.WoodGrainAxis, i =>
+            {
+                _material.WoodGrainAxis = (WoodGrainAxis)i;
+                RefreshFinishUi();
+            }, "Which way the log ran through the carving. Vertical suits heads and figures; the grain shows as long flames along it and rings where you look down it.");
+            UIFactory.CreateLabel(group, "Grain", 12, FontStyle.Normal);
+            _woodGrainSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.WoodGrain, v => _material.WoodGrain = v,
+                "How strongly the growth rings, fibres and pores show - 1 is the preset, 0 is plain even wood.");
+            UIFactory.CreateLabel(group, "Grain Size", 12, FontStyle.Normal);
+            _woodScaleSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.WoodGrainScale, v => _material.WoodGrainScale = v,
+                "Spacing of the rings and fibres - 1 is the preset's own size.");
+            UIFactory.CreateLabel(group, "Grain Shift", 12, FontStyle.Normal);
+            _woodSeedSlider = UIFactory.CreateSlider(group, 0f, 1f, _material.WoodGrainSeed, v => _material.WoodGrainSeed = v,
+                "Moves the heart of the log through the model - near 0 the rings circle the middle, near 1 they straighten into stripes.");
+            UIFactory.CreateButton(group, "Shuffle Grain", () =>
+            {
+                _material.ShuffleWoodGrain();
+                RefreshFinishUi();
+            }, "Cut the carving from a different part of the log.");
+            UIFactory.CreateLabel(group, "Edge Wear", 12, FontStyle.Normal);
+            _woodWearSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.WoodEdgeWear, v => _material.WoodEdgeWear = v,
+                "How far raised edges and high forms are rubbed back to lighter, glowing wood.");
+            UIFactory.CreateLabel(group, "Patina", 12, FontStyle.Normal);
+            _woodPatinaSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.WoodPatina, v => _material.WoodPatina = v,
+                "How dark the old wax and grime in the recesses goes - 0 keeps them the wood's own colour.");
+            UIFactory.CreateLabel(group, "Detail Contrast", 12, FontStyle.Normal);
+            _woodDetailSlider = UIFactory.CreateSlider(group, 0.25f, 3f, _material.WoodDetail, v => _material.WoodDetail = v,
+                "How much relief counts as an edge or a recess - low keeps wear and patina to the sharpest carving, high spreads them over gentle forms.");
+            UIFactory.CreateLabel(group, "Sheen", 12, FontStyle.Normal);
+            _woodSheenSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.WoodSheen, v => _material.WoodSheen = v,
+                "The waxed finish - 1 is the preset's dull shine, 0 bare dry wood, 2 freshly polished.");
+            UIFactory.CreateLabel(group, "Cracks", 12, FontStyle.Normal);
+            _woodCracksSlider = UIFactory.CreateSlider(group, 0f, 2f, _material.WoodCracks, v => _material.WoodCracks = v,
+                "Seasoning cracks running along the grain - 1 is the preset, 0 none, 2 many.");
+        }
+
         private static GameObject CreateGroup(Transform parent, string name)
         {
             var go = new GameObject(name, typeof(RectTransform));
@@ -327,14 +389,18 @@ namespace Sculpting
             return frame;
         }
 
-        private ((bool, SurfaceFinish, string, string, string), (float, float, float, float, float),
-                 (float, float, float, float, float, float, float), (float, float, float, float, float, float)) FinishStateSignature() =>
-            ((_material.MatcapEnabled, _material.Finish, _material.LurePresetId, _material.MetalPresetId, _material.ClayPresetId),
+        private ((bool, SurfaceFinish, string, string, string, string, WoodGrainAxis), (float, float, float, float, float),
+                 (float, float, float, float, float, float, float), (float, float, float, float, float, float),
+                 (float, float, float, float, float, float, float, float)) FinishStateSignature() =>
+            ((_material.MatcapEnabled, _material.Finish, _material.LurePresetId, _material.MetalPresetId, _material.ClayPresetId,
+              _material.WoodPresetId, _material.WoodGrainAxis),
              (_material.LureFlakeSize, _material.LureFlakeAmount, _material.LureSparkle, _material.LureTranslucency, _material.LureGloss),
              (_material.MetalExposure, _material.MetalEdgeWear, _material.MetalWash, _material.MetalDetail,
               _material.MetalPatternSize, _material.MetalGloss, _material.MetalPatternSeed),
              (_material.ClayGloss, _material.ClayWetness, _material.ClaySubsurface, _material.ClayRecess,
-              _material.ClayDetail, _material.ClayGrain));
+              _material.ClayDetail, _material.ClayGrain),
+             (_material.WoodGrain, _material.WoodGrainScale, _material.WoodGrainSeed, _material.WoodEdgeWear,
+              _material.WoodPatina, _material.WoodDetail, _material.WoodSheen, _material.WoodCracks));
 
         private void RefreshFinishUi()
         {
@@ -349,6 +415,7 @@ namespace Sculpting
             if (_lureGroup.activeSelf != (finish == SurfaceFinish.LurePlastic)) _lureGroup.SetActive(finish == SurfaceFinish.LurePlastic);
             if (_metalGroup.activeSelf != (finish == SurfaceFinish.Metal)) _metalGroup.SetActive(finish == SurfaceFinish.Metal);
             if (_clayGroup.activeSelf != (finish == SurfaceFinish.Clay)) _clayGroup.SetActive(finish == SurfaceFinish.Clay);
+            if (_woodGroup.activeSelf != (finish == SurfaceFinish.Wood)) _woodGroup.SetActive(finish == SurfaceFinish.Wood);
 
             _lureSizeSlider.SetValueWithoutNotify(_material.LureFlakeSize);
             _lureAmountSlider.SetValueWithoutNotify(_material.LureFlakeAmount);
@@ -368,14 +435,25 @@ namespace Sculpting
             _clayRecessSlider.SetValueWithoutNotify(_material.ClayRecess);
             _clayDetailSlider.SetValueWithoutNotify(_material.ClayDetail);
             _clayGrainSlider.SetValueWithoutNotify(_material.ClayGrain);
+            _woodAxisDropdown.SetValueWithoutNotify((int)_material.WoodGrainAxis);
+            _woodGrainSlider.SetValueWithoutNotify(_material.WoodGrain);
+            _woodScaleSlider.SetValueWithoutNotify(_material.WoodGrainScale);
+            _woodSeedSlider.SetValueWithoutNotify(_material.WoodGrainSeed);
+            _woodWearSlider.SetValueWithoutNotify(_material.WoodEdgeWear);
+            _woodPatinaSlider.SetValueWithoutNotify(_material.WoodPatina);
+            _woodDetailSlider.SetValueWithoutNotify(_material.WoodDetail);
+            _woodSheenSlider.SetValueWithoutNotify(_material.WoodSheen);
+            _woodCracksSlider.SetValueWithoutNotify(_material.WoodCracks);
 
             HighlightSwatches(_lureButtons, finish == SurfaceFinish.LurePlastic ? _material.LurePresetId : null);
             HighlightSwatches(_metalButtons, finish == SurfaceFinish.Metal ? _material.MetalPresetId : null);
             HighlightSwatches(_clayButtons, finish == SurfaceFinish.Clay ? _material.ClayPresetId : null);
+            HighlightSwatches(_woodButtons, finish == SurfaceFinish.Wood ? _material.WoodPresetId : null);
 
             string presetName = finish == SurfaceFinish.LurePlastic ? LurePlasticPresets.Find(_material.LurePresetId)?.Name
                               : finish == SurfaceFinish.Metal ? MetalFinishPresets.Find(_material.MetalPresetId)?.Name
                               : finish == SurfaceFinish.Clay ? ClayPresets.Find(_material.ClayPresetId)?.Name
+                              : finish == SurfaceFinish.Wood ? WoodPresets.Find(_material.WoodPresetId)?.Name
                               : null;
             if (finish == SurfaceFinish.None)
             {

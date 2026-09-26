@@ -52,7 +52,7 @@ namespace Sculpting
                 if (dist > radius) continue;
 
                 float t01 = 1f - dist / radius;
-                float smooth = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - _mask[i]); // smoothstep, masked-out
+                float smooth = BrushFalloff.Smoothstep(t01) * (1f - _mask[i]); // smoothstep, masked-out
                 if (smooth <= 0f) continue;
                 // Multiplied into the weight rather than used to reject outright, and through the
                 // SAME helper every other brush uses: the old hard test gave the grabbed region a

@@ -87,6 +87,36 @@ Shader "Custom/SculptPBR"
         _ClayGrainSize("Clay Grain Size (world)", Float) = 0.006
         _ClayDetail("Clay Detail Contrast", Range(0.1,4)) = 1
 
+        // Carved, waxed wood (antique fruitwood, walnut, oak...): growth rings and fibre streaks
+        // in 3D around a log axis, a dark patina settled in the recesses, raised edges worn and
+        // polished back to lighter wood, and a dull wax sheen (see WoodShade). Driven by
+        // WoodPresets through SculptMaterialController.
+        _WoodEnabled("Wood Enabled", Float) = 0
+        _WoodEarlyColor("Wood Earlywood Color", Color) = (0.42,0.2,0.08,1)
+        _WoodLateColor("Wood Latewood Color", Color) = (0.25,0.1,0.04,1)
+        _WoodWornColor("Wood Worn Color", Color) = (0.7,0.34,0.12,1)
+        _WoodRecessColor("Wood Recess Color", Color) = (0.05,0.02,0.01,1)
+        _WoodScatterColor("Wood Scatter Color", Color) = (0.8,0.35,0.12,1)
+        _WoodAxis("Wood Grain Axis (object)", Vector) = (0,1,0,0)
+        _WoodPith("Wood Pith Offset (world)", Vector) = (0,0,0,0)
+        _WoodRingSize("Wood Ring Spacing (world)", Float) = 0.02
+        _WoodRingContrast("Wood Ring Contrast", Range(0,2)) = 0.5
+        _WoodRingSharpness("Wood Latewood Fraction", Range(0.05,0.9)) = 0.3
+        _WoodWobble("Wood Ring Wobble", Range(0,3)) = 0.6
+        _WoodFigureSize("Wood Figure Size (world)", Float) = 0.2
+        _WoodStreaks("Wood Fibre Streaks", Range(0,2)) = 0.3
+        _WoodStreakSize("Wood Streak Width (world)", Float) = 0.003
+        _WoodPores("Wood Pores", Range(0,2)) = 0
+        _WoodEndGrain("Wood End Grain Darkening", Range(0,1)) = 0.3
+        _WoodPatina("Wood Recess Patina", Range(0,3)) = 1
+        _WoodWear("Wood Edge Wear", Range(0,3)) = 1
+        _WoodSmoothness("Wood Wax Smoothness", Range(0,1)) = 0.55
+        _WoodWax("Wood Wax Sheen", Range(0,3)) = 0.4
+        _WoodWaxPower("Wood Wax Sharpness", Float) = 60
+        _WoodSubsurface("Wood Subsurface", Range(0,2)) = 0.2
+        _WoodChecks("Wood Checks (cracks)", Range(0,1)) = 0
+        _WoodDetail("Wood Detail Contrast", Range(0.1,4)) = 1
+
         // Darker grey rather than a saturated color - matches ZBrush/Blender/Mudbox's
         // convention of shading masked areas toward grey/black instead of tinting them a
         // color, so the mask overlay doesn't read as "painted" onto the surface.
@@ -190,6 +220,31 @@ Shader "Custom/SculptPBR"
                 half _ClayGrain;
                 float _ClayGrainSize;
                 half _ClayDetail;
+                half _WoodEnabled;
+                half4 _WoodEarlyColor;
+                half4 _WoodLateColor;
+                half4 _WoodWornColor;
+                half4 _WoodRecessColor;
+                half4 _WoodScatterColor;
+                float4 _WoodAxis;
+                float4 _WoodPith;
+                float _WoodRingSize;
+                half _WoodRingContrast;
+                half _WoodRingSharpness;
+                half _WoodWobble;
+                float _WoodFigureSize;
+                half _WoodStreaks;
+                float _WoodStreakSize;
+                half _WoodPores;
+                half _WoodEndGrain;
+                half _WoodPatina;
+                half _WoodWear;
+                half _WoodSmoothness;
+                half _WoodWax;
+                float _WoodWaxPower;
+                half _WoodSubsurface;
+                half _WoodChecks;
+                half _WoodDetail;
             CBUFFER_END
 
             // "Shade Flat" normal from the screen-space derivatives of the interpolated world
@@ -927,6 +982,188 @@ Shader "Custom/SculptPBR"
                 return color;
             }
 
+            // ---- Carved wood ---------------------------------------------------------------
+            //
+            // An old waxed carving (the fruitwood/walnut heads of a Baroque workshop) reads as
+            // wood rather than brown plastic through:
+            //   1. Figure that belongs to a LOG, not to the surface: growth rings are shells around
+            //      a pith line running through the model, so a long-grain face shows long wavy
+            //      flames and an end-grain face shows rings - WoodRingPhase. Fibre streaks run
+            //      along the axis on top of that, and ring-porous woods (oak) add pores.
+            //   2. Age: years of wax and grime settled dark into every recess, while the raised
+            //      edges and high forms are rubbed back to lighter, warmer and glossier wood.
+            //   3. A dull wax shine - a soft satin lobe plus a broad wax highlight, never a mirror.
+            //   4. A touch of warm light past the shadow line (polished wood is slightly
+            //      translucent), and the odd check - a seasoning crack running along the grain.
+
+            // The log's frame, in object space at world size: `a` along the grain, (u, w) across it.
+            void WoodFrame(out float3 a, out float3 u, out float3 w)
+            {
+                a = normalize(_WoodAxis.xyz);
+                u = normalize(cross(a, abs(a.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0)));
+                w = cross(a, u);
+            }
+
+            // Fibres: value noise stretched ~30x along the grain, so it prints as fine streaks.
+            float WoodStreakHeight(float3 q, float3 a, float3 u, float3 w, float streakSize)
+            {
+                float3 s = float3(dot(q, u), dot(q, w), dot(q, a) / 30.0) / streakSize;
+                return ValueNoise3D(s) * 0.65 + ValueNoise3D(s * 2.3 + 5.1) * 0.35;
+            }
+
+            struct WoodLighting
+            {
+                half3 wax;
+                half3 scatter;
+            };
+
+            void AccumulateWoodLight(Light light, float3 N, float3 V, inout WoodLighting acc)
+            {
+                half3 radiance = light.color * light.distanceAttenuation;
+                float3 L = light.direction;
+                half ndl = dot(N, L);
+                // Normalised Blinn-Phong with a dielectric's fresnel, as the clay's wet film - but
+                // broad: rubbed wax is a soft glow over the form, not a glint.
+                float3 H = normalize(L + V);
+                float spec = pow(saturate(dot(N, H)), _WoodWaxPower) * (_WoodWaxPower + 8.0) / 8.0;
+                half fresnel = 0.04h + 0.96h * pow(1.0h - saturate(dot(V, H)), 5.0h);
+                acc.wax += radiance * light.shadowAttenuation * ((half)spec * fresnel * saturate(ndl));
+                half wrapped = saturate((ndl + 0.4h) / 1.4h);
+                acc.scatter += radiance * lerp(1.0h, light.shadowAttenuation, 0.6h) * max(wrapped - saturate(ndl), 0.0h);
+            }
+
+            half4 WoodShade(Varyings input, float3 normalWS, float3 smoothNormalWS, float3 positionOS)
+            {
+                float3 objectScale = ObjectAxisScale();
+                float3 p = positionOS * objectScale;
+                float footprint = length(fwidth(p));
+                half cv = SurfaceConvexity(input, _WoodDetail);
+
+                float3 a, u, w;
+                WoodFrame(a, u, w);
+                float3 q = p - _WoodPith.xyz;
+                float along = dot(q, a);
+                float2 radial = float2(dot(q, u), dot(q, w));
+                float radius = length(radial);
+
+                // ---- growth rings
+                // A trunk is never a true cylinder: low-frequency noise pushes the rings in and
+                // out by a few ring widths, stretched along the axis so they stay coherent along
+                // the grain - that is what draws the long flames on a flat-sawn face.
+                float ringSize = max(_WoodRingSize, 1e-6);
+                float figSize = max(_WoodFigureSize, 1e-5);
+                float wob = MetalFbm(float3(radial.x, along * 0.3, radial.y) / figSize) * 2.0 - 1.0;
+                float phase = (radius + wob * _WoodWobble * ringSize * 4.0) / ringSize;
+                // Good years and lean years: ring widths vary.
+                phase += ValueNoise3D(float3(phase * 0.3, along / figSize * 0.4, 7.7)) * 1.5;
+                float t = frac(phase);
+                float fw = fwidth(phase);
+                // Earlywood eases into dark latewood, which stops dead at the next year's start
+                // (softened over a pixel so the edge doesn't stair-step).
+                half late = (half)(smoothstep(1.0 - _WoodRingSharpness * 1.8, 1.0 - _WoodRingSharpness * 0.3, t)
+                                   * (1.0 - smoothstep(1.0 - max(fw, 0.02), 1.0, t)));
+                // Once a pixel spans most of a ring, what's left is moire - settle on the average.
+                half ringLod = saturate(1.3h - (half)fw * 1.6h);
+                late = lerp((half)_WoodRingSharpness * 0.8h, late, ringLod);
+                half3 wood = lerp(_WoodEarlyColor.rgb, _WoodLateColor.rgb, saturate(late * _WoodRingContrast));
+
+                // ---- fibres and pores, faded before they're smaller than a pixel
+                float streakSize = max(_WoodStreakSize, 1e-6);
+                half streakLod = saturate(1.5h - (half)(footprint / streakSize));
+                float streak = WoodStreakHeight(q, a, u, w, streakSize);
+                wood *= 1.0h + ((half)streak - 0.5h) * 0.7h * _WoodStreaks * streakLod;
+                if (_WoodPores > 0.001)
+                {
+                    // Ring-porous: big vessels in the earlywood, cut open as short dark dashes.
+                    float3 ps = float3(radial.x, radial.y, along / 6.0) / (streakSize * 0.6);
+                    half pore = smoothstep(0.7h, 0.82h, (half)ValueNoise3D(ps + 13.7)) * (1.0h - late)
+                              * saturate(1.5h - (half)(footprint / (streakSize * 0.6)));
+                    wood *= 1.0h - 0.55h * saturate(pore * _WoodPores);
+                }
+
+                // End grain drinks the finish and goes darker where the surface looks down the log.
+                float3 surfaceS = normalize(TransformWorldToObjectNormal(smoothNormalWS, false) / objectScale);
+                half endGrain = smoothstep(0.55h, 0.95h, (half)abs(dot(surfaceS, a))) * _WoodEndGrain;
+                wood *= 1.0h - 0.35h * endGrain;
+
+                // ---- age: grime in the recesses, rubbed-back edges on the high points
+                half wearNoise = (half)MetalFbm(p / figSize * 3.0 + 23.1);
+                half wear = saturate(smoothstep(0.12h, 0.55h, cv) * _WoodWear * (0.55h + 0.9h * wearNoise));
+                // The worn colour keeps the figure: scale it by how light this bit of wood is.
+                half woodLum = Luminance(wood) / max(Luminance(_WoodEarlyColor.rgb), 1e-3h);
+                half3 albedo = lerp(wood, _WoodWornColor.rgb * woodLum, wear);
+                half recess = saturate(smoothstep(0.0h, 0.4h, -cv) * _WoodPatina);
+                albedo = lerp(albedo, _WoodRecessColor.rgb, recess);
+
+                // ---- checks: seasoning cracks, radial from the pith and running along the grain
+                half crack = 0.0h;
+                if (_WoodChecks > 0.001)
+                {
+                    const float sectors = 7.0;
+                    float angle = atan2(radial.y, radial.x) / 6.2831853 + 0.5;
+                    // Cracks wander a little rather than ruling a straight line.
+                    angle += (ValueNoise3D(float3(along / figSize * 2.5, 3.3, 1.1)) - 0.5) * 0.02;
+                    float sector = floor(angle * sectors);
+                    float3 h = FlakeHash33(float3(sector, 17.0, 5.0));
+                    if (h.x < _WoodChecks)
+                    {
+                        float crackAngle = (sector + 0.2 + 0.6 * h.y) / sectors;
+                        float dist = abs(sin((angle - crackAngle) * 6.2831853)) * radius;
+                        // Checks open outward from the pith and run only part of the log's length.
+                        float width = ringSize * 0.35 * saturate(radius / figSize);
+                        half runs = smoothstep(0.35h, 0.5h, (half)ValueNoise3D(float3(along / figSize * 0.6, h.z * 40.0, 9.0)));
+                        crack = (half)(saturate((width - dist) / max(footprint, 1e-6) + 0.5)
+                                       * saturate(width * 2.0 / max(footprint, 1e-6))) * runs;
+                    }
+                }
+                albedo = lerp(albedo, _WoodRecessColor.rgb * 0.5h, crack);
+
+                half smoothness = saturate(_WoodSmoothness + 0.12h * wear - 0.3h * recess) * (1.0h - crack);
+
+                // Fibres raise the surface a hair, which breaks the sheen up along the grain.
+                half bump = _WoodStreaks * streakLod;
+                if (bump > 0.001h)
+                {
+                    float e = streakSize * 0.35;
+                    float3 grad = float3(WoodStreakHeight(q + float3(e, 0, 0), a, u, w, streakSize) - streak,
+                                         WoodStreakHeight(q + float3(0, e, 0), a, u, w, streakSize) - streak,
+                                         WoodStreakHeight(q + float3(0, 0, e), a, u, w, streakSize) - streak) / e;
+                    float3 gradWS = TransformObjectToWorldDir(grad / objectScale, false);
+                    float3 n = normalWS;
+                    normalWS = normalize(n - (gradWS - n * dot(gradWS, n)) * (bump * 0.05 * streakSize));
+                }
+
+                InputData inputData = BuildInputData(input, normalWS);
+                half4 color = PhysicallyShade(inputData, albedo, 0.0h, smoothness, 1.0h - 0.6h * recess);
+
+                float3 V = inputData.viewDirectionWS;
+                WoodLighting acc = (WoodLighting)0;
+                Light mainLight = GetMainLight(inputData.shadowCoord, inputData.positionWS, inputData.shadowMask);
+                AccumulateWoodLight(mainLight, normalWS, V, acc);
+                #if defined(_ADDITIONAL_LIGHTS)
+                uint pixelLightCount = GetAdditionalLightsCount();
+                #if USE_CLUSTER_LIGHT_LOOP
+                [loop] for (uint lightIndex = 0; lightIndex < min(URP_FP_DIRECTIONAL_LIGHTS_COUNT, MAX_VISIBLE_LIGHTS); lightIndex++)
+                {
+                    CLUSTER_LIGHT_LOOP_SUBTRACTIVE_LIGHT_CHECK
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulateWoodLight(light, normalWS, V, acc);
+                }
+                #endif
+                LIGHT_LOOP_BEGIN(pixelLightCount)
+                    Light light = GetAdditionalLight(lightIndex, inputData.positionWS, inputData.shadowMask);
+                    AccumulateWoodLight(light, normalWS, V, acc);
+                LIGHT_LOOP_END
+                #endif
+
+                // Wax builds up where hands polish it and is dull with grime in the recesses.
+                half waxAmount = _WoodWax * (1.0h - 0.8h * recess) * (0.7h + 0.6h * wear) * (1.0h - crack);
+                color.rgb += acc.wax * waxAmount
+                           + acc.scatter * _WoodScatterColor.rgb * _WoodSubsurface * (1.0h - recess);
+                color.rgb *= 1.0h - 0.35h * recess;
+                return color;
+            }
+
             half4 SculptPBRFragment(Varyings input) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
@@ -958,6 +1195,8 @@ Shader "Custom/SculptPBR"
                     litColor = MetalShade(input, normalWS, positionOS);
                 else if (_ClayEnabled > 0.5)
                     litColor = ClayShade(input, normalWS, positionOS);
+                else if (_WoodEnabled > 0.5)
+                    litColor = WoodShade(input, normalWS, normalize(input.normalWS), positionOS);
                 else
                     litColor = PhysicallyShade(BuildInputData(input, normalWS), _BaseColor.rgb, _Metallic, _Smoothness);
 

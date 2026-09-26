@@ -55,10 +55,19 @@ namespace Sculpting
         // so switching brushes silently changed the ACTUAL value while the panel kept showing
         // whatever the last brush had. Now resynced every frame alongside _brushSizeSlider.
         private Slider _brushStrengthSlider;
+        // Per brush and D-draggable, so polled like the strength slider. Mask Hardness too: in
+        // mask mode the D-drag edits it instead.
+        private Slider _focalShiftSlider;
+        private Slider _maskHardnessSlider;
         private Text _polyCountLabel;
         private Text _exportStatusLabel;
         // Polled, not set from the button: Remesh also fires from the R hotkey.
         private Text _remeshReportLabel;
+        // Quad Remesh target: a log-scale slider (100 to 200k is too wide for a linear one) plus
+        // a readout, both resynced per frame because Half/Double change the value too.
+        private Slider _quadTargetSlider;
+        private Text _quadTargetLabel;
+        private int _quadTargetShown = -1;
         private int _lastShownTriCount = -1, _lastShownVertCount = -1;
         private Button _undoButton, _redoButton;
         private BrushType _lastShownBrush = (BrushType)(-1);
@@ -81,6 +90,20 @@ namespace Sculpting
         // resync on selection change - see RefreshMirrorToggles.
         private bool _lastShownMirrorX, _lastShownMirrorY, _lastShownMirrorZ, _lastShownShowPlanes;
         private bool _mirrorTogglesShown;
+
+        // Radial symmetry controls (see BuildRadialSection), synced the same way as the mirror
+        // toggles: per-object settings, so a selection change has to repaint them.
+        private static readonly Color RadialCustomColor = new Color(1f, 0.8f, 0.25f);
+        private Toggle _radialToggle;
+        private Slider _radialCountSlider;
+        private Text _radialCountLabel;
+        private readonly Image[] _radialAxisImages = new Image[4];
+        private GameObject _radialCustomRow;
+        private InputField _radialCustomField;
+        private bool _lastShownRadial;
+        private int _lastShownRadialCount = -1;
+        private int _lastShownRadialAxis = -1;
+        private Vector3 _lastShownRadialCustomAxis;
 
         // Mask extract (see BuildExtractSection). The controller owns all the state; these are
         // just the controls whose enabled-ness and text have to follow it.
@@ -169,6 +192,9 @@ namespace Sculpting
             _lastShownSelectionVersion = -1;
             _lastShownMirrorX = _lastShownMirrorY = _lastShownMirrorZ = _lastShownShowPlanes = false;
             _mirrorTogglesShown = false;
+            _lastShownRadial = false;
+            _lastShownRadialCount = -1;
+            _lastShownRadialAxis = -1;
             _lastShownSymmetryAxis = -1;
             _lastShownExtractPreviewing = false;
             _lastShownExtractTris = -1;
@@ -193,10 +219,18 @@ namespace Sculpting
                     controller.BrushSizeMin, controller.BrushSizeMax, controller.BrushSize);
             }
             if (_remeshResolutionSlider != null) _remeshResolutionSlider.SetValueWithoutNotify(controller.RemeshResolution);
+            if (_quadTargetSlider != null && _quadTargetShown != controller.QuadRemeshTarget)
+            {
+                _quadTargetShown = controller.QuadRemeshTarget;
+                _quadTargetSlider.SetValueWithoutNotify(Mathf.Log10(_quadTargetShown));
+                _quadTargetLabel.text = $"Quad Remesh Target: {_quadTargetShown:N0} quads";
+            }
             // Reference compare: the report string is only replaced when a Remesh runs.
             if (_remeshReportLabel != null && !ReferenceEquals(_remeshReportLabel.text, controller.LastRemeshReport))
                 _remeshReportLabel.text = controller.LastRemeshReport;
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
+            if (_focalShiftSlider != null) _focalShiftSlider.SetValueWithoutNotify(controller.FocalShift * 100f);
+            if (_maskHardnessSlider != null) _maskHardnessSlider.SetValueWithoutNotify(controller.MaskHardness);
 
             // Brush switches can now come from the keyboard outside of SetBrushType (hotkeys
             // 1-5, and holding Shift to temporarily switch to Smooth), so the highlighted
@@ -280,7 +314,10 @@ namespace Sculpting
 
             bool changed = !_mirrorTogglesShown || _selection.SelectionVersion != _lastShownSelectionVersion ||
                 mirror.MirrorX != _lastShownMirrorX || mirror.MirrorY != _lastShownMirrorY ||
-                mirror.MirrorZ != _lastShownMirrorZ || mirror.ShowPlanes != _lastShownShowPlanes;
+                mirror.MirrorZ != _lastShownMirrorZ || mirror.ShowPlanes != _lastShownShowPlanes ||
+                mirror.Radial != _lastShownRadial || mirror.RadialCount != _lastShownRadialCount ||
+                (int)mirror.RadialAxisChoice != _lastShownRadialAxis ||
+                !mirror.RadialCustomAxis.Equals(_lastShownRadialCustomAxis);
             if (!changed) return;
 
             _mirrorTogglesShown = true;
@@ -294,6 +331,128 @@ namespace Sculpting
             _mirrorYToggle.SetIsOnWithoutNotify(mirror.MirrorY);
             _mirrorZToggle.SetIsOnWithoutNotify(mirror.MirrorZ);
             _showPlanesToggle.SetIsOnWithoutNotify(mirror.ShowPlanes);
+            RefreshRadialControls(mirror);
+        }
+
+        private void RefreshRadialControls(MirrorController mirror)
+        {
+            _lastShownRadial = mirror.Radial;
+            _lastShownRadialCount = mirror.RadialCount;
+            _lastShownRadialAxis = (int)mirror.RadialAxisChoice;
+            _lastShownRadialCustomAxis = mirror.RadialCustomAxis;
+            if (_radialToggle == null) return;
+
+            _radialToggle.SetIsOnWithoutNotify(mirror.Radial);
+            _radialCountSlider.SetValueWithoutNotify(mirror.RadialCount);
+            _radialCountLabel.text = RadialCountText(mirror.RadialCount);
+
+            int axis = (int)mirror.RadialAxisChoice;
+            for (int i = 0; i < _radialAxisImages.Length; i++)
+            {
+                if (_radialAxisImages[i] == null) continue;
+                // Tinted with the colour MirrorController draws the radial guide in for that axis.
+                _radialAxisImages[i].color = i != axis ? UIFactory.InactiveColor
+                    : i == 0 ? MirrorXColor : i == 1 ? MirrorYColor : i == 2 ? MirrorZColor : RadialCustomColor;
+            }
+
+            bool custom = mirror.RadialAxisChoice == RadialAxis.Custom;
+            if (_radialCustomRow.activeSelf != custom) _radialCustomRow.SetActive(custom);
+            if (custom && !_radialCustomField.isFocused) _radialCustomField.SetTextWithoutNotify(FormatAxis(mirror.RadialCustomAxis));
+        }
+
+        private static string RadialCountText(int count) => $"Radial Repeats: {count}";
+
+        private static string FormatAxis(Vector3 axis) =>
+            string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0:0.###}, {1:0.###}, {2:0.###}", axis.x, axis.y, axis.z);
+
+        /// "x, y, z" (commas or spaces). Null when it does not read as a usable direction.
+        private static Vector3? ParseAxis(string text)
+        {
+            string[] parts = text.Split(new[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 3) return null;
+            var values = new float[3];
+            for (int i = 0; i < 3; i++)
+                if (!float.TryParse(parts[i], System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out values[i])) return null;
+            var axis = new Vector3(values[0], values[1], values[2]);
+            return axis.sqrMagnitude > 1e-12f ? axis.normalized : (Vector3?)null;
+        }
+
+        // The setters below are null-guarded for the same reason SetMirrorAxis is.
+        private void SetRadial(bool on)
+        {
+            MirrorController mirror = controller.Mirror;
+            if (mirror != null) mirror.Radial = on;
+        }
+
+        private void SetRadialCount(float value)
+        {
+            MirrorController mirror = controller.Mirror;
+            if (mirror == null) return;
+            mirror.RadialCount = Mathf.RoundToInt(value);
+            if (_radialCountLabel != null) _radialCountLabel.text = RadialCountText(mirror.RadialCount);
+        }
+
+        private void SetRadialAxis(RadialAxis axis)
+        {
+            MirrorController mirror = controller.Mirror;
+            if (mirror != null) mirror.RadialAxisChoice = axis;
+        }
+
+        private void SetRadialCustomAxis(string text)
+        {
+            MirrorController mirror = controller.Mirror;
+            if (mirror == null) return;
+            Vector3? axis = ParseAxis(text);
+            // An unreadable entry snaps back to the current axis rather than zeroing it.
+            if (axis.HasValue) mirror.RadialCustomAxis = axis.Value;
+            _radialCustomField.SetTextWithoutNotify(FormatAxis(mirror.RadialCustomAxis));
+        }
+
+        /// Aims the custom axis straight down the view, in the object's own local space - so, seen
+        /// from here, the repeats land evenly spaced around the object's pivot on screen.
+        private void SetRadialAxisFromView()
+        {
+            MirrorController mirror = controller.Mirror;
+            Camera cam = Camera.main;
+            if (mirror == null || cam == null) return;
+            Vector3 local = mirror.transform.InverseTransformDirection(cam.transform.forward);
+            if (local.sqrMagnitude < 1e-12f) return;
+            mirror.RadialCustomAxis = local.normalized;
+            mirror.RadialAxisChoice = RadialAxis.Custom;
+        }
+
+        private void BuildRadialSection(Transform panel, MirrorController mirror)
+        {
+            CreateLabel(panel, "Radial Symmetry (Selected Object)", 14, FontStyle.Normal);
+            _radialToggle = CreateToggle(panel, "Radial", mirror != null && mirror.Radial, SetRadial, out _,
+                tooltip: "Repeats every stroke evenly around the axis below, through the object's pivot. Combines with the mirror axes. Lathe objects are built around Y.");
+
+            int count = mirror != null ? mirror.RadialCount : 8;
+            _radialCountLabel = CreateLabel(panel, RadialCountText(count), 12, FontStyle.Normal);
+            _radialCountSlider = CreateSlider(panel, SymmetryGroup.MinRadialCount, SymmetryGroup.MaxRadialCount, count,
+                SetRadialCount, "How many times each stroke is repeated around the axis.");
+            _radialCountSlider.wholeNumbers = true;
+
+            CreateLabel(panel, "Radial Axis", 12, FontStyle.Normal);
+            var axisRow = CreateRow(panel);
+            string[] names = { "X", "Y", "Z", "Custom" };
+            for (int i = 0; i < names.Length; i++)
+            {
+                var axis = (RadialAxis)i; // captured per iteration, not shared across the callbacks
+                Button b = CreateButton(axisRow.transform, names[i], () => SetRadialAxis(axis),
+                    i < 3 ? $"Repeats strokes around the object's local {names[i]} axis."
+                          : "Repeats strokes around an axis you set below - typed in, or taken from the view.");
+                _radialAxisImages[i] = b.GetComponent<Image>();
+            }
+
+            _radialCustomRow = CreateRow(panel);
+            _radialCustomField = UIFactory.CreateInputField(_radialCustomRow.transform,
+                FormatAxis(mirror != null ? mirror.RadialCustomAxis : Vector3.up), SetRadialCustomAxis);
+            _radialCustomField.GetComponent<LayoutElement>().flexibleWidth = 2f; // the field gets the room, not the button
+            CreateButton(_radialCustomRow.transform, "From View", SetRadialAxisFromView,
+                "Sets the custom axis to point straight down the current view, through the object's pivot.");
+            _radialCustomRow.SetActive(mirror != null && mirror.RadialAxisChoice == RadialAxis.Custom);
         }
 
         /// Null-guarded because controller.Mirror resolves through the live selection, which
@@ -376,6 +535,12 @@ namespace Sculpting
                 v => controller.ScreenSpaceBrushSize = v, out _,
                 tooltip: "On (ZBrush's Draw Size): the brush stays the same size on screen as you zoom. Off: the brush has a fixed size on the model.");
 
+            // ZBrush's -100..100 scale; the controller keeps -1..1. See BrushFalloff.Shift.
+            CreateLabel(panel.transform, "Focal Shift (Hard <-> Soft)", 14, FontStyle.Normal);
+            _focalShiftSlider = CreateSlider(panel.transform, -100f, 100f, controller.FocalShift * 100f,
+                v => controller.FocalShift = v / 100f,
+                "Where the brush's falloff happens, shown by the cursor's inner ring (where the brush is at half strength). Negative is harder, positive softer. Each brush keeps its own. Also adjustable by holding D and dragging.");
+
             _positiveToggle = CreateToggle(panel.transform, "Positive (Add)", controller.IsPositive, v =>
             {
                 controller.IsPositive = v;
@@ -457,8 +622,8 @@ namespace Sculpting
             // Collapsed by default, same reasoning as the other shaping foldouts below.
             Transform maskFoldout = UIFactory.CreateFoldoutSection(panel.transform, "Masking", false);
             CreateLabel(maskFoldout, "Hardness (Soft <-> Hard)", 12, FontStyle.Normal);
-            CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v,
-                "Sharpness of the mask edge - low fades gradually, high cuts off sharply.");
+            _maskHardnessSlider = CreateSlider(maskFoldout, 0f, 1f, controller.MaskHardness, v => controller.MaskHardness = v,
+                "Sharpness of the mask edge - low fades gradually, high cuts off sharply. Also adjustable by holding D and dragging while mask painting.");
             var maskActionRow = CreateRow(maskFoldout);
             CreateButton(maskActionRow.transform, "Invert Mask", () => controller.InvertMask(), "Swaps masked and unmasked areas.");
             CreateButton(maskActionRow.transform, "Clear Mask", () =>
@@ -604,8 +769,9 @@ namespace Sculpting
             // Applied scene-wide, not to the selection alone - see
             // MirrorController.SetShowPlanesForAll for why a per-object visibility toggle
             // reads as broken.
-            _showPlanesToggle = CreateToggle(panel.transform, "Show Mirror Planes", mirror == null || mirror.ShowPlanes,
-                MirrorController.SetShowPlanesForAll, out _, tooltip: "Draws the active mirror plane(s) in the viewport.");
+            BuildRadialSection(panel.transform, mirror);
+            _showPlanesToggle = CreateToggle(panel.transform, "Show Symmetry Guides", mirror == null || mirror.ShowPlanes,
+                MirrorController.SetShowPlanesForAll, out _, tooltip: "Draws the active mirror plane(s) and radial axis in the viewport.");
 
             BuildSymmetrySection(panel.transform);
 
@@ -652,12 +818,31 @@ namespace Sculpting
                 "Voxel density used by Remesh - higher captures finer detail but is slower. Also adjustable by holding R and dragging.");
             CreateButton(panel.transform, "Remesh", () => controller.Remesh(),
                 "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R. Capped at a 10M-triangle budget, so compact models stop gaining detail before slender ones do.");
+
+            _quadTargetLabel = CreateLabel(panel.transform, "Quad Remesh Target", 14, FontStyle.Normal);
+            _quadTargetSlider = CreateSlider(panel.transform,
+                Mathf.Log10(SculptController.MinQuadRemeshTarget), Mathf.Log10(SculptController.MaxQuadRemeshTarget),
+                Mathf.Log10(controller.QuadRemeshTarget),
+                v => controller.QuadRemeshTarget = RoundQuadTarget(Mathf.Pow(10f, v)),
+                "How many quads Quad Remesh aims for - the result lands within a few percent.");
+            var quadTargetRow = CreateRow(panel.transform);
+            CreateButton(quadTargetRow.transform, "Half", () => controller.QuadRemeshTarget /= 2, "Halves the quad target.");
+            CreateButton(quadTargetRow.transform, "Double", () => controller.QuadRemeshTarget *= 2, "Doubles the quad target.");
+            CreateButton(panel.transform, "Quad Remesh", () => controller.QuadRemesh(),
+                "Rebuilds the mesh as evenly-sized quads following the shape, aiming for the target above. Export OBJ then writes the quads. Sculpting keeps the quads; any other topology change (Remesh, Trim, Boolean) turns them back into plain triangles.");
             _remeshReportLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform,
-                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  8 Standard\n9 Layer  0 Snakehook  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
+                "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  8 Standard\n9 Layer  0 Snakehook  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nHold D + drag: Focal Shift (inner ring; mask hardness in Mask mode)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",
                 11, FontStyle.Italic);
 
+        }
+
+        /// Two significant figures, so the slider lands on 4,700 rather than 4,683.
+        private static int RoundQuadTarget(float value)
+        {
+            int magnitude = (int)Mathf.Pow(10f, Mathf.Max(0f, Mathf.Floor(Mathf.Log10(Mathf.Max(value, 1f))) - 1f));
+            return Mathf.RoundToInt(value / magnitude) * magnitude;
         }
 
         // Throttled rather than refreshed every frame: EditHistory.TotalBytes walks every step
@@ -739,6 +924,7 @@ namespace Sculpting
             graphGO.AddComponent<LayoutElement>().preferredHeight = 110f;
             var graph = graphGO.GetComponent<FalloffCurveGraphic>();
             graph.Source = () => controller.CurrentFalloffCurve;
+            graph.FocalShiftSource = () => controller.IsMaskPaintMode ? 0f : controller.FocalShift;
             graph.raycastTarget = true;
 
             CreateLabel(foldout, "Left: brush centre   Right: edge\nDrag points - click to add - right-click to remove", 10, FontStyle.Italic);

@@ -240,18 +240,18 @@ namespace Sculpting
         private void ApplyClayBrushAtLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt)
         {
             int centresBefore = _relaxCentres.Count;
-            // Order-symmetric near a mirror plane - see MirroredDabWalk. Reach is the widest query
-            // ApplyClayBrushLocal makes.
+            // Order-symmetric near a mirror plane or radial axis - see MirroredDabWalk. Reach is the
+            // widest query ApplyClayBrushLocal makes.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, clayTipRoundness < 1f ? brushRadius * Sqrt2 : brushRadius);
-            while (NextMirroredDab(ref dabs, out Vector3 sign))
+            while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
-                Vector3 mirroredPoint = Vector3.Scale(localPoint, sign);
-                Vector3 mirroredNormal = Vector3.Scale(localNormal, sign).normalized;
-                // Mirror the frozen stroke tangent frame the same way the point/normal are
-                // mirrored, instead of rebuilding it from the mirrored normal - keeps a
-                // mirrored stroke's square exactly as stable as the primary one.
-                Vector3 mirroredTangent0 = Vector3.Scale(_clayStrokeTangent0, sign);
-                Vector3 mirroredBitangent0 = Vector3.Scale(_clayStrokeBitangent0, sign);
+                Vector3 mirroredPoint = op.Apply(localPoint);
+                Vector3 mirroredNormal = op.Apply(localNormal).normalized;
+                // Map the frozen stroke tangent frame the same way the point/normal are mapped,
+                // instead of rebuilding it from the mapped normal - keeps a mirrored or radial
+                // stroke's square exactly as stable as the primary one.
+                Vector3 mirroredTangent0 = op.Apply(_clayStrokeTangent0);
+                Vector3 mirroredBitangent0 = op.Apply(_clayStrokeBitangent0);
                 ApplyClayBrushLocal(mirroredPoint, mirroredNormal, mirroredTangent0, mirroredBitangent0, positive, dt);
             }
 

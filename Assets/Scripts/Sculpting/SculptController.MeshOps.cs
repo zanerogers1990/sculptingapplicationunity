@@ -34,6 +34,16 @@ namespace Sculpting
                 : $"{tris} tris at density {used}";
         }
 
+        /// Rebuilds the selected object as quads (QuadRemesher), aiming for QuadRemeshTarget
+        /// faces. One undo step. Reports through LastRemeshReport like Remesh.
+        public void QuadRemesh()
+        {
+            if (sculptableMesh == null) return;
+            EndActiveDrags();
+            string summary = sculptableMesh.QuadRemeshUndoable(quadRemeshTarget);
+            LastRemeshReport = summary ?? "Quad remesh produced nothing - mesh left as it was";
+        }
+
         /// Live symmetry report for the selected object - pairs found, centreline size, and how
         /// many vertices have no counterpart. See SymmetryOps.Status for why it is recomputed
         /// rather than cached.

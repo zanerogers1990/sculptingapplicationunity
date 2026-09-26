@@ -50,16 +50,11 @@ namespace Sculpting
             var copyMirror = copy.GetComponent<MirrorController>();
 
             // Valid for a mirrored copy too: its local frame is the source's reflected, and every
-            // symmetry plane runs through the origin along an axis the reflection only negates, so
-            // the same flags describe the same planes.
+            // symmetry plane and X/Y/Z radial axis runs through the origin along an axis the
+            // reflection only negates, so the same settings describe the same symmetry (a custom
+            // radial axis is reflected with the geometry - see CopySettingsFrom).
             var sourceMirror = source.GetComponent<MirrorController>();
-            if (sourceMirror != null)
-            {
-                copyMirror.MirrorX = sourceMirror.MirrorX;
-                copyMirror.MirrorY = sourceMirror.MirrorY;
-                copyMirror.MirrorZ = sourceMirror.MirrorZ;
-                copyMirror.ShowPlanes = sourceMirror.ShowPlanes;
-            }
+            if (sourceMirror != null) copyMirror.CopySettingsFrom(sourceMirror, localSigns);
 
             // Vertex indices are identical (the triangles were copied index for index), so the
             // mask transfers one-to-one - carrying it over means a copy made mid-workflow stays

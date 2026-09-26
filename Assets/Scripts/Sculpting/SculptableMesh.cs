@@ -426,7 +426,9 @@ namespace Sculpting
             _cavityRaw = CloneExact(_cavityRaw, _vertexCount);
             _mask = CloneExact(_mask, _vertexCount);
             _originalVertices = CloneExact(_originalVertices, _vertexCount);
+            int[] oldTriangles = _workingTriangles;
             _workingTriangles = CloneExact(_workingTriangles, _cornerCount);
+            CarryQuadsAcrossCompaction(oldTriangles);
             if (_hiddenTriangles != null) _hiddenTriangles = CloneExact(_hiddenTriangles, TriangleCount);
             if (_hiddenVertices != null) _hiddenVertices = CloneExact(_hiddenVertices, _vertexCount);
 

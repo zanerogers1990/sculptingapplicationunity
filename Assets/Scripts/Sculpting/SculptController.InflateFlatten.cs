@@ -142,7 +142,7 @@ namespace Sculpting
 
                 Vector3 n = normals[i];
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
-                float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i]) // smoothstep, masked-out
+                float weight = BrushFalloff.Smoothstep(t01) * (1f - mask[i]) // smoothstep, masked-out
                     * BrushMath.FrontFacingWeight(frontFacingOnly, n, p, cameraLocalPos);
                 if (weight <= 0f) continue;
 

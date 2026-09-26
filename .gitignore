@@ -75,3 +75,7 @@ crashlytics-build.properties
 # Scene backups pulled out of Assets/ during the cleanup pass - kept on disk, not
 # part of the Unity project any more.
 /_RecoveryBackups/
+
+# Offline geometry test harness (dotnet) - its project file is source, unlike Unity's
+# generated ones above.
+!/Tools/GeometryHarness/GeometryHarness.csproj

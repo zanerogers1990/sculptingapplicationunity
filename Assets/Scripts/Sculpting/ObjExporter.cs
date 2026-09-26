@@ -24,7 +24,21 @@ namespace Sculpting
             Transform t = sculptableMesh.transform;
             Vector3[] verts = sculptableMesh.VerticesExact();
             Vector3[] normals = sculptableMesh.NormalsExact();
-            int[] triangles = mesh.triangles;
+            // TrianglesExact, not mesh.triangles: while anything is hidden the Mesh's index
+            // buffer holds only the visible triangles, and exporting from it silently dropped
+            // the hidden part of the model.
+            int[] triangles = sculptableMesh.TrianglesExact();
+
+            // After a quad remesh the faces are written as the quads themselves (the triangles
+            // are those quads split in two); otherwise as triangles.
+            int[] faceStart = sculptableMesh.QuadFaceStart;
+            int[] faceIndices = sculptableMesh.QuadFaceIndices;
+            if (faceStart == null)
+            {
+                faceStart = new int[triangles.Length / 3 + 1];
+                for (int f = 0; f < faceStart.Length; f++) faceStart[f] = f * 3;
+                faceIndices = triangles;
+            }
 
             var sb = new StringBuilder();
             sb.Append("# Exported from Sculpting Application\n");
@@ -47,17 +61,17 @@ namespace Sculpting
             }
 
             // 1-based indices, reversed winding order (c, b, a instead of a, b, c) to match
-            // the X flip above - flipping one axis inverts triangle orientation, so the
-            // winding has to flip back too or every face reads backwards/inside-out.
-            for (int i = 0; i < triangles.Length; i += 3)
+            // the X flip above - flipping one axis inverts face orientation, so the winding
+            // has to flip back too or every face reads backwards/inside-out.
+            for (int f = 0; f + 1 < faceStart.Length; f++)
             {
-                int a = triangles[i] + 1;
-                int b = triangles[i + 1] + 1;
-                int c = triangles[i + 2] + 1;
-                sb.Append("f ")
-                  .Append(c).Append("//").Append(c).Append(' ')
-                  .Append(b).Append("//").Append(b).Append(' ')
-                  .Append(a).Append("//").Append(a).Append('\n');
+                sb.Append('f');
+                for (int c = faceStart[f + 1] - 1; c >= faceStart[f]; c--)
+                {
+                    int v = faceIndices[c] + 1;
+                    sb.Append(' ').Append(v).Append("//").Append(v);
+                }
+                sb.Append('\n');
             }
 
             string folderPath = Path.GetDirectoryName(fullPath);

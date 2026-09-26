@@ -28,10 +28,17 @@ namespace Sculpting
         private static readonly Color CurveColor = new Color(0.35f, 0.65f, 1f, 1f);
         private static readonly Color PointColor = Color.white;
         private static readonly Color DisabledColor = new Color(1f, 1f, 1f, 0.2f);
+        private static readonly Color ShiftedColor = new Color(1f, 0.8f, 0.35f, 0.7f);
 
         /// Where the curve being edited comes from - the controller's current brush, re-read every
         /// frame so switching brushes shows that brush's curve. Null means the built-in falloff.
         public Func<BrushFalloffCurve> Source;
+
+        /// The current brush's Focal Shift (-1..1). While it is not 0 the graph also draws the
+        /// curve the brush actually uses - the points stay where they were drawn, unshifted.
+        public Func<float> FocalShiftSource;
+
+        private float _shownFocal;
 
         private BrushFalloffCurve _shown;
         private int _shownVersion = -1;
@@ -41,7 +48,9 @@ namespace Sculpting
         {
             BrushFalloffCurve curve = Source?.Invoke();
             int version = curve?.Version ?? -1;
-            if (curve == _shown && version == _shownVersion) return;
+            float focal = FocalShiftSource?.Invoke() ?? 0f;
+            if (curve == _shown && version == _shownVersion && focal == _shownFocal) return;
+            _shownFocal = focal;
             // Our own edits bump Version every drag frame; only a different curve (brush switch)
             // should drop the drag.
             if (curve != _shown) _dragIndex = -1;
@@ -144,7 +153,7 @@ namespace Sculpting
                 Vector2 prev = ToLocal(new Vector2(0f, 1f));
                 for (int i = 1; i <= CurveSegments; i++)
                 {
-                    float u = i / (float)CurveSegments, t = 1f - u;
+                    float u = i / (float)CurveSegments, t = 1f - BrushFalloff.ShiftDistance(u, _shownFocal);
                     Vector2 p = ToLocal(new Vector2(u, t * t * (3f - 2f * t)));
                     AddSegment(vh, prev, p, DisabledColor);
                     prev = p;
@@ -159,6 +168,17 @@ namespace Sculpting
                 Vector2 p = ToLocal(new Vector2(u, curve.Evaluate(u)));
                 AddSegment(vh, last, p, CurveColor);
                 last = p;
+            }
+            if (_shownFocal != 0f)
+            {
+                last = ToLocal(new Vector2(0f, curve.Evaluate(0f)));
+                for (int i = 1; i <= CurveSegments; i++)
+                {
+                    float u = i / (float)CurveSegments;
+                    Vector2 p = ToLocal(new Vector2(u, curve.Evaluate(BrushFalloff.ShiftDistance(u, _shownFocal))));
+                    AddSegment(vh, last, p, ShiftedColor);
+                    last = p;
+                }
             }
             float half = PointSizePx * 0.5f;
             foreach (Vector2 point in curve.Points)

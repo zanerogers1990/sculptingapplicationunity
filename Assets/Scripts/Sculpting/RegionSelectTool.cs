@@ -408,18 +408,15 @@ namespace Sculpting
             Rect viewport = cam.pixelRect;
 
             MirrorController mirror = target.GetComponent<MirrorController>();
-            List<Vector3> signs = mirror != null ? mirror.GetMirrorSigns() : null;
-            bool mirrored = signs != null && signs.Count > 1;
+            SymmetryGroup symmetry = mirror != null ? mirror.GetSymmetry() : SymmetryGroup.Trivial;
 
             for (int i = 0; i < vertexCount; i++)
             {
                 bool covered = ProjectsInside(mvp, verts[i], viewport, region);
-                if (!covered && mirrored)
-                {
-                    // signs[0] is always Vector3.one (the un-mirrored position), already tested.
-                    for (int s = 1; s < signs.Count && !covered; s++)
-                        covered = ProjectsInside(mvp, Vector3.Scale(verts[i], signs[s]), viewport, region);
-                }
+                // Element 0 is the identity (the un-mirrored position), already tested. A vertex is
+                // under copy k of the region when its inverse image is under the region itself.
+                for (int s = 1; s < symmetry.Count && !covered; s++)
+                    covered = ProjectsInside(mvp, symmetry[s].ApplyInverse(verts[i]), viewport, region);
                 _insideScratch[i] = actOnOutside ? !covered : covered;
             }
 

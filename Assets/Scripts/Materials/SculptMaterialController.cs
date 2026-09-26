@@ -3,7 +3,10 @@ using UnityEngine;
 namespace Sculpting
 {
     /// The Surface Shader categories that replace plain Base Color shading. At most one is on.
-    public enum SurfaceFinish { None, LurePlastic, Metal, Clay }
+    public enum SurfaceFinish { None, LurePlastic, Metal, Clay, Wood }
+
+    /// Which of the model's own axes the wood grain runs along - the log it was carved from.
+    public enum WoodGrainAxis { Vertical, LeftRight, FrontBack }
 
     /// Assigns a runtime instance of the Custom/SculptPBR shader to the sculpted mesh and
     /// exposes its parameters (base PBR sliders, a procedural normal-detail strength, matcap,
@@ -94,6 +97,25 @@ namespace Sculpting
         // Frozen-at-pick model size, as metalReferenceSize: the grain and mottling scale with it.
         [SerializeField, HideInInspector] private float clayReferenceSize;
 
+        // Carved wood (see WoodPresets / SculptPBR's WoodShade): antique fruitwood, walnut, oak and
+        // friends - the fourth Surface Shader category, exclusive with the others. Sliders are
+        // adjustments on top of the preset (1 = as the preset has it); the grain axis and where
+        // the log's heart runs through the model are the user's own.
+        [SerializeField] private bool woodEnabled = false;
+        [SerializeField] private string woodPresetId = "antique_fruitwood";
+        [SerializeField] private WoodGrainAxis woodGrainAxis = WoodGrainAxis.Vertical;
+        [SerializeField, Range(0f, 2f)] private float woodGrain = 1f;
+        [SerializeField, Range(0.25f, 3f)] private float woodGrainScale = 1f;
+        [SerializeField, Range(0f, 2f)] private float woodEdgeWear = 1f;
+        [SerializeField, Range(0f, 2f)] private float woodPatina = 1f;
+        [SerializeField, Range(0.25f, 3f)] private float woodDetail = 1f;
+        [SerializeField, Range(0f, 2f)] private float woodSheen = 1f;
+        [SerializeField, Range(0f, 2f)] private float woodCracks = 1f;
+        // Where the pith (the log's heart) runs: a position along a path off the model's centre.
+        [SerializeField, Range(0f, 1f)] private float woodGrainSeed = 0f;
+        // Frozen-at-pick model size, as clayReferenceSize: rings and streaks scale with it.
+        [SerializeField, HideInInspector] private float woodReferenceSize;
+
         private Material _material;
         [System.NonSerialized] private Texture2D _matcapTexture;
 
@@ -158,7 +180,7 @@ namespace Sculpting
             set
             {
                 lureEnabled = value && LurePlasticPresets.Find(lurePresetId) != null;
-                if (lureEnabled) { metalEnabled = false; clayEnabled = false; }
+                if (lureEnabled) { metalEnabled = false; clayEnabled = false; woodEnabled = false; }
                 if (lureEnabled && lureReferenceSize <= 0f) lureReferenceSize = MeasureReferenceSize();
                 Push();
             }
@@ -186,6 +208,7 @@ namespace Sculpting
             lureEnabled = true;
             metalEnabled = false;
             clayEnabled = false;
+            woodEnabled = false;
             lureReferenceSize = MeasureReferenceSize();
             Push();
         }
@@ -196,7 +219,7 @@ namespace Sculpting
             set
             {
                 metalEnabled = value && MetalFinishPresets.Find(metalPresetId) != null;
-                if (metalEnabled) { lureEnabled = false; clayEnabled = false; }
+                if (metalEnabled) { lureEnabled = false; clayEnabled = false; woodEnabled = false; }
                 if (metalEnabled && metalReferenceSize <= 0f) metalReferenceSize = MeasureReferenceSize();
                 Push();
             }
@@ -223,6 +246,7 @@ namespace Sculpting
             metalEnabled = true;
             lureEnabled = false;
             clayEnabled = false;
+            woodEnabled = false;
             metalReferenceSize = MeasureReferenceSize();
             Push();
         }
@@ -251,7 +275,7 @@ namespace Sculpting
             set
             {
                 clayEnabled = value && ClayPresets.Find(clayPresetId) != null;
-                if (clayEnabled) { lureEnabled = false; metalEnabled = false; }
+                if (clayEnabled) { lureEnabled = false; metalEnabled = false; woodEnabled = false; }
                 if (clayEnabled && clayReferenceSize <= 0f) clayReferenceSize = MeasureReferenceSize();
                 Push();
             }
@@ -278,6 +302,7 @@ namespace Sculpting
             clayEnabled = true;
             lureEnabled = false;
             metalEnabled = false;
+            woodEnabled = false;
             clayReferenceSize = MeasureReferenceSize();
             Push();
         }
@@ -296,6 +321,64 @@ namespace Sculpting
             set { clayReferenceSize = Mathf.Max(0f, value); Push(); }
         }
 
+        public bool WoodEnabled
+        {
+            get => woodEnabled;
+            set
+            {
+                woodEnabled = value && WoodPresets.Find(woodPresetId) != null;
+                if (woodEnabled) { lureEnabled = false; metalEnabled = false; clayEnabled = false; }
+                if (woodEnabled && woodReferenceSize <= 0f) woodReferenceSize = MeasureReferenceSize();
+                Push();
+            }
+        }
+
+        /// Id of the selected WoodPreset; an unknown one switches the finish off.
+        public string WoodPresetId
+        {
+            get => woodPresetId;
+            set
+            {
+                woodPresetId = value ?? string.Empty;
+                if (WoodPresets.Find(woodPresetId) == null) woodEnabled = false;
+                Push();
+            }
+        }
+
+        /// Picks a wood and turns it on - a palette click. Re-measures the model, like
+        /// SelectLurePreset.
+        public void SelectWoodPreset(string id)
+        {
+            if (WoodPresets.Find(id) == null) return;
+            woodPresetId = id;
+            woodEnabled = true;
+            lureEnabled = false;
+            metalEnabled = false;
+            clayEnabled = false;
+            woodReferenceSize = MeasureReferenceSize();
+            Push();
+        }
+
+        public WoodGrainAxis WoodGrainAxis { get => woodGrainAxis; set { woodGrainAxis = value; Push(); } }
+        public float WoodGrain { get => woodGrain; set { woodGrain = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float WoodGrainScale { get => woodGrainScale; set { woodGrainScale = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
+        public float WoodEdgeWear { get => woodEdgeWear; set { woodEdgeWear = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float WoodPatina { get => woodPatina; set { woodPatina = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float WoodDetail { get => woodDetail; set { woodDetail = Mathf.Clamp(value, 0.25f, 3f); Push(); } }
+        public float WoodSheen { get => woodSheen; set { woodSheen = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float WoodCracks { get => woodCracks; set { woodCracks = Mathf.Clamp(value, 0f, 2f); Push(); } }
+        public float WoodGrainSeed { get => woodGrainSeed; set { woodGrainSeed = Mathf.Clamp01(value); Push(); } }
+
+        /// A random place for the log's heart - the Shuffle button.
+        public void ShuffleWoodGrain() => WoodGrainSeed = Random.value;
+
+        /// See woodReferenceSize; settable for the .sculpt loader, 0 means "measure it".
+        public float WoodReferenceSize
+        {
+            get => woodReferenceSize;
+            set { woodReferenceSize = Mathf.Max(0f, value); Push(); }
+        }
+
         /// Which Surface Shader category is on - the Material panel's dropdown. Choosing a
         /// category turns on its last-picked preset.
         public SurfaceFinish Finish
@@ -303,6 +386,7 @@ namespace Sculpting
             get => lureEnabled ? SurfaceFinish.LurePlastic
                  : metalEnabled ? SurfaceFinish.Metal
                  : clayEnabled ? SurfaceFinish.Clay
+                 : woodEnabled ? SurfaceFinish.Wood
                  : SurfaceFinish.None;
             set
             {
@@ -311,7 +395,8 @@ namespace Sculpting
                     case SurfaceFinish.LurePlastic: LureEnabled = true; break;
                     case SurfaceFinish.Metal: MetalEnabled = true; break;
                     case SurfaceFinish.Clay: ClayEnabled = true; break;
-                    default: lureEnabled = false; metalEnabled = false; clayEnabled = false; Push(); break;
+                    case SurfaceFinish.Wood: WoodEnabled = true; break;
+                    default: lureEnabled = false; metalEnabled = false; clayEnabled = false; woodEnabled = false; Push(); break;
                 }
             }
         }
@@ -456,7 +541,59 @@ namespace Sculpting
             PushLurePlastic(useMatcap);
             PushMetal();
             PushClay();
+            PushWood();
         }
+
+        private void PushWood()
+        {
+            WoodPreset preset = WoodPresets.Find(woodPresetId);
+            bool on = woodEnabled && preset != null;
+            _material.SetFloat("_WoodEnabled", on ? 1f : 0f);
+            if (!on) return;
+
+            if (woodReferenceSize <= 0f) woodReferenceSize = MeasureReferenceSize();
+            float size = woodReferenceSize;
+            float scale = size * woodGrainScale;
+            _material.SetColor("_WoodEarlyColor", preset.EarlyColor);
+            _material.SetColor("_WoodLateColor", preset.LateColor);
+            _material.SetColor("_WoodWornColor", preset.WornColor);
+            _material.SetColor("_WoodRecessColor", preset.RecessColor);
+            _material.SetColor("_WoodScatterColor", preset.ScatterColor);
+            _material.SetFloat("_WoodSubsurface", preset.Subsurface);
+            _material.SetVector("_WoodAxis", GrainAxisVector(woodGrainAxis));
+            // Starts a little off centre: a pith dead in the middle of the model rings its
+            // centre with perfect bullseyes. The path is off-axis so every seed moves it sideways.
+            _material.SetVector("_WoodPith", PithPath * ((PithStart + woodGrainSeed * PithPathLength) * size));
+            _material.SetFloat("_WoodRingSize", preset.RingSize * scale);
+            _material.SetFloat("_WoodRingContrast", preset.RingContrast * woodGrain);
+            _material.SetFloat("_WoodRingSharpness", preset.Latewood);
+            _material.SetFloat("_WoodWobble", preset.Wobble);
+            _material.SetFloat("_WoodFigureSize", preset.FigureSize * scale);
+            _material.SetFloat("_WoodStreaks", preset.Streaks * woodGrain);
+            _material.SetFloat("_WoodStreakSize", preset.StreakSize * scale);
+            _material.SetFloat("_WoodPores", preset.Pores * woodGrain);
+            _material.SetFloat("_WoodEndGrain", preset.EndGrain);
+            _material.SetFloat("_WoodPatina", preset.Patina * woodPatina);
+            _material.SetFloat("_WoodWear", preset.EdgeWear * woodEdgeWear);
+            _material.SetFloat("_WoodSmoothness", Mathf.Clamp01(preset.Smoothness * woodSheen));
+            // Sheen takes the wax with it: a dry, unwaxed wood has no wax highlight either.
+            _material.SetFloat("_WoodWax", preset.Wax * woodSheen);
+            _material.SetFloat("_WoodWaxPower", preset.WaxSharpness);
+            // Additive, so the slider can add cracks to a preset that has none (1 = the preset).
+            _material.SetFloat("_WoodChecks", Mathf.Clamp01(preset.Checks + (woodCracks - 1f) * 0.5f));
+            _material.SetFloat("_WoodDetail", woodDetail);
+        }
+
+        private static Vector4 GrainAxisVector(WoodGrainAxis axis) =>
+            axis == WoodGrainAxis.LeftRight ? new Vector4(1f, 0f, 0f, 0f)
+          : axis == WoodGrainAxis.FrontBack ? new Vector4(0f, 0f, 1f, 0f)
+          : new Vector4(0f, 1f, 0f, 0f);
+
+        // The pith's walk, in model sizes: from a little off centre out to past the model's edge,
+        // where the rings flatten into the straight stripes of quarter-sawn wood.
+        private const float PithStart = 0.12f;
+        private const float PithPathLength = 0.9f;
+        private static readonly Vector4 PithPath = new Vector3(0.61f, 0.17f, -0.77f).normalized;
 
         private void PushClay()
         {
@@ -628,6 +765,21 @@ namespace Sculpting
             public float clayDetail = 1f;
             public float clayGrain = 1f;
             public float clayReferenceSize;
+
+            // Carved wood by preset id (WoodPresets), same scheme again. Older files have none
+            // of these and load with it off.
+            public bool woodEnabled;
+            public string woodPresetId = string.Empty;
+            public int woodGrainAxis;
+            public float woodGrain = 1f;
+            public float woodGrainScale = 1f;
+            public float woodEdgeWear = 1f;
+            public float woodPatina = 1f;
+            public float woodDetail = 1f;
+            public float woodSheen = 1f;
+            public float woodCracks = 1f;
+            public float woodGrainSeed;
+            public float woodReferenceSize;
         }
 
         public Settings CaptureSettings()
@@ -673,6 +825,18 @@ namespace Sculpting
             s.clayDetail = ClayDetail;
             s.clayGrain = ClayGrain;
             s.clayReferenceSize = ClayReferenceSize;
+            s.woodEnabled = WoodEnabled;
+            s.woodPresetId = WoodPresetId;
+            s.woodGrainAxis = (int)WoodGrainAxis;
+            s.woodGrain = WoodGrain;
+            s.woodGrainScale = WoodGrainScale;
+            s.woodEdgeWear = WoodEdgeWear;
+            s.woodPatina = WoodPatina;
+            s.woodDetail = WoodDetail;
+            s.woodSheen = WoodSheen;
+            s.woodCracks = WoodCracks;
+            s.woodGrainSeed = WoodGrainSeed;
+            s.woodReferenceSize = WoodReferenceSize;
             return s;
         }
 
@@ -734,6 +898,21 @@ namespace Sculpting
             if (!string.IsNullOrEmpty(s.clayPresetId)) ClayPresetId = s.clayPresetId;
             // Last, for the same reason as the metal: on turns the others off, off leaves them.
             ClayEnabled = s.clayEnabled;
+
+            WoodGrainAxis = System.Enum.IsDefined(typeof(WoodGrainAxis), s.woodGrainAxis)
+                ? (WoodGrainAxis)s.woodGrainAxis : WoodGrainAxis.Vertical;
+            WoodGrain = s.woodGrain;
+            WoodGrainScale = s.woodGrainScale;
+            WoodEdgeWear = s.woodEdgeWear;
+            WoodPatina = s.woodPatina;
+            WoodDetail = s.woodDetail;
+            WoodSheen = s.woodSheen;
+            WoodCracks = s.woodCracks;
+            WoodGrainSeed = s.woodGrainSeed;
+            WoodReferenceSize = s.woodReferenceSize;
+            if (!string.IsNullOrEmpty(s.woodPresetId)) WoodPresetId = s.woodPresetId;
+            // Last again: on turns the others off, off leaves them.
+            WoodEnabled = s.woodEnabled;
         }
     }
 }

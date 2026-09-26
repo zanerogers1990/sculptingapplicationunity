@@ -44,6 +44,14 @@ namespace Sculpting.IO
             public bool mirrorX, mirrorY, mirrorZ;
             public bool showMirrorPlanes = true;
 
+            // Radial symmetry - see MirrorController. radialCount is 0 in a file written before
+            // radial symmetry existed, which is how a load tells "absent" from "off" and leaves the
+            // object on its defaults. radialAxis is MirrorController.RadialAxis by value.
+            public bool radial;
+            public int radialCount;
+            public int radialAxis;
+            public Vector3 radialCustomAxis;
+
             // Sizes of this object's binary block, in element counts (not bytes). Read back to
             // slice the geometry section - see SceneSerializer.
             public int vertexCount;

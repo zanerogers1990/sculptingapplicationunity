@@ -4,7 +4,7 @@ using UnityEngine.UI;
 namespace Sculpting
 {
     /// The viewport HUD that follows the pointer and the gestures: the 2D brush cursor ring (with
-    /// its halo, centre dot and F-drag strength circle), the Lazy Mouse tether, the action toast
+    /// its halo, centre dot, inner falloff ring and F-drag strength circle), the Lazy Mouse tether, the action toast
     /// (Undo/Redo/Save), the R-hold remesh density gauge, and the box/lasso region marquee and
     /// crosshair. Everything here only READS SculptController's presentation state, every frame.
     ///
@@ -115,6 +115,23 @@ namespace Sculpting
                     Color sc = StrengthCircleColor;
                     sc.a = StrengthCircleBaseAlpha * fade;
                     _cursorStrengthImage.color = sc;
+                }
+
+                // Inner falloff ring (see SculptController.BrushCursorFalloffRadius01) - the
+                // ZBrush focal circle. Scaled against the outer ring's VISIBLE radius, not the
+                // rect's: the ring sprite's band sits a little inside its square, and the two
+                // circles are read against each other. Brightened while D scrubs it.
+                float falloff01 = controller.BrushCursorFalloffRadius01;
+                bool showFalloff = falloff01 >= 0f;
+                if (_cursorFalloffRing.enabled != showFalloff) _cursorFalloffRing.enabled = showFalloff;
+                if (showFalloff)
+                {
+                    bool adjusting = controller.IsAdjustingFocalShift;
+                    float radius = Mathf.Max(FalloffRingMinRadiusPx, diameter * 0.5f * RingSpriteBandFraction * falloff01);
+                    _cursorFalloffRing.Set(radius, adjusting ? 2f : 1.5f, controller.BrushCursorDashed);
+                    Color fc = controller.BrushCursorColor;
+                    fc.a *= (adjusting ? 1f : FalloffRingBaseAlpha) * fade;
+                    _cursorFalloffRing.color = fc;
                 }
             }
 
@@ -232,6 +249,22 @@ namespace Sculpting
         private const float CursorHaloExtraPx = 3f;
 
         private const float CursorDotSizePx = 4f;
+
+        // The inner falloff ring - see Update(). Drawn fainter than the outer ring it sits in,
+        // so size stays the first thing the cursor says; floored so it never collapses onto the
+        // centre dot.
+        private CircleOutlineGraphic _cursorFalloffRing;
+
+        private const float FalloffRingBaseAlpha = 0.6f;
+
+        private const float FalloffRingMinRadiusPx = 4f;
+
+        // Where GetRingSprite's band is centred, as a fraction of the sprite's half-width.
+        private const float RingSpriteBandFraction = (RingSpriteSize * 0.5f - RingSpriteThickness * 0.5f - 1f) / (RingSpriteSize * 0.5f);
+
+        private const int RingSpriteSize = 128;
+
+        private const float RingSpriteThickness = 6f;
 
         // Lazy Mouse tether (see SculptController.LazyMouseTetherActive) - a thin line from the
         // ring, which sits where the brush is actually working, back to a small dot at the raw
@@ -480,6 +513,17 @@ namespace Sculpting
             _cursorStrengthImage.raycastTarget = false;
             _cursorStrengthImage.enabled = false;
 
+            // Inner falloff ring, above the strength disc so it stays readable through it while
+            // F is held, and under the centre dot. Zero-size rect: the graphic draws around its
+            // pivot in pixels.
+            var falloffGO = new GameObject("FalloffRing", typeof(RectTransform), typeof(CanvasRenderer), typeof(CircleOutlineGraphic));
+            falloffGO.transform.SetParent(go.transform, false);
+            var falloffRect = falloffGO.GetComponent<RectTransform>();
+            falloffRect.anchorMin = falloffRect.anchorMax = new Vector2(0.5f, 0.5f);
+            falloffRect.sizeDelta = Vector2.zero;
+            _cursorFalloffRing = falloffGO.GetComponent<CircleOutlineGraphic>();
+            _cursorFalloffRing.raycastTarget = false;
+
             var dotGO = new GameObject("Dot", typeof(RectTransform), typeof(Image));
             dotGO.transform.SetParent(go.transform, false);
             var dotRect = dotGO.GetComponent<RectTransform>();
@@ -503,8 +547,8 @@ namespace Sculpting
         private static Sprite GetRingSprite()
         {
             if (_ringSprite != null) return _ringSprite;
-            const int size = 128;
-            const float thickness = 6f;
+            const int size = RingSpriteSize;
+            const float thickness = RingSpriteThickness;
             float outerR = size * 0.5f - thickness * 0.5f - 1f;
             Vector2 center = new Vector2(size * 0.5f, size * 0.5f);
 

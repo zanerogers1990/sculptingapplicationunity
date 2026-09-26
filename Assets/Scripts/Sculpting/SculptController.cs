@@ -14,9 +14,9 @@ namespace Sculpting
     /// silhouette. Smooth relaxes vertices toward their mesh-neighbor average (see
     /// SculptableMesh.GetNeighborAverage). 1/2/3 switch brushes; holding S resizes the brush
     /// (drag horizontally) instead of sculpting, shown via a ZBrush-style popup gauge (see
-    /// SculptUIBuilder). When MirrorController has any axis enabled, every brush application
-    /// is repeated at each mirrored local-space position (see MirrorController.GetMirrorSigns)
-    /// so strokes land symmetrically.
+    /// SculptUIBuilder). When MirrorController has any mirror axis or radial symmetry enabled,
+    /// every brush application is repeated at each symmetric local-space position (see
+    /// MirrorController.GetSymmetry) so strokes land symmetrically.
     /// No longer [RequireComponent]d on SculptableMesh/MirrorController - this component now
     /// lives once on a persistent object (SceneSystems) and follows whichever object is
     /// selected (see Target/SyncSelectionTarget) instead of hardcoding a single sculpted mesh.
@@ -261,6 +261,7 @@ namespace Sculpting
 
         [Header("Remesh Settings")]
         [SerializeField, Range(4, 4096)] private int remeshResolution = 24;
+        [SerializeField, Range(MinQuadRemeshTarget, MaxQuadRemeshTarget)] private int quadRemeshTarget = 5000;
 
         [Header("Symmetry Repair")]
         // Which plane the correspondence-map tools work across. Deliberately its own setting
@@ -591,6 +592,19 @@ namespace Sculpting
         private readonly BrushFalloffCurve[] _falloffCurves = new BrushFalloffCurve[Enum.GetValues(typeof(BrushType)).Length];
         private BrushFalloffCurve _syncedFalloff;
         private int _syncedFalloffVersion = -1;
+        private float _syncedFocalShift;
+
+        // ZBrush's Focal Shift, per brush like the curve: -1 hard .. 0 the brush's own falloff ..
+        // +1 soft. Layered over the built-in falloff or the custom curve alike (BrushFalloff.Shift).
+        private readonly float[] _focalShiftPerType = new float[Enum.GetValues(typeof(BrushType)).Length];
+
+        /// The current brush's focal shift, -1..1. Mask painting shows and edits MaskHardness
+        /// under the same control instead - see MaskHardness and IsAdjustingFocalShift.
+        public float FocalShift
+        {
+            get => _focalShiftPerType[(int)currentBrush];
+            set => _focalShiftPerType[(int)currentBrush] = Mathf.Clamp(value, -1f, 1f);
+        }
 
         /// The current brush's custom falloff, or null while it uses its built-in one. The curve
         /// editor edits this instance in place and calls Normalize, which bumps its Version.
@@ -615,10 +629,12 @@ namespace Sculpting
         {
             BrushFalloffCurve curve = _isMaskPaintMode ? null : CurrentFalloffCurve;
             int version = curve?.Version ?? -1;
-            if (curve == _syncedFalloff && version == _syncedFalloffVersion) return;
-            BrushFalloff.SetActive(curve);
+            float focal = _isMaskPaintMode ? 0f : FocalShift;
+            if (curve == _syncedFalloff && version == _syncedFalloffVersion && focal == _syncedFocalShift) return;
+            BrushFalloff.SetActive(curve, focal);
             _syncedFalloff = curve;
             _syncedFalloffVersion = version;
+            _syncedFocalShift = focal;
         }
         public bool MoveConnectedOnly { get => moveConnectedOnly; set => moveConnectedOnly = value; }
         public float MaskHardness { get => maskHardness; set => maskHardness = Mathf.Clamp01(value); }
@@ -645,6 +661,12 @@ namespace Sculpting
         public const int MaxRemeshResolution = MeshRemesher.MaxResolution;
 
         public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, MaxRemeshResolution); }
+
+        /// Quad Remesh's target face count. The result lands near it, not exactly on it: the
+        /// quad size is set from the surface area, and extraction adds or drops a few percent.
+        public const int MinQuadRemeshTarget = 100;
+        public const int MaxQuadRemeshTarget = 200_000;
+        public int QuadRemeshTarget { get => quadRemeshTarget; set => quadRemeshTarget = Mathf.Clamp(value, MinQuadRemeshTarget, MaxQuadRemeshTarget); }
 
         // One value shared by every brush (unlike BrushStrength) - lazy mouse is an input-
         // smoothing behavior, not a property of any particular brush's effect.
@@ -786,7 +808,7 @@ namespace Sculpting
         // selection, and returned null here. That killed SculptUIBuilder.BuildUI partway
         // through the Mirror toggles (so the bottom of the brush panel - mirror axes, plane
         // visibility, wireframe, undo/redo, the brush-resize gauge - silently never got built)
-        // and would have thrown out of GetMirrorSigns on the first brush stroke against that
+        // and would have thrown out of GetSymmetry on the first brush stroke against that
         // object. Self-healing here fixes every one of those call sites at once, and costs a
         // GetComponent on a path that already did one.
         public MirrorController Mirror
@@ -848,6 +870,7 @@ namespace Sculpting
             HandleBrushSwitchKeys();
             HandleBrushResizeKey();
             HandleBrushStrengthKey();
+            HandleFocalShiftKey();
             HandleRemeshDensityKey();
             HandleRadialMenuKey();
             HandleRegionRadialMenuKey();
@@ -878,6 +901,7 @@ namespace Sculpting
             BrushFalloff.SetActive(null);
             _syncedFalloff = null;
             _syncedFalloffVersion = -1;
+            _syncedFocalShift = 0f;
         }
 
         private void OnApplicationFocus(bool hasFocus)
@@ -970,7 +994,7 @@ namespace Sculpting
             // Force _isOverUI false too so UpdateBrushCursor keeps showing the ring at the
             // mouse ray (the deliberate resize-gauge UX) rather than hiding it as "over UI".
             // Same reasoning applies to the strength gauge (F) below.
-            if (_isResizingBrush || _isAdjustingStrength)
+            if (_isResizingBrush || _isAdjustingStrength || _isAdjustingFocalShift)
             {
                 _isHovering = false;
                 _isOverUI = false;

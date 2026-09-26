@@ -65,6 +65,7 @@ namespace Sculpting
             public float pressureCurve;
 
             public int remeshResolution;
+            public int quadRemeshTarget;
 
             public bool useBurstJobs;
             public bool showWireframeGizmo;
@@ -77,6 +78,8 @@ namespace Sculpting
             public float[] perBrushStrength;
             // Custom falloff curves, one entry per brush that has one (see BrushFalloff).
             public FalloffCurveEntry[] falloffCurves;
+            // Focal Shift per brush, -1..1 (see BrushFalloff.Shift). Missing in older files: 0.
+            public float[] perBrushFocalShift;
             // No perBrushRadius counterpart: radius is one value shared by every brush (see
             // _brushStrengthPerType), saved as `brushRadius` above. A file written before that
             // change still carries the old per-brush array; JsonUtility drops the unknown field
@@ -135,6 +138,7 @@ namespace Sculpting
                 pressureCurve = pressureCurve,
 
                 remeshResolution = remeshResolution,
+                quadRemeshTarget = quadRemeshTarget,
                 useBurstJobs = useBurstJobs,
                 showWireframeGizmo = showWireframeGizmo,
 
@@ -146,6 +150,7 @@ namespace Sculpting
                 perBrushAccumulateStrength = (float[])_accumulateStrengthPerType.Clone(),
                 perBrushFrontFacingOnly = (bool[])_brushFrontFacingOnly.Clone(),
                 falloffCurves = CaptureFalloffCurves(),
+                perBrushFocalShift = (float[])_focalShiftPerType.Clone(),
             };
         }
 
@@ -186,6 +191,10 @@ namespace Sculpting
             CopyPerBrush(s.perBrushAccumulateStrength, _accumulateStrengthPerType);
             CopyPerBrush(s.perBrushFrontFacingOnly, _brushFrontFacingOnly);
             ApplyFalloffCurves(s.falloffCurves);
+            System.Array.Clear(_focalShiftPerType, 0, _focalShiftPerType.Length);
+            CopyPerBrush(s.perBrushFocalShift, _focalShiftPerType);
+            for (int b = 0; b < _focalShiftPerType.Length; b++)
+                _focalShiftPerType[b] = Mathf.Clamp(_focalShiftPerType[b], -1f, 1f); // hand-edited files
 
             ClayHeightFactor = s.clayHeightFactor;
             ClayTipRoundness = s.clayTipRoundness;
@@ -207,6 +216,9 @@ namespace Sculpting
             PressureCurve = s.pressureCurve;
 
             RemeshResolution = s.remeshResolution;
+            // A file from before Quad Remesh existed has 0 here (JsonUtility's default for a
+            // missing field) - keep the built-in default rather than clamping 0 up to the minimum.
+            if (s.quadRemeshTarget > 0) QuadRemeshTarget = s.quadRemeshTarget;
             UseBurstJobs = s.useBurstJobs;
             ShowWireframeGizmo = s.showWireframeGizmo;
 

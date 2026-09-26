@@ -25,7 +25,7 @@ namespace Sculpting
         private Image _editImage;
         private Text _segmentsLabel, _radiusLabel, _heightLabel, _scaleLabel, _cornerLabel;
         private Slider _segmentsSlider, _radiusSlider, _heightSlider, _scaleSlider;
-        private Toggle _loopToggle, _capToggle, _evenToggle;
+        private Toggle _loopToggle, _capToggle, _evenToggle, _radialToggle;
 
         private int _shownStatusVersion = -1;
         private float _stickyUntil;
@@ -82,6 +82,11 @@ namespace Sculpting
                 v => _lathe.EvenTriangles = v,
                 tooltip: "Uses fewer vertices on rings near the axis so every triangle is about the same " +
                          "size - no slivers at the poles, which brushes handle much better.");
+            _radialToggle = UIFactory.CreateToggle(section, "Radial Symmetry on Create", _lathe.RadialSymmetryOnCreate,
+                v => _lathe.RadialSymmetryOnCreate = v,
+                tooltip: "Turns on radial symmetry around the lathe axis for the created object, so every " +
+                         "stroke is repeated all the way round. Set the repeat count under Radial Symmetry " +
+                         "in the sculpting panel.");
 
             _segmentsLabel = UIFactory.CreateLabel(section, string.Empty, 12, FontStyle.Normal);
             _segmentsSlider = UIFactory.CreateSlider(section, LatheMeshBuilder.MinSegments, LatheMeshBuilder.MaxSegments,
@@ -183,6 +188,7 @@ namespace Sculpting
             SyncToggle(_loopToggle, _lathe.ClosedLoop);
             SyncToggle(_capToggle, _lathe.CapEnds);
             SyncToggle(_evenToggle, _lathe.EvenTriangles);
+            SyncToggle(_radialToggle, _lathe.RadialSymmetryOnCreate);
 
             // WithoutNotify: writing a slider normally fires straight back into the setter.
             SyncSlider(_segmentsSlider, _lathe.RadialSegments);

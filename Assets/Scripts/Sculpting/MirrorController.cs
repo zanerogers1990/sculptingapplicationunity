@@ -12,13 +12,22 @@ namespace Sculpting
         float WorldExtentForPlaneAt(Vector3 planeOrigin);
     }
 
-    /// Adds up to three axes of local-space mirroring to sculpting brushes: each enabled
-    /// axis reflects every brush stroke through the sculptable mesh's local origin, and
-    /// any combination can be active at once (e.g. X+Y mirrors a stroke into all four
-    /// quadrants). Draws a transparent, axis-colored plane per active axis - following
-    /// Unity's gizmo convention of red/green/blue for X/Y/Z - so the mirror plane's
-    /// position is visible in the scene. Plane visibility has its own toggle independent
-    /// of whether mirroring is enabled, so it can be checked and then hidden again.
+    /// The axis radial symmetry repeats around - a local axis through the object's origin.
+    /// Stored by value in save files, so new members go on the end.
+    public enum RadialAxis { X, Y, Z, Custom }
+
+    /// The sculpting symmetry of one object: up to three axes of local-space mirroring, plus
+    /// N-fold radial symmetry around an axis, all through the sculptable mesh's local origin.
+    /// Each enabled mirror axis reflects every brush stroke, any combination can be active at
+    /// once (e.g. X+Y mirrors a stroke into all four quadrants), and radial symmetry repeats it
+    /// at N evenly spaced angles - combined with the mirrors when both are on (see
+    /// SymmetryGroup, which turns these settings into the list of ops a stroke is applied under).
+    ///
+    /// Draws a transparent, axis-colored plane per active mirror axis - following Unity's gizmo
+    /// convention of red/green/blue for X/Y/Z - and, for radial symmetry, the axis line with one
+    /// spoke per repeat, so where the symmetry sits is visible in the scene. Guide visibility has
+    /// its own toggle independent of whether symmetry is enabled, so it can be checked and then
+    /// hidden again.
     [RequireComponent(typeof(SculptableMesh))]
     public class MirrorController : MonoBehaviour
     {
@@ -27,6 +36,14 @@ namespace Sculpting
         [SerializeField] private bool mirrorY;
         [SerializeField] private bool mirrorZ;
         [SerializeField] private bool showPlanes = true;
+
+        // Y by default: the axis a Lathe object is revolved around (see LatheController.Create),
+        // and the usual "up" of a bust or a vase.
+        [Header("Radial Symmetry (around a local axis through object origin)")]
+        [SerializeField] private bool radial;
+        [SerializeField, Range(SymmetryGroup.MinRadialCount, SymmetryGroup.MaxRadialCount)] private int radialCount = 8;
+        [SerializeField] private RadialAxis radialAxis = RadialAxis.Y;
+        [SerializeField] private Vector3 radialCustomAxis = Vector3.up;
 
         // Unity's axis-handle/gizmo convention: X red, Y green, Z blue.
         private static readonly Color XColor = new Color(1f, 0.25f, 0.25f);
@@ -37,13 +54,68 @@ namespace Sculpting
         // plane visibly extends past the silhouette instead of clipping it.
         private const float PlanePadding = 1.4f;
 
+        // Radial guide colour for a custom axis - none of the three axis colours, so it never reads
+        // as one of them.
+        private static readonly Color CustomAxisColor = new Color(1f, 0.8f, 0.25f);
+        private const float RadialGuideAlpha = 0.6f;
+
         private SculptableMesh _sculptableMesh;
         private Transform _planeX, _planeY, _planeZ;
+        private Transform _radialGuide;
+        private Mesh _radialGuideMesh;
+        private Material _radialGuideMaterial;
+        private int _radialGuideCount;
 
         public bool MirrorX { get => mirrorX; set => mirrorX = value; }
         public bool MirrorY { get => mirrorY; set => mirrorY = value; }
         public bool MirrorZ { get => mirrorZ; set => mirrorZ = value; }
         public bool ShowPlanes { get => showPlanes; set => showPlanes = value; }
+
+        public bool Radial { get => radial; set => radial = value; }
+
+        public int RadialCount
+        {
+            get => radialCount;
+            set => radialCount = Mathf.Clamp(value, SymmetryGroup.MinRadialCount, SymmetryGroup.MaxRadialCount);
+        }
+
+        public RadialAxis RadialAxisChoice { get => radialAxis; set => radialAxis = value; }
+
+        /// The direction used when RadialAxisChoice is Custom. Stored as given; a zero vector
+        /// falls back to Y when used (see RadialAxisVector).
+        public Vector3 RadialCustomAxis { get => radialCustomAxis; set => radialCustomAxis = value; }
+
+        /// The radial axis as a unit local-space direction.
+        public Vector3 RadialAxisVector
+        {
+            get
+            {
+                switch (radialAxis)
+                {
+                    case RadialAxis.X: return Vector3.right;
+                    case RadialAxis.Z: return Vector3.forward;
+                    case RadialAxis.Custom:
+                        return radialCustomAxis.sqrMagnitude > 1e-12f ? radialCustomAxis.normalized : Vector3.up;
+                    default: return Vector3.up;
+                }
+            }
+        }
+
+        /// Every symmetry setting of `source`, for a copy of it. `localSigns` is the reflection the
+        /// copy's geometry was built with (all +1 for a plain clone - see MeshCloner.Duplicate).
+        /// Mirror flags and an X/Y/Z radial axis describe the same planes and axis either way (a
+        /// reflection only negates along them); a custom axis is reflected with the geometry.
+        public void CopySettingsFrom(MirrorController source, Vector3 localSigns)
+        {
+            mirrorX = source.mirrorX;
+            mirrorY = source.mirrorY;
+            mirrorZ = source.mirrorZ;
+            showPlanes = source.showPlanes;
+            radial = source.radial;
+            radialCount = source.radialCount;
+            radialAxis = source.radialAxis;
+            radialCustomAxis = Vector3.Scale(source.radialCustomAxis, localSigns);
+        }
 
         /// Applies a plane-visibility choice to EVERY object in the scene, not just the
         /// selected one. Mirroring itself is deliberately per-object (each object reflects
@@ -71,6 +143,15 @@ namespace Sculpting
             _planeX = CreatePlane("MirrorPlane_X", XColor, Quaternion.Euler(0f, 90f, 0f));
             _planeY = CreatePlane("MirrorPlane_Y", YColor, Quaternion.Euler(90f, 0f, 0f));
             _planeZ = CreatePlane("MirrorPlane_Z", ZColor, Quaternion.identity);
+            _radialGuide = CreateRadialGuide();
+        }
+
+        private void OnDestroy()
+        {
+            // Runtime-built, so nothing else ever frees them - see the Mesh lifetime remarks on
+            // SculptableMesh.
+            if (_radialGuideMesh != null) Destroy(_radialGuideMesh);
+            if (_radialGuideMaterial != null) Destroy(_radialGuideMaterial);
         }
 
         private void Update()
@@ -78,6 +159,7 @@ namespace Sculpting
             UpdatePlane(_planeX, mirrorX);
             UpdatePlane(_planeY, mirrorY);
             UpdatePlane(_planeZ, mirrorZ);
+            UpdateRadialGuide();
         }
 
         private void UpdatePlane(Transform plane, bool axisActive)
@@ -90,6 +172,86 @@ namespace Sculpting
 
             float size = PlaneSize();
             plane.localScale = new Vector3(size, size, 1f);
+        }
+
+        /// The radial guide: the axis line through the object, and a ring around it with one spoke
+        /// per repeat, so both the axis and where the sectors fall are visible. Built as a unit-size
+        /// line mesh around local +Y, then rotated onto the axis and scaled like the mirror planes.
+        private void UpdateRadialGuide()
+        {
+            bool visible = radial && showPlanes && _sculptableMesh.Visible && !TurntableController.CleanViewActive;
+            if (_radialGuide.gameObject.activeSelf != visible) _radialGuide.gameObject.SetActive(visible);
+            if (!visible) return;
+
+            if (_radialGuideCount != radialCount) RebuildRadialGuideMesh();
+
+            Color color = radialAxis == RadialAxis.X ? XColor
+                        : radialAxis == RadialAxis.Z ? ZColor
+                        : radialAxis == RadialAxis.Custom ? CustomAxisColor : YColor;
+            color.a = RadialGuideAlpha;
+            if (_radialGuideMaterial.color != color) _radialGuideMaterial.color = color;
+
+            _radialGuide.localRotation = Quaternion.FromToRotation(Vector3.up, RadialAxisVector);
+            float size = PlaneSize() * 0.5f;
+            _radialGuide.localScale = new Vector3(size, size, size);
+        }
+
+        private Transform CreateRadialGuide()
+        {
+            var go = new GameObject("RadialSymmetryGuide");
+            Transform t = go.transform;
+            t.SetParent(transform, false);
+
+            _radialGuideMesh = new Mesh { name = "RadialSymmetryGuide" };
+            go.AddComponent<MeshFilter>().sharedMesh = _radialGuideMesh;
+            var renderer = go.AddComponent<MeshRenderer>();
+            _radialGuideMaterial = new Material(Shader.Find("Sprites/Default"));
+            renderer.sharedMaterial = _radialGuideMaterial;
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+
+            go.SetActive(false);
+            return t;
+        }
+
+        private void RebuildRadialGuideMesh()
+        {
+            const int ringSegments = 64;
+            int n = radialCount;
+            var vertices = new List<Vector3>(2 + ringSegments + 1 + n);
+            var indices = new List<int>(2 + ringSegments * 2 + n * 2);
+
+            // The axis, end to end.
+            vertices.Add(Vector3.down);
+            vertices.Add(Vector3.up);
+            indices.Add(0); indices.Add(1);
+
+            // The ring.
+            int ringStart = vertices.Count;
+            for (int i = 0; i < ringSegments; i++)
+            {
+                float a = 2f * Mathf.PI * i / ringSegments;
+                vertices.Add(new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)));
+                indices.Add(ringStart + i);
+                indices.Add(ringStart + (i + 1) % ringSegments);
+            }
+
+            // One spoke per repeat, from the axis out to the ring.
+            int centre = vertices.Count;
+            vertices.Add(Vector3.zero);
+            for (int k = 0; k < n; k++)
+            {
+                float a = 2f * Mathf.PI * k / n;
+                vertices.Add(new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)));
+                indices.Add(centre);
+                indices.Add(vertices.Count - 1);
+            }
+
+            _radialGuideMesh.Clear();
+            _radialGuideMesh.SetVertices(vertices);
+            _radialGuideMesh.SetIndices(indices, MeshTopology.Lines, 0);
+            _radialGuideMesh.RecalculateBounds();
+            _radialGuideCount = n;
         }
 
         private float PlaneSize()
@@ -176,60 +338,36 @@ namespace Sculpting
             return t;
         }
 
-        // The signs for the CURRENT axis flags, rebuilt only when those flags change. This used to
-        // build a fresh List (plus one more per enabled axis, via Expand) on every call - and
-        // every one of the eight brush apply sites calls it once per DAB, with Clay alone laying
-        // up to ClayMaxDabsPerFrame dabs in a single frame. That is pure per-frame garbage on the
-        // sculpting hot path, and GC pressure during a stroke is felt as exactly the intermittent
-        // hitching between cursor and surface that a brush is judged on.
-        //
-        // Handing out the cached list rather than a copy is safe because every caller only ever
-        // foreach-es it, and List<T>'s own struct enumerator keeps that allocation-free too.
-        private readonly List<Vector3> _signs = new List<Vector3>(8);
-        private bool _signsBuilt;
-        private bool _signsX, _signsY, _signsZ;
+        // The group for the CURRENT settings, rebuilt only when they change. Every brush apply
+        // site asks for it once per DAB, with Clay alone laying up to ClayMaxDabsPerFrame dabs in a
+        // single frame, so building it per call would be per-frame garbage on the sculpting hot
+        // path - and GC pressure during a stroke is felt as exactly the intermittent hitching
+        // between cursor and surface that a brush is judged on.
+        private SymmetryGroup _symmetry;
+        private bool _builtX, _builtY, _builtZ;
+        private int _builtRadialCount;
+        private Vector3 _builtRadialAxis;
 
-        /// Local-space mirror sign combinations for every currently-enabled axis, always
-        /// including the identity (1,1,1) so the original, unmirrored stroke is included.
-        /// Scaling a local point/delta/normal by one of these reflects it through whichever
-        /// axes are active - e.g. with X and Y both enabled this returns four signs
-        /// covering all quadrants.
+        /// Every symmetry op a stroke on this object is applied under, identity first - the
+        /// enabled mirror reflections times the radial rotations (see SymmetryGroup). Mapping a
+        /// local point, delta or normal through op k gives its k-th symmetric copy.
         ///
-        /// The returned list is REUSED between calls - read it, do not keep or mutate it.
-        public List<Vector3> GetMirrorSigns()
+        /// Shared and immutable; cached until a setting changes.
+        public SymmetryGroup GetSymmetry()
         {
-            if (_signsBuilt && _signsX == mirrorX && _signsY == mirrorY && _signsZ == mirrorZ)
-                return _signs;
+            int count = radial ? radialCount : 1;
+            Vector3 axis = RadialAxisVector;
+            if (_symmetry != null && _builtX == mirrorX && _builtY == mirrorY && _builtZ == mirrorZ &&
+                _builtRadialCount == count && (count == 1 || _builtRadialAxis.Equals(axis)))
+                return _symmetry;
 
-            _signs.Clear();
-            _signs.Add(Vector3.one);
-            if (mirrorX) ExpandInPlace(_signs, true, false, false);
-            if (mirrorY) ExpandInPlace(_signs, false, true, false);
-            if (mirrorZ) ExpandInPlace(_signs, false, false, true);
-
-            _signsBuilt = true;
-            _signsX = mirrorX; _signsY = mirrorY; _signsZ = mirrorZ;
-            return _signs;
-        }
-
-        /// Doubles the list in place, each existing sign followed immediately by its reflection.
-        ///
-        /// Filled BACKWARDS, which is what makes an in-place expansion safe: entry i moves to 2i,
-        /// and 2i >= i for every i, so no slot is written before it has been read. The
-        /// interleaved order is deliberate rather than incidental - it is the order the previous
-        /// allocating version produced, and the brushes apply these signs in sequence against the
-        /// live vertex array, so reordering them would quietly change what a mirrored stroke does
-        /// where two footprints overlap near the plane.
-        private static void ExpandInPlace(List<Vector3> signs, bool x, bool y, bool z)
-        {
-            int count = signs.Count;
-            for (int i = 0; i < count; i++) signs.Add(Vector3.zero);
-            for (int i = count - 1; i >= 0; i--)
-            {
-                Vector3 s = signs[i];
-                signs[i * 2] = s;
-                signs[i * 2 + 1] = new Vector3(x ? -s.x : s.x, y ? -s.y : s.y, z ? -s.z : s.z);
-            }
+            _symmetry = !mirrorX && !mirrorY && !mirrorZ && count == 1
+                ? SymmetryGroup.Trivial
+                : SymmetryGroup.Build(mirrorX, mirrorY, mirrorZ, count, axis);
+            _builtX = mirrorX; _builtY = mirrorY; _builtZ = mirrorZ;
+            _builtRadialCount = count;
+            _builtRadialAxis = axis;
+            return _symmetry;
         }
     }
 }

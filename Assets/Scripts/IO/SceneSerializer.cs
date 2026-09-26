@@ -99,6 +99,10 @@ namespace Sculpting.IO
                         entry.mirrorY = mirror.MirrorY;
                         entry.mirrorZ = mirror.MirrorZ;
                         entry.showMirrorPlanes = mirror.ShowPlanes;
+                        entry.radial = mirror.Radial;
+                        entry.radialCount = mirror.RadialCount;
+                        entry.radialAxis = (int)mirror.RadialAxisChoice;
+                        entry.radialCustomAxis = mirror.RadialCustomAxis;
                     }
 
                     // Recorded on the original half only - see ObjectEntry.mirrorLinked.
@@ -457,6 +461,14 @@ namespace Sculpting.IO
             mirror.MirrorY = entry.mirrorY;
             mirror.MirrorZ = entry.mirrorZ;
             mirror.ShowPlanes = entry.showMirrorPlanes;
+            if (entry.radialCount > 0)
+            {
+                mirror.Radial = entry.radial;
+                mirror.RadialCount = entry.radialCount;
+                if (System.Enum.IsDefined(typeof(RadialAxis), entry.radialAxis))
+                    mirror.RadialAxisChoice = (RadialAxis)entry.radialAxis;
+                mirror.RadialCustomAxis = entry.radialCustomAxis;
+            }
 
             if (mask != null) sculptable.SetMask(mask);
             if (hidden != null) sculptable.RestoreHiddenTriangles(hidden);

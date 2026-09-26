@@ -75,7 +75,7 @@ namespace Sculpting
                 // SURVIVOR, and MeshJoiner combines every other mesh into the survivor's own
                 // local space - so the merged result inherits the survivor's pivot, and
                 // MirrorController mirrors through that pivot (its planes sit at localPosition
-                // zero and GetMirrorSigns reflects local coordinates through the origin).
+                // zero and GetSymmetry maps local coordinates through the origin).
                 //
                 // Reassigning here meant the survivor was whichever object was Ctrl-clicked
                 // LAST: merging a torso plus two shoulder spheres left the merged body with a

@@ -173,6 +173,35 @@ namespace Sculpting.Tests
             }
         }
 
+        /// Focal Shift rides the same shared table, on top of the built-in falloff: job and
+        /// managed must still agree (the parity assertions inside each case), and the job must
+        /// actually see the shift.
+        [Test]
+        public void FocalShift([Values("Inflate", "Crease", "Clay", "Standard")] string brush,
+            [Values(-0.7f, 0.7f)] float focal)
+        {
+            Sequence unshifted = RunFalloffCase(brush, jobs: true);
+            BrushFalloff.SetActive(null, focal);
+            try
+            {
+                switch (brush)
+                {
+                    case "Inflate": Inflate(accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                    case "Crease": Crease(accumulate: false, positive: false, maskAndFrontFacing: false); break;
+                    case "Clay": Clay(1f, accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                    default: StandardAndLayer("ApplyStandardBrushLocal", accumulate: true, positive: true, maskAndFrontFacing: false); break;
+                }
+                Sequence shifted = RunFalloffCase(brush, jobs: true);
+                float change = MaxDelta(unshifted.Vertices, shifted.Vertices, out _);
+                Assert.That(change, Is.GreaterThan(DabSequenceTolerance * MeaningfulDisplacementFactor),
+                    $"{brush}: the job ignored the focal shift.");
+            }
+            finally
+            {
+                BrushFalloff.SetActive(null);
+            }
+        }
+
         private Sequence RunFalloffCase(string brush, bool jobs)
         {
             Configure(radius: 0.2f, strength: 0.5f, maskAndFrontFacing: false);

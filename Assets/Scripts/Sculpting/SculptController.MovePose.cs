@@ -15,9 +15,9 @@ namespace Sculpting
 
         private Vector3 _lastDragPoint;
 
-        // One selection per active mirror sign, paired with the sign used to make it, so a
-        // drag delta can be re-mirrored before being applied to that selection.
-        private List<(SculptableMesh.GrabSelection selection, Vector3 sign)> _grabSelections;
+        // One selection per symmetry op (mirror / radial copy), paired with the op used to make
+        // it, so a drag delta can be mapped the same way before being applied to that selection.
+        private List<(SculptableMesh.GrabSelection selection, SymmetryOp op)> _grabSelections;
 
         // Pose brush - see HandlePoseInput. Same click/hold-drag/release shape as Move above,
         // right down to reusing RayPlaneIntersect against a camera-facing plane through the
@@ -30,10 +30,10 @@ namespace Sculpting
 
         private Vector3 _poseDragPlaneNormal;
 
-        private List<(SculptableMesh.PoseSelection selection, Vector3 sign)> _poseSelections;
+        private List<(SculptableMesh.PoseSelection selection, SymmetryOp op)> _poseSelections;
 
         // Guide line (see UpdatePoseChainVisual): a world-space LineRenderer per active pose
-        // selection - up to one per mirror sign, matching _poseSelections. First version used
+        // selection - up to one per symmetry op, matching _poseSelections. First version used
         // Sprites/Default with ordinary depth testing and was reported as barely-visible - "maybe
         // a slight outline" - because the chain runs directly along the mesh's own surface, which
         // z-fights against that same surface almost everywhere except where floating-point noise
@@ -145,9 +145,9 @@ namespace Sculpting
                         Vector3 localDelta = sculptableMesh.transform.InverseTransformVector(worldDelta);
                         int versionBefore = sculptableMesh.GeometryVersion;
                         BeginDirtyVertices();
-                        foreach (var (selection, sign) in _grabSelections)
+                        foreach (var (selection, op) in _grabSelections)
                         {
-                            sculptableMesh.ApplyGrabDelta(selection, Vector3.Scale(localDelta, sign));
+                            sculptableMesh.ApplyGrabDelta(selection, op.Apply(localDelta));
                             int[] indices = selection.Indices;
                             for (int k = 0; k < indices.Length; k++) _dirtyVertexScratch.Add(indices[k]);
                         }
@@ -182,17 +182,19 @@ namespace Sculpting
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
 
-            var selections = new List<(SculptableMesh.GrabSelection, Vector3)>();
-            foreach (Vector3 sign in MirrorSigns())
+            var selections = new List<(SculptableMesh.GrabSelection, SymmetryOp)>();
+            SymmetryGroup symmetry = Symmetry();
+            for (int k = 0; k < symmetry.Count; k++)
             {
-                // Each mirrored selection is judged from its OWN mirrored viewpoint - see
+                // Each mirrored or radial selection is judged from its OWN mapped viewpoint - see
                 // _dabCameraLocal. A grab is picked once and then dragged for the whole gesture, so
                 // getting this wrong here strands half of the far side's vertices behind for the
                 // entire drag rather than merely weakening one frame of it.
-                BeginMirroredDab(sign);
-                var selection = sculptableMesh.SelectGrab(Vector3.Scale(localHit, sign), brushRadius, frontFacingOnly, _dabCameraLocal,
+                BeginMirroredDab(symmetry, k);
+                SymmetryOp op = symmetry[k];
+                var selection = sculptableMesh.SelectGrab(op.Apply(localHit), brushRadius, frontFacingOnly, _dabCameraLocal,
                     moveConnectedOnly);
-                if (selection.IsValid) selections.Add((selection, sign));
+                if (selection.IsValid) selections.Add((selection, op));
             }
             if (selections.Count == 0) return;
             _grabSelections = selections;
@@ -240,9 +242,9 @@ namespace Sculpting
                     Vector3 localCurrent = sculptableMesh.transform.InverseTransformPoint(current);
                     int versionBefore = sculptableMesh.GeometryVersion;
                     BeginDirtyVertices();
-                    foreach (var (selection, sign) in _poseSelections)
+                    foreach (var (selection, op) in _poseSelections)
                     {
-                        sculptableMesh.ApplyPoseDelta(selection, Vector3.Scale(localCurrent, sign));
+                        sculptableMesh.ApplyPoseDelta(selection, op.Apply(localCurrent));
                         int[] indices = selection.Indices;
                         for (int k = 0; k < indices.Length; k++) _dirtyVertexScratch.Add(indices[k]);
                     }
@@ -275,11 +277,13 @@ namespace Sculpting
             _previewPositive = true;
 
             Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
-            var selections = new List<(SculptableMesh.PoseSelection, Vector3)>();
-            foreach (Vector3 sign in MirrorSigns())
+            var selections = new List<(SculptableMesh.PoseSelection, SymmetryOp)>();
+            SymmetryGroup symmetry = Symmetry();
+            for (int k = 0; k < symmetry.Count; k++)
             {
-                var selection = sculptableMesh.SelectPose(Vector3.Scale(localHit, sign), brushRadius, poseRigidity, poseSegments);
-                if (selection.IsValid) selections.Add((selection, sign));
+                SymmetryOp op = symmetry[k];
+                var selection = sculptableMesh.SelectPose(op.Apply(localHit), brushRadius, poseRigidity, poseSegments);
+                if (selection.IsValid) selections.Add((selection, op));
             }
             _poseSelections = selections.Count > 0 ? selections : null;
 
@@ -334,7 +338,7 @@ namespace Sculpting
             float width = Mathf.Max(brushRadius * PoseChainWidthFactor, 0.0005f);
             for (int s = 0; s < _poseSelections.Count; s++)
             {
-                var (selection, sign) = _poseSelections[s];
+                var (selection, _) = _poseSelections[s];
                 LineRenderer lr = _poseChainLines[s];
                 Vector3[] points = selection.ChainPoints;
                 if (points == null || points.Length < 2) { lr.gameObject.SetActive(false); continue; }
@@ -342,8 +346,11 @@ namespace Sculpting
                 lr.gameObject.SetActive(true);
                 lr.widthMultiplier = width;
                 lr.positionCount = points.Length;
+                // Already where this copy's chain is: SelectPose ran at the mapped hit, so its chain
+                // points are that copy's own mesh positions. (Mapping them again used to draw every
+                // mirrored chain back on top of the primary one.)
                 for (int p = 0; p < points.Length; p++)
-                    lr.SetPosition(p, sculptableMesh.transform.TransformPoint(Vector3.Scale(points[p], sign)));
+                    lr.SetPosition(p, sculptableMesh.transform.TransformPoint(points[p]));
             }
             for (int s = _poseSelections.Count; s < _poseChainLines.Count; s++)
                 _poseChainLines[s].gameObject.SetActive(false);

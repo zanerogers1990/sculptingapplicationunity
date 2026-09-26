@@ -50,6 +50,7 @@ namespace Sculpting
         /// Smootherstep from the edge of the radius up to the plateau. u is distance / radius.
         internal static float DirectionalFalloff(float u, float plateau)
         {
+            u = BrushFalloff.ShiftDistance(u);
             float t = Mathf.Clamp01((1f - u) / Mathf.Max(1f - plateau, 1e-4f));
             return BrushFalloff.Apply(1f - u, t * t * t * (t * (t * 6f - 15f) + 10f));
         }
@@ -269,8 +270,8 @@ namespace Sculpting
                 // this frame has already carried them.
                 float pad = travelled;
                 MirroredDabWalk dabs = BeginMirroredDabs(localTip, brushRadius + pad);
-                while (NextMirroredDab(ref dabs, out Vector3 sign))
-                    SnakeHookStep(Vector3.Scale(localTip, sign), Vector3.Scale(step, sign), pad);
+                while (NextMirroredDab(ref dabs, out SymmetryOp op))
+                    SnakeHookStep(op.Apply(localTip), op.Apply(step), pad);
                 localTip += step;
                 travelled += step.magnitude;
             }
@@ -298,7 +299,7 @@ namespace Sculpting
                 if (sqrDist > radiusSqr) continue;
 
                 float t01 = 1f - Mathf.Sqrt(sqrDist) * invRadius;
-                float weight = BrushFalloff.Apply(t01, t01 * t01 * (3f - 2f * t01)) * (1f - mask[i])
+                float weight = BrushFalloff.Smoothstep(t01) * (1f - mask[i])
                     * BrushMath.FrontFacingWeight(frontFacingOnly, normals[i], p, _dabCameraLocal);
                 if (weight <= 0f) continue;
 

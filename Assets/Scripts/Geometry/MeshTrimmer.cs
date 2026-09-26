@@ -112,11 +112,11 @@ namespace Sculpting
         /// view direction, returning the surviving geometry.
         ///
         /// `mvp` is projection * worldToCamera * localToWorld and `modelToView` is
-        /// worldToCamera * localToWorld, both for the object being cut. `mirrorSign` is a
-        /// component-wise flip applied to every point BEFORE it is tested, which is how one pass
-        /// cuts against a mirrored copy of the shape (see TrimTool - symmetry is done as one pass
-        /// per mirror sign rather than by widening the test, so each pass has a single
-        /// well-defined swept surface to close the hole against).
+        /// worldToCamera * localToWorld, both for the object being cut. `symmetry` is a symmetry
+        /// op (a mirror flip or radial rotation): a point is tested through its inverse, which is
+        /// how one pass cuts against the op's mirrored or rotated copy of the shape (see TrimTool -
+        /// symmetry is done as one pass per op rather than by widening the test, so each pass has
+        /// a single well-defined swept surface to close the hole against).
         ///
         /// `removeCovered` false inverts the sense: everything the shape does NOT cover is
         /// removed, i.e. a crop down to the shape.
@@ -124,7 +124,7 @@ namespace Sculpting
         /// Fails (with a reason) when the cut would do nothing, or would leave nothing behind.
         public static Result Trim(
             Vector3[] verts, int[] tris,
-            Matrix4x4 mvp, Matrix4x4 modelToView, Rect viewport, Vector3 mirrorSign,
+            Matrix4x4 mvp, Matrix4x4 modelToView, Rect viewport, SymmetryOp symmetry,
             ScreenRegionMask region, bool removeCovered)
         {
             if (verts == null || verts.Length == 0 || tris == null || tris.Length < 3)
@@ -132,7 +132,7 @@ namespace Sculpting
             if (region == null)
                 return new Result("the region was empty");
 
-            var pass = new Pass(verts, tris, mvp, modelToView, viewport, mirrorSign, region, removeCovered);
+            var pass = new Pass(verts, tris, mvp, modelToView, viewport, symmetry, region, removeCovered);
             return pass.Run();
         }
 
@@ -146,7 +146,7 @@ namespace Sculpting
             private readonly Matrix4x4 _mvp;
             private readonly Matrix4x4 _modelToView;
             private readonly Rect _viewport;
-            private readonly Vector3 _mirrorSign;
+            private readonly SymmetryOp _symmetry;
             private readonly ScreenRegionMask _region;
             private readonly bool _removeCovered;
 
@@ -186,14 +186,14 @@ namespace Sculpting
             private float ShellEdgeLength => _shellEdgeCount > 0 ? (float)(_shellEdgeSum / _shellEdgeCount) : 0f;
 
             public Pass(Vector3[] verts, int[] tris, Matrix4x4 mvp, Matrix4x4 modelToView, Rect viewport,
-                        Vector3 mirrorSign, ScreenRegionMask region, bool removeCovered)
+                        SymmetryOp symmetry, ScreenRegionMask region, bool removeCovered)
             {
                 _verts = verts;
                 _tris = tris;
                 _mvp = mvp;
                 _modelToView = modelToView;
                 _viewport = viewport;
-                _mirrorSign = mirrorSign;
+                _symmetry = symmetry;
                 _region = region;
                 _removeCovered = removeCovered;
 
@@ -229,7 +229,7 @@ namespace Sculpting
 
             private bool IsRemoved(Vector3 local)
             {
-                Vector3 tested = Vector3.Scale(local, _mirrorSign);
+                Vector3 tested = _symmetry.ApplyInverse(local);
                 bool covered = ScreenRegionMask.ProjectToScreen(_mvp, tested, _viewport, out Vector2 screen) &&
                                _region.Contains(screen);
                 return covered == _removeCovered;
@@ -292,7 +292,7 @@ namespace Sculpting
                 _outVerts.Add(p);
                 _crossings.Add(key, index);
 
-                Vector3 tested = Vector3.Scale(p, _mirrorSign);
+                Vector3 tested = _symmetry.ApplyInverse(p);
                 ScreenRegionMask.ProjectToScreen(_mvp, tested, _viewport, out Vector2 screen);
                 _cutArc.Add(_region.ArcPosition(screen));
                 // Unity's view space looks down -Z, so a point in front of the camera has
@@ -607,8 +607,8 @@ namespace Sculpting
                 float ry = ndcY * w - _viewToClip[1, 2] * z - _viewToClip[1, 3];
                 Vector3 view = new Vector3((d * rx - b * ry) / det, (a * ry - c * rx) / det, z);
 
-                // Scaling by the mirror sign again undoes it: every component is +/-1.
-                local = Vector3.Scale(_viewToModel.MultiplyPoint3x4(view), _mirrorSign);
+                // Back from the tested copy to the geometry being cut.
+                local = _symmetry.Apply(_viewToModel.MultiplyPoint3x4(view));
                 return true;
             }
 
