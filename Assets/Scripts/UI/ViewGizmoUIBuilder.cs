@@ -98,6 +98,16 @@ namespace Sculpting
         private Image _centreImage;
         private Image _projImage;
         private Text _projText;
+        private Image _pivotImage;
+
+        // The stroke-pivot dot (see CameraOrbitController.TryGetShownAnchor): a dark ring under a
+        // white core, so it reads on both a pale clay surface and a dark background.
+        private const float PivotDotSize = 11f;
+        private const float PivotDotCore = 5f;
+        private RectTransform _pivotDotRect;
+        private Image _pivotDotRing;
+        private Image _pivotDotCore;
+        private bool _pivotDotShown;
 
         // Scratch for Refresh's depth sort - the seventh entry is the centre cube.
         private readonly int[] _order = new int[7];
@@ -116,6 +126,32 @@ namespace Sculpting
             if (_canvasRoot == null) BuildUI();
             if (_orbit == null) _orbit = FindFirstObjectByType<CameraOrbitController>();
             if (RefreshInputsChanged()) Refresh();
+            UpdatePivotDot();
+        }
+
+        /// Only touches the canvas while the dot is (or has just stopped being) visible, so an
+        /// idle view costs one bool test here.
+        private void UpdatePivotDot()
+        {
+            if (_pivotDotRect == null) return;
+            Camera cam = Camera.main;
+            bool show = _orbit != null && cam != null && !TurntableController.CleanViewActive &&
+                        _orbit.TryGetShownAnchor(out Vector3 world, out float alpha) &&
+                        ShowDotAt(cam, world, alpha);
+            if (show || !_pivotDotShown) { _pivotDotShown = show; return; }
+            _pivotDotRect.gameObject.SetActive(false);
+            _pivotDotShown = false;
+        }
+
+        private bool ShowDotAt(Camera cam, Vector3 world, float alpha)
+        {
+            Vector3 screen = cam.WorldToScreenPoint(world);
+            if (screen.z <= 0f) return false;
+            if (!_pivotDotShown) _pivotDotRect.gameObject.SetActive(true);
+            _pivotDotRect.anchoredPosition = new Vector2(screen.x, screen.y);
+            SetColor(_pivotDotRing, new Color(0.08f, 0.08f, 0.1f), 0.75f * alpha);
+            SetColor(_pivotDotCore, Color.white, alpha);
+            return true;
         }
 
         // What Refresh() last drew from. It is a pure function of these, and it rewrites every
@@ -125,6 +161,7 @@ namespace Sculpting
         private Quaternion _shownRotation;
         private int _shownHoverMask = -1;
         private bool _shownOrtho;
+        private bool _shownPivotOnStroke;
         private float _shownPanelWidth = -1f;
 
         private bool RefreshInputsChanged()
@@ -135,18 +172,20 @@ namespace Sculpting
             for (int i = 0; i < _hovers.Length; i++)
                 if (_hovers[i] != null && _hovers[i].Hovered) hoverMask |= 1 << i;
             bool ortho = _orbit != null && _orbit.Orthographic;
+            bool pivotOnStroke = _orbit != null && _orbit.PivotOnStroke;
             float panelWidth = UIFactory.ResponsivePanelWidth(RightPanelWidth);
 
             // Equals, not ==: Quaternion == is approximate, and a slow orbit could otherwise
             // leave the gizmo a hair behind the camera it describes.
             if (cam == _shownCamera && rotation.Equals(_shownRotation) && hoverMask == _shownHoverMask &&
-                ortho == _shownOrtho && panelWidth.Equals(_shownPanelWidth))
+                ortho == _shownOrtho && pivotOnStroke == _shownPivotOnStroke && panelWidth.Equals(_shownPanelWidth))
                 return false;
 
             _shownCamera = cam;
             _shownRotation = rotation;
             _shownHoverMask = hoverMask;
             _shownOrtho = ortho;
+            _shownPivotOnStroke = pivotOnStroke;
             _shownPanelWidth = panelWidth;
             return true;
         }
@@ -193,6 +232,8 @@ namespace Sculpting
             for (int i = 0; i < 6; i++) BuildHandle(gizmoRect, i);
 
             BuildProjectionButton(gizmoRect);
+            BuildPivotButton(gizmoRect);
+            BuildPivotDot(canvasGO.transform);
             Refresh();
         }
 
@@ -309,6 +350,51 @@ namespace Sculpting
             _projText = btn.GetComponentInChildren<Text>();
         }
 
+        /// Under the Persp/Ortho button: the other "how does the view move" switch.
+        private void BuildPivotButton(RectTransform gizmoRect)
+        {
+            Button btn = UIFactory.CreateButton(gizmoRect, "Stroke Pivot", TogglePivotOnStroke,
+                "Orbit and zoom around the last spot you sculpted, so it stays put on screen " +
+                "(like Nomad and ZBrush). Off: around the centre of the view.");
+            var rect = btn.GetComponent<RectTransform>();
+            rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 0f);
+            rect.pivot = new Vector2(0.5f, 1f);
+            rect.anchoredPosition = new Vector2(0f, -26f);
+            rect.sizeDelta = new Vector2(76f, 22f);
+            _pivotImage = btn.GetComponent<Image>();
+        }
+
+        /// Straight on the canvas, which is ConstantPixelSize at scale 1 with a (0,0)-anchored
+        /// rect - so anchoredPosition IS the screen pixel.
+        private void BuildPivotDot(Transform canvas)
+        {
+            var go = new GameObject("StrokePivotDot", typeof(RectTransform));
+            go.transform.SetParent(canvas, false);
+            // Behind the gizmo and its buttons, in case an anchor sits under them.
+            go.transform.SetAsFirstSibling();
+            _pivotDotRect = go.GetComponent<RectTransform>();
+            _pivotDotRect.anchorMin = _pivotDotRect.anchorMax = Vector2.zero;
+            _pivotDotRect.pivot = new Vector2(0.5f, 0.5f);
+            _pivotDotRect.sizeDelta = new Vector2(PivotDotSize, PivotDotSize);
+            _pivotDotRing = AddDotLayer(_pivotDotRect, "Ring", PivotDotSize);
+            _pivotDotCore = AddDotLayer(_pivotDotRect, "Core", PivotDotCore);
+            go.SetActive(false);
+            _pivotDotShown = false;
+        }
+
+        private static Image AddDotLayer(RectTransform parent, string name, float size)
+        {
+            var go = new GameObject(name, typeof(RectTransform), typeof(Image));
+            go.transform.SetParent(parent, false);
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = rect.anchorMax = rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.sizeDelta = new Vector2(size, size);
+            var img = go.GetComponent<Image>();
+            img.sprite = DiscSprite;
+            img.raycastTarget = false;
+            return img;
+        }
+
         /// Keeps the gizmo clear of SceneGraphUIBuilder's panel as it scales with the window -
         /// see RightPanelWidth's remarks. Run from Refresh() (which re-runs when that width
         /// changes) rather than once at build time, since the window can now be resized live.
@@ -388,6 +474,8 @@ namespace Sculpting
             bool ortho = _orbit != null && _orbit.Orthographic;
             if (_projText != null) _projText.text = ortho ? "Ortho" : "Persp";
             if (_projImage != null) _projImage.color = ortho ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            if (_pivotImage != null)
+                _pivotImage.color = _orbit != null && _orbit.PivotOnStroke ? UIFactory.ActiveColor : UIFactory.InactiveColor;
         }
 
         /// Draws the seven pieces back to front. uGUI has no depth within a canvas beyond
@@ -451,6 +539,11 @@ namespace Sculpting
         private void ToggleProjection()
         {
             if (_orbit != null) _orbit.Orthographic = !_orbit.Orthographic;
+        }
+
+        private void TogglePivotOnStroke()
+        {
+            if (_orbit != null) _orbit.PivotOnStroke = !_orbit.PivotOnStroke;
         }
 
         private static Sprite ConeSprite

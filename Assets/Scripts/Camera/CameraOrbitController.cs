@@ -30,9 +30,19 @@ namespace Sculpting
     /// 0.3 of the lens). Now each notch covers a percentage of the gap to the surface, so the
     /// camera approaches it asymptotically and never crosses it, and the near plane shrinks with
     /// that gap (see UpdateNearPlane). Pan moves the surface 1:1 with the cursor at any zoom.
+    ///
+    /// Stroke pivot (Nomad's "pivot on stroke", ZBrush's Local): with PivotOnStroke on, orbiting
+    /// and zooming are anchored on the last spot sculpted (SculptController.TryGetStrokeAnchor)
+    /// instead of the view centre, so the detail being worked on stays put on screen while the
+    /// model turns or comes closer. The rig's own yaw/pitch/distance/pivot parameterisation is
+    /// untouched - an anchored move is the ordinary move plus the shift of _pivot that holds the
+    /// anchor still (see OrbitAbout/ZoomAbout) - so snapping, the turntable, saving and pan all
+    /// work exactly as before. Falls back to the view centre when there is no anchor yet or it
+    /// has left the screen: turning about a point you can't see is disorienting, not helpful.
     public class CameraOrbitController : MonoBehaviour
     {
         public Transform target;
+        [SerializeField] private bool pivotOnStroke = true;
         [SerializeField] private float orbitSpeed = 0.25f;
         // Fraction of the current distance covered per wheel notch. Using a percentage rather
         // than a fixed step keeps zoom speed consistent near and far, and - crucially - makes it
@@ -211,6 +221,28 @@ namespace Sculpting
         /// to them for the length of the drag and carries on from wherever they leave it.
         public bool IsUserOrbiting { get; private set; }
 
+        /// See the class remarks. Toggled from the view gizmo's Stroke Pivot button.
+        public bool PivotOnStroke
+        {
+            get => pivotOnStroke;
+            set => pivotOnStroke = value;
+        }
+
+        // Unscaled time the last anchored orbit/zoom happened, and where - drives the pivot dot
+        // ViewGizmoUIBuilder draws, so the user can see what the view is turning about.
+        private float _anchorUsedTime = float.NegativeInfinity;
+        private Vector3 _anchorUsedPoint;
+        private const float AnchorDotLinger = 0.35f;
+
+        /// Where an anchored orbit/zoom is (or very recently was) holding the view, and how
+        /// strongly to show it (1 while in use, fading to 0 over AnchorDotLinger after).
+        public bool TryGetShownAnchor(out Vector3 worldPoint, out float alpha)
+        {
+            worldPoint = _anchorUsedPoint;
+            alpha = 1f - Mathf.Clamp01((Time.unscaledTime - _anchorUsedTime) / AnchorDotLinger);
+            return alpha > 0f;
+        }
+
         /// Turns the view about the pivot by `degrees` of yaw - the turntable's spin. Yaw is
         /// unbounded here exactly as it is for a live orbit drag.
         public void AddYaw(float degrees)
@@ -260,9 +292,13 @@ namespace Sculpting
             bool altShiftPan = altLeftDrag && shiftHeld && !ctrlHeld;
             IsUserOrbiting = altLeftDrag && !ctrlHeld && !shiftHeld;
 
+            // Resolved once per frame, before anything moves, so the on-screen test below sees
+            // the view the user is looking at.
+            bool anchored = TryGetNavigationAnchor(out Vector3 anchor);
+
             if (altLeftDrag && ctrlHeld)
             {
-                Zoom(Mathf.Max(0.1f, 1f - delta.y * dragZoomSensitivity), viewDepth);
+                ZoomAbout(Mathf.Max(0.1f, 1f - delta.y * dragZoomSensitivity), viewDepth, anchored, anchor);
             }
             else if (IsUserOrbiting)
             {
@@ -270,9 +306,7 @@ namespace Sculpting
                 // values, so it takes them over. Pan and zoom move the pivot and the distance
                 // instead, and compose with a snap in flight rather than cancelling it.
                 _snapElapsed = -1f;
-                _yaw += delta.x * orbitSpeed;
-                _pitch -= delta.y * orbitSpeed;
-                _pitch = Mathf.Clamp(_pitch, -89f, 89f);
+                Orbit(delta.x * orbitSpeed, -delta.y * orbitSpeed, anchored, anchor);
             }
 
             if (mouse.middleButton.isPressed || altShiftPan)
@@ -295,7 +329,7 @@ namespace Sculpting
             {
                 float scroll = mouse.scroll.ReadValue().y;
                 if (Mathf.Abs(scroll) > 0.01f)
-                    Zoom(1f - Mathf.Sign(scroll) * zoomPercentPerNotch, viewDepth);
+                    ZoomAbout(1f - Mathf.Sign(scroll) * zoomPercentPerNotch, viewDepth, anchored, anchor);
             }
 
             AdvanceSnap();
@@ -535,6 +569,93 @@ namespace Sculpting
             // push it back out either if it's already inside that (e.g. after an orbit).
             if (surfaceInFront && factor < 1f) target = Mathf.Max(target, Mathf.Min(viewDepth, MinSurfaceGap));
             _distance = Mathf.Clamp(_distance + (target - viewDepth), MinPivotDistance, upper);
+        }
+
+        /// The last sculpted spot, when PivotOnStroke is on and that spot is in front of the
+        /// camera and inside the viewport - see the class remarks for why off-screen falls back.
+        private bool TryGetNavigationAnchor(out Vector3 anchor)
+        {
+            anchor = default;
+            if (!pivotOnStroke || Cam == null) return false;
+            if (_sculpt == null) _sculpt = FindFirstObjectByType<SculptController>();
+            if (_sculpt == null || !_sculpt.TryGetStrokeAnchor(out anchor)) return false;
+
+            Vector3 vp = Cam.WorldToViewportPoint(anchor);
+            return vp.z > 0f && vp.x >= 0f && vp.x <= 1f && vp.y >= 0f && vp.y <= 1f;
+        }
+
+        /// One orbit step. Anchored, the yaw/pitch change becomes a rotation of the whole rig
+        /// about `anchor` rather than about _pivot: the camera frame is (_pivot, rotation) with
+        /// the lens a fixed offset back along it, so rotating _pivot about the anchor by the same
+        /// delta moves the lens and its orientation rigidly around the anchor - which leaves the
+        /// anchor at the same view-space position, i.e. the same pixel, in perspective and ortho
+        /// alike. Internal for the EditMode tests (CameraPivotTests).
+        internal void Orbit(float yawDegrees, float pitchDegrees, bool anchored, Vector3 anchor)
+        {
+            Quaternion before = Quaternion.Euler(_pitch, _yaw, 0f);
+            _yaw += yawDegrees;
+            _pitch = Mathf.Clamp(_pitch + pitchDegrees, -89f, 89f);
+            if (!anchored) return;
+
+            Quaternion delta = Quaternion.Euler(_pitch, _yaw, 0f) * Quaternion.Inverse(before);
+            _pivot = anchor + delta * (_pivot - anchor);
+            MarkAnchorUsed(anchor);
+        }
+
+        /// Zoom, but toward `anchor` instead of the view centre when anchored.
+        ///
+        /// Perspective: the camera travels the SAME forward distance Zoom would give it (so the
+        /// surface-gap bookkeeping that keeps it from ever crossing the surface is unchanged),
+        /// but along the line of sight to the anchor rather than straight ahead - moving along
+        /// that line is exactly what leaves the anchor's pixel unchanged. The depth handed to
+        /// Zoom is capped at the anchor's own, so the approach is asymptotic to the anchor when
+        /// it is nearer than the surface the probe found; the anchor is never passed.
+        ///
+        /// Ortho: zoom scales the framing about the screen centre, so the anchor keeps its pixel
+        /// when its sideways offset from _pivot scales by the same ratio as _distance.
+        internal void ZoomAbout(float factor, float viewDepth, bool anchored, Vector3 anchor)
+        {
+            if (!anchored)
+            {
+                Zoom(factor, viewDepth);
+                return;
+            }
+
+            // From the rig's state, not the transform: an orbit earlier this frame has already
+            // changed the angles, and UpdateTransform hasn't run yet.
+            Vector3 forward = Quaternion.Euler(_pitch, _yaw, 0f) * Vector3.forward;
+            float before = _distance;
+
+            if (_orthographic)
+            {
+                Zoom(factor, viewDepth);
+                Vector3 offset = _pivot - anchor;
+                Vector3 sideways = offset - forward * Vector3.Dot(offset, forward);
+                _pivot += sideways * (_distance / before - 1f);
+                MarkAnchorUsed(anchor);
+                return;
+            }
+
+            Vector3 toAnchor = anchor - (_pivot - forward * _distance);
+            float anchorDepth = Vector3.Dot(toAnchor, forward);
+            if (anchorDepth <= 1e-6f)
+            {
+                Zoom(factor, viewDepth);
+                return;
+            }
+
+            Zoom(factor, Mathf.Min(viewDepth, anchorDepth));
+            float travel = before - _distance; // forward travel of the lens, + = in
+            // Lens moves by toAnchor * travel / anchorDepth; _distance already accounts for the
+            // forward part of that, _pivot takes the sideways rest.
+            _pivot += toAnchor * (travel / anchorDepth) - forward * travel;
+            MarkAnchorUsed(anchor);
+        }
+
+        private void MarkAnchorUsed(Vector3 anchor)
+        {
+            _anchorUsedTime = Time.unscaledTime;
+            _anchorUsedPoint = anchor;
         }
 
         /// View-space depth of the nearest visible sculpt surface across a few viewport sample
