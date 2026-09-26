@@ -57,6 +57,8 @@ namespace Sculpting
         private Slider _brushStrengthSlider;
         private Text _polyCountLabel;
         private Text _exportStatusLabel;
+        // Polled, not set from the button: Remesh also fires from the R hotkey.
+        private Text _remeshReportLabel;
         private int _lastShownTriCount = -1, _lastShownVertCount = -1;
         private Button _undoButton, _redoButton;
         private BrushType _lastShownBrush = (BrushType)(-1);
@@ -191,6 +193,9 @@ namespace Sculpting
                     controller.BrushSizeMin, controller.BrushSizeMax, controller.BrushSize);
             }
             if (_remeshResolutionSlider != null) _remeshResolutionSlider.SetValueWithoutNotify(controller.RemeshResolution);
+            // Reference compare: the report string is only replaced when a Remesh runs.
+            if (_remeshReportLabel != null && !ReferenceEquals(_remeshReportLabel.text, controller.LastRemeshReport))
+                _remeshReportLabel.text = controller.LastRemeshReport;
             if (_brushStrengthSlider != null) _brushStrengthSlider.SetValueWithoutNotify(controller.BrushStrength);
 
             // Brush switches can now come from the keyboard outside of SetBrushType (hotkeys
@@ -634,11 +639,11 @@ namespace Sculpting
             CreateLabel(panel.transform, "Export", 14, FontStyle.Normal);
             CreateButton(panel.transform, "Export OBJ", () =>
             {
-                string path = controller.Export();
-                _exportStatusLabel.text = path != null
-                    ? "Saved to Desktop/SculptExports/" + System.IO.Path.GetFileName(path)
+                string path = controller.Export(out bool cancelled);
+                _exportStatusLabel.text = path != null ? "Saved to " + path
+                    : cancelled ? "Export cancelled"
                     : "Export failed - no mesh yet";
-            }, "Saves the selected mesh as an OBJ file to Desktop/SculptExports.");
+            }, "Saves the selected mesh as an OBJ file - opens a dialog to pick the folder and name.");
             _exportStatusLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform, "Remesh Resolution", 14, FontStyle.Normal);
@@ -646,7 +651,8 @@ namespace Sculpting
                 v => controller.RemeshResolution = Mathf.RoundToInt(v),
                 "Voxel density used by Remesh - higher captures finer detail but is slower. Also adjustable by holding R and dragging.");
             CreateButton(panel.transform, "Remesh", () => controller.Remesh(),
-                "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R.");
+                "Rebuilds the mesh on a clean, evenly-spaced grid at the resolution above - fixes stretched/uneven topology from sculpting. Also bound to tapping R. Capped at a 10M-triangle budget, so compact models stop gaining detail before slender ones do.");
+            _remeshReportLabel = CreateLabel(panel.transform, "", 11, FontStyle.Italic);
 
             CreateLabel(panel.transform,
                 "Keys: 1 Move  2 Clay  3 Smooth  4 Crease\n5 Inflate  6 Flatten  7 Pose  8 Standard\n9 Layer  0 Snakehook  M Toggle Mask Paint\nHold Space: radial tool menu (Move/Clay/Smooth/Crease/\nMask/Inflate/Flatten + Strength/Size sliders)\nTap R: Remesh  Hold R + drag: adjust remesh density\nH Box/Lasso Hide  N Box/Lasso Mask  T Box/Lasso Trim\n(Esc cancels a region drag)\nZ Undo  Shift+Z Redo (not Ctrl+Z - that's the Editor's)\nHold S + drag, or Scroll over model: resize brush\nHold F + drag: adjust brush strength (red inner circle)\nLMB Sculpt/Mask | RMB or Ctrl+LMB Invert/Erase\nAlt+LMB Orbit | MMB Pan | Scroll Zoom | Ctrl+Alt+LMB Drag Zoom",

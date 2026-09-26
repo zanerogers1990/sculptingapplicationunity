@@ -31,10 +31,80 @@ namespace Sculpting
         private static readonly int[][] CubeEdges = BuildCubeEdges();
         private static readonly Vector3Int[] CubeCorners = BuildCubeCorners();
 
-        /// Highest grid resolution the extraction will attempt. Well past what the UI offers -
-        /// this is the structural limit, and it is here so a saved scene or a script asking for
-        /// something absurd is clamped rather than trusted.
-        public const int MaxResolution = 2048;
+        /// Highest grid resolution the extraction will attempt - the structural limit, here so a
+        /// saved scene or a script asking for something absurd is clamped rather than trusted.
+        /// In practice MaxTriangles and MaxBricks below bind long before this does on anything
+        /// but a very slender model.
+        public const int MaxResolution = 4096;
+
+        /// Most triangles a remesh may produce. This, and not the resolution, is the real
+        /// ceiling: resolution counts voxels along the LONGEST bounding-box axis only, so the
+        /// same number gives wildly different triangle counts by shape. Measured at 1024: a
+        /// slender worm (218 x 46 x 18 units) came out at 681k triangles while a compact model
+        /// reaches about 10M. A resolution cap tuned for the compact case starved the slender
+        /// one, and one high enough for the slender case let a compact model run out of memory.
+        /// 10M is about what a compact model already reached at the old 1024 cap.
+        public const long MaxTriangles = 10_000_000;
+
+        /// Most 8^3 bricks SparseRemesher's dense brick table may hold (5 bytes each, so about
+        /// 200 MB). The table follows the bounding box's VOLUME, not the surface, so a model
+        /// with little area but large empty bounds - two small parts far apart - can blow this
+        /// up while staying far under MaxTriangles.
+        private const long MaxBricks = 40_000_000;
+
+        /// Output triangles per unit of source surface area, in cells. Surface-nets theory
+        /// gives 2 x the mean of |nx|+|ny|+|nz| (1.5 over a sphere) = 3; measured 2.8 on a
+        /// sculpted model. The rounder figure errs toward estimating high.
+        private const double TrianglesPerCellArea = 3.0;
+
+        /// `requested`, lowered as far as needed to keep the output within MaxTriangles and
+        /// MaxBricks. `estimatedTriangles` is the expected output at the returned resolution.
+        /// Linear in the source triangle count - trivial next to the remesh itself.
+        public static int BudgetedResolution(Vector3[] sourceVertices, int[] sourceTriangles, int requested,
+                                             out long estimatedTriangles)
+        {
+            int resolution = Mathf.Clamp(requested, 4, MaxResolution);
+            estimatedTriangles = 0;
+            if (sourceVertices == null || sourceTriangles == null || sourceVertices.Length == 0) return resolution;
+
+            double area = 0;
+            for (int i = 0; i + 2 < sourceTriangles.Length; i += 3)
+            {
+                Vector3 a = sourceVertices[sourceTriangles[i]];
+                Vector3 ab = sourceVertices[sourceTriangles[i + 1]] - a;
+                Vector3 ac = sourceVertices[sourceTriangles[i + 2]] - a;
+                area += 0.5 * Vector3.Cross(ab, ac).magnitude;
+            }
+
+            Bounds bounds = ComputeBounds(sourceVertices);
+            double maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
+
+            // Triangles grow with resolution squared, so the fit is a square root.
+            double perResolutionSq = TrianglesPerCellArea * area / (maxExtent * maxExtent);
+            if (perResolutionSq * resolution * resolution > MaxTriangles)
+                resolution = Mathf.Max(4, (int)Math.Floor(Math.Sqrt(MaxTriangles / perResolutionSq)));
+
+            // Bricks grow with resolution cubed, but the fixed 2-cell padding keeps that from
+            // being exact - step down by the cube-root ratio until it fits.
+            for (int guard = 0; guard < 8; guard++)
+            {
+                long bricks = BrickEstimate(bounds, (float)(maxExtent / resolution));
+                if (bricks <= MaxBricks || resolution <= 4) break;
+                resolution = Mathf.Max(4, (int)Math.Floor(resolution * Math.Pow((double)MaxBricks / bricks, 1.0 / 3.0) * 0.98));
+            }
+
+            estimatedTriangles = (long)(perResolutionSq * resolution * resolution);
+            return resolution;
+        }
+
+        private static long BrickEstimate(Bounds bounds, float cellSize)
+        {
+            Vector3Int dims = GridDimensions(bounds, cellSize, out _);
+            long bx = (dims.x + SparseRemesher.BrickSize - 1) / SparseRemesher.BrickSize;
+            long by = (dims.y + SparseRemesher.BrickSize - 1) / SparseRemesher.BrickSize;
+            long bz = (dims.z + SparseRemesher.BrickSize - 1) / SparseRemesher.BrickSize;
+            return bx * by * bz;
+        }
 
         /// Vertices, normals and indices of a remesh, before any of it becomes a Unity Mesh.
         ///
@@ -50,6 +120,9 @@ namespace Sculpting
             public Vector3[] Normals;
             public int[] Triangles;
             public Bounds Bounds;
+            /// The resolution actually used, after BudgetedResolution - lower than the one
+            /// asked for when the triangle or memory budget stepped in.
+            public int Resolution;
 
             public bool IsEmpty => Vertices == null || Vertices.Length == 0 || Triangles == null || Triangles.Length < 3;
         }
@@ -74,7 +147,9 @@ namespace Sculpting
         {
             lock (ExtractionLock)
             {
-                resolution = Mathf.Clamp(resolution, 4, MaxResolution);
+                // Applied here, not only by the UI, so every caller (Join's remesh, saved
+                // settings) gets the same memory protection.
+                resolution = BudgetedResolution(sourceVertices, sourceTriangles, resolution, out _);
 
                 Bounds bounds = ComputeBounds(sourceVertices);
                 float maxExtent = Mathf.Max(bounds.size.x, bounds.size.y, bounds.size.z, 0.0001f);
@@ -85,7 +160,9 @@ namespace Sculpting
                 SparseRemesher.Build(sourceVertices, sourceTriangles, origin, cellSize, dims, _buffer, out _);
                 PatchHoles(_buffer);
 
-                return Finish(_buffer);
+                RemeshResult result = Finish(_buffer);
+                result.Resolution = resolution;
+                return result;
             }
         }
 

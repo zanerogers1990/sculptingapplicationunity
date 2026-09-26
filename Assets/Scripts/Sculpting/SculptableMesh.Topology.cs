@@ -12,7 +12,9 @@ namespace Sculpting
         /// triangles heavy sculpting leaves in the original topology. Commits the new
         /// topology as the mesh's baseline, so ResetMesh afterwards reverts to this remeshed
         /// shape rather than the pre-sculpt original.
-        public void Remesh(int resolution)
+        /// Returns the resolution actually used (see MeshRemesher.BudgetedResolution), or 0 when
+        /// nothing was extracted and the object was left as it was.
+        public int Remesh(int resolution)
         {
             // Must read _workingVertices, not _mesh.vertices - ordinary sculpting now writes
             // touched vertices straight into the mesh's GPU buffer via GpuVertexScatter
@@ -22,17 +24,18 @@ namespace Sculpting
             // the actual sculpted one. _workingTriangles is topology, unaffected either way,
             // but reading it avoids the same needless full-array copy _mesh.triangles would do.
             MeshRemesher.RemeshResult result = MeshRemesher.RemeshGeometry(_workingVertices, _workingTriangles, resolution);
-            if (result.IsEmpty) return; // nothing extracted - leave the object as it was
+            if (result.IsEmpty) return 0; // nothing extracted - leave the object as it was
             ReplaceGeometry(result.Vertices, result.Normals, result.Triangles, result.Bounds);
+            return result.Resolution;
         }
 
         /// Remesh as one undo step: a full snapshot first, so Z steps back to the pre-remesh
         /// shape. What every user-facing Remesh wants; plain Remesh is for callers that manage
         /// history themselves.
-        public void RemeshUndoable(int resolution)
+        public int RemeshUndoable(int resolution)
         {
             SnapshotForUndo();
-            Remesh(resolution);
+            return Remesh(resolution);
         }
 
         /// ReplaceMesh as one undo step: a full snapshot of the current geometry first, so Z

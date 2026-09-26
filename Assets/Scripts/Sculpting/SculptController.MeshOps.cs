@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using Sculpting.IO;
 using UnityEngine;
 
 namespace Sculpting
@@ -15,10 +16,22 @@ namespace Sculpting
             sculptableMesh.ResetMesh();
         }
 
+        /// What the last Remesh produced, for the panel - including when the triangle budget
+        /// lowered the resolution, since otherwise raising the slider past that point would
+        /// silently do nothing.
+        public string LastRemeshReport { get; private set; } = string.Empty;
+
         public void Remesh()
         {
             if (sculptableMesh == null) return;
-            sculptableMesh.RemeshUndoable(remeshResolution);
+            int used = sculptableMesh.RemeshUndoable(remeshResolution);
+            if (used <= 0) { LastRemeshReport = "Remesh produced nothing - mesh left as it was"; return; }
+
+            string tris = sculptableMesh.TriangleCount.ToString("N0");
+            LastRemeshReport = used < remeshResolution
+                ? $"{tris} tris - capped at density {used} " +
+                  $"({MeshRemesher.MaxTriangles / 1_000_000}M triangle budget)"
+                : $"{tris} tris at density {used}";
         }
 
         /// Live symmetry report for the selected object - pairs found, centreline size, and how
@@ -114,18 +127,40 @@ namespace Sculpting
                 : $"Snapped {snapped} onto {axis}, welded {welded} duplicate vertices";
         }
 
-        // Fixed destination rather than a save-file dialog - EditorUtility.SaveFilePanel only
-        // exists in the Editor and would silently vanish once this ships as a standalone
-        // build, whereas Environment.GetFolderPath is plain .NET and resolves the real
-        // Desktop path in both. A proper save/load feature (with its own file-picker UX) is
-        // planned as separate future work; this is just "get the current sculpt out to a
-        // file I can open elsewhere" for now.
-        public string Export()
+        // Where the next export dialog opens: the folder the last export went to, so repeated
+        // exports into one project folder don't mean navigating there every time.
+        private static string _lastExportDirectory;
+
+        /// Asks where to save (the native dialog - see FileDialog) and writes the selected mesh
+        /// there as OBJ. Returns the path written, or null if there is no mesh or the dialog
+        /// was cancelled - `cancelled` tells those two apart for the status line.
+        ///
+        /// Falls back to the old fixed Desktop/SculptExports destination only where no dialog
+        /// exists (non-Windows builds), so export never becomes impossible.
+        public string Export(out bool cancelled)
         {
+            cancelled = false;
             if (sculptableMesh == null) return null;
-            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-            string folder = Path.Combine(desktop, "SculptExports");
-            string path = ObjExporter.Export(sculptableMesh, folder);
+
+            string path;
+            if (FileDialog.IsSupported)
+            {
+                string start = _lastExportDirectory ??
+                               Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                string defaultName = sculptableMesh.name + "_" + DateTime.Now.ToString("yyyy-MM-dd_HHmmss");
+                path = FileDialog.SaveFile("Export OBJ", start, defaultName, "obj");
+                if (string.IsNullOrEmpty(path)) { cancelled = true; return null; }
+                if (!path.EndsWith(".obj", StringComparison.OrdinalIgnoreCase)) path += ".obj";
+                _lastExportDirectory = Path.GetDirectoryName(path);
+            }
+            else
+            {
+                string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+                path = Path.Combine(desktop, "SculptExports",
+                                    "Sculpt_" + DateTime.Now.ToString("yyyy-MM-dd_HHmmss") + ".obj");
+            }
+
+            path = ObjExporter.ExportToFile(sculptableMesh, path);
             if (path != null) Debug.Log($"[Sculpt] Exported to {path}");
             return path;
         }

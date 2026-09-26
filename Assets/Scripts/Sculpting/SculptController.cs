@@ -260,7 +260,7 @@ namespace Sculpting
         [SerializeField, Range(0f, 1f)] private float maskHardness = 0.5f;
 
         [Header("Remesh Settings")]
-        [SerializeField, Range(4, 500)] private int remeshResolution = 24;
+        [SerializeField, Range(4, 4096)] private int remeshResolution = 24;
 
         [Header("Symmetry Repair")]
         // Which plane the correspondence-map tools work across. Deliberately its own setting
@@ -635,9 +635,14 @@ namespace Sculpting
         /// grid to produce 2.7M triangles, and the same cubic growth made anything past that
         /// unreachable rather than merely slow. The sparse extraction's memory follows the
         /// SURFACE instead, so 1024 - roughly 6-7 million triangles on a compact model - costs a
-        /// few hundred megabytes. Kept below MeshRemesher.MaxResolution so the structural limit
-        /// stays a backstop and not the thing users bump into.
-        public const int MaxRemeshResolution = 1024;
+        /// few hundred megabytes.
+        ///
+        /// Raised again to 4096 because resolution counts voxels along the LONGEST axis only: a
+        /// slender model (a 218 x 46 x 18 worm) topped out at 681k triangles at 1024 while a
+        /// compact one reached 10M. The real ceiling is now MeshRemesher.MaxTriangles, which
+        /// lowers the resolution per shape - so a slender model can go much finer while a compact
+        /// one stays where it was. Remesh reports when that budget stepped in.
+        public const int MaxRemeshResolution = MeshRemesher.MaxResolution;
 
         public int RemeshResolution { get => remeshResolution; set => remeshResolution = Mathf.Clamp(value, 4, MaxRemeshResolution); }
 
@@ -855,6 +860,7 @@ namespace Sculpting
             SyncScreenSpaceBrushRadius();
             SyncBrushFalloff();
             HandleSculptInput();
+            TrackStrokeAnchor();
             HandleBrushSizeScroll();
             HandleStrokeEndCommit();
             UpdateBrushCursor();

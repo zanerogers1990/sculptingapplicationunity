@@ -35,9 +35,9 @@ namespace Sculpting
         // range" feel, scaled to the smaller range.
         private const float StrengthAdjustSensitivity = 0.00125f;
         // Same "full-width drag covers roughly the whole range" tuning, for RemeshResolution's
-        // 4-1024 span - see HandleRemeshDensityKey. Scaled up with the range so a full-width
-        // drag still spans it rather than stopping halfway.
-        private const float RemeshDensityDragSensitivity = 0.62f;
+        // 4-4096 span - see HandleRemeshDensityKey. Scaled up with the range so a full-width
+        // drag still spans it rather than stopping partway.
+        private const float RemeshDensityDragSensitivity = 2.48f;
         // How long R must stay down before it arms the density gauge instead of firing a plain
         // Remesh() - long enough that the existing tap-to-remesh shortcut still lands cleanly
         // without a drag attached, short enough that reaching for the gauge on purpose doesn't
@@ -688,6 +688,57 @@ namespace Sculpting
         // sculptable surface, so the same wheel resizes the active brush there instead (see
         // HandleBrushSizeScroll) and zooms the camera everywhere else.
         public static bool IsHoveringSculptSurface { get; private set; }
+
+        // The spot the current (or last) stroke was working on - what CameraOrbitController orbits
+        // and zooms about when its Stroke Pivot is on, as Nomad and ZBrush do. The brush's own
+        // surface hit, not SculptActivity's edit point: that one is the centroid of everything the
+        // stroke moved, which with symmetry on is the midpoint of the two mirrored dabs - inside
+        // the model, on the mirror plane. Kept as object + local point for the same reasons
+        // SculptActivity keeps its point that way: it rides along with a gizmo move, and dies with
+        // the object.
+        private SculptableMesh _strokeAnchorOwner;
+        private Vector3 _strokeAnchorLocal;
+        // A stroke that began on the surface - not over UI, not an Alt navigation drag, not a
+        // press that missed the mesh. Only those move the anchor, so dragging in off a panel or
+        // orbiting with Alt can't drop it somewhere the user never sculpted.
+        private bool _strokeAnchorTracking;
+
+        /// Runs after HandleSculptInput, so _isHovering/_hoverPoint are this frame's brush hit (the
+        /// grabbed point for Move/Pose, the tip for Snake Hook - each handler sets it that way).
+        private void TrackStrokeAnchor()
+        {
+            var mouse = Mouse.current;
+            if (mouse == null || sculptableMesh == null) return;
+
+            bool held = mouse.leftButton.isPressed || mouse.rightButton.isPressed;
+            if (!held)
+            {
+                _strokeAnchorTracking = false;
+                return;
+            }
+            if (mouse.leftButton.wasPressedThisFrame || mouse.rightButton.wasPressedThisFrame)
+            {
+                bool altHeld = Keyboard.current != null && Keyboard.current.leftAltKey.isPressed;
+                _strokeAnchorTracking = _isHovering && !_isOverUI && !altHeld;
+            }
+            if (!_strokeAnchorTracking || !_isHovering) return;
+
+            _strokeAnchorOwner = sculptableMesh;
+            _strokeAnchorLocal = sculptableMesh.transform.InverseTransformPoint(_hoverPoint);
+        }
+
+        /// World position of the last spot sculpted - see _strokeAnchorOwner. False before the
+        /// first stroke, and while the object it was on is deleted, disabled or hidden.
+        public bool TryGetStrokeAnchor(out Vector3 worldPoint)
+        {
+            if (_strokeAnchorOwner == null || !_strokeAnchorOwner.isActiveAndEnabled || !_strokeAnchorOwner.Visible)
+            {
+                worldPoint = default;
+                return false;
+            }
+            worldPoint = _strokeAnchorOwner.transform.TransformPoint(_strokeAnchorLocal);
+            return true;
+        }
 
         // Scroll-to-resize: adjusts BrushRadius by a percentage per notch, same feel as
         // CameraOrbitController's own scroll-zoom (see its zoomPercentPerNotch remarks), so

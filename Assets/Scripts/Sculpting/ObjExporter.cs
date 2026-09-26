@@ -1,4 +1,3 @@
-using System;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -15,8 +14,9 @@ namespace Sculpting
     /// geometry reads mirrored/backwards-facing once opened in a right-handed DCC app.
     public static class ObjExporter
     {
-        // Returns the full path written, or null if there's no mesh yet to export.
-        public static string Export(SculptableMesh sculptableMesh, string folderPath, string fileNamePrefix = "Sculpt")
+        // Writes to exactly `fullPath` (e.g. one picked in a save dialog), creating its folder
+        // if needed. Returns the path written, or null if there's no mesh yet to export.
+        public static string ExportToFile(SculptableMesh sculptableMesh, string fullPath)
         {
             Mesh mesh = sculptableMesh.Mesh;
             if (mesh == null) return null;
@@ -60,9 +60,8 @@ namespace Sculpting
                   .Append(a).Append("//").Append(a).Append('\n');
             }
 
-            Directory.CreateDirectory(folderPath);
-            string fileName = fileNamePrefix + "_" + DateTime.Now.ToString("yyyy-MM-dd_HHmmss") + ".obj";
-            string fullPath = Path.Combine(folderPath, fileName);
+            string folderPath = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(folderPath)) Directory.CreateDirectory(folderPath);
             File.WriteAllText(fullPath, sb.ToString());
             return fullPath;
         }
