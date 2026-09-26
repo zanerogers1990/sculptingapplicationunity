@@ -53,43 +53,130 @@ namespace Sculpting
 
         private const float ClayStrokeDepthLimit = 1.5f;
 
-        // Clay's own stroke-continuity memory, in mesh-local space - null between strokes
-        // (mouse up / hover lost / brush switched), same lifecycle as _lastCarveStrokeLocal
-        // above. Used by ApplyClayStroke to sub-divide a fast drag into multiple dabs instead
-        // of one dab per rendered frame - see its remarks for why.
-        private Vector3? _lastClayStrokeLocal;
+        // Clay's own stroke-continuity memory, in mesh-local space: the curve through this stroke's
+        // input samples (see StrokePath and ApplyClayKnots). Reset between strokes (mouse up /
+        // hover lost / brush switched / target changed), the same lifecycle _lastCarveStrokeLocal
+        // has.
+        private readonly StrokePath _clayPath = new StrokePath();
+        private readonly List<StrokePath.Knot> _clayKnotScratch = new List<StrokePath.Knot>(32);
+        private readonly List<StrokePath.Dab> _clayDabScratch = new List<StrokePath.Dab>(64);
 
-        private Vector3? _lastClayStrokeNormalLocal;
+        // The newest knot's screen position and input time - for the spacing filter and the
+        // pause flush below.
+        private Vector2 _clayLastKnotScreen;
+        private double _clayLastKnotTime;
+        // The sign the stroke is being drawn with, for the flush on the frame the button comes up
+        // (which has no sign of its own).
+        private bool _clayStrokePositive;
+
+        // A pointer sample closer than this on screen to the previous knot is not raycast. A 1000 Hz
+        // mouse can deliver a sample for every pixel of travel; the curve gains nothing from knots
+        // that close, and each one costs a raycast. Also what makes a cursor resting under a
+        // jittery hand deposit nothing.
+        private const float ClayKnotMinPixels = 2f;
+
+        // The newest segment of the curve waits for the knot after it (see StrokePath). While the
+        // pointer is moving that is the next input sample, milliseconds away; when it stops there
+        // is no next knot, and the stroke's tip would stay one segment behind the brush until
+        // release. After this long with no new knot the pending segment is closed with a guessed
+        // end direction instead. Long enough that the gaps in a slow mouse's reports (125 Hz is
+        // 8 ms) never trigger it mid-motion, short enough to be invisible as a delay.
+        private const double ClayPauseFlushSeconds = 0.05;
 
         private void HandleClayInput(Mouse mouse, bool overUI, bool altHeld)
         {
             _isHovering = false;
-            if (overUI) { _lastClayStrokeLocal = null; return; }
-
-            Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
-
-            _isHovering = hasHit;
-            if (!_isHovering) { _lastClayStrokeLocal = null; return; }
-
-            _hoverPoint = hitPoint;
-            _hoverNormal = hitNormal;
-
-            bool rightHeld = mouse.rightButton.isPressed;
-            bool invertHeld = rightHeld || CtrlHeld;
-            _previewPositive = invertHeld ? !isPositive : isPositive;
-
-            LogRayHit(mouse, ray, hitPoint, hitNormal);
+            if (overUI) { EndClayStroke(); return; }
 
             // Alt+Left-drag is reserved for orbiting the camera (see CameraOrbitController),
             // so don't also sculpt while Alt is held. Right-drag, or holding Ctrl while
             // left-dragging, sculpts with the sign inverted (Ctrl mirrors Blender's
             // invert-while-held sculpt convention).
+            bool rightHeld = mouse.rightButton.isPressed;
+            bool invertHeld = rightHeld || CtrlHeld;
             bool sculptingLeft = mouse.leftButton.isPressed && !altHeld;
-            if (!sculptingLeft && !rightHeld) { _lastClayStrokeLocal = null; return; }
+            bool stroking = sculptingLeft || rightHeld;
 
-            ApplyClayStroke(hitPoint, hitNormal, sculptingLeft ? (invertHeld ? !isPositive : isPositive) : !isPositive);
+            // Every pointer sample of the frame, through Lazy Mouse - see PrepareStrokeSamples. The
+            // last one is where the pointer (or the rope's near end) is now.
+            PrepareStrokeSamples(mouse, stroking, freshStroke: _clayPath.KnotCount == 0);
+            FrameSample current = _strokeSamples[_strokeSamples.Count - 1];
+
+            Ray ray = cam.ScreenPointToRay(current.Screen);
+            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+
+            _isHovering = hasHit;
+            if (!_isHovering) { EndClayStroke(); return; }
+
+            _hoverPoint = hitPoint;
+            _hoverNormal = hitNormal;
+            _previewPositive = invertHeld ? !isPositive : isPositive;
+
+            LogRayHit(mouse, ray, hitPoint, hitNormal);
+
+            if (!stroking) { EndClayStroke(); return; }
+
+            ApplyClaySamples(hitPoint, hitNormal, sculptingLeft ? (invertHeld ? !isPositive : isPositive) : !isPositive);
         }
+
+        /// One frame of a Clay stroke from the frame's stroke samples (_strokeSamples, see
+        /// PrepareStrokeSamples), the last of which hit the mesh at currentHit.
+        private void ApplyClaySamples(Vector3 currentHit, Vector3 currentNormal, bool positive)
+        {
+            FrameSample current = _strokeSamples[_strokeSamples.Count - 1];
+
+            // One knot per sample that has moved far enough from the last one. The last sample
+            // reuses the hover raycast; a sample that misses the mesh is skipped, so a stroke
+            // that grazes an edge bridges the gap as the per-frame stroke always did.
+            _clayKnotScratch.Clear();
+            bool haveKnot = _clayPath.KnotCount > 0;
+            float minPixelsSqr = ClayKnotMinPixels * ClayKnotMinPixels;
+            for (int i = 0; i < _strokeSamples.Count; i++)
+            {
+                FrameSample sample = _strokeSamples[i];
+                if (haveKnot && (sample.Screen - _clayLastKnotScreen).sqrMagnitude < minPixelsSqr) continue;
+
+                Vector3 point = currentHit, normal = currentNormal;
+                if (i < _strokeSamples.Count - 1 &&
+                    !sculptableMesh.RaycastMesh(cam.ScreenPointToRay(sample.Screen), 1000f, out point, out normal))
+                    continue;
+
+                _clayKnotScratch.Add(ToLocalClayKnot(point, normal, sample.Pressure));
+                _clayLastKnotScreen = sample.Screen;
+                _clayLastKnotTime = sample.Time;
+                haveKnot = true;
+            }
+
+            bool paused = _clayKnotScratch.Count == 0 && current.Time - _clayLastKnotTime > ClayPauseFlushSeconds;
+            ApplyClayKnots(positive, flush: paused);
+        }
+
+        private StrokePath.Knot ToLocalClayKnot(Vector3 worldPoint, Vector3 worldNormal, float pressure) =>
+            new StrokePath.Knot
+            {
+                Point = sculptableMesh.transform.InverseTransformPoint(worldPoint),
+                // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
+                // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
+                Normal = sculptableMesh.WorldToLocalNormal(worldNormal),
+                Pressure = pressure,
+            };
+
+        /// Ends the stroke in progress: deposits the segment still waiting for a next knot (see
+        /// StrokePath.Flush), then forgets the stroke. Called every frame the stroke is not running,
+        /// so it is a no-op unless a segment is pending.
+        private void EndClayStroke()
+        {
+            if (_clayPath.HasPendingSegment)
+            {
+                _clayKnotScratch.Clear();
+                ApplyClayKnots(_clayStrokePositive, flush: true);
+            }
+            ResetClayStroke();
+        }
+
+        /// Forgets the stroke in progress without depositing anything more - the mesh or the brush
+        /// changed under it.
+        private void ResetClayStroke() => _clayPath.Reset();
 
         // Paces a held Clay stroke by DISTANCE TRAVELLED rather than by elapsed time: a dab of
         // fixed size and fixed material is laid down every `spacing` of cursor travel, and a
@@ -117,14 +204,15 @@ namespace Sculpting
         // gaps between consecutive dabs' plateaus, which read as a washboard of separate raised
         // terraces rather than one continuous ridge - exactly the "blobby"/lumpy look the Nomad
         // Sculpt comparison this was built to close showed, since Nomad (and every other
-        // sculpting app) resamples along the stroke path for the same reason. Interpolates the
-        // mesh-local hit point/normal directly rather than re-raycasting per sub-step (a real
-        // re-raycast per dab would track surface curvature more precisely, but a straight lerp
-        // is a good approximation at the sub-brush-radius travel distances this only kicks in
-        // for, and avoids doubling the raycast cost of every held frame). dt is split evenly
-        // across sub-steps so a stroke's total build-up over one real frame stays correct
-        // regardless of how many dabs that frame took - a fast drag shouldn't deposit MORE clay
-        // than a slow one just because it needed more dabs to stay gap-free.
+        // sculpting app) resamples along the stroke path for the same reason.
+        //
+        // The path the dabs are spaced along is a curve through EVERY input sample of the frame
+        // (see PointerSampler, StrokePath), not a straight line between one hit per frame: a fast
+        // curved stroke used to come out as a polygon with a corner at each frame. Dabs between
+        // two samples interpolate the mesh-local point along that curve and the normal and pen
+        // pressure between the samples' own, rather than re-raycasting per dab - the samples are
+        // already a few pixels apart, which is far finer than the surface's own curvature at
+        // brush scale, and a raycast per dab would double the cost of every held frame.
         private const float ClayDabSpacingFraction = 0.2f;
 
         // Raised from 8 now that a dab is a fixed quantum of material rather than a slice of the
@@ -141,11 +229,6 @@ namespace Sculpting
         // StrengthReferenceRadius; the build rate, which IS a distance, gets RadiusScale instead.
         private const float ClayDabTimeQuantum = ClayDabSpacingFraction * StrengthReferenceRadius;
 
-        // Distance travelled since the last dab was placed, carried ACROSS frames. Without it a
-        // slow drag - one that covers less than a dab spacing per frame - would round down to
-        // zero dabs every frame and deposit nothing at all.
-        private float _clayDabCarry;
-
         // The square tip's own axes (see ClayTipShapeT01) - frozen for the WHOLE stroke rather
         // than rebuilt per dab from that dab's own (interpolated) normal. Early testing showed
         // rebuilding per dab lets the square's orientation drift/flip dab to dab on a curved
@@ -158,17 +241,46 @@ namespace Sculpting
 
         private Vector3 _clayStrokeBitangent0;
 
-        private void ApplyClayStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive)
-        {
-            Transform t = sculptableMesh.transform;
-            Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
-            // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+        /// One frame of a Clay stroke with a single input sample at `worldPoint` - the entry point
+        /// the tests and benchmarks drive (HandleClayInput feeds every sample of the frame through
+        /// ApplyClayKnots instead). At CurrentPressure, like the per-frame stroke always was.
+        private void ApplyClayStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive) =>
+            ApplyClayStrokeWithPressure(worldPoint, worldNormal, CurrentPressure, positive);
 
+        private void ApplyClayStrokeWithPressure(Vector3 worldPoint, Vector3 worldNormal, float pressure, bool positive)
+        {
+            _clayKnotScratch.Clear();
+            _clayKnotScratch.Add(ToLocalClayKnot(worldPoint, worldNormal, pressure));
+            ApplyClayKnots(positive, flush: false);
+        }
+
+        /// One frame of a Clay stroke: extends the stroke's curve through the frame's knots
+        /// (_clayKnotScratch, oldest first) and places a dab every `spacing` of travel along it -
+        /// see StrokePath, and ClayDabSpacingFraction for why travel rather than time. `flush` also
+        /// closes the segment still waiting for a next knot (stroke end, or a pause).
+        ///
+        /// A stationary cursor adds no knots and so deposits nothing. The first knot of a stroke
+        /// places one dab on itself, so a tap still marks the surface.
+        private void ApplyClayKnots(bool positive, bool flush)
+        {
+            _clayStrokePositive = positive;
             float spacing = Mathf.Max(brushRadius * ClayDabSpacingFraction, 0.0005f);
-            // One dab = one fixed quantum of material, NOT a slice of this frame's time.
-            float dabDt = ClayDabTimeQuantum;
+            // Shared by every segment of the frame; once spent, the rest of the frame's travel is
+            // dropped instead of banked into a burst of dabs next frame, which would pile material
+            // exactly where the stroke was already struggling to keep up.
+            int budget = ClayMaxDabsPerFrame;
+
+            _clayDabScratch.Clear();
+            for (int k = 0; k < _clayKnotScratch.Count; k++)
+            {
+                StrokePath.Knot knot = _clayKnotScratch[k];
+                // Fresh stroke - (re)lock the square tip's orientation to this first dab's normal
+                // for the rest of the stroke.
+                if (_clayPath.KnotCount == 0)
+                    BuildTangentBasis(knot.Normal, out _clayStrokeTangent0, out _clayStrokeBitangent0);
+                _clayPath.AddKnot(knot, spacing, ref budget, _clayDabScratch);
+            }
+            if (flush) _clayPath.Flush(spacing, ref budget, _clayDabScratch);
 
             // One dirty set and one relax batch for the WHOLE frame, however many dabs it turns
             // out to place - see FlushClayFrame.
@@ -176,51 +288,15 @@ namespace Sculpting
             BeginRelaxBatch();
             BeginClayDabs();
 
-            if (_lastClayStrokeLocal.HasValue)
+            // One dab = one fixed quantum of material, NOT a slice of this frame's time.
+            for (int d = 0; d < _clayDabScratch.Count; d++)
             {
-                Vector3 from = _lastClayStrokeLocal.Value;
-                Vector3 fromNormal = _lastClayStrokeNormalLocal.Value;
-                float dist = Vector3.Distance(from, localPoint);
-
-                // Place a dab every `spacing` of TRAVEL, continuing from wherever the previous
-                // frame's leftover distance left off. A stationary cursor travels nothing and so
-                // deposits nothing - which is the whole point of this rewrite.
-                _clayDabCarry += dist;
-                int placed = 0;
-                while (_clayDabCarry >= spacing && placed < ClayMaxDabsPerFrame)
-                {
-                    _clayDabCarry -= spacing;
-                    // Where along THIS frame's segment the dab falls. dist can be ~0 while carry
-                    // still crosses the threshold (a dab banked by earlier frames finally firing),
-                    // in which case the dab belongs at the current point.
-                    float u = dist > 1e-9f ? Mathf.Clamp01((dist - _clayDabCarry) / dist) : 1f;
-                    Vector3 stepPoint = Vector3.Lerp(from, localPoint, u);
-                    Vector3 stepNormal = Vector3.Slerp(fromNormal, localNormal, u).normalized;
-                    ApplyClayBrushAtLocal(stepPoint, stepNormal, positive, dabDt);
-                    placed++;
-                }
-
-                // Hit the per-frame ceiling: drop the unspent travel instead of banking it into
-                // a burst of dabs next frame, which would pile material exactly where the stroke
-                // was already struggling to keep up.
-                if (placed >= ClayMaxDabsPerFrame) _clayDabCarry = 0f;
-            }
-            else
-            {
-                // Fresh stroke - (re)lock the square tip's orientation to this first dab's
-                // normal for the rest of the stroke, and lay one dab down so a tap still marks
-                // the surface (the distance-driven path above never fires for a click that
-                // doesn't move).
-                BuildTangentBasis(localNormal, out _clayStrokeTangent0, out _clayStrokeBitangent0);
-                _clayDabCarry = 0f;
-                ApplyClayBrushAtLocal(localPoint, localNormal, positive, dabDt);
+                StrokePath.Dab dab = _clayDabScratch[d];
+                ApplyClayBrushAtLocal(dab.Point, dab.Normal, dab.Pressure, positive, ClayDabTimeQuantum);
             }
 
             EndClayDabs(positive);
             FlushClayFrame();
-
-            _lastClayStrokeLocal = localPoint;
-            _lastClayStrokeNormalLocal = localNormal;
         }
 
         /// Closes out a frame's worth of Clay dabs: one relaxation pass across everything they
@@ -239,7 +315,7 @@ namespace Sculpting
             FlushDirtyVertices();
         }
 
-        private void ApplyClayBrushAtLocal(Vector3 localPoint, Vector3 localNormal, bool positive, float dt)
+        private void ApplyClayBrushAtLocal(Vector3 localPoint, Vector3 localNormal, float pressure, bool positive, float dt)
         {
             int centresBefore = _relaxCentres.Count;
             // Order-symmetric near a mirror plane or radial axis - see MirroredDabWalk. Reach is the
@@ -254,7 +330,7 @@ namespace Sculpting
                 // stroke's square exactly as stable as the primary one.
                 Vector3 mirroredTangent0 = op.Apply(_clayStrokeTangent0);
                 Vector3 mirroredBitangent0 = op.Apply(_clayStrokeBitangent0);
-                ApplyClayBrushLocal(mirroredPoint, mirroredNormal, mirroredTangent0, mirroredBitangent0, positive, dt);
+                ApplyClayBrushLocal(mirroredPoint, mirroredNormal, mirroredTangent0, mirroredBitangent0, positive, dt, pressure);
             }
 
             // Counted only if the dab actually landed on geometry (ApplyClayBrushLocal records a
@@ -263,12 +339,12 @@ namespace Sculpting
             if (_relaxCentres.Count > centresBefore) _relaxDabCount++;
         }
 
-        private void ApplyClayBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt)
+        private void ApplyClayBrushLocal(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, float pressure)
         {
             if (_dabProgramRecording)
             {
                 // Batched - see BeginClayDabs. The relax centre is recorded as it is below.
-                RecordApplyDab(localPoint, localNormal, tangent0, bitangent0, dt);
+                RecordClayDab(localPoint, localNormal, tangent0, bitangent0, positive, dt, pressure);
                 RecordRelaxCentre(localPoint);
                 return;
             }
@@ -284,13 +360,13 @@ namespace Sculpting
             List<int> candidates = sculptableMesh.QueryNear(localPoint, queryRadius);
             if (candidates.Count == 0) return;
 
-            float effectiveRadius = EffectiveClayRadius;
-            float effectiveEdgeSoftness = EffectiveClayEdgeSoftness;
+            float effectiveRadius = EffectiveClayRadiusAt(pressure);
+            float effectiveEdgeSoftness = EffectiveClayEdgeSoftnessAt(pressure);
 
             if (useBurstJobs && candidates.Count >= MinJobVertexCount)
-                ApplyClayBrushLocalJob(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness);
+                ApplyClayBrushLocalJob(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness, pressure);
             else
-                ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness);
+                ApplyClayBrushLocalManaged(localPoint, localNormal, tangent0, bitangent0, positive, dt, candidates, verts, normals, effectiveRadius, effectiveEdgeSoftness, pressure);
 
             // The relax pass this dab needs runs once for the whole frame, over the union of every
             // dab centre in it - see ApplySurfaceRelaxBatched. Recorded here rather than in
@@ -312,11 +388,11 @@ namespace Sculpting
             if (_dabProgramRecording) RunClayProgram(positive);
         }
 
-        private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness)
+        private void ApplyClayBrushLocalJob(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness, float pressure)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveBrushStrength;
-            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
+            float effectiveStrength = EffectiveBrushStrengthAt(pressure);
+            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulateAt(pressure);
             // Height stays tied to the UN-shrunk brushRadius - pressure already scales how much
             // this dab deposits via effectiveStrength, so scaling height too would double-count
             // it. Only the footprint's WIDTH (effectiveRadius/effectiveEdgeSoftness) responds to
@@ -394,11 +470,11 @@ namespace Sculpting
             ScatterJobResults(candidates, verts);
         }
 
-        private void ApplyClayBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness)
+        private void ApplyClayBrushLocalManaged(Vector3 localPoint, Vector3 localNormal, Vector3 tangent0, Vector3 bitangent0, bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals, float effectiveRadius, float effectiveEdgeSoftness, float pressure)
         {
             float sign = positive ? 1f : -1f;
-            float effectiveStrength = EffectiveBrushStrength;
-            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulate;
+            float effectiveStrength = EffectiveBrushStrengthAt(pressure);
+            float effectiveStrengthAccumulate = EffectiveClayStrengthAccumulateAt(pressure);
             // See ApplyClayBrushLocalJob's matching line - height deliberately stays tied to the
             // UN-shrunk brushRadius so pressure isn't double-counted between strength and height.
             float height = brushRadius * clayHeightFactor * sign;

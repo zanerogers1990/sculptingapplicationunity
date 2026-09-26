@@ -41,16 +41,22 @@ namespace Sculpting
             public float Scale;      // Commit: the scale on the summed deltas (see CommitMirrorGroup). Clay Apply: the dab's dt.
             public int Side;         // Apply: which symmetric copy the dab is (its group index) - see _dabOpIndex
             public SymmetryOp Op;    // Apply: that copy's op - see _dabOp
+            // Clay Apply: everything that depends on the dab's own pen pressure (see RecordClayDab) -
+            // the dabs of one frame no longer share one value.
+            public float Radius, Softness, LerpScale, Rate;
         }
 
         /// One symmetric copy's dabs (a "side" - one element of the symmetry group), for
-        /// ClayProgramJob's lookup. Every dab of a side lies on the straight segment First..Last
-        /// (they are interpolated between two frame hits, then mapped through the side's op).
+        /// ClayProgramJob's lookup. A side's dabs follow the stroke's curve (see StrokePath), mapped
+        /// through the side's op; First..Last is the chord from its first dab to its last, and Bulge
+        /// the furthest any of its dabs lies from that chord - so a capsule of radius reach + Bulge
+        /// around the chord holds every dab's footprint.
         private struct DabSide
         {
             public bool Active;
             public Vector3 Centre, Axis;
             public Vector3 First, Last;
+            public float Bulge;
             // Sides whose dabs could move a vertex into each other's reach share a component - see
             // ClayProgramJob.
             public int Component;
@@ -63,8 +69,8 @@ namespace Sculpting
         // Every vertex any recorded dab can reach, deduped by generation stamp (same scheme as
         // DirtyVertexSet), in "slot" order - the index every native array of the program uses.
         // Gathered with ONE query per symmetric side, a sphere around all of that side's dab centres,
-        // rather than one per dab: a frame's dabs lie on the straight segment between two frame
-        // hits and overlap each other by ~90%, so twenty footprint queries cost far more than the
+        // rather than one per dab: a frame's dabs lie along one short stretch of the stroke
+        // and overlap each other by ~90%, so twenty footprint queries cost far more than the
         // job they feed. The sphere is a superset, and the jobs' own radius tests do the exact
         // selection. It is also complete: a vertex inside dab k's reach when dab k runs either had
         // not moved yet this frame - so it sits within that reach of dab k's centre now, inside the
@@ -122,6 +128,24 @@ namespace Sculpting
             });
         }
 
+        /// Records one Clay dab, with everything its pressure decides worked out now - the same
+        /// expressions ApplyClayBrushLocal's job and managed paths evaluate for a dab at that
+        /// pressure, so the batched program cannot drift from them.
+        private void RecordClayDab(Vector3 point, Vector3 normal, Vector3 tangent0, Vector3 bitangent0, bool positive,
+            float dt, float pressure)
+        {
+            float sign = positive ? 1f : -1f;
+            _dabProgram.Add(new DabOp
+            {
+                Kind = DabOpKind.Apply, Point = point, Normal = normal, Dir = tangent0, Aux = bitangent0,
+                Camera = _dabCameraLocal, Scale = dt, Side = _dabOpIndex, Op = _dabOp,
+                Radius = EffectiveClayRadiusAt(pressure),
+                Softness = EffectiveClayEdgeSoftnessAt(pressure),
+                LerpScale = EffectiveBrushStrengthAt(pressure) * ClaySpeed * dt,
+                Rate = sign * clayHeightFactor * EffectiveClayStrengthAccumulateAt(pressure) * ClaySpeed * dt * RadiusScale,
+            });
+        }
+
         /// Fills _dabUnion - see its remarks - and _dabSides. One sphere per symmetric side, never
         /// one around everything: mirrored and radial copies sit on different sides of the model,
         /// and a sphere around them all would take in the whole thing between them.
@@ -173,11 +197,21 @@ namespace Sculpting
                     _dabUnion.Add(vi);
                 }
 
+                // How far the side's curve strays from its chord - see DabSide.
+                float bulgeSqr = 0f;
+                for (int k = 0; k < _dabProgram.Count; k++)
+                {
+                    DabOp op = _dabProgram[k];
+                    if (op.Kind != DabOpKind.Apply || op.Side != flip) continue;
+                    bulgeSqr = Mathf.Max(bulgeSqr, SqrDistanceToSegment(op.Point, first, last));
+                }
+
                 Vector3 axis = last - first;
                 axis = axis.sqrMagnitude > 1e-12f ? axis.normalized : Vector3.right;
                 _dabSides[flip] = new DabSide
                 {
-                    Active = true, Centre = centre, Axis = axis, First = first, Last = last, Component = flip,
+                    Active = true, Centre = centre, Axis = axis, First = first, Last = last,
+                    Bulge = Mathf.Sqrt(bulgeSqr), Component = flip,
                 };
             }
 
@@ -202,6 +236,14 @@ namespace Sculpting
                     merged = true;
                 }
             }
+        }
+
+        private static float SqrDistanceToSegment(Vector3 p, Vector3 a, Vector3 b)
+        {
+            Vector3 ab = b - a;
+            float lengthSqr = ab.sqrMagnitude;
+            float u = lengthSqr > 1e-12f ? Mathf.Clamp01(Vector3.Dot(p - a, ab) / lengthSqr) : 0f;
+            return (p - (a + ab * u)).sqrMagnitude;
         }
 
         /// Sizes the side tables for a symmetry group of `count` elements (8 covers every mirror
@@ -392,13 +434,10 @@ namespace Sculpting
             for (int f = 0; f < _dabSideCount; f++) sides[f] = _dabSides[f];
             EnsureAlphaNative(); // read only with useAlpha, but the job needs a valid array either way
 
-            // Same values ApplyClayBrushLocalJob computes per dab; none of them change within a frame
-            // (every dab of a frame shares one dt - see ApplyClayStroke).
-            float dt = 0f;
-            for (int k = 0; k < _dabProgram.Count; k++)
-                if (_dabProgram[k].Kind == DabOpKind.Apply) { dt = _dabProgram[k].Scale; break; }
+            // Same values ApplyClayBrushLocalJob computes per dab that do not change within a frame.
+            // Whatever depends on a dab's pressure (radius, softness, strength) travels in its op -
+            // see RecordClayDab.
             float sign = positive ? 1f : -1f;
-            float effectiveRadius = EffectiveClayRadius;
             float height = brushRadius * clayHeightFactor * sign;
             float rot = alphaRotation * Mathf.Deg2Rad;
 
@@ -430,22 +469,18 @@ namespace Sculpting
                 Stats = _nativeDabStats,
                 SlotCount = count,
                 Reach = reach,
-                EffectiveRadius = effectiveRadius,
-                EdgeSoftness = EffectiveClayEdgeSoftness,
+                AlphaScale = alphaScale,
                 TipRoundness = clayTipRoundness,
                 FrontFacingOnly = frontFacingOnly,
                 Displace = new ClayDisplaceSettings
                 {
                     Height = height,
-                    LerpFactorScale = EffectiveBrushStrength * ClaySpeed * dt,
                     UseAlpha = useAlpha,
                     InvertAlpha = invertAlpha,
                     CosR = Mathf.Cos(rot),
                     SinR = Mathf.Sin(rot),
-                    InvStampRadius = 1f / Mathf.Max(0.0001f, effectiveRadius * alphaScale),
                     AlphaSize = useAlpha ? _nativeAlphaSize : 0,
                     Accumulate = accumulate,
-                    Rate = sign * clayHeightFactor * EffectiveClayStrengthAccumulate * ClaySpeed * dt * RadiusScale,
                     MaxAlong = height * (accumulate ? ClayStrokeDepthLimitAccumulate : ClayStrokeDepthLimit),
                     SoftBand = Mathf.Abs(height) * StrokeDepthSoftBand,
                 },
@@ -468,10 +503,11 @@ namespace Sculpting
         /// distance test does the exact selection.
         ///
         /// Why that is complete: a vertex can only be inside a dab if it either has not moved this
-        /// frame - then it is within reach of that dab's segment at frame start - or some earlier dab
-        /// moved it, and before its first move it was within reach of THAT dab's segment. Either way
-        /// it sits within reach of a segment of a side it could have travelled between, which is
-        /// what a component is. The axis window then covers it because it has moved at most
+        /// frame - then at frame start it is within reach of that dab, so within reach + Bulge of
+        /// its side's segment - or some earlier dab moved it, and before its first move it was
+        /// within reach of THAT dab. Either way it sits within the capsule of a side it could have
+        /// travelled between, which is what a component is. The axis window, which is centred on
+        /// the dab itself rather than the segment, then covers it because it has moved at most
         /// maxMoved. Components are judged generously on the main thread (see GatherDabUnion); if
         /// anything ever moved further than they allow for, the dab falls back to testing every
         /// gathered slot, which is exact, and says so in Stats[0].
@@ -509,10 +545,10 @@ namespace Sculpting
             public int SideCount;
             public int SlotCount;
             public float Reach;
-            public float EffectiveRadius;
-            public float EdgeSoftness;
+            public float AlphaScale;
             public float TipRoundness;
             public bool FrontFacingOnly;
+            // The frame-wide part; each dab fills in its pressure-dependent fields from its op.
             public ClayDisplaceSettings Displace;
 
             // How far a vertex could travel between sides and still count as the same component -
@@ -597,14 +633,14 @@ namespace Sculpting
             }
 
             /// Flags in Weights (1 / 0) every slot within reach of a segment of any side in component
-            /// c, by frame-start position. False when no active side belongs to c.
+            /// c, by frame-start position - reach plus the side's Bulge, since its dabs follow a curve
+            /// that can stray from its chord (see DabSide). False when no active side belongs to c.
             private bool MarkComponent(int c)
             {
                 bool any = false;
                 for (int f = 0; f < SideCount && !any; f++) any = Sides[f].Active && Sides[f].Component == c;
                 if (!any) return false;
 
-                float capsuleSqr = Reach * Reach * 1.0001f; // a hair over, never under
                 for (int s = 0; s < SlotCount; s++)
                 {
                     Vector3 p = PositionsStart[s];
@@ -613,7 +649,8 @@ namespace Sculpting
                     {
                         DabSide other = Sides[g];
                         if (!other.Active || other.Component != c) continue;
-                        inside = SqrDistanceToSegment(p, other.First, other.Last) <= capsuleSqr;
+                        float capsule = Reach + other.Bulge;
+                        inside = SqrDistanceToSegment(p, other.First, other.Last) <= capsule * capsule * 1.0001f; // a hair over, never under
                     }
                     Weights[s] = inside ? 1f : 0f;
                 }
@@ -673,14 +710,6 @@ namespace Sculpting
             private static int BucketOf(float key, float min, float width, int buckets) =>
                 (int)Mathf.Clamp((key - min) / width, 0f, buckets - 1);
 
-            private static float SqrDistanceToSegment(Vector3 p, Vector3 a, Vector3 b)
-            {
-                Vector3 ab = b - a;
-                float lengthSqr = ab.sqrMagnitude;
-                float u = lengthSqr > 1e-12f ? Mathf.Clamp01(Vector3.Dot(p - a, ab) / lengthSqr) : 0f;
-                return (p - (a + ab * u)).sqrMagnitude;
-            }
-
             private void ApplyDab(DabOp op, ref float maxMoved, bool inGroup, int groupGeneration, ref int groupCount)
             {
                 int lo, hi, listBase = 0;
@@ -716,8 +745,8 @@ namespace Sculpting
                     int s = everySlot ? j : BucketSlots[j];
                     Vector3 pos = Positions[s];
                     Vector3 normal = NormalsIn[s];
-                    float weight = ClayWeight(pos, normal, MaskIn[s], op.Point, EffectiveRadius, op.Dir, op.Aux,
-                        TipRoundness, EdgeSoftness, FrontFacingOnly, op.Camera, out float planeW);
+                    float weight = ClayWeight(pos, normal, MaskIn[s], op.Point, op.Radius, op.Dir, op.Aux,
+                        TipRoundness, op.Softness, FrontFacingOnly, op.Camera, out float planeW);
                     Weights[s] = weight;
                     if (planeW > 0f) plane.Add(pos * planeW, normal * planeW, planeW);
                 }
@@ -727,6 +756,13 @@ namespace Sculpting
                 Vector3 planeNormal = plane.NormalOr(op.Normal);
                 DabTangentBasis(planeNormal, op.Op, out Vector3 tangent, out Vector3 bitangent);
 
+                // This dab's own pressure-dependent settings, exactly as ApplyClayBrushLocalJob
+                // builds them for a dab of this radius and strength.
+                ClayDisplaceSettings displace = Displace;
+                displace.LerpFactorScale = op.LerpScale;
+                displace.Rate = op.Rate;
+                displace.InvStampRadius = 1f / Mathf.Max(0.0001f, op.Radius * AlphaScale);
+
                 // Pass 2: displacement.
                 for (int j = lo; j < hi; j++)
                 {
@@ -735,7 +771,7 @@ namespace Sculpting
                     if (weight <= 0f) continue;
                     Vector3 pos = Positions[s];
                     if (!ClayDisplace(ref pos, weight, StrokeStartIn[s], op.Point, planeOrigin, planeNormal,
-                            tangent, bitangent, Displace, AlphaSamples))
+                            tangent, bitangent, displace, AlphaSamples))
                         continue;
 
                     if (inGroup && GroupStamp[s] != groupGeneration)

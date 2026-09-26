@@ -358,8 +358,7 @@ namespace Sculpting.Tests
             _controller.Accumulate = brush == Brush.ClayAccumulate || brush == Brush.Inflate;
 
             _sculptable.BeginStrokeUndo();
-            TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
-            TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
+            TestReflection.Invoke(_controller, "ResetClayStroke");
             TestReflection.SetField(_controller, "_lastCarveStrokeLocal", null);
 
             var clay = TestReflection.Bind<Action<Vector3, Vector3, bool>>(_controller, "ApplyClayStroke");

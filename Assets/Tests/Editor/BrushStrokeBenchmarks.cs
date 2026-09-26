@@ -359,8 +359,7 @@ namespace Sculpting.Tests
 
         private void ResetStrokeContinuity()
         {
-            SetField(_controller, "_lastClayStrokeLocal", null);
-            SetField(_controller, "_lastClayStrokeNormalLocal", null);
+            Invoke(_controller, "ResetClayStroke");
             SetField(_controller, "_lastCarveStrokeLocal", null);
             Invoke(_controller, "ResetDabStroke");
         }

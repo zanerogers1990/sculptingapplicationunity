@@ -144,21 +144,61 @@ namespace Sculpting
             {
                 var pen = Pen.current;
                 if (pen == null || !pen.tip.isPressed) return 1f;
-                float shaped = Mathf.Pow(Mathf.Clamp01(_smoothedPenPressure), pressureCurve);
-                return pressureFloor + (1f - pressureFloor) * shaped;
+                return ShapePressure(_smoothedPenPressure);
             }
         }
+
+        /// The floor and curve CurrentPressure applies to the smoothed axis - see its remarks.
+        private float ShapePressure(float smoothed)
+        {
+            float shaped = Mathf.Pow(Mathf.Clamp01(smoothed), pressureCurve);
+            return pressureFloor + (1f - pressureFloor) * shaped;
+        }
+
+        // Every pointer sample of the frame (see PointerSampler), with its shaped pressure - what
+        // PrepareStrokeSamples turns into stroke positions. Filled by UpdatePointerSamples.
+        private readonly PointerSampler _pointerSampler = new PointerSampler();
+
+        private struct FrameSample
+        {
+            public Vector2 Screen;  // raw pointer position, before Lazy Mouse
+            public float Pressure;  // shaped, as CurrentPressure would have read it at that moment
+            public double Time;
+        }
+
+        private readonly System.Collections.Generic.List<FrameSample> _frameSamples =
+            new System.Collections.Generic.List<FrameSample>(64);
+
+        // Input time of the previous pointer sample, for per-sample Lazy Mouse and pressure steps.
+        private double _lastPointerSampleTime = -1;
+
+        // The longest step one pressure sample may take. Pen events arrive every 5-10 ms while the
+        // tip is down, so this binds mainly on the first sample after a touch-down, whose gap since
+        // the previous pen sample is however long the pen was lifted: capped at one 60 Hz frame,
+        // it eases on from the held value the way the old once-per-frame update did, instead of
+        // jumping straight to the new touch's pressure - see UpdatePointerSamples on why.
+        private const float MaxPressureSampleDt = 1f / 60f;
 
         // Real tablet pressure sensors are noisy enough that reading Pen.current.pressure raw
         // every frame produces a visibly jittery, stair-stepped stroke rather than the smooth,
         // evenly-building ridge ZBrush/Blender strokes have - this exponentially chases the raw
         // value instead of tracking it 1:1, filtering that noise out before CurrentPressure's
-        // curve is applied. Deliberately updated exactly once per frame (from Update(), not from
-        // inside CurrentPressure's getter) so its smoothing rate doesn't scale with how many
-        // times a brush's apply path runs this frame (once per Mirror plane).
-        private void UpdatePenPressure()
+        // curve is applied. Deliberately updated from Update(), not from inside CurrentPressure's
+        // getter, so its smoothing rate doesn't scale with how many times a brush's apply path
+        // runs this frame (once per Mirror plane).
+        //
+        // It steps once per pointer SAMPLE, with that sample's own time step, rather than once per
+        // frame: each sample keeps the pressure of its own moment, so a brush placing several
+        // dabs in one frame can give each dab its own pressure instead of every dab sharing the
+        // frame's last value (the per-frame steps a fast pen stroke used to show in width and
+        // height). With one sample a frame, at 60 fps or better, it is the old per-frame update.
+        private void UpdatePointerSamples()
         {
+            var mouse = Mouse.current;
             var pen = Pen.current;
+            _pointerSampler.BeginFrame(mouse, pen);
+            _frameSamples.Clear();
+
             // Deliberately leaves _smoothedPenPressure untouched while not pressed, rather than
             // resetting it to 1 (full strength) - resetting meant every new touch-down eased
             // DOWN from full strength for its first few frames instead of picking up from
@@ -167,10 +207,24 @@ namespace Sculpting
             // tap the UI checkbox, then touches back down to resume, so the very next stroke got
             // the spike). Holding the last value means a fresh touch continues smoothing from a
             // realistic starting point instead of a synthetic one.
-            if (pen == null || !pen.tip.isPressed) return;
+            bool penDown = pen != null && pen.tip.isPressed;
 
-            float raw = pen.pressure.ReadValue();
-            _smoothedPenPressure = Mathf.Lerp(_smoothedPenPressure, raw, Mathf.Clamp01(Time.deltaTime * PressureSmoothingSpeed));
+            var samples = _pointerSampler.Samples;
+            for (int i = 0; i < samples.Count; i++)
+            {
+                PointerSampler.Sample s = samples[i];
+                float pressure = 1f;
+                if (penDown && s.FromPen)
+                {
+                    float dt = _lastPointerSampleTime < 0 ? MaxPressureSampleDt
+                        : Mathf.Clamp((float)(s.Time - _lastPointerSampleTime), 0f, MaxPressureSampleDt);
+                    _smoothedPenPressure = Mathf.Lerp(_smoothedPenPressure, s.RawPressure,
+                        Mathf.Clamp01(dt * PressureSmoothingSpeed));
+                    pressure = ShapePressure(_smoothedPenPressure);
+                }
+                _lastPointerSampleTime = s.Time;
+                _frameSamples.Add(new FrameSample { Screen = s.Position, Pressure = pressure, Time = s.Time });
+            }
         }
 
         public bool IsAdjustingStrength => _isAdjustingStrength;
@@ -866,12 +920,24 @@ namespace Sculpting
         // inheriting wherever a previous, unrelated stroke left it.
         private Vector2 GetStrokeScreenPosition(Mouse mouse)
         {
-            Vector2 raw = mouse.position.ReadValue();
-            _lazyMouseRawScreenPos = raw;
-            if (!lazyMouseEnabled) { _lazyMouseActive = false; return raw; }
-
             bool pressed = mouse.leftButton.isPressed || mouse.rightButton.isPressed;
-            if (!pressed) { _lazyMouseActive = false; return raw; }
+            return AdvanceLazyMouse(mouse.position.ReadValue(), Time.unscaledDeltaTime, pressed);
+        }
+
+        // lazyMouseStrength is the fraction of the rope's slack taken up per 60 Hz frame. It used to
+        // be applied once per rendered frame as-is, so the same setting trailed twice as far behind
+        // at 30 fps as at 60 and half as far at 120 - and once per INPUT SAMPLE (see
+        // PrepareStrokeSamples) it would have meant something different again. As an exponential
+        // decay of the slack over elapsed time it means the same at any rate: identical to the old
+        // behaviour at 60 fps, and splitting a frame into samples changes nothing for a still target.
+        private const float LazyMouseReferenceRate = 60f;
+
+        /// One step of the Lazy Mouse rope toward `raw`, `dt` seconds after the previous step (see
+        /// GetStrokeScreenPosition). Returns where the stroke should raycast from.
+        private Vector2 AdvanceLazyMouse(Vector2 raw, float dt, bool pressed)
+        {
+            _lazyMouseRawScreenPos = raw;
+            if (!lazyMouseEnabled || !pressed) { _lazyMouseActive = false; return raw; }
 
             if (!_lazyMouseActive)
             {
@@ -883,9 +949,51 @@ namespace Sculpting
             Vector2 delta = raw - _lazyMouseScreenPos;
             float dist = delta.magnitude;
             if (dist > lazyMouseRadius)
-                _lazyMouseScreenPos += delta.normalized * ((dist - lazyMouseRadius) * lazyMouseStrength);
+                _lazyMouseScreenPos += delta / dist * ((dist - lazyMouseRadius) * LazyMouseFollow(lazyMouseStrength, dt));
 
             return _lazyMouseScreenPos;
+        }
+
+        // The frame's pointer samples as stroke positions - PrepareStrokeSamples' output.
+        private readonly System.Collections.Generic.List<FrameSample> _strokeSamples =
+            new System.Collections.Generic.List<FrameSample>(64);
+        private double _lazyMouseSampleTime = -1;
+
+        /// Turns the frame's pointer samples (see UpdatePointerSamples) into the positions a stroke
+        /// should raycast from, oldest first, in _strokeSamples: each one stepped through Lazy
+        /// Mouse with its own time step, so the rope trails the pointer's real path rather than
+        /// jumping from one frame's position to the next. The per-sample counterpart of
+        /// GetStrokeScreenPosition, for a brush that walks every sample.
+        ///
+        /// Only the current sample while not stroking (hovering needs nothing else), and on a
+        /// stroke's first frame: samples from earlier in that frame were hover motion before the
+        /// press, and a fresh stroke starts exactly under the cursor.
+        private void PrepareStrokeSamples(Mouse mouse, bool pressed, bool freshStroke)
+        {
+            _strokeSamples.Clear();
+            if (_frameSamples.Count == 0)
+            {
+                // No sampler this frame (Update did not run it) - the pointer as it is now.
+                _frameSamples.Add(new FrameSample { Screen = mouse.position.ReadValue(), Pressure = CurrentPressure, Time = Time.unscaledTimeAsDouble });
+            }
+
+            int first = pressed && !freshStroke ? 0 : _frameSamples.Count - 1;
+            for (int i = first; i < _frameSamples.Count; i++)
+            {
+                FrameSample sample = _frameSamples[i];
+                float dt = _lazyMouseSampleTime < 0 ? 0f : (float)(sample.Time - _lazyMouseSampleTime);
+                _lazyMouseSampleTime = sample.Time;
+                sample.Screen = AdvanceLazyMouse(sample.Screen, dt, pressed);
+                _strokeSamples.Add(sample);
+            }
+        }
+
+        /// The fraction of the rope's slack taken up over `dt` seconds - see LazyMouseReferenceRate.
+        /// Full strength stays exactly taut at any dt, including a zero-length step.
+        private static float LazyMouseFollow(float strength, float dt)
+        {
+            if (strength >= 1f) return 1f;
+            return 1f - Mathf.Pow(1f - strength, Mathf.Max(dt, 0f) * LazyMouseReferenceRate);
         }
 
         // Drives the 2D screen-space ring cursor (see ShowBrushCursor/BrushCursorScreenPosition/

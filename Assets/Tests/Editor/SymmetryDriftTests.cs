@@ -241,8 +241,7 @@ namespace Sculpting.Tests
 
             // What a mouse press does before the first frame of a stroke.
             _sculptable.BeginStrokeUndo();
-            TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
-            TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
+            TestReflection.Invoke(_controller, "ResetClayStroke");
             TestReflection.SetField(_controller, "_lastCarveStrokeLocal", null);
 
             var clay = TestReflection.Bind<Action<Vector3, Vector3, bool>>(_controller, "ApplyClayStroke");

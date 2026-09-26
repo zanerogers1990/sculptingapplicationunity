@@ -213,13 +213,17 @@ namespace Sculpting.Tests
         /// the mesh exactly as the plain per-dab path does - here with X symmetry on and the stroke
         /// crossing the plane, so the mirror-group steps run too. Surface Relax is off: its job and
         /// managed passes relax in different orders by design (see SculptControllerJobParityTests).
+        ///
+        /// pressureRamp: pen pressure climbing along the stroke, so every dab carries its own radius,
+        /// edge softness and strength - recorded into each dab's op on the batched path, evaluated
+        /// per dab on the per-dab one.
         [Test]
         public void ClayProgramMatchesThePerDabPath([Values(true, false)] bool accumulate, [Values(true, false)] bool mirror,
-            [Values(12, 60)] int framesPerSweep)
+            [Values(12, 60)] int framesPerSweep, [Values(false, true)] bool pressureRamp)
         {
-            Vector3[] batched = ClayStroke(jobs: true, framesPerSweep, accumulate, mirror);
+            Vector3[] batched = ClayStroke(jobs: true, framesPerSweep, accumulate, mirror, pressureRamp);
             ResetState();
-            Vector3[] perDab = ClayStroke(jobs: false, framesPerSweep, accumulate, mirror);
+            Vector3[] perDab = ClayStroke(jobs: false, framesPerSweep, accumulate, mirror, pressureRamp);
 
             float moved = 0f, diff = 0f;
             for (int i = 0; i < batched.Length; i++)
@@ -231,7 +235,7 @@ namespace Sculpting.Tests
             Assert.That(diff, Is.LessThan(1e-5f), $"Batched Clay differs from per-dab Clay by {diff:E2} (stroke moved {moved:E2}).");
         }
 
-        private Vector3[] ClayStroke(bool jobs, int framesPerSweep, bool accumulate, bool mirror)
+        private Vector3[] ClayStroke(bool jobs, int framesPerSweep, bool accumulate, bool mirror, bool pressureRamp = false)
         {
             _mirror.MirrorX = mirror;
             // Brush first: strength and Accumulate are remembered per brush, so setting them before
@@ -241,28 +245,157 @@ namespace Sculpting.Tests
             _controller.Accumulate = accumulate;
             _controller.SurfaceRelax = 0f;
             _controller.UseAlpha = false;
+            _controller.ClayPressureRadiusInfluence = 0.6f;
+            _controller.ClayPressureSoftnessInfluence = 0.5f;
             bool before = _controller.UseBurstJobs;
             _controller.UseBurstJobs = jobs;
             try
             {
-                TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
-                TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
-                var stroke = TestReflection.Bind<Action<Vector3, Vector3, bool>>(_controller, "ApplyClayStroke");
-                for (int f = 0; f <= framesPerSweep * 2; f++)
+                TestReflection.Invoke(_controller, "ResetClayStroke");
+                var stroke = TestReflection.Bind<Action<Vector3, Vector3, float, bool>>(_controller, "ApplyClayStrokeWithPressure");
+                int frames = framesPerSweep * 2;
+                for (int f = 0; f <= frames; f++)
                 {
                     // Across the X plane and back.
                     float x = Mathf.Lerp(-0.15f, 0.15f, Mathf.PingPong(f / (float)framesPerSweep, 1f));
                     Vector3 dir = new Vector3(x, 0.08f, -0.45f).normalized;
                     Vector3 point = dir * SymmetricTestMesh.SurfaceRadius(dir);
                     TestReflection.Invoke(_controller, "MarkPositionMirrorStale");
-                    stroke(point, dir, true);
+                    stroke(point, dir, pressureRamp ? Mathf.Lerp(0.15f, 1f, f / (float)frames) : 1f, true);
                 }
+                // The release: the last segment is still waiting for a next sample.
+                TestReflection.Invoke(_controller, "MarkPositionMirrorStale");
+                TestReflection.Invoke(_controller, "EndClayStroke");
                 return (Vector3[])_sculptable.Vertices.Clone();
             }
             finally
             {
                 _controller.UseBurstJobs = before;
             }
+        }
+
+        /// The Apply ops the last frame's Clay program recorded (jobs on): each dab's point and radius.
+        private List<(Vector3 Point, float Radius)> RecordedClayDabs()
+        {
+            var program = (System.Collections.IList)TestReflection.GetField(_controller, "_dabProgram");
+            var dabs = new List<(Vector3, float)>();
+            foreach (object op in program)
+            {
+                Type type = op.GetType();
+                const System.Reflection.BindingFlags fields = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public;
+                if (type.GetField("Kind", fields).GetValue(op).ToString() != "Apply") continue;
+                dabs.Add(((Vector3)type.GetField("Point", fields).GetValue(op), (float)type.GetField("Radius", fields).GetValue(op)));
+            }
+            return dabs;
+        }
+
+        private static Vector3 OnSphere(Vector3 dir)
+        {
+            dir.Normalize();
+            return dir * SymmetricTestMesh.SurfaceRadius(dir);
+        }
+
+        /// A fast circular stroke, one sample every 20 degrees (brush-radius-sized jumps). Joining the
+        /// samples with straight lines put the dabs up to rho(1 - cos 10deg) inside the circle, a
+        /// visible polygon; along the stroke's spline they stay on it.
+        ///
+        /// Also run per dab with jobs off: the batched program finds each dab's footprint by capsules
+        /// around the chord of the frame's dabs, which a curve bulges out of (see DabSide.Bulge).
+        [Test]
+        public void ClayDabsFollowTheCurveOfAFastStroke([Values(2, 3)] int samplesPerFrame)
+        {
+            var dabs = new List<Vector3>();
+            float rho = 0.5f * Mathf.Sin(28f * Mathf.Deg2Rad);
+            Vector3[] batched = ClayCircleStroke(jobs: true, samplesPerFrame, dabs);
+            ResetState();
+            Vector3[] perDab = ClayCircleStroke(jobs: false, samplesPerFrame, null);
+            _controller.UseBurstJobs = true;
+
+            float worst = 0f;
+            foreach (Vector3 p in dabs) worst = Mathf.Max(worst, Mathf.Abs(new Vector2(p.x, p.y).magnitude - rho));
+            float chordSag = rho * (1f - Mathf.Cos(10f * Mathf.Deg2Rad));
+            TestContext.WriteLine($"{dabs.Count} dabs, worst off-circle {worst:E2} (chords would be {chordSag:E2})");
+            Assert.That(dabs.Count, Is.GreaterThan(40));
+            Assert.That(worst, Is.LessThan(chordSag * 0.2f), "The dabs cut across between samples instead of following the curve.");
+
+            float diff = 0f;
+            for (int i = 0; i < batched.Length; i++) diff = Mathf.Max(diff, (batched[i] - perDab[i]).magnitude);
+            Assert.That(diff, Is.LessThan(1e-5f), $"Batched Clay differs from per-dab Clay by {diff:E2} along a curve.");
+        }
+
+        /// One sample every 20 degrees round a cone about the view axis, samplesPerFrame of them per
+        /// frame (several knots, so several curved segments, per batched program). `dabs` collects
+        /// the dabs the batched program recorded, skipping the first segment (closed with a phantom
+        /// start) and the end.
+        private Vector3[] ClayCircleStroke(bool jobs, int samplesPerFrame, List<Vector3> dabs)
+        {
+            _controller.CurrentBrush = BrushType.Clay;
+            // After the switch - strength and Accumulate are remembered per brush.
+            _controller.BrushStrength = 0.5f;
+            _controller.AccumulateStrength = 1f;
+            _controller.Accumulate = false;
+            _controller.SurfaceRelax = 0f; // its job and managed passes differ by design
+            _controller.UseAlpha = false;
+            _controller.UseBurstJobs = jobs;
+            TestReflection.Invoke(_controller, "ResetClayStroke");
+            var knots = (System.Collections.IList)TestReflection.GetField(_controller, "_clayKnotScratch");
+            var apply = TestReflection.Bind<Action<bool, bool>>(_controller, "ApplyClayKnots");
+
+            float cone = 28f * Mathf.Deg2Rad;
+            const int samples = 19;
+            int k = 0;
+            while (k < samples)
+            {
+                knots.Clear();
+                for (int s = 0; s < samplesPerFrame && k < samples; s++, k++)
+                {
+                    float phi = k * 20f * Mathf.Deg2Rad;
+                    // On an exact circle, not snapped to this fixture's slightly bumpy surface - the
+                    // stroke takes the points as given, and a true circle is what dabs are judged by.
+                    Vector3 point = 0.5f * new Vector3(Mathf.Sin(cone) * Mathf.Cos(phi), Mathf.Sin(cone) * Mathf.Sin(phi), -Mathf.Cos(cone));
+                    knots.Add(new StrokePath.Knot { Point = point, Normal = point.normalized, Pressure = 1f });
+                }
+                TestReflection.Invoke(_controller, "MarkPositionMirrorStale");
+                apply(true, false);
+                if (dabs != null && k > 3)
+                    foreach (var dab in RecordedClayDabs())
+                        if (Vector3.Distance(dab.Point, 0.5f * new Vector3(Mathf.Sin(cone), 0f, -Mathf.Cos(cone))) > 0.1f)
+                            dabs.Add(dab.Point);
+            }
+            return (Vector3[])_sculptable.Vertices.Clone();
+        }
+
+        /// Pressure is per dab: within one frame of a pen stroke whose pressure is rising, every dab
+        /// gets its own (larger) footprint, instead of the whole frame sharing one value.
+        [Test]
+        public void ClayDabsCarryTheirOwnPressure()
+        {
+            _controller.CurrentBrush = BrushType.Clay;
+            _controller.UseBurstJobs = true;
+            _controller.ClayPressureRadiusInfluence = 0.6f;
+            TestReflection.Invoke(_controller, "ResetClayStroke");
+            var stroke = TestReflection.Bind<Action<Vector3, Vector3, float, bool>>(_controller, "ApplyClayStrokeWithPressure");
+
+            var radii = new List<float>();
+            int framesWithSeveral = 0;
+            const int frames = 8;
+            for (int f = 0; f <= frames; f++)
+            {
+                // Big jumps - several dabs a frame - with pressure rising from light to full.
+                Vector3 point = OnSphere(new Vector3(Mathf.Lerp(-0.2f, 0.2f, f / (float)frames), 0.05f, -0.45f));
+                TestReflection.Invoke(_controller, "MarkPositionMirrorStale");
+                stroke(point, point.normalized, Mathf.Lerp(0.1f, 1f, f / (float)frames), true);
+                var frameDabs = RecordedClayDabs();
+                if (frameDabs.Count >= 2 && frameDabs[frameDabs.Count - 1].Radius > frameDabs[0].Radius) framesWithSeveral++;
+                foreach (var dab in frameDabs) radii.Add(dab.Radius);
+            }
+
+            Assert.That(framesWithSeveral, Is.GreaterThan(3), "Dabs within a frame shared one pressure.");
+            for (int i = 1; i < radii.Count; i++)
+                Assert.That(radii[i], Is.GreaterThan(radii[i - 1]), $"dab {i}: pressure rose but the footprint did not grow.");
+            // Radius = brushRadius * lerp(1 - influence, 1, pressure), between the two ends' values.
+            Assert.That(radii[0], Is.EqualTo(BrushRadius * Mathf.Lerp(0.4f, 1f, 0.1f)).Within(1e-5f));
+            Assert.That(radii[radii.Count - 1], Is.LessThanOrEqualTo(BrushRadius + 1e-6f));
         }
 
         private delegate Vector3 StrokeDepthLimit(Vector3 from, Vector3 moved, Vector3 strokeStart,
@@ -329,8 +462,7 @@ namespace Sculpting.Tests
             _controller.Accumulate = false;
             _controller.SurfaceRelax = 0f; // relax is not capped, and would blur what is measured
             _controller.UseAlpha = false;
-            TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
-            TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
+            TestReflection.Invoke(_controller, "ResetClayStroke");
             var stroke = TestReflection.Bind<Action<Vector3, Vector3, bool>>(_controller, "ApplyClayStroke");
             const int framesPerPass = 30, passes = 8;
             for (int f = 0; f <= framesPerPass * passes; f++)

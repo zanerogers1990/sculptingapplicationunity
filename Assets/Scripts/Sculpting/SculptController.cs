@@ -205,9 +205,11 @@ namespace Sculpting
         // asked for it.
         [SerializeField] private bool lazyMouseEnabled = false;
         [SerializeField, Range(1f, 150f)] private float lazyMouseRadius = 25f;
-        // Fraction of the rope's excess length (dist - radius) closed per frame once taut. 1 =
-        // classic ZBrush feel (the rope stays exactly taut every frame); lower values add extra
-        // spring-like lag on top of the radius itself, for an even smoother/syrupier trail.
+        // Fraction of the rope's excess length (dist - radius) closed per 60 Hz frame once taut -
+        // applied as a decay over elapsed time, so it means the same at any frame or input rate
+        // (see LazyMouseReferenceRate). 1 = classic ZBrush feel (the rope stays exactly taut);
+        // lower values add extra spring-like lag on top of the radius itself, for an even
+        // smoother/syrupier trail.
         [SerializeField, Range(0.05f, 1f)] private float lazyMouseStrength = 1f;
 
         [Header("Clay Brush")]
@@ -518,7 +520,7 @@ namespace Sculpting
 
                     EndActiveDrags();
                     _lastCarveStrokeLocal = null;
-                    _lastClayStrokeLocal = null;
+                    ResetClayStroke();
                     ResetDabStroke();
                     _brushPolarity[(int)currentBrush] = isPositive;
                     _brushAccumulate[(int)currentBrush] = accumulate;
@@ -878,7 +880,7 @@ namespace Sculpting
             HandleSaveKeys();
             HandleDeleteObjectKey();
             UpdatePoseChainVisual();
-            UpdatePenPressure();
+            UpdatePointerSamples();
             UpdateAdaptiveBrushRange();
             SyncScreenSpaceBrushRadius();
             SyncBrushFalloff();
@@ -892,8 +894,13 @@ namespace Sculpting
         // Cursor.visible is a global OS setting, not per-component - if this component (or the
         // whole app) goes away while the ring cursor had it hidden, the real pointer must come
         // back or the user is left with no visible cursor at all outside this app's control.
+        // Every pointer sample of each frame, not just where the pointer ended up - see
+        // PointerSampler and UpdatePointerSamples.
+        private void OnEnable() => _pointerSampler.Enable();
+
         private void OnDisable()
         {
+            _pointerSampler.Disable();
             Cursor.visible = true;
             // The falloff table is process-wide (see BrushFalloff) and outlives this component -
             // leaving a custom curve installed would bend every brush in the next session, or in
@@ -928,8 +935,7 @@ namespace Sculpting
             EndActiveDrags();
             _isHovering = false;
             _lastCarveStrokeLocal = null;
-            _lastClayStrokeLocal = null;
-            _lastClayStrokeNormalLocal = null;
+            ResetClayStroke();
             ResetDabStroke();
         }
 
@@ -1034,6 +1040,7 @@ namespace Sculpting
                 sculptableMesh.BeginStrokeUndo();
                 // A fresh stroke never joins the segment the last one ended on.
                 ResetDabStroke();
+                ResetClayStroke();
             }
 
             switch (currentBrush)

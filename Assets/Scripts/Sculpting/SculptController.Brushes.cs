@@ -108,14 +108,21 @@ namespace Sculpting
         // At CurrentPressure==1 (a firm press, or no pen at all - mouse users always read 1 here)
         // this returns exactly brushRadius, so the radius math below is a strict no-op until a
         // pen actually lifts off full pressure.
-        private float EffectiveClayRadius =>
-            brushRadius * Mathf.Lerp(1f - clayPressureRadiusInfluence, 1f, CurrentPressure);
+        //
+        // The *At(pressure) forms take one dab's own pressure: Clay gives every dab of a frame the
+        // pressure of its own moment in the stroke (see StrokePath), not the frame's CurrentPressure.
+        private float EffectiveClayRadius => EffectiveClayRadiusAt(CurrentPressure);
+
+        private float EffectiveClayRadiusAt(float pressure) =>
+            brushRadius * Mathf.Lerp(1f - clayPressureRadiusInfluence, 1f, pressure);
 
         // Clay's own pressure-shaped edge softness - see clayPressureSoftnessInfluence's remarks.
         // Same CurrentPressure==1 no-op as EffectiveClayRadius above. Clamped to clayEdgeSoftness's
         // own [0.05, 1] range for the same NaN-avoidance reason ClayFalloff's own Max() guards.
-        private float EffectiveClayEdgeSoftness => Mathf.Clamp(
-            clayEdgeSoftness * Mathf.Lerp(1f + clayPressureSoftnessInfluence, 1f, CurrentPressure),
+        private float EffectiveClayEdgeSoftness => EffectiveClayEdgeSoftnessAt(CurrentPressure);
+
+        private float EffectiveClayEdgeSoftnessAt(float pressure) => Mathf.Clamp(
+            clayEdgeSoftness * Mathf.Lerp(1f + clayPressureSoftnessInfluence, 1f, pressure),
             0.05f, 1f);
 
         // What every brush handler's OFF/plateau path applies - brushStrength scaled by live pen
@@ -123,7 +130,9 @@ namespace Sculpting
         // BrushStrength property the UI slider is bound to (SculptUIBuilder), so a mouse user
         // (or a pen user between strokes) always sees the base value they set, not a
         // pressure-jittered one.
-        private float EffectiveBrushStrength => brushStrength * CurrentPressure;
+        private float EffectiveBrushStrength => EffectiveBrushStrengthAt(CurrentPressure);
+
+        private float EffectiveBrushStrengthAt(float pressure) => brushStrength * pressure;
 
         // Accumulate mode's brush handlers reapply their rate every single frame with no
         // self-limiting cap toward a target (unlike the OFF/plateau path's Clamp01 ease-toward-
@@ -172,11 +181,15 @@ namespace Sculpting
         private float EffectiveDabStrength => EffectiveBrushStrength * accumulateStrength;
 
         /// The Accumulate-ON (keeps building for as long as the stroke travels) strength.
-        private float EffectiveDabStrengthAccumulate => brushStrength * Mathf.Lerp(1f, CurrentPressure, AccumulatePressureInfluence) * accumulateStrength;
+        private float EffectiveDabStrengthAccumulate => EffectiveDabStrengthAccumulateAt(CurrentPressure);
 
-        /// Clay's accumulate strength - the same value, kept under its own name because Clay's
-        /// ClayWeight/ClayDisplace plumbing predates the other brushes' move to dabs.
-        private float EffectiveClayStrengthAccumulate => EffectiveDabStrengthAccumulate;
+        private float EffectiveDabStrengthAccumulateAt(float pressure) =>
+            brushStrength * Mathf.Lerp(1f, pressure, AccumulatePressureInfluence) * accumulateStrength;
+
+        /// Clay's accumulate strength at one dab's pressure - the same value, kept under its own
+        /// name because Clay's ClayWeight/ClayDisplace plumbing predates the other brushes' move to
+        /// dabs.
+        private float EffectiveClayStrengthAccumulateAt(float pressure) => EffectiveDabStrengthAccumulateAt(pressure);
 
         // Commits whatever BeginStrokeUndo/RecordUndoBeforeIfNeeded accumulated during a stroke
         // - fires uniformly across every brush type (including Move, whose own drag-end

@@ -55,7 +55,7 @@ namespace Sculpting.Tests
             List<int> candidates, Vector3[] verts);
         private delegate void ClayPath(Vector3 point, Vector3 normal, Vector3 tangent0, Vector3 bitangent0,
             bool positive, float dt, List<int> candidates, Vector3[] verts, Vector3[] normals,
-            float effectiveRadius, float effectiveEdgeSoftness);
+            float effectiveRadius, float effectiveEdgeSoftness, float pressure);
         private delegate void SmoothPath(Vector3 point, float dt, List<int> candidates, Vector3[] verts);
         private delegate void RelaxPath(float relaxRadius, List<int> candidates, float passAmount);
 
@@ -222,7 +222,7 @@ namespace Sculpting.Tests
                     var clay = Bind<ClayPath>("ApplyClayBrushLocalJob");
                     BuildTangentBasis(dabs[0].Normal, out Vector3 t0, out Vector3 b0);
                     float radius = _controller.BrushRadius, soft = _controller.ClayEdgeSoftness;
-                    return Run(dabs, d => clay(d.Point, d.Normal, t0, b0, true, 0.05f, d.Candidates, Verts, Normals, radius, soft));
+                    return Run(dabs, d => clay(d.Point, d.Normal, t0, b0, true, 0.05f, d.Candidates, Verts, Normals, radius, soft, 1f));
                 }
                 var apply = Bind<Action<Vector3, Vector3, bool, float>>(method);
                 return Run(dabs, d => apply(d.Point, d.Normal, true, 0.1f));
@@ -330,8 +330,43 @@ namespace Sculpting.Tests
             float softness = _controller.ClayEdgeSoftness;
 
             AssertParity("Clay", DabSequenceTolerance,
-                Run(dabs, d => managed(d.Point, d.Normal, tangent0, bitangent0, positive, dabDt, d.Candidates, Verts, Normals, radius, softness)),
-                Run(dabs, d => job(d.Point, d.Normal, tangent0, bitangent0, positive, dabDt, d.Candidates, Verts, Normals, radius, softness)));
+                Run(dabs, d => managed(d.Point, d.Normal, tangent0, bitangent0, positive, dabDt, d.Candidates, Verts, Normals, radius, softness, 1f)),
+                Run(dabs, d => job(d.Point, d.Normal, tangent0, bitangent0, positive, dabDt, d.Candidates, Verts, Normals, radius, softness, 1f)));
+        }
+
+        /// Pen pressure changing from dab to dab (see StrokePath): each dab's radius, edge softness and
+        /// strength come from its own pressure, on both paths.
+        [Test]
+        public void ClayWithPerDabPressure([Values(true, false)] bool accumulate)
+        {
+            Configure(radius: 0.2f, strength: 0.5f, maskAndFrontFacing: false);
+            _controller.Accumulate = accumulate;
+            _controller.ClayTipRoundness = 1f;
+            _controller.UseAlpha = false;
+            _controller.ClayHeightFactor = 0.3f;
+            _controller.ClayEdgeSoftness = 0.45f;
+            _controller.ClayPressureRadiusInfluence = 0.5f;
+            _controller.ClayPressureSoftnessInfluence = 0.5f;
+
+            var job = Bind<ClayPath>("ApplyClayBrushLocalJob");
+            var managed = Bind<ClayPath>("ApplyClayBrushLocalManaged");
+            var radiusAt = Bind<Func<float, float>>("EffectiveClayRadiusAt");
+            var softnessAt = Bind<Func<float, float>>("EffectiveClayEdgeSoftnessAt");
+            List<Dab> dabs = BuildDabs(LongPath, _controller.BrushRadius, withDirection: false);
+            BuildTangentBasis(dabs[0].Normal, out Vector3 tangent0, out Vector3 bitangent0);
+            const float dabDt = 0.05f;
+
+            int index = 0;
+            Action<Dab> Apply(ClayPath path) => d =>
+            {
+                float p = Mathf.Lerp(0.2f, 1f, index++ / (float)(dabs.Count - 1));
+                path(d.Point, d.Normal, tangent0, bitangent0, true, dabDt, d.Candidates, Verts, Normals, radiusAt(p), softnessAt(p), p);
+            };
+
+            Sequence managedRun = Run(dabs, Apply(managed));
+            index = 0;
+            Sequence jobRun = Run(dabs, Apply(job));
+            AssertParity("Clay per-dab pressure", DabSequenceTolerance, managedRun, jobRun);
         }
 
         /// The job path computes Flatten's weights with ClayWeightJob at EdgeSoftness 1, which goes
