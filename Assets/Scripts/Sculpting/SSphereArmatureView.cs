@@ -13,13 +13,13 @@ namespace Sculpting
     /// physics copy of every collider lags the transform until Physics.SyncTransforms, so clicks
     /// landed where spheres USED to be, and cooking dozens of mesh colliders per frame made drags
     /// stutter. Here nothing is a physics object. The controller picks analytically against the
-    /// same ZSphereRig.CollectGeometry output this class draws, so the thing under the cursor is
+    /// same SSphereRig.CollectGeometry output this class draws, so the thing under the cursor is
     /// exactly the thing on screen, on the frame it is on screen.
     ///
     /// State is shown through SUBMESHES rather than vertex colours, so ordinary URP/Lit materials
     /// work - no custom shader to keep in step with the pipeline. A vertex can belong to
     /// triangles in several submeshes, so alternating link bands share their boundary rings.
-    internal sealed class ZSphereArmatureView
+    internal sealed class SSphereArmatureView
     {
         private const int SphereSegments = 18;
         private const int SphereRings = 12;
@@ -31,7 +31,7 @@ namespace Sculpting
         private const float LinkVisualScale = 0.6f;
 
         /// Band length along a link, as a multiple of the link's mean radius. The alternating
-        /// bands are the ZBrush ZSphere look, and they earn their place: on a smooth tube there is
+        /// bands are the ZBrush SSphere look, and they earn their place: on a smooth tube there is
         /// nothing to tell you which way it is twisting or how long it is in depth.
         private const float BandLengthPerRadius = 0.55f;
         private const int MaxBandsPerLink = 40;
@@ -69,44 +69,44 @@ namespace Sculpting
         private readonly List<Vector3> _verts = new List<Vector3>();
         private readonly List<Vector3> _normals = new List<Vector3>();
         private readonly List<int>[] _tris = new List<int>[SubmeshCount];
-        private readonly List<ZSphereRig.SphereInstance> _spheres = new List<ZSphereRig.SphereInstance>();
-        private readonly List<ZSphereRig.LinkInstance> _links = new List<ZSphereRig.LinkInstance>();
+        private readonly List<SSphereRig.SphereInstance> _spheres = new List<SSphereRig.SphereInstance>();
+        private readonly List<SSphereRig.LinkInstance> _links = new List<SSphereRig.LinkInstance>();
 
         private static Vector3[] _unitSphereVerts;
         private static int[] _unitSphereTris;
 
-        public ZSphereArmatureView(Transform parent)
+        public SSphereArmatureView(Transform parent)
         {
             BuildUnitSphere();
             for (int i = 0; i < SubmeshCount; i++) _tris[i] = new List<int>();
 
-            _mesh = new Mesh { name = "ZSphere Armature", indexFormat = IndexFormat.UInt32 };
+            _mesh = new Mesh { name = "SSphere Armature", indexFormat = IndexFormat.UInt32 };
             _mesh.MarkDynamic();
 
             _materials = new Material[SubmeshCount];
-            _materials[SubNode] = CreateLit("ZSphere Node", NodeColor, 0.35f);
-            _materials[SubSelected] = CreateLit("ZSphere Selected", SelectedColor, 0.4f);
-            _materials[SubHovered] = CreateLit("ZSphere Hovered", HoveredColor, 0.4f);
-            _materials[SubLinkLight] = CreateLit("ZSphere Link Light", LinkLightColor, 0.25f);
-            _materials[SubLinkDark] = CreateLit("ZSphere Link Dark", LinkDarkColor, 0.25f);
-            _materials[SubLinkHovered] = CreateLit("ZSphere Link Hovered", LinkHoveredColor, 0.3f);
+            _materials[SubNode] = CreateLit("SSphere Node", NodeColor, 0.35f);
+            _materials[SubSelected] = CreateLit("SSphere Selected", SelectedColor, 0.4f);
+            _materials[SubHovered] = CreateLit("SSphere Hovered", HoveredColor, 0.4f);
+            _materials[SubLinkLight] = CreateLit("SSphere Link Light", LinkLightColor, 0.25f);
+            _materials[SubLinkDark] = CreateLit("SSphere Link Dark", LinkDarkColor, 0.25f);
+            _materials[SubLinkHovered] = CreateLit("SSphere Link Hovered", LinkHoveredColor, 0.3f);
 
-            _armature = CreateRendererObject("ZSphereArmature", parent, _mesh, _materials);
+            _armature = CreateRendererObject("SSphereArmature", parent, _mesh, _materials);
 
-            _sphereMesh = new Mesh { name = "ZSphere Cursor" };
+            _sphereMesh = new Mesh { name = "SSphere Cursor" };
             _sphereMesh.SetVertices(_unitSphereVerts);
             _sphereMesh.SetNormals(_unitSphereVerts);
             _sphereMesh.SetTriangles(_unitSphereTris, 0);
             _sphereMesh.RecalculateBounds();
 
-            _cursorMaterial = CreateTranslucent("ZSphere Cursor", CursorColor, CursorRimColor);
-            _cursor = CreateRendererObject("ZSpherePlacementCursor", parent, _sphereMesh, new[] { _cursorMaterial });
+            _cursorMaterial = CreateTranslucent("SSphere Cursor", CursorColor, CursorRimColor);
+            _cursor = CreateRendererObject("SSpherePlacementCursor", parent, _sphereMesh, new[] { _cursorMaterial });
             _cursor.SetActive(false);
 
             _planeMesh = BuildQuadMesh();
             Shader spriteShader = Shader.Find("Sprites/Default");
-            _planeMaterial = new Material(spriteShader) { name = "ZSphere Symmetry Plane (Runtime)", color = PlaneColor };
-            _plane = CreateRendererObject("ZSphereSymmetryPlane", parent, _planeMesh, new[] { _planeMaterial });
+            _planeMaterial = new Material(spriteShader) { name = "SSphere Symmetry Plane (Runtime)", color = PlaneColor };
+            _plane = CreateRendererObject("SSphereSymmetryPlane", parent, _planeMesh, new[] { _planeMaterial });
             // The quad faces +Z; a quarter turn about Y lays it in the YZ plane - rig-local x = 0,
             // the plane every reflection goes through.
             _plane.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
@@ -120,7 +120,7 @@ namespace Sculpting
 
         /// Rebuilds the armature mesh. The caller decides WHEN (it polls rig version, selection and
         /// hover), so this does the work unconditionally.
-        public void Rebuild(ZSphereRig rig, bool symmetry, int selectedNode, int hoveredNode, int hoveredLink)
+        public void Rebuild(SSphereRig rig, bool symmetry, int selectedNode, int hoveredNode, int hoveredLink)
         {
             _verts.Clear();
             _normals.Clear();
@@ -130,14 +130,14 @@ namespace Sculpting
 
             for (int i = 0; i < _links.Count; i++)
             {
-                ZSphereRig.LinkInstance link = _links[i];
+                SSphereRig.LinkInstance link = _links[i];
                 bool hovered = link.Child == hoveredLink;
                 AppendTube(link.A, link.B, link.RadiusA * LinkVisualScale, link.RadiusB * LinkVisualScale, hovered);
             }
 
             for (int i = 0; i < _spheres.Count; i++)
             {
-                ZSphereRig.SphereInstance sphere = _spheres[i];
+                SSphereRig.SphereInstance sphere = _spheres[i];
                 // Both a node and its reflection light up together: they are one node, and an edit
                 // to either lands on both, so showing only the half under the cursor would be lying
                 // about what a drag is about to do.
@@ -284,7 +284,7 @@ namespace Sculpting
 
         private static Mesh BuildQuadMesh()
         {
-            var mesh = new Mesh { name = "ZSphere Symmetry Quad" };
+            var mesh = new Mesh { name = "SSphere Symmetry Quad" };
             mesh.vertices = new[]
             {
                 new Vector3(-0.5f, -0.5f, 0f), new Vector3(0.5f, -0.5f, 0f),

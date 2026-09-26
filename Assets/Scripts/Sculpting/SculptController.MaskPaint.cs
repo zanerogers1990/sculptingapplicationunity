@@ -50,7 +50,7 @@ namespace Sculpting
             }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(ray, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
             if (!_isHovering) { ResetDabStroke(); return; }
@@ -75,11 +75,11 @@ namespace Sculpting
         // included: a soft mask brush is meant to be a dwell-to-build-up wash.
         private void ApplyMaskPaint(Vector3 worldPoint, Vector3 worldNormal, bool applying, float dt)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
             float speed = Mathf.Lerp(MaskPaintSpeedSoft, MaskPaintSpeedHard, maskHardness);
             _maskDabAmount = (applying ? 1f : -1f) * EffectiveBrushStrength * speed * DabTimeQuantum;
-            StepDabStroke(localPoint, sculptableMesh.WorldToLocalNormal(worldNormal), dt, DabHoldMode.AlwaysWorks,
+            StepDabStroke(localPoint, WorldToLocalNormal(worldNormal), dt, DabHoldMode.AlwaysWorks,
                 _placeMaskDab ??= PlaceMaskDab);
         }
 
@@ -91,7 +91,7 @@ namespace Sculpting
         {
             SymmetryGroup symmetry = Symmetry();
             for (int k = 0; k < symmetry.Count; k++)
-                sculptableMesh.PaintMask(symmetry[k].Apply(localPoint), brushRadius, _maskDabAmount, maskHardness);
+                sculptableMesh.PaintMask(symmetry[k].ApplyPoint(localPoint), brushRadius, _maskDabAmount, maskHardness);
         }
     }
 }

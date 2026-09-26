@@ -189,7 +189,7 @@ namespace Sculpting
             HandleModeKeys();
             if (mode == RegionSelectMode.Off) return;
 
-            // A non-Sculpt gizmo tool (Transpose/Scale/ZSphere) owns the mouse - stand down
+            // A non-Sculpt gizmo tool (Transpose/Scale/SSphere) owns the mouse - stand down
             // entirely rather than fighting it for the same click, the same carve-out
             // SculptController's own brushes make.
             if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt)
@@ -213,7 +213,7 @@ namespace Sculpting
             if (InputFocus.IsTypingInText()) return;
             // Outside Sculpt mode an armed gesture is dropped again on the very next line of
             // Update, so arming one there did nothing - except that the Mode setter also switches
-            // mask painting off, which a stray H/N/T in ZSphere or Transpose mode used to do.
+            // mask painting off, which a stray H/N/T in SSphere or Transpose mode used to do.
             if (Gizmo != null && Gizmo.Mode != GizmoMode.Sculpt) return;
 
             if (kb.hKey.wasPressedThisFrame)
@@ -404,7 +404,9 @@ namespace Sculpting
             // would redo the transform chain (and its own viewport lookups) per call, which is
             // the difference between a few milliseconds and a visible stall at multi-million-
             // vertex resolutions.
-            Matrix4x4 mvp = cam.projectionMatrix * cam.worldToCameraMatrix * target.transform.localToWorldMatrix;
+            // One per place the mesh is drawn: the object itself, then each live mirror copy (see
+            // MirrorRepeater) - a region drawn over a copy covers the vertices the copy shows.
+            List<Matrix4x4> mvps = MeshFrameMatrices(target, cam.projectionMatrix * cam.worldToCameraMatrix);
             Rect viewport = cam.pixelRect;
 
             MirrorController mirror = target.GetComponent<MirrorController>();
@@ -412,15 +414,38 @@ namespace Sculpting
 
             for (int i = 0; i < vertexCount; i++)
             {
-                bool covered = ProjectsInside(mvp, verts[i], viewport, region);
-                // Element 0 is the identity (the un-mirrored position), already tested. A vertex is
-                // under copy k of the region when its inverse image is under the region itself.
-                for (int s = 1; s < symmetry.Count && !covered; s++)
-                    covered = ProjectsInside(mvp, symmetry[s].ApplyInverse(verts[i]), viewport, region);
+                bool covered = false;
+                for (int f = 0; f < mvps.Count && !covered; f++)
+                {
+                    covered = ProjectsInside(mvps[f], verts[i], viewport, region);
+                    // Element 0 is the identity (the un-mirrored position), already tested. A vertex is
+                    // under copy k of the region when its inverse image is under the region itself.
+                    for (int s = 1; s < symmetry.Count && !covered; s++)
+                        covered = ProjectsInside(mvps[f], symmetry[s].ApplyInversePoint(verts[i]), viewport, region);
+                }
                 _insideScratch[i] = actOnOutside ? !covered : covered;
             }
 
             return _insideScratch;
+        }
+
+        private static readonly List<Matrix4x4> s_frameMatrices = new List<Matrix4x4>(8);
+
+        /// `leftFactor` times the local-to-world matrix of every place `target`'s mesh is drawn:
+        /// its own transform first, then each visible live mirror copy. Shared scratch list,
+        /// consumed before the next call.
+        internal static List<Matrix4x4> MeshFrameMatrices(SculptableMesh target, Matrix4x4 leftFactor)
+        {
+            s_frameMatrices.Clear();
+            s_frameMatrices.Add(leftFactor * target.transform.localToWorldMatrix);
+            MirrorRepeater repeater = target.Repeater;
+            if (repeater == null) return s_frameMatrices;
+            for (int i = 0; i < repeater.ViewCount; i++)
+            {
+                Transform view = repeater.ShownViewTransform(i);
+                if (view != null) s_frameMatrices.Add(leftFactor * view.localToWorldMatrix);
+            }
+            return s_frameMatrices;
         }
 
         private static bool ProjectsInside(Matrix4x4 mvp, Vector3 localPos, Rect viewport, ScreenRegionMask region) =>

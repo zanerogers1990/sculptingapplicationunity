@@ -10,7 +10,7 @@ namespace Sculpting
     /// otherwise, so the skin always trailed the spheres - the opposite of the armature feeling
     /// alive. And a settled skin at Convert's full resolution cost a detailed creature almost half
     /// a second, which as a hitch on every mouse release would be its own kind of unresponsive.
-    public partial class ZSphereController
+    public partial class SSphereController
     {
         /// How long the rig must sit still before the Preview skin replaces the Draft. Short
         /// enough to feel immediate on release, long enough that a pause mid-gesture does not
@@ -25,7 +25,7 @@ namespace Sculpting
         private static readonly Color ShellRimColor = new Color(1f, 0.94f, 0.88f, 1f);
         private static readonly Color SolidColor = new Color(0.8f, 0.5f, 0.42f);
 
-        private ZSphereSkinner.SkinSettings _settings = ZSphereSkinner.SkinSettings.Default;
+        private SSphereSkinner.SkinSettings _settings = SSphereSkinner.SkinSettings.Default;
         private int _settingsVersion;
 
         /// Draw the skin as a translucent shell over the armature while editing.
@@ -39,7 +39,7 @@ namespace Sculpting
         public float Density
         {
             get => _settings.Density;
-            set => SetSetting(ref _settings.Density, Mathf.Clamp(value, ZSphereSkinner.MinDensity, ZSphereSkinner.MaxDensity));
+            set => SetSetting(ref _settings.Density, Mathf.Clamp(value, SSphereSkinner.MinDensity, SSphereSkinner.MaxDensity));
         }
 
         public float Blend
@@ -74,9 +74,9 @@ namespace Sculpting
         /// Whether the skin on screen is the coarse mid-drag one.
         public bool SkinIsDraft { get; private set; }
 
-        public ZSphereSkinner.SkinStats LastSkinStats { get; private set; }
+        public SSphereSkinner.SkinStats LastSkinStats { get; private set; }
 
-        public int EffectiveResolution => ZSphereSkinner.PreviewResolution(_rig, _symmetryX, _settings);
+        public int EffectiveResolution => SSphereSkinner.PreviewResolution(_rig, _symmetryX, _settings);
 
         private GameObject _skinObject;
         private MeshRenderer _skinRenderer;
@@ -127,9 +127,9 @@ namespace Sculpting
             bool settled = _drag == DragKind.None && now - _lastChangeTime >= SettledSkinDelay;
 
             if (settled && (!current || !_skinAttemptWasSettled))
-                RunSkin(ZSphereSkinner.SkinQuality.Preview, now);
+                RunSkin(SSphereSkinner.SkinQuality.Preview, now);
             else if (!settled && !current && now >= _nextDraftAllowed)
-                RunSkin(ZSphereSkinner.SkinQuality.Draft, now);
+                RunSkin(SSphereSkinner.SkinQuality.Draft, now);
 
             SetSkinVisible(_hasSkin);
             if (_skinRenderer != null)
@@ -139,18 +139,18 @@ namespace Sculpting
             }
         }
 
-        private void RunSkin(ZSphereSkinner.SkinQuality quality, float now)
+        private void RunSkin(SSphereSkinner.SkinQuality quality, float now)
         {
             EnsureSkinObject();
 
-            bool ok = ZSphereSkinner.SkinInto(_rig, _symmetryX, _settings, quality, _skinMesh,
-                                              out ZSphereSkinner.SkinStats stats, out string error);
+            bool ok = SSphereSkinner.SkinInto(_rig, _symmetryX, _settings, quality, _skinMesh,
+                                              out SSphereSkinner.SkinStats stats, out string error);
 
             // Recorded even on failure, so a rig that cannot skin is not retried every frame.
             _skinRigVersion = _observedRigVersion;
             _skinSettingsVersion = _observedSettingsVersion;
             _skinSymmetry = _observedSymmetry;
-            _skinAttemptWasSettled = quality != ZSphereSkinner.SkinQuality.Draft;
+            _skinAttemptWasSettled = quality != SSphereSkinner.SkinQuality.Draft;
 
             if (ok)
             {
@@ -165,7 +165,7 @@ namespace Sculpting
                 Error = error;
             }
 
-            if (quality == ZSphereSkinner.SkinQuality.Draft)
+            if (quality == SSphereSkinner.SkinQuality.Draft)
                 _nextDraftAllowed = stats.Milliseconds > DraftBudgetMs ? now + stats.Milliseconds * 0.0015f : now;
         }
 
@@ -174,12 +174,12 @@ namespace Sculpting
             if (_skinObject != null) return;
             EnsureRigRoot();
 
-            _skinMesh = new Mesh { name = "ZSphere Skin Preview", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+            _skinMesh = new Mesh { name = "SSphere Skin Preview", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
             _skinMesh.MarkDynamic();
 
             // Under the rig root, so the rig-local skin lands on the spheres with no transform maths.
             // No collider and no SculptableMesh: it is a view, not an object.
-            _skinObject = new GameObject("ZSphereSkinPreview", typeof(MeshFilter), typeof(MeshRenderer))
+            _skinObject = new GameObject("SSphereSkinPreview", typeof(MeshFilter), typeof(MeshRenderer))
             {
                 hideFlags = HideFlags.DontSave
             };
@@ -190,8 +190,8 @@ namespace Sculpting
             _skinRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             _skinRenderer.receiveShadows = false;
 
-            _shellMaterial = ZSphereArmatureView.CreateTranslucent("ZSphere Skin Shell", ShellColor, ShellRimColor);
-            _solidMaterial = ZSphereArmatureView.CreateLit("ZSphere Skin Solid", SolidColor, 0.3f);
+            _shellMaterial = SSphereArmatureView.CreateTranslucent("SSphere Skin Shell", ShellColor, ShellRimColor);
+            _solidMaterial = SSphereArmatureView.CreateLit("SSphere Skin Solid", SolidColor, 0.3f);
             _skinRenderer.sharedMaterial = _shellMaterial;
         }
 
@@ -232,12 +232,12 @@ namespace Sculpting
             EndDrag();
             CommitRigEdit();
 
-            Mesh skin = ZSphereSkinner.Skin(_rig, _symmetryX, _settings, ZSphereSkinner.SkinQuality.Final,
+            Mesh skin = SSphereSkinner.Skin(_rig, _symmetryX, _settings, SSphereSkinner.SkinQuality.Final,
                                             out _, out string error);
             Error = error;
             if (skin == null) return null;
 
-            ZSphereRig.Node[] rigBefore = _rig.Snapshot();
+            SSphereRig.Node[] rigBefore = _rig.Snapshot();
             bool symmetryBefore = _symmetryX;
 
             // Re-origin about the mesh's own centre and put the offset into the Transform: an
@@ -251,7 +251,7 @@ namespace Sculpting
             skin.vertices = verts;
             skin.RecalculateBounds();
 
-            SculptableMesh sculptable = SceneObjectFactory.Create(skin, ObjectNaming.Unique("ZSphere Mesh"),
+            SculptableMesh sculptable = SceneObjectFactory.Create(skin, ObjectNaming.Unique("SSphere Mesh"),
                 _rigRoot.TransformPoint(centre), _rigRoot.rotation, _rigRoot.lossyScale);
 
             bool clearedRig = !KeepRigOnConvert;
@@ -270,14 +270,14 @@ namespace Sculpting
         /// Makes Convert one undo press. Undo PARKS the created object (unregistered, deactivated)
         /// rather than destroying it, so redoing the convert still finds the object - and any
         /// strokes made on it - intact. The rig is only put back if Convert actually cleared it.
-        private void RecordConvertUndo(SculptableMesh created, ZSphereRig.Node[] rigBefore, bool symmetryBefore, bool clearedRig)
+        private void RecordConvertUndo(SculptableMesh created, SSphereRig.Node[] rigBefore, bool symmetryBefore, bool clearedRig)
         {
             Mesh createdMesh = created.Mesh;
-            long bytes = ZSphereRig.SnapshotBytes(rigBefore);
+            long bytes = SSphereRig.SnapshotBytes(rigBefore);
             if (createdMesh != null)
                 bytes += (long)createdMesh.vertexCount * 12 + (long)createdMesh.triangles.Length * 4;
 
-            EditHistory.RecordSceneAction("Skin ZSpheres",
+            EditHistory.RecordSceneAction("Skin SSpheres",
                 undo: () =>
                 {
                     if (created != null)
@@ -294,7 +294,7 @@ namespace Sculpting
                         _symmetryX = symmetryBefore;
                         SelectedNode = NoNode;
                     }
-                    Gizmo?.SetMode(GizmoMode.ZSphere);
+                    Gizmo?.SetMode(GizmoMode.SSphere);
                 },
                 redo: () =>
                 {

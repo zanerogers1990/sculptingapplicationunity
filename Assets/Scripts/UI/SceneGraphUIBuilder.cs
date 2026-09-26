@@ -8,12 +8,13 @@ using Sculpting.IO;
 
 namespace Sculpting
 {
-    /// Builds the right-hand panel: scene-file actions (Import Object / Load Scene / Save
-    /// Scene), add-primitive buttons, a live object list (select/visibility/delete), the
-    /// Transpose/Scale gizmo mode toolbar, separate/linked Mirror, Join, and - merged in further down -
-    /// the collapsible Studio Lighting/Material/Presentation sections. Docked flush to the
-    /// top-right corner at full window height, fixed there (no longer draggable), mirroring
-    /// SculptUIBuilder's Sculpting Tools panel on the left.
+    /// Builds the right-hand Scene panel. Pinned at the top: the tool row (Sculpt / Move-Rotate /
+    /// Scale / SSpheres) and the status line every action here reports to. Below, one UICategory
+    /// each: File, Objects (add primitives, the live object list, rename/clone/reset), Blockout
+    /// (SSpheres, Lathe), Mirror & Combine (mirror copies, booleans, Join), Environment
+    /// (lighting, HDRI, material, presentation, turntable, timelapse) and Mold Maker. Docked
+    /// flush to the top-right corner at full window height, fixed there, mirroring
+    /// SculptUIBuilder's Sculpt panel on the left.
     ///
     /// Two things used to be separate panels of their own: the scene-file actions (top-center
     /// SaveLoadUIBuilder) and Studio Lighting/Material/Presentation (top-right
@@ -27,9 +28,8 @@ namespace Sculpting
         // stale line.
         private const float StatusHoldSeconds = 5f;
 
-        // Object-list text for either half of a live mirror pair (see MirrorLink). The name can't
-        // say it: a separate mirror copy is named exactly the same way.
-        private static readonly Color LinkedTextColor = new Color(1f, 0.82f, 0.45f);
+        // Object-list text for a live-mirrored object and its mirror copy rows (see MirrorRepeater).
+        private static readonly Color MirroredTextColor = new Color(1f, 0.82f, 0.45f);
 
         private SelectionManager _selection;
         private PrimitiveSpawner _spawner;
@@ -44,6 +44,9 @@ namespace Sculpting
         private sealed class ListRow
         {
             public SculptableMesh Obj;
+            // -1 for the object's own row, otherwise the index of the live mirror copy this row
+            // stands for (see MirrorRepeater) - listed indented under the object.
+            public int View = -1;
             public GameObject Go;
             public bool Renaming;
             public Button NameButton;
@@ -52,7 +55,8 @@ namespace Sculpting
         }
         private int _lastShownSelectionVersion = -1;
 
-        private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _zsphereModeImg;
+        private Image _sculptModeImg, _transposeModeImg, _scaleModeImg, _ssphereModeImg;
+        private readonly Image[] _orientationImgs = new Image[3];
         private GizmoMode _lastShownToolMode = GizmoMode.Sculpt;
         private Button _joinButton;
         private Button _subtractButton, _unionButton, _intersectButton;
@@ -77,7 +81,7 @@ namespace Sculpting
         // already work - they edit whatever is selected rather than repeating themselves per
         // object.
         private InputField _renameField;
-        private Button _cloneButton;
+        private Button _cloneButton, _resetShapeButton;
 
         // The object whose row is currently showing an inline rename field instead of its name
         // button - set by double-clicking a row (see AddDoubleClickHandler/BeginInlineRename),
@@ -86,13 +90,13 @@ namespace Sculpting
 
         // Defaults to X only - the common bilateral symmetry axis for character parts (left/
         // right limbs either side of a centered torso), matching the user's own "remove an arm
-        // to see the torso" framing.
-        private bool _mirrorX = true, _mirrorY, _mirrorZ;
-
-        // The mirror controls that follow the selection: Mirror Linked is refused for an object
-        // already in a pair, Finalize needs one, and the note says which (see
+        // to see the torso" framing. Follows the selection's live mirror when it has one (see
         // RefreshMirrorControls).
-        private Button _mirrorLinkedButton, _finalizeMirrorButton;
+        private bool _mirrorX = true, _mirrorY, _mirrorZ;
+        private Toggle _mirrorXToggle, _mirrorYToggle, _mirrorZToggle;
+
+        // The live-mirror controls that follow the selection (see RefreshMirrorControls).
+        private Button _mirrorButton, _validateMirrorButton, _removeMirrorButton;
         private Text _mirrorNote;
 
         // Scene-file (Import/Load/Save) display - see the old SaveLoadUIBuilder this was merged
@@ -111,8 +115,8 @@ namespace Sculpting
         // work - there is no other route to Save Scene.
         private GameObject _canvasRoot;
 
-        // The ZSphere section - see ZSphereUIBuilder.
-        private ZSphereUIBuilder _zsphereUI;
+        // The SSphere section - see SSphereUIBuilder.
+        private SSphereUIBuilder _ssphereUI;
 
         // Start(), not Awake() - reads/uses SelectionManager.AllObjects (via RefreshList),
         // which needs every SculptableMesh's OnEnable to have already registered - see
@@ -176,7 +180,7 @@ namespace Sculpting
 
             RefreshTimelapseSection(false);
 
-            // Tools switch modes on their own too (ZSphere Convert and Lathe Create drop into
+            // Tools switch modes on their own too (SSphere Convert and Lathe Create drop into
             // Sculpt, the Lathe section arms itself), so the highlight follows the gizmo rather
             // than only this panel's own clicks.
             GizmoMode shownMode = _gizmo != null ? _gizmo.Mode : GizmoMode.Sculpt;
@@ -184,6 +188,8 @@ namespace Sculpting
             {
                 _lastShownToolMode = shownMode;
                 RefreshToolButtons();
+                // Its controls live in the Blockout category, which may well be closed.
+                if (shownMode == GizmoMode.SSphere && _ssphereUI != null) UICategory.Reveal(_ssphereUI.Section);
             }
             RefreshFullscreenButton(false);
 
@@ -199,6 +205,14 @@ namespace Sculpting
             }
         }
 
+        // Category accents - see SculptUIBuilder's, which the left panel uses the same way.
+        private static readonly Color FileAccent = new Color(0.6f, 0.72f, 0.9f);
+        private static readonly Color ObjectsAccent = new Color(0.3f, 0.6f, 1f);
+        private static readonly Color BlockoutAccent = new Color(0.95f, 0.68f, 0.3f);
+        private static readonly Color CombineAccent = new Color(0.95f, 0.45f, 0.62f);
+        private static readonly Color EnvironmentAccent = new Color(0.95f, 0.85f, 0.4f);
+        private static readonly Color MoldAccent = new Color(0.62f, 0.62f, 0.68f);
+
         private void BuildUI()
         {
             // Docked flush to the top-right corner, full window height, fixed there - no
@@ -208,51 +222,111 @@ namespace Sculpting
                 "SceneGraphCanvas", new Vector2(1f, 1f), Vector2.zero, 260f);
             _canvasRoot = panel.root.gameObject;
 
-            UIFactory.CreateLabel(panel, "Scene", 18, FontStyle.Bold);
+            // ------------------------------------------ always visible: title, tool, status line
+            UIFactory.CreateLabel(panel, "Scene", 20, FontStyle.Bold);
 
-            UIFactory.CreateButton(panel, "Import Object...", ImportObject, "Brings in a mesh file (OBJ/FBX/etc.) from disk as a new sculptable object.");
-            UIFactory.CreateButton(panel, "Load Scene...", LoadScene, "Opens a saved .sculpt scene file, replacing everything currently in the scene.");
-            UIFactory.CreateButton(panel, "Save", Save, "Saves over the current scene file. Prompts for a location the first time.");
-            UIFactory.CreateButton(panel, "Save As...", SaveAs, "Saves the current scene to a new file.");
-            UIFactory.CreateButton(panel, "Exit", ShowExitConfirm, "Closes the app. Offers to save first.");
-            var fullscreenButton = UIFactory.CreateButton(panel, "Fullscreen (F11)", FullscreenController.Toggle,
+            // The tool decides what the mouse does in the viewport, so it stays on screen rather
+            // than living in a category that might be closed.
+            GameObject toolRow = UIFactory.CreateRow(panel, 26f);
+            _sculptModeImg = UIFactory.CreateButton(toolRow.transform, "Sculpt", () => SetGizmoMode(GizmoMode.Sculpt),
+                "Brush sculpting on the selected object.").GetComponent<Image>();
+            _transposeModeImg = UIFactory.CreateButton(toolRow.transform, "Move / Rotate", () => SetGizmoMode(GizmoMode.Transpose),
+                "Move/rotate gizmo (Transpose) for repositioning the selected object.").GetComponent<Image>();
+            GameObject toolRow2 = UIFactory.CreateRow(panel, 26f);
+            _scaleModeImg = UIFactory.CreateButton(toolRow2.transform, "Scale", () => SetGizmoMode(GizmoMode.Scale),
+                "Scale gizmo for resizing the selected object.").GetComponent<Image>();
+            _ssphereModeImg = UIFactory.CreateButton(toolRow2.transform, "SSpheres", () => SetGizmoMode(GizmoMode.SSphere),
+                "Edits the selected object's SSphere (Shape Sphere) rig, if it has one.").GetComponent<Image>();
+
+            // Which way the Move/Rotate handles point - see GizmoOrientation.
+            Text axesLabel = UIFactory.CreateLabel(panel, "Gizmo axes (Move / Rotate)", 10, FontStyle.Italic);
+            axesLabel.color = UIFactory.StatusHintColor;
+            GameObject axesRow = UIFactory.CreateRow(panel, 22f);
+            string[] orientationNames = { "Auto", "Local", "Global" };
+            string[] orientationTips =
+            {
+                "Move/Rotate handles follow the object's own axes, or the world axes when several objects are selected.",
+                "Move/Rotate handles always follow the selected object's own axes.",
+                "Move/Rotate handles always follow the world axes.",
+            };
+            for (int i = 0; i < 3; i++)
+            {
+                var orientation = (GizmoOrientation)i; // captured per iteration
+                _orientationImgs[i] = UIFactory.CreateButton(axesRow.transform, orientationNames[i],
+                    () => SetGizmoOrientation(orientation), orientationTips[i] + " Scale always uses the object's own axes.")
+                    .GetComponent<Image>();
+            }
+
+            // Every operation on this panel reports here (save/load, boolean, SSpheres...), so it
+            // is pinned too - a result must not land inside a closed category.
+            _statusLabel = UIFactory.CreateLabel(panel, "\n", 11, FontStyle.Normal);
+            ShowHint();
+
+            BuildFileCategory(panel);
+            BuildObjectsCategory(panel);
+            BuildBlockoutCategory(panel);
+            BuildCombineCategory(panel);
+            BuildEnvironmentCategory(panel);
+            BuildMoldCategory(panel);
+        }
+
+        private void BuildFileCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.file", "File", FileAccent, true,
+                () => _document != null && !string.IsNullOrEmpty(_document.CurrentSavePath)
+                    ? Path.GetFileNameWithoutExtension(_document.CurrentSavePath) : "Unsaved",
+                "Open, save, import and export.");
+            category.Keywords = "file open load save import export obj stl sculpt exit quit fullscreen";
+            Transform c = category.Content;
+
+            GameObject row1 = UIFactory.CreateRow(c, 26f);
+            UIFactory.CreateButton(row1.transform, "Load...", LoadScene, "Opens a saved .sculpt scene file - replacing the scene, or adding its objects to it.");
+            UIFactory.CreateButton(row1.transform, "Save", Save, "Saves over the current scene file. Prompts for a location the first time.");
+            UIFactory.CreateButton(row1.transform, "Save As...", SaveAs, "Saves the current scene to a new file.");
+            GameObject row2 = UIFactory.CreateRow(c, 26f);
+            UIFactory.CreateButton(row2.transform, "Import...", ImportObject, "Brings in a mesh file (.obj, .stl) from disk as a new sculptable object.");
+            UIFactory.CreateButton(row2.transform, "Export OBJ...", ExportSelected, "Saves the selected mesh as an OBJ file - opens a dialog to pick the folder and name.");
+            GameObject row3 = UIFactory.CreateRow(c, 26f);
+            var fullscreenButton = UIFactory.CreateButton(row3.transform, "Fullscreen (F11)", FullscreenController.Toggle,
                 "Fills the whole screen, hiding the window's title bar and the taskbar. F11 or Alt+Enter toggles it too.");
             _fullscreenButtonLabel = fullscreenButton.GetComponentInChildren<Text>();
             RefreshFullscreenButton(true);
+            UIFactory.CreateButton(row3.transform, "Exit", ShowExitConfirm, "Closes the app. Offers to save first.");
 
             if (!FileDialog.IsSupported)
             {
-                UIFactory.CreateLabel(panel, "File path", 11, FontStyle.Normal);
-                _fallbackField = UIFactory.CreateInputField(panel, SceneSerializer.DefaultPath, null);
+                UIFactory.CreateLabel(c, "File path", 11, FontStyle.Normal);
+                _fallbackField = UIFactory.CreateInputField(c, SceneSerializer.DefaultPath, null);
             }
+        }
 
-            _statusLabel = UIFactory.CreateLabel(panel, string.Empty, 11, FontStyle.Normal);
-            ShowHint();
+        private void ExportSelected()
+        {
+            if (_controller == null) return;
+            string path = _controller.Export(out bool cancelled);
+            if (path != null) SetStatus("Exported to " + path, UIFactory.StatusOkColor, hold: true);
+            else if (cancelled) SetStatus("Export cancelled", UIFactory.StatusHintColor, hold: true);
+            else SetStatus("Export failed - nothing selected", UIFactory.StatusErrorColor, hold: false);
+        }
 
-            UIFactory.CreateLabel(panel, "Add Primitive", 13, FontStyle.Normal);
-            GameObject addRow1 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow1.transform, "Cube", () => Spawn(PrimitiveShapeType.Cube), "Spawns a new sculptable cube.");
-            UIFactory.CreateButton(addRow1.transform, "Sphere", () => Spawn(PrimitiveShapeType.Sphere), "Spawns a new sculptable sphere.");
-            GameObject addRow2 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow2.transform, "Cylinder", () => Spawn(PrimitiveShapeType.Cylinder), "Spawns a new sculptable cylinder.");
-            UIFactory.CreateButton(addRow2.transform, "Capsule", () => Spawn(PrimitiveShapeType.Capsule), "Spawns a new sculptable capsule.");
+        private void BuildObjectsCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.objects", "Objects", ObjectsAccent, true,
+                ObjectsSummary, "Add shapes, pick what you're working on, rename, clone and hide objects.");
+            category.Keywords = "object add new primitive cube sphere cylinder capsule list select rename clone duplicate hide show visible delete reset";
+            Transform c = category.Content;
 
-            // A ZSphere rig belongs among the primitives even though it is not one: this is the
-            // "start a model from nothing" row, and a blockout is a perfectly ordinary way to
-            // start one - it just happens to become geometry at Convert rather than immediately.
-            // Without an entry here the tool could only be reached by first spawning a primitive
-            // to click near, which is exactly backwards for building a figure out of ZSpheres.
-            GameObject addRow3 = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(addRow3.transform, "ZSphere Rig", () => _zsphereUI?.StartZSphereRig(),
-                "Starts a jointed skeleton of spheres you can pose and grow, then convert into a sculptable mesh - good for blocking out a figure from scratch.");
-            // The lathe is the same kind of entry: a way to start a model, which becomes geometry
-            // at Create. Its controls open in the Lathe section below.
-            UIFactory.CreateButton(addRow3.transform, "Lathe", StartLathe,
-                "Shapes a turned solid - a vase, bowl, bottle, knob or ring - by dragging its outline, like clay on a wheel.");
+            UIFactory.CreateLabel(c, "Add", 12, FontStyle.Bold);
+            GameObject addRow = UIFactory.CreateRow(c, 26f);
+            UIFactory.CreateButton(addRow.transform, "Cube", () => Spawn(PrimitiveShapeType.Cube), "Spawns a new sculptable cube.");
+            UIFactory.CreateButton(addRow.transform, "Sphere", () => Spawn(PrimitiveShapeType.Sphere), "Spawns a new sculptable sphere.");
+            UIFactory.CreateButton(addRow.transform, "Cylinder", () => Spawn(PrimitiveShapeType.Cylinder), "Spawns a new sculptable cylinder.");
+            UIFactory.CreateButton(addRow.transform, "Capsule", () => Spawn(PrimitiveShapeType.Capsule), "Spawns a new sculptable capsule.");
 
-            UIFactory.CreateLabel(panel, "Objects (click=select, Ctrl+click=multi)", 12, FontStyle.Normal);
+            Text listHint = UIFactory.CreateLabel(c, "Ctrl+click adds to selection. Double-click renames.", 10, FontStyle.Italic);
+            listHint.color = UIFactory.StatusHintColor;
             var listGO = new GameObject("ObjectList", typeof(RectTransform));
-            listGO.transform.SetParent(panel, false);
+            listGO.transform.SetParent(c, false);
             var vlg = listGO.AddComponent<VerticalLayoutGroup>();
             vlg.spacing = 4;
             vlg.childControlHeight = true;
@@ -262,99 +336,132 @@ namespace Sculpting
             listGO.AddComponent<ContentSizeFitter>().verticalFit = ContentSizeFitter.FitMode.PreferredSize;
             _listContent = listGO.transform;
 
-            UIFactory.CreateLabel(panel, "Selected Object", 13, FontStyle.Normal);
-            _renameField = UIFactory.CreateInputField(panel, string.Empty, RenameSelected);
-            _cloneButton = UIFactory.CreateButton(panel, "Clone Selected", CloneSelected, "Duplicates the selected object as a new, independent copy.");
+            UIFactory.CreateLabel(c, "Selected Object", 12, FontStyle.Bold);
+            _renameField = UIFactory.CreateInputField(c, string.Empty, RenameSelected);
+            TooltipSystem.Attach(_renameField.gameObject, "The selected object's name - type to rename it.");
+            GameObject selectedRow = UIFactory.CreateRow(c, 26f);
+            _cloneButton = UIFactory.CreateButton(selectedRow.transform, "Clone", CloneSelected, "Duplicates the selected object as a new, independent copy.");
+            _resetShapeButton = UIFactory.CreateButton(selectedRow.transform, "Reset Shape", () => _controller?.ResetMesh(),
+                "Puts the selected object back to the shape it had before any sculpting. Undo (Z) brings the sculpt back.");
+        }
 
-            UIFactory.CreateLabel(panel, "Tool", 13, FontStyle.Normal);
-            GameObject toolRow = UIFactory.CreateRow(panel, 26f);
-            _sculptModeImg = UIFactory.CreateButton(toolRow.transform, "Sculpt", () => SetGizmoMode(GizmoMode.Sculpt),
-                "Brush sculpting on the selected object.").GetComponent<Image>();
-            _transposeModeImg = UIFactory.CreateButton(toolRow.transform, "Transpose", () => SetGizmoMode(GizmoMode.Transpose),
-                "Move/rotate gizmo for repositioning the selected object.").GetComponent<Image>();
-            GameObject toolRow2 = UIFactory.CreateRow(panel, 26f);
-            _scaleModeImg = UIFactory.CreateButton(toolRow2.transform, "Scale", () => SetGizmoMode(GizmoMode.Scale),
-                "Scale gizmo for resizing the selected object.").GetComponent<Image>();
-            _zsphereModeImg = UIFactory.CreateButton(toolRow2.transform, "ZSpheres", () => SetGizmoMode(GizmoMode.ZSphere),
-                "Edits the selected object's ZSphere rig, if it has one.").GetComponent<Image>();
+        private string ObjectsSummary()
+        {
+            if (_selection == null) return string.Empty;
+            int n = 0;
+            foreach (SculptableMesh obj in _selection.AllObjects) if (obj != null) n++;
+            return n == 1 ? "1 object" : n + " objects";
+        }
 
-            // ZSpheres: its own builder, the same BuildContent pattern as the Lathe's below.
-            _zsphereUI = GetComponent<ZSphereUIBuilder>();
-            if (_zsphereUI == null) _zsphereUI = gameObject.AddComponent<ZSphereUIBuilder>();
-            _zsphereUI.BuildContent(panel, SetGizmoMode, RefreshToolButtons,
+        private void BuildBlockoutCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.blockout", "Blockout", BlockoutAccent, false,
+                tooltip: "Start a model from nothing: an SSphere (Shape Sphere) skeleton for figures, or a lathe for turned shapes.");
+            category.Keywords = "ssphere sspheres rig skeleton armature figure lathe turned vase bowl bottle revolve blockout start";
+            Transform c = category.Content;
+
+            // Neither is a primitive, but both are ways to START a model - they just become
+            // geometry at Convert/Create rather than immediately. Without an entry here the
+            // SSphere tool could only be reached by first spawning a primitive to click near.
+            GameObject startRow = UIFactory.CreateRow(c, 26f);
+            UIFactory.CreateButton(startRow.transform, "New SSphere Rig", () => _ssphereUI?.StartSSphereRig(),
+                "Starts a jointed skeleton of spheres you can pose and grow, then convert into a sculptable mesh - good for blocking out a figure from scratch.");
+            UIFactory.CreateButton(startRow.transform, "New Lathe", StartLathe,
+                "Shapes a turned solid - a vase, bowl, bottle, knob or ring - by dragging its outline, like clay on a wheel.");
+
+            // SSpheres: its own builder, the same BuildContent pattern as the Lathe's below.
+            _ssphereUI = GetComponent<SSphereUIBuilder>();
+            if (_ssphereUI == null) _ssphereUI = gameObject.AddComponent<SSphereUIBuilder>();
+            _ssphereUI.BuildContent(c, SetGizmoMode, RefreshToolButtons,
                 (message, ok) => SetStatus(message, ok ? UIFactory.StatusOkColor : UIFactory.StatusErrorColor, hold: ok));
 
-            // Lathe: its own builder, filled into a foldout like the Turntable's and self-installed
-            // the same way, since the scene predates it.
+            // Lathe: its own builder, self-installed since the scene predates it.
             var lathe = FindFirstObjectByType<LatheUIBuilder>();
             if (lathe == null) lathe = gameObject.AddComponent<LatheUIBuilder>();
-            lathe.BuildContent(UIFactory.CreateFoldoutSection(panel, "Lathe (Turned Solids)", false));
+            lathe.BuildContent(UIFactory.CreateFoldoutSection(c, "Lathe (Turned Solids)", false));
+        }
 
-            UIFactory.CreateLabel(panel, "Mirror Selected Across Sphere", 13, FontStyle.Normal);
-            GameObject mirrorRow = UIFactory.CreateRow(panel, 22f);
-            UIFactory.CreateToggle(mirrorRow.transform, "X", _mirrorX, v => _mirrorX = v, tooltip: "Mirror across the X axis.");
-            UIFactory.CreateToggle(mirrorRow.transform, "Y", _mirrorY, v => _mirrorY = v, tooltip: "Mirror across the Y axis.");
-            UIFactory.CreateToggle(mirrorRow.transform, "Z", _mirrorZ, v => _mirrorZ = v, tooltip: "Mirror across the Z axis.");
-            GameObject mirrorButtonRow = UIFactory.CreateRow(panel, 26f);
-            UIFactory.CreateButton(mirrorButtonRow.transform, "Mirror Separate", () => DoMirror(false),
-                "Creates a mirrored copy across the checked axes. The copy is its own object from then on.");
-            _mirrorLinkedButton = UIFactory.CreateButton(mirrorButtonRow.transform, "Mirror Linked", () => DoMirror(true),
-                "Creates a mirrored copy that stays linked: move, rotate, scale or sculpt either one and the other " +
-                "follows, mirrored, until you finalize. Remesh, Trim, Boolean and Join finalize it too.");
-            _finalizeMirrorButton = UIFactory.CreateButton(panel, "Finalize Mirror", FinalizeMirror,
-                "Ends the selected object's mirror link, leaving two separate objects exactly where they are.");
+        private void BuildCombineCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.combine", "Mirror & Combine", CombineAccent, false,
+                () => _selection != null && _selection.SelectedSet.Count >= 2 ? _selection.SelectedSet.Count + " selected" : string.Empty,
+                "Mirror copies of objects, and merge or cut objects together.");
+            category.Keywords = "mirror copy instance live validate bake join merge boolean subtract union intersect cut combine";
+            Transform c = category.Content;
+
+            UIFactory.CreateLabel(c, "Mirror (across the world origin)", 12, FontStyle.Bold);
+            GameObject mirrorRow = UIFactory.CreateRow(c, 22f);
+            _mirrorXToggle = UIFactory.CreateToggle(mirrorRow.transform, "X", _mirrorX, v => SetMirrorAxis(0, v), tooltip: "Mirror across the world X plane.");
+            _mirrorYToggle = UIFactory.CreateToggle(mirrorRow.transform, "Y", _mirrorY, v => SetMirrorAxis(1, v), tooltip: "Mirror across the world Y plane.");
+            _mirrorZToggle = UIFactory.CreateToggle(mirrorRow.transform, "Z", _mirrorZ, v => SetMirrorAxis(2, v), tooltip: "Mirror across the world Z plane.");
+            GameObject mirrorButtonRow = UIFactory.CreateRow(c, 26f);
+            _mirrorButton = UIFactory.CreateButton(mirrorButtonRow.transform, "Mirror", ApplyMirror,
+                "Adds a live mirrored copy of the selected object across the checked world planes. It is the same " +
+                "mesh drawn again, so sculpting, remeshing or trimming either side shows on both, and moving one " +
+                "moves the other. Select the copy in the list or the viewport to work from its side.");
+            _validateMirrorButton = UIFactory.CreateButton(mirrorButtonRow.transform, "Validate", ValidateMirror,
+                "Turns the live mirror copies into real, separate objects, exactly where they are.");
+            _removeMirrorButton = UIFactory.CreateButton(mirrorButtonRow.transform, "Remove", RemoveMirror,
+                "Removes the selected object's live mirror copies. Undo (Z) brings them back.");
             // Built with two lines because CreateLabel sizes itself from the newlines it starts with,
             // and every note RefreshMirrorControls writes is two lines.
-            _mirrorNote = UIFactory.CreateLabel(panel, "\n", 11, FontStyle.Italic);
+            _mirrorNote = UIFactory.CreateLabel(c, "\n", 11, FontStyle.Italic);
 
-            UIFactory.CreateLabel(panel, "Join (destructive)", 13, FontStyle.Normal);
-            _joinButton = UIFactory.CreateButton(panel, "Join Selected", ShowJoinConfirm,
-                "Merges every selected object into one mesh, deleting the originals.");
-
-            // One row of three rather than a button each: they are the same gesture with the
-            // same prompt, and the panel already spends a lot of vertical space above this.
-            UIFactory.CreateLabel(panel, "Boolean (watertight)", 13, FontStyle.Normal);
-            GameObject booleanRow = UIFactory.CreateRow(panel, 26f);
+            UIFactory.CreateLabel(c, "Combine (select 2+ objects)", 12, FontStyle.Bold);
+            Text combineHint = UIFactory.CreateLabel(c, "The first-selected object is the one kept.", 10, FontStyle.Italic);
+            combineHint.color = UIFactory.StatusHintColor;
+            // One row of three: the same gesture with the same prompt.
+            GameObject booleanRow = UIFactory.CreateRow(c, 26f);
             _subtractButton = UIFactory.CreateButton(booleanRow.transform, "Subtract", () => ShowBooleanConfirm(BooleanOp.Subtract),
                 "Cuts the other selected object(s) out of the first.");
             _unionButton = UIFactory.CreateButton(booleanRow.transform, "Union", () => ShowBooleanConfirm(BooleanOp.Union),
                 "Merges the selected objects into one solid shape.");
             _intersectButton = UIFactory.CreateButton(booleanRow.transform, "Intersect", () => ShowBooleanConfirm(BooleanOp.Intersect),
                 "Keeps only the volume where the selected objects overlap.");
+            _joinButton = UIFactory.CreateButton(c, "Join (no undo)", ShowJoinConfirm,
+                "Merges every selected object into one mesh, deleting the originals. Unlike Union it keeps every shell as-is. Cannot be undone.");
+        }
 
-            // Mold Maker: a whole workflow of its own, so what sits here is only the door into
-            // it - a button and a line of state. The tools themselves open as a full-screen
-            // workspace that stands in front of this panel, because molding is a mode rather
-            // than a tool and every control it needs would not fit in this column beside the
-            // scene list. See MoldUIBuilder. Self-installed if the scene predates the feature.
-            var mold = FindFirstObjectByType<Sculpting.Molding.MoldUIBuilder>();
-            if (mold == null) mold = gameObject.AddComponent<Sculpting.Molding.MoldUIBuilder>();
-            mold.BuildContent(UIFactory.CreateFoldoutSection(panel, "Mold Maker", true));
+        /// Everything about how the model is SHOWN rather than shaped: lights, the HDRI, the
+        /// material, camera effects and background, the turntable, and recording.
+        private void BuildEnvironmentCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.environment", "Environment", EnvironmentAccent, false,
+                tooltip: "Lighting, HDRI, material, presentation effects, turntable and recording.");
+            category.Keywords = "environment lighting light preset hdri sky material color colour shader matcap cavity " +
+                                "presentation bloom vignette depth of field background turntable spin record timelapse render";
+            Transform c = category.Content;
 
-            BuildTimelapseSection(panel);
-
-            // Turntable: spin, clean view and the 360 loop recorder. Its own builder, filled into
-            // a foldout like the Mold Maker's, and self-installed the same way.
-            var turntable = FindFirstObjectByType<TurntableUIBuilder>();
-            if (turntable == null) turntable = gameObject.AddComponent<TurntableUIBuilder>();
-            turntable.BuildContent(UIFactory.CreateFoldoutSection(panel, "Turntable", false));
-
-            // Material / Presentation used to be separate always-open panels (bottom-center,
-            // bottom-right). Merged into this panel as collapsible sections - one panel to dock
-            // instead of several, and each section starts collapsed so the panel stays small
-            // until the user opens the one they want. These builders no longer build their own
-            // canvas - they just fill whatever content transform they're handed (see
-            // LightingUIBuilder.BuildContent's remarks).
-            //
-            // Lighting is handed the panel ITSELF rather than a section of its own: its two
-            // parts - the Lighting presets and HDRI Environment - make their own top-level
-            // foldouts.
+            // These builders never build a canvas of their own - they fill whatever content
+            // transform they're handed. Lighting is handed the category ITSELF: its two parts,
+            // the Lighting presets and HDRI Environment, make their own sub-sections.
             var lighting = FindFirstObjectByType<LightingUIBuilder>();
             var material = FindFirstObjectByType<MaterialUIBuilder>();
             var presentation = FindFirstObjectByType<PostProcessingUIBuilder>();
-            if (lighting != null) lighting.BuildContent(panel);
-            if (material != null) material.BuildContent(UIFactory.CreateFoldoutSection(panel, "Material", false));
-            if (presentation != null) presentation.BuildContent(UIFactory.CreateFoldoutSection(panel, "Presentation", false));
+            if (lighting != null) lighting.BuildContent(c);
+            if (material != null) material.BuildContent(UIFactory.CreateFoldoutSection(c, "Material", false));
+            if (presentation != null) presentation.BuildContent(UIFactory.CreateFoldoutSection(c, "Presentation", false));
+
+            // Turntable: spin, clean view and the 360 loop recorder. Self-installed like the lathe.
+            var turntable = FindFirstObjectByType<TurntableUIBuilder>();
+            if (turntable == null) turntable = gameObject.AddComponent<TurntableUIBuilder>();
+            turntable.BuildContent(UIFactory.CreateFoldoutSection(c, "Turntable", false));
+
+            BuildTimelapseSection(c);
+        }
+
+        private void BuildMoldCategory(Transform panel)
+        {
+            UICategory category = UICategory.Create(panel, "scene.mold", "Mold Maker", MoldAccent, false,
+                tooltip: "Turn the model into a two-part injection mold (experimental).");
+            category.Keywords = "mold mould cavity lure injection print vents pins sprue";
+
+            // A whole workflow of its own, so what sits here is only the door into it - a button
+            // and a line of state. The tools open as a full-screen workspace in front of this
+            // panel. See MoldUIBuilder. Self-installed if the scene predates the feature.
+            var mold = FindFirstObjectByType<Sculpting.Molding.MoldUIBuilder>();
+            if (mold == null) mold = gameObject.AddComponent<Sculpting.Molding.MoldUIBuilder>();
+            mold.BuildContent(category.Content);
         }
 
         /// Start/Stop for the sculpting timelapse, so a recording can be driven without leaving
@@ -367,7 +474,7 @@ namespace Sculpting
         {
             if (!Application.isEditor) return;
 
-            UIFactory.CreateLabel(panel, "Timelapse", 13, FontStyle.Normal);
+            panel = UIFactory.CreateFoldoutSection(panel, "Timelapse", false);
 
             Button button = UIFactory.CreateButton(panel, "Start Timelapse", TimelapseControl.RequestToggle,
                 "Records a timelapse that follows your viewing angle and the part you are " +
@@ -495,7 +602,7 @@ namespace Sculpting
 
         private void ShowHint()
         {
-            _statusLabel.text = "Import adds a model (.obj, .stl). Load opens a saved scene (.sculpt).";
+            _statusLabel.text = "Import adds a model (.obj / .stl). Load opens a saved .sculpt scene.";
             _statusLabel.color = UIFactory.StatusHintColor;
             _statusClearAt = -1f;
         }
@@ -544,6 +651,8 @@ namespace Sculpting
             {
                 if (obj == null) continue;
                 GameObject rowGO = UIFactory.CreateRow(_listContent, 24f);
+                // The name gets the room; the visibility tick and delete button take only what they need.
+                rowGO.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = false;
                 var row = new ListRow { Obj = obj, Go = rowGO, Renaming = obj == _renamingObject };
                 _listRows.Add(row);
 
@@ -552,25 +661,47 @@ namespace Sculpting
                     InputField renameField = UIFactory.CreateInputField(rowGO.transform, obj.name,
                         newName => CommitInlineRename(obj, newName));
                     FocusRenameField(renameField);
+                    renameField.GetComponent<LayoutElement>().flexibleWidth = 1;
                 }
                 else
                 {
                     row.NameButton = UIFactory.CreateButton(rowGO.transform, obj.name, () => OnRowClicked(obj));
                     row.NameText = row.NameButton.GetComponentInChildren<Text>();
                     AddDoubleClickHandler(row.NameButton.gameObject, () => BeginInlineRename(obj));
+                    row.NameButton.GetComponent<LayoutElement>().flexibleWidth = 1;
                 }
 
                 row.Visible = UIFactory.CreateToggle(rowGO.transform, "Vis", obj.Visible, v => _selection.SetVisible(obj, v),
                     tooltip: "Shows or hides this object in the viewport.");
-                UIFactory.CreateButton(rowGO.transform, "X", () => ShowDeleteConfirm(obj), "Deletes this object (asks to confirm).");
+                row.Visible.GetComponent<LayoutElement>().preferredWidth = 44;
+                Button delete = UIFactory.CreateButton(rowGO.transform, "X", () => ShowDeleteConfirm(obj), "Deletes this object (asks to confirm).");
+                delete.GetComponent<LayoutElement>().preferredWidth = 26;
                 UpdateRow(row);
+
+                // Its live mirror copies, indented beneath it. Selecting one puts the gizmo on
+                // that side; visibility and deletion belong to the object itself.
+                MirrorRepeater repeater = obj.Repeater;
+                for (int v = 0; repeater != null && v < repeater.ViewCount; v++)
+                {
+                    GameObject viewGO = UIFactory.CreateRow(_listContent, 22f);
+                    var layout = viewGO.GetComponent<HorizontalLayoutGroup>();
+                    layout.childForceExpandWidth = false;
+                    layout.padding.left = 18;
+                    int view = v; // captured per iteration
+                    var viewRow = new ListRow { Obj = obj, View = view, Go = viewGO };
+                    viewRow.NameButton = UIFactory.CreateButton(viewGO.transform, string.Empty, () => _selection.SelectView(obj, view));
+                    viewRow.NameText = viewRow.NameButton.GetComponentInChildren<Text>();
+                    viewRow.NameButton.GetComponent<LayoutElement>().flexibleWidth = 1;
+                    _listRows.Add(viewRow);
+                    UpdateRow(viewRow);
+                }
             }
 
             RefreshSelectedObjectControls();
         }
 
-        /// Whether _listRows is still one row per live object, in AllObjects order, each in the
-        /// right state (inline rename or name button).
+        /// Whether _listRows is still one row per live object (plus one per live mirror copy under
+        /// it), in AllObjects order, each in the right state (inline rename or name button).
         private bool RowsMatchObjects()
         {
             int r = 0;
@@ -579,30 +710,52 @@ namespace Sculpting
                 if (obj == null) continue;
                 if (r >= _listRows.Count) return false;
                 ListRow row = _listRows[r++];
-                if (row.Go == null || row.Obj != obj || row.Renaming != (obj == _renamingObject)) return false;
+                if (row.Go == null || row.Obj != obj || row.View != -1 || row.Renaming != (obj == _renamingObject)) return false;
+
+                int views = obj.Repeater != null ? obj.Repeater.ViewCount : 0;
+                for (int v = 0; v < views; v++)
+                {
+                    if (r >= _listRows.Count) return false;
+                    ListRow viewRow = _listRows[r++];
+                    if (viewRow.Go == null || viewRow.Obj != obj || viewRow.View != v) return false;
+                }
             }
             return r == _listRows.Count;
         }
 
-        /// Everything a row shows about its object: name, selection highlight, mirror link and
+        /// Everything a row shows about its object: name, selection highlight, live mirror and
         /// visibility.
         private void UpdateRow(ListRow row)
         {
             SculptableMesh obj = row.Obj;
             if (row.NameButton != null)
             {
-                // Either half of a live mirror pair says so in its text colour and tooltip.
-                MirrorLink link = obj.LinkedMirror;
-                SculptableMesh partner = link != null ? link.PartnerOf(obj) : null;
-                string tooltip = "Click to select, Ctrl+click to add to selection, double-click to rename.";
-                if (partner != null)
-                    tooltip = $"Mirror-linked with \"{partner.name}\": moving or sculpting either one mirrors onto the other. " + tooltip;
+                MirrorRepeater repeater = obj.Repeater;
+                bool primary = _selection.PrimarySelection == obj;
+                bool thisSide = primary && _selection.PrimaryView == row.View;
 
-                row.NameButton.gameObject.name = "Button_" + obj.name;
-                row.NameText.text = obj.name;
-                row.NameText.color = partner != null ? LinkedTextColor : Color.white;
-                row.NameButton.GetComponent<Image>().color = _selection.PrimarySelection == obj ? UIFactory.ActiveColor
-                    : _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
+                string tooltip;
+                if (row.View >= 0)
+                {
+                    MirrorRepeaterView view = repeater != null ? repeater.View(row.View) : null;
+                    row.NameText.text = "Mirror " + (view != null ? view.AxisName : string.Empty);
+                    tooltip = $"The live mirror copy of \"{obj.name}\". Click to select it - the gizmo then moves it, " +
+                              "and the original follows on the other side.";
+                }
+                else
+                {
+                    row.NameButton.gameObject.name = "Button_" + obj.name;
+                    row.NameText.text = obj.name;
+                    tooltip = "Click to select, Ctrl+click to add to selection, double-click to rename.";
+                    if (repeater != null)
+                        tooltip = $"Mirrored live across {MirrorRepeater.AxisNameOf(repeater.AxisMask)} - its copies are listed below it. " + tooltip;
+                }
+
+                // A mirrored object and its copies share the amber text; the highlight marks the
+                // side the gizmo is on, and the other side of the same object reads as selected.
+                row.NameText.color = repeater != null ? MirroredTextColor : Color.white;
+                row.NameButton.GetComponent<Image>().color = thisSide ? UIFactory.ActiveColor
+                    : primary || _selection.IsSelected(obj) ? new Color(0.4f, 0.4f, 0.45f) : UIFactory.InactiveColor;
                 TooltipSystem.Attach(row.NameButton.gameObject, tooltip);
             }
             if (row.Visible != null) row.Visible.SetIsOnWithoutNotify(obj.Visible);
@@ -624,6 +777,7 @@ namespace Sculpting
                 _renameField.SetTextWithoutNotify(primary != null ? primary.name : string.Empty);
             }
             if (_cloneButton != null) _cloneButton.interactable = primary != null;
+            if (_resetShapeButton != null) _resetShapeButton.interactable = primary != null;
             RefreshMirrorControls(primary);
         }
 
@@ -733,59 +887,109 @@ namespace Sculpting
             _sculptModeImg.color = mode == GizmoMode.Sculpt ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _transposeModeImg.color = mode == GizmoMode.Transpose ? UIFactory.ActiveColor : UIFactory.InactiveColor;
             _scaleModeImg.color = mode == GizmoMode.Scale ? UIFactory.ActiveColor : UIFactory.InactiveColor;
-            _zsphereModeImg.color = mode == GizmoMode.ZSphere ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+            _ssphereModeImg.color = mode == GizmoMode.SSphere ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+
+            GizmoOrientation orientation = _gizmo != null ? _gizmo.Orientation : GizmoOrientation.Auto;
+            for (int i = 0; i < _orientationImgs.Length; i++)
+                if (_orientationImgs[i] != null)
+                    _orientationImgs[i].color = (int)orientation == i ? UIFactory.ActiveColor : UIFactory.InactiveColor;
+        }
+
+        private void SetGizmoOrientation(GizmoOrientation orientation)
+        {
+            if (_gizmo != null) _gizmo.Orientation = orientation;
+            RefreshToolButtons();
         }
 
         // ------------------------------------------------------------------------------ mirror
 
-        private void DoMirror(bool linked)
+        private int CheckedMirrorMask => (_mirrorX ? 1 : 0) | (_mirrorY ? 2 : 0) | (_mirrorZ ? 4 : 0);
+
+        /// A tick on an already-mirrored object changes its mirror straight away - the toggles
+        /// then describe the live copies, like Nomad's repeater panel. On an unmirrored object
+        /// they only pick the axes for the next Mirror press.
+        private void SetMirrorAxis(int axis, bool on)
         {
-            if (_selection == null || _spawner == null) return;
-            if (!_mirrorX && !_mirrorY && !_mirrorZ) return;
+            switch (axis)
+            {
+                case 0: _mirrorX = on; break;
+                case 1: _mirrorY = on; break;
+                default: _mirrorZ = on; break;
+            }
 
-            SculptableMesh target = _selection.PrimarySelection;
-            SculptableMesh main = _spawner.MainObject;
-            if (target == null || main == null) return;
-
-            MeshMirror.MirrorAcross(target, main.transform.position, _mirrorX, _mirrorY, _mirrorZ, linked);
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            if (primary == null || primary.Repeater == null) return;
+            // Unticking the last axis would silently delete the mirror; Remove is for that.
+            if (CheckedMirrorMask == 0) { RefreshMirrorControls(primary); return; }
+            MirrorRepeater.Set(primary, CheckedMirrorMask, primary.Repeater.Center, recordUndo: true);
         }
 
-        /// Nothing to refresh here: ending a link bumps SelectionVersion, which redraws the list and
-        /// this section on the next Update.
-        private void FinalizeMirror()
+        /// Nothing to refresh by hand in any of these: a mirror change bumps SelectionVersion,
+        /// which redraws the list and this section on the next Update.
+        private void ApplyMirror()
         {
             SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
-            MirrorLink link = primary != null ? primary.LinkedMirror : null;
-            if (link != null) link.Unlink();
+            if (primary == null) return;
+            if (CheckedMirrorMask == 0)
+            {
+                SetStatus("Tick at least one axis to mirror across.", UIFactory.StatusErrorColor, hold: false);
+                return;
+            }
+            Vector3 center = primary.Repeater != null ? primary.Repeater.Center : Vector3.zero;
+            MirrorRepeater.Set(primary, CheckedMirrorMask, center, recordUndo: true);
+            SetStatus($"Mirrored \"{primary.name}\" across {MirrorRepeater.AxisNameOf(CheckedMirrorMask)}.", UIFactory.StatusOkColor, hold: true);
+        }
+
+        private void ValidateMirror()
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            MirrorRepeater repeater = primary != null ? primary.Repeater : null;
+            if (repeater == null) return;
+            int count = repeater.Bake().Count;
+            SetStatus($"Validated: {count} mirror cop{(count == 1 ? "y is" : "ies are")} now separate objects.",
+                UIFactory.StatusOkColor, hold: true);
+        }
+
+        private void RemoveMirror()
+        {
+            SculptableMesh primary = _selection != null ? _selection.PrimarySelection : null;
+            if (primary == null || primary.Repeater == null) return;
+            MirrorRepeater.Set(primary, 0, Vector3.zero, recordUndo: true);
         }
 
         private void RefreshMirrorControls(SculptableMesh primary)
         {
-            MirrorLink link = primary != null ? primary.LinkedMirror : null;
-            // One pair per object (see MirrorLink.Create); a Separate copy of a linked object is fine.
-            if (_mirrorLinkedButton != null) _mirrorLinkedButton.interactable = primary != null && link == null;
-            if (_finalizeMirrorButton != null) _finalizeMirrorButton.interactable = link != null;
+            MirrorRepeater repeater = primary != null ? primary.Repeater : null;
+
+            // The toggles show the live mirror's own axes whenever there is one.
+            if (repeater != null && _mirrorXToggle != null)
+            {
+                int mask = repeater.AxisMask;
+                _mirrorX = (mask & 1) != 0;
+                _mirrorY = (mask & 2) != 0;
+                _mirrorZ = (mask & 4) != 0;
+                _mirrorXToggle.SetIsOnWithoutNotify(_mirrorX);
+                _mirrorYToggle.SetIsOnWithoutNotify(_mirrorY);
+                _mirrorZToggle.SetIsOnWithoutNotify(_mirrorZ);
+            }
+
+            if (_mirrorButton != null) _mirrorButton.interactable = primary != null && repeater == null;
+            if (_validateMirrorButton != null) _validateMirrorButton.interactable = repeater != null;
+            if (_removeMirrorButton != null) _removeMirrorButton.interactable = repeater != null;
             if (_mirrorNote == null) return;
 
-            SculptableMesh partner = link != null ? link.PartnerOf(primary) : null;
-            if (partner == null)
+            if (repeater == null)
             {
-                _mirrorNote.text = "Linked copies follow each other's moves\nand sculpting until you finalize.";
+                _mirrorNote.text = "A live copy: sculpt or move either side\nand the other follows.";
                 _mirrorNote.color = UIFactory.StatusHintColor;
                 return;
             }
 
-            // A deleted half is only parked until its undo step expires (see
-            // SelectionManager.DeleteObject), and the pair holds through that - so it is still
-            // named, just flagged.
-            string deleted = partner.gameObject.activeInHierarchy ? string.Empty : " (deleted)";
-            _mirrorNote.text = $"Linked with \"{partner.name}\"{deleted} across {AxisNames(link.Signs)}.\n" +
-                               "Moves and sculpting mirror live.";
+            int copies = repeater.ViewCount;
+            _mirrorNote.text = $"\"{primary.name}\" is mirrored across {MirrorRepeater.AxisNameOf(repeater.AxisMask)}\n" +
+                               $"({copies} live cop{(copies == 1 ? "y" : "ies")}). Validate to make them real.";
             _mirrorNote.color = UIFactory.StatusOkColor;
         }
-
-        private static string AxisNames(Vector3 signs) =>
-            (signs.x < 0f ? "X" : string.Empty) + (signs.y < 0f ? "Y" : string.Empty) + (signs.z < 0f ? "Z" : string.Empty);
 
         // -------------------------------------------------------------------------------- join
 

@@ -2,43 +2,19 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// Duplicate-and-reflect, used by SceneGraphUIBuilder's two Mirror buttons, always reflecting
-    /// across PrimitiveSpawner.MainObject's world position (the scene's anchor sphere). Two flavours
-    /// of the same copy:
-    /// - SEPARATE: independent from the moment it exists, like Blender's Duplicate + Mirror.
-    /// - LINKED: the copy and the original keep following each other, mirrored, until the user
-    ///   finalizes them - like Nomad's mirror or Blender's Mirror modifier. See MirrorLink.
+    /// The reflection maths shared by MirrorRepeater's live copies and by baking them into real
+    /// objects (MirrorRepeater.Bake -> MeshCloner.Duplicate).
     ///
-    /// The copy is an exact mirror in LOCAL space: each vertex and normal is reflected through the
-    /// object's own origin, and the transform is reflected to match (position across the centre,
-    /// rotation conjugated by the reflection, scale unchanged). It used to bake the source's
-    /// WORLD-space shape into an identity transform and then call RecalculateNormals, which is what
-    /// made a mirrored sphere look lower-poly than the original with the very same 515 verts and 768
-    /// tris. Unity's sphere duplicates its vertices along the UV seam and at the poles, and
-    /// RecalculateNormals averages each duplicate over only its own triangles, so every seam came
-    /// out as a hard crease - measured 108 seam positions up to 17.5 degrees apart on the copy,
-    /// against none on the original. Carrying the source's own normals keeps the shading identical,
-    /// and keeping the transform intact is what lets a linked copy follow a drag with a transform
-    /// write instead of a rebake.
+    /// A baked copy is an exact mirror in LOCAL space: each vertex and normal is reflected through
+    /// the object's own origin, and the transform is reflected to match (position across the
+    /// centre, rotation conjugated by the reflection, scale unchanged). Baking the WORLD-space
+    /// shape into an identity transform and calling RecalculateNormals instead made a mirrored
+    /// sphere look lower-poly than the original with the very same 515 verts and 768 tris: Unity's
+    /// sphere duplicates its vertices along the UV seam and at the poles, and RecalculateNormals
+    /// averages each duplicate over only its own triangles, so every seam came out as a hard
+    /// crease. Carrying the source's own normals keeps the shading identical.
     public static class MeshMirror
     {
-        /// Returns the new copy, or null when there is nothing to do: no source, no axis checked,
-        /// or a LINKED copy asked of an object already in a pair (see MirrorLink.Create).
-        public static SculptableMesh MirrorAcross(SculptableMesh source, Vector3 centerWorld,
-                                                  bool axisX, bool axisY, bool axisZ, bool linked = false)
-        {
-            if (source == null || (!axisX && !axisY && !axisZ)) return null;
-            if (linked && source.LinkedMirror != null) return null;
-
-            Vector3 signs = AxisSigns(axisX, axisY, axisZ);
-            Transform srcT = source.transform;
-            SculptableMesh mirrored = MeshCloner.Duplicate(source, source.name + " Mirror", signs,
-                ReflectPoint(srcT.position, centerWorld, signs), ReflectRotation(srcT.rotation, signs));
-
-            if (linked) MirrorLink.Create(source, mirrored, centerWorld, signs);
-            return mirrored;
-        }
-
         /// -1 on each mirrored axis and +1 on the rest. Scaling a local point or normal by this
         /// reflects it through the origin on exactly those axes.
         public static Vector3 AxisSigns(bool axisX, bool axisY, bool axisZ) =>

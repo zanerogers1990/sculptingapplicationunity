@@ -413,10 +413,6 @@ namespace Sculpting
             BindGpuScatter();
 
             ReseatCollider();
-
-            // Undoing or redoing across a Remesh is a topology change like any other - see
-            // MirrorLink.OnTopologyChanged.
-            if (LinkedMirror != null) LinkedMirror.OnTopologyChanged(this);
         }
     }
 }

@@ -6,7 +6,7 @@ namespace Sculpting
     ///
     /// The gizmo used to drive the primary SculptableMesh's Transform directly, which works right
     /// up until something that is not a whole sculptable GameObject wants the same handles. A
-    /// ZSphere rig node is an index into an array of rig-LOCAL positions with no GameObject at
+    /// SSphere rig node is an index into an array of rig-LOCAL positions with no GameObject at
     /// all; a scene light is a Transform with no mesh to size the gizmo against. Both want exactly
     /// the drag behaviour the gizmo already has, so it now drives a LIST of these and never learns
     /// what any of them actually is.
@@ -115,21 +115,85 @@ namespace Sculpting
             other is TransformGizmoTarget t && t._transform == _transform;
     }
 
-    /// One ZSphere rig node, addressed by index.
+    /// One live mirror copy (see MirrorRepeater), selected on its own. The copy has no transform
+    /// of its own to write - it is always the original's reflection - so every write lands on the
+    /// original, reflected back: dragging the copy right moves the original left, as in Nomad.
+    /// Reflection is its own inverse, so the same maps serve both directions.
+    ///
+    /// Scale is reported as the original's (positive) scale rather than the copy's negative one:
+    /// the gizmo clamps scale components to a positive minimum, and the copy's local axis k is the
+    /// original's local axis k anyway.
+    public sealed class MirrorViewGizmoTarget : GizmoTarget
+    {
+        private readonly MirrorRepeater _repeater;
+        private readonly int _index;
+
+        public MirrorRepeater Repeater => _repeater;
+        public int Index => _index;
+
+        public MirrorViewGizmoTarget(MirrorRepeater repeater, int index)
+        {
+            _repeater = repeater;
+            _index = index;
+        }
+
+        private Transform Source => _repeater.transform;
+        private Vector3 Signs => _repeater.View(_index).Signs;
+
+        public override bool IsAlive => _repeater != null && _repeater.View(_index) != null;
+
+        public override Vector3 Position
+        {
+            get => MeshMirror.ReflectPoint(Source.position, _repeater.Center, Signs);
+            set => Source.position = MeshMirror.ReflectPoint(value, _repeater.Center, Signs);
+        }
+
+        public override Quaternion Rotation
+        {
+            get => MeshMirror.ReflectRotation(Source.rotation, Signs);
+            set => Source.rotation = MeshMirror.ReflectRotation(value, Signs);
+        }
+
+        public override bool SupportsRotation => true;
+
+        public override Vector3 LocalScale
+        {
+            get => Source.localScale;
+            set => Source.localScale = value;
+        }
+
+        public override bool SupportsScale => true;
+
+        public override float WorldRadius
+        {
+            get
+            {
+                var renderer = Source.GetComponent<Renderer>();
+                if (renderer == null) return 0f;
+                Vector3 e = renderer.bounds.extents;
+                return (e.x + e.y + e.z) / 3f;
+            }
+        }
+
+        public override bool SameAs(GizmoTarget other) =>
+            other is MirrorViewGizmoTarget m && m._repeater == _repeater && m._index == _index;
+    }
+
+    /// One SSphere rig node, addressed by index.
     ///
     /// A rig node has no GameObject of its own - the spheres on screen are drawn from the rig each
     /// frame - so this reads and writes through the controller instead, converting between the
     /// gizmo's world space and the rig's own local space on the way. Writes route through
     /// MoveNodeFromGizmo, which carries the node's branch exactly as a Move-mode drag does; the
     /// mirrored side follows by construction, since reflections are derived rather than stored.
-    public sealed class ZSphereNodeTarget : GizmoTarget
+    public sealed class SSphereNodeTarget : GizmoTarget
     {
-        private readonly ZSphereController _controller;
+        private readonly SSphereController _controller;
         private readonly int _nodeIndex;
 
         public int NodeIndex => _nodeIndex;
 
-        public ZSphereNodeTarget(ZSphereController controller, int nodeIndex)
+        public SSphereNodeTarget(SSphereController controller, int nodeIndex)
         {
             _controller = controller;
             _nodeIndex = nodeIndex;
@@ -141,7 +205,7 @@ namespace Sculpting
         {
             get
             {
-                ZSphereRig.Node node = _controller != null ? _controller.Rig.Get(_nodeIndex) : null;
+                SSphereRig.Node node = _controller != null ? _controller.Rig.Get(_nodeIndex) : null;
                 return node != null ? _controller.RigPointToWorld(node.Position) : Vector3.zero;
             }
             set
@@ -152,7 +216,7 @@ namespace Sculpting
         }
 
         // A sphere is rotationally symmetric and its radius is the Scale edit mode's job, so the
-        // gizmo shows neither - see ZSphereController's GizmoHandleSet.Move push.
+        // gizmo shows neither - see SSphereController's GizmoHandleSet.Move push.
         public override bool SupportsRotation => false;
         public override bool SupportsScale => false;
 
@@ -160,13 +224,13 @@ namespace Sculpting
         {
             get
             {
-                ZSphereRig.Node node = _controller != null ? _controller.Rig.Get(_nodeIndex) : null;
+                SSphereRig.Node node = _controller != null ? _controller.Rig.Get(_nodeIndex) : null;
                 return node != null ? _controller.RigRadiusToWorld(node.Radius) : 0f;
             }
         }
 
         public override bool SameAs(GizmoTarget other) =>
-            other is ZSphereNodeTarget z && z._controller == _controller && z._nodeIndex == _nodeIndex;
+            other is SSphereNodeTarget z && z._controller == _controller && z._nodeIndex == _nodeIndex;
     }
 
     /// Optional for an IGizmoTargetSource: lets the tool that owns the gizmo keep a press that

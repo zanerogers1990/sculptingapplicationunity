@@ -16,7 +16,7 @@ namespace Sculpting
     ///     cells holding surface directly from it. Its cost and memory scale with the surface,
     ///     which is what lets it reach several million triangles; see that class for the
     ///     measurements behind the change.
-    ///   - BuildFromSdf() takes a grid the caller filled in itself - ZSphereSkinner's analytic
+    ///   - BuildFromSdf() takes a grid the caller filled in itself - SSphereSkinner's analytic
     ///     field, MeshBoolean's combined one - where there is no source mesh to read occupancy
     ///     from, so the grid is dense by construction and the extraction walks it.
     ///
@@ -316,7 +316,7 @@ namespace Sculpting
         /// Extracts a surface from a signed distance grid the caller filled in itself, instead
         /// of one sampled from an existing mesh.
         ///
-        /// Exists for ZSphereSkinner, which has an ANALYTIC field (a smooth union of tapered
+        /// Exists for SSphereSkinner, which has an ANALYTIC field (a smooth union of tapered
         /// capsules) rather than a triangle soup, and for MeshBoolean, whose field is several
         /// sampled fields folded together. Neither has a source mesh to read cell occupancy
         /// from, so neither can use the sparse path; both want everything below that line -

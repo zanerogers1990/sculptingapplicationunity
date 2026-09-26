@@ -321,11 +321,11 @@ namespace Sculpting
             // Deferred to SculptController while the cursor is over the sculptable surface -
             // there, the same wheel resizes the active brush instead (see
             // SculptController.HandleBrushSizeScroll/IsHoveringSculptSurface) - and to
-            // ZSphereController while the cursor is over a rig sphere, where it resizes that
+            // SSphereController while the cursor is over a rig sphere, where it resizes that
             // sphere. Also skipped while the cursor is over a UI panel, so scrolling one of the
             // panel's own scrollbars (see UIFactory.CreateScrollingPanelCanvas) doesn't also zoom
             // the 3D view underneath it.
-            if (!SculptController.IsHoveringSculptSurface && !ZSphereController.IsHoveringNode && !IsPointerOverUI())
+            if (!SculptController.IsHoveringSculptSurface && !SSphereController.IsHoveringNode && !IsPointerOverUI())
             {
                 float scroll = mouse.scroll.ReadValue().y;
                 if (Mathf.Abs(scroll) > 0.01f)
@@ -539,6 +539,12 @@ namespace Sculpting
                 if (renderer == null || !renderer.enabled) continue;
                 if (any) combined.Encapsulate(renderer.bounds);
                 else { combined = renderer.bounds; any = true; }
+
+                // Live mirror copies (see MirrorRepeater) are part of what is on screen.
+                MirrorRepeater repeater = obj.Repeater;
+                if (repeater == null) continue;
+                for (int v = 0; v < repeater.ViewCount; v++)
+                    if (repeater.ShownViewTransform(v) != null) combined.Encapsulate(repeater.View(v).Renderer.bounds);
             }
             if (!any) return;
 

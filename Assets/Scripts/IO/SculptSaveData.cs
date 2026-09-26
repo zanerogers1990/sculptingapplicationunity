@@ -66,13 +66,18 @@ namespace Sculpting.IO
             /// a file with any such block is written as format v2).
             public bool hasHidden;
 
-            /// Set only on the ORIGINAL half of a live mirror pair (see MirrorLink): the index into
-            /// `objects` of its twin, and the plane the two mirror across. The twin's own entry
-            /// records nothing, so a load can never form the same pair twice.
-            public bool mirrorLinked;
-            public int mirrorLinkTwin;
-            public Vector3 mirrorLinkCenter;
-            public Vector3 mirrorLinkSigns;
+            /// MirrorController.Space by value (0 Local, 1 World) - 0 in older files, which were all
+            /// local-space symmetry.
+            public int symmetrySpace;
+
+            /// Live mirror copies (see MirrorRepeater): axes as X = 1, Y = 2, Z = 4, 0 for none,
+            /// and the world point their planes pass through. The copies themselves are not
+            /// stored - they are this object's own mesh, drawn again.
+            ///
+            /// Files from the old linked-mirror pairs carried mirrorLinked/mirrorLinkTwin/... here
+            /// instead; JsonUtility drops those, and both halves load as ordinary objects.
+            public int mirrorRepeaterAxes;
+            public Vector3 mirrorRepeaterCenter;
         }
 
         [Serializable]

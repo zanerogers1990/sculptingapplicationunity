@@ -73,8 +73,6 @@ namespace Sculpting
             EnsureSyncBuffer();
             Array.Copy(_workingVertices, _syncedVertices, _workingVertices.Length);
             _syncFilterSuspended = false;
-
-            if (LinkedMirror != null) LinkedMirror.OnAllVerticesApplied(this, fullRebuild);
         }
 
         // The dirty vertices plus their direct one-ring neighbors - the set of vertices whose
@@ -177,9 +175,6 @@ namespace Sculpting
         public void RefreshStrokeNormalsAndCurvature()
         {
             RefreshNormalsAndCurvature(_strokeDeltaIndices);
-            // The stroke's quiet moves - the ones no brush reported dirty - reach a linked mirror half
-            // here, once, rather than never (see MirrorLink.OnStrokeEnded).
-            if (LinkedMirror != null) LinkedMirror.OnStrokeEnded(this, _strokeDeltaIndices);
         }
 
         private void RecomputeNormalsLocal()
@@ -407,11 +402,6 @@ namespace Sculpting
             // Before the drift filter: the positions have already been written, filtered or not,
             // and raycasts read the working positions directly.
             if (_dirtyVertexList.Count > 0) GeometryVersion++;
-
-            // Before the drift filter below trims the list, and outside the profiler scope: a linked
-            // mirror half has to receive every reported position (only its own filter knows what it
-            // has already uploaded), and its apply is its own cost, not this one's.
-            if (LinkedMirror != null) LinkedMirror.OnVerticesApplied(this, _dirtyVertexList);
 
             using (ApplyMarker.Auto())
             {

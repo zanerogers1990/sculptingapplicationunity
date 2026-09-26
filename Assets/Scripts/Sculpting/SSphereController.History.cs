@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Sculpting
 {
     /// Rig-local undo, and attaching the rig to an existing object.
-    public partial class ZSphereController
+    public partial class SSphereController
     {
         private const int MaxRigUndoSteps = 128;
 
@@ -21,7 +21,7 @@ namespace Sculpting
         /// falls through to the scene's history otherwise - see HandlesUndoKey.
         private struct RigUndoStep
         {
-            public ZSphereRig.Node[] Rig;
+            public SSphereRig.Node[] Rig;
             public int Selection;
             /// Symmetry is part of the rig's shape - a derived reflection appears and disappears
             /// with it - so it is restored with the nodes. Undoing "Symmetry Off" must bring back
@@ -33,7 +33,7 @@ namespace Sculpting
         private readonly List<RigUndoStep> _rigUndo = new List<RigUndoStep>();
         private readonly List<RigUndoStep> _rigRedo = new List<RigUndoStep>();
 
-        private ZSphereRig.Node[] _pendingSnapshot;
+        private SSphereRig.Node[] _pendingSnapshot;
         private int _pendingSelection;
         private int _pendingVersion;
         private bool _pendingSymmetry;
@@ -62,7 +62,7 @@ namespace Sculpting
         /// LatheController.HandlesUndoKey.
         public bool HandlesUndoKey(bool redo)
         {
-            if (Gizmo == null || Gizmo.Mode != GizmoMode.ZSphere) return false;
+            if (Gizmo == null || Gizmo.Mode != GizmoMode.SSphere) return false;
             if (!(redo ? CanRedoRig : CanUndoRig)) return false;
             // Mid-drag the press is swallowed, not acted on, as it always was: stepping the rig
             // back under a live drag would leave the drag holding start state for nodes that moved.

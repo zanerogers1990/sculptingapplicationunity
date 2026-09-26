@@ -12,7 +12,7 @@ namespace Sculpting
     /// SculptableMesh.Undo() on whatever happened to be selected, so undoing after switching
     /// objects walked back through the NEW object's history instead of reversing what you last
     /// did - and no per-object stack can express an edit that is not about one object at all,
-    /// like skinning a ZSphere rig into a brand new mesh. Sculpt three strokes, convert a rig,
+    /// like skinning an SSphere rig into a brand new mesh. Sculpt three strokes, convert a rig,
     /// sculpt two more, and the only structure that can undo those five things in the order they
     /// happened is one list covering all of them.
     ///
@@ -21,7 +21,7 @@ namespace Sculpting
     ///   entry, so the cheap delta encoding there is untouched by any of this.
     /// - A SCENE step carries its own undo/redo closures, for things that create or remove
     ///   objects. `discard` is its third: called when the step falls off the end of history or
-    ///   history is cleared, so an action holding onto something (ZSphere Convert parks the
+    ///   history is cleared, so an action holding onto something (SSphere Convert parks the
     ///   object it made rather than destroying it) can finally let go.
     ///
     /// Static, matching how the rest of this project reaches shared state without a singleton
@@ -82,7 +82,7 @@ namespace Sculpting
             TrimToLimits();
         }
 
-        /// Records a step that is not about one object's vertices - today, skinning a ZSphere rig
+        /// Records a step that is not about one object's vertices - today, skinning an SSphere rig
         /// into a new mesh. `approxBytes` is whatever the closures are holding alive, so the
         /// memory budget can see it; pass 0 for an action that retains nothing.
         public static void RecordSceneAction(string label, Action undo, Action redo, Action discard, long approxBytes)

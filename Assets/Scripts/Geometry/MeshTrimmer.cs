@@ -229,7 +229,7 @@ namespace Sculpting
 
             private bool IsRemoved(Vector3 local)
             {
-                Vector3 tested = _symmetry.ApplyInverse(local);
+                Vector3 tested = _symmetry.ApplyInversePoint(local);
                 bool covered = ScreenRegionMask.ProjectToScreen(_mvp, tested, _viewport, out Vector2 screen) &&
                                _region.Contains(screen);
                 return covered == _removeCovered;
@@ -292,7 +292,7 @@ namespace Sculpting
                 _outVerts.Add(p);
                 _crossings.Add(key, index);
 
-                Vector3 tested = _symmetry.ApplyInverse(p);
+                Vector3 tested = _symmetry.ApplyInversePoint(p);
                 ScreenRegionMask.ProjectToScreen(_mvp, tested, _viewport, out Vector2 screen);
                 _cutArc.Add(_region.ArcPosition(screen));
                 // Unity's view space looks down -Z, so a point in front of the camera has
@@ -608,7 +608,7 @@ namespace Sculpting
                 Vector3 view = new Vector3((d * rx - b * ry) / det, (a * ry - c * rx) / det, z);
 
                 // Back from the tested copy to the geometry being cut.
-                local = _symmetry.Apply(_viewToModel.MultiplyPoint3x4(view));
+                local = _symmetry.ApplyPoint(_viewToModel.MultiplyPoint3x4(view));
                 return true;
             }
 

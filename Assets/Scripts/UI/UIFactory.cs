@@ -39,7 +39,7 @@ namespace Sculpting
         public static readonly Color RegionRemoveColor = new Color(1f, 0.3f, 0.3f);
 
         // Text colours of the one-line status readouts under the panels' actions (save/load,
-        // HDRI, matcaps, symmetry, extract, lathe, ZSpheres, recording): it worked, it failed,
+        // HDRI, matcaps, symmetry, extract, lathe, SSpheres, recording): it worked, it failed,
         // a neutral hint, and a soft warning.
         public static readonly Color StatusOkColor = new Color(0.55f, 0.85f, 0.55f);
         public static readonly Color StatusErrorColor = new Color(0.95f, 0.45f, 0.4f);
@@ -470,6 +470,7 @@ namespace Sculpting
             var btn = go.AddComponent<Button>();
             btn.targetGraphic = img;
             btn.onClick.AddListener(() => onClick());
+            AddHoverGlow(go);
 
             var textGO = new GameObject("Text", typeof(RectTransform));
             textGO.transform.SetParent(go.transform, false);
@@ -486,6 +487,85 @@ namespace Sculpting
 
             TooltipSystem.Attach(go, tooltip);
             return btn;
+        }
+
+        /// Keeps `readout` showing the slider's current value, formatted by `format`. Watches the
+        /// slider rather than its onValueChanged, because the panels resync their sliders with
+        /// SetValueWithoutNotify (hotkey drags, brush switches, scene loads), which fires nothing.
+        public static void AddValueReadout(Slider slider, Text readout, Func<float, string> format)
+        {
+            var watcher = slider.gameObject.AddComponent<SliderReadout>();
+            watcher.Slider = slider;
+            watcher.Readout = readout;
+            watcher.Format = format;
+            watcher.Refresh();
+        }
+
+        private sealed class SliderReadout : MonoBehaviour
+        {
+            public Slider Slider;
+            public Text Readout;
+            public Func<float, string> Format;
+            private float _shown = float.NaN;
+
+            private void LateUpdate()
+            {
+                // Compared as a value, so an unchanged slider costs no string per frame.
+                if (Slider != null && Slider.value != _shown) Refresh();
+            }
+
+            public void Refresh()
+            {
+                if (Slider == null || Readout == null) return;
+                _shown = Slider.value;
+                Readout.text = Format != null ? Format(_shown) : _shown.ToString("0.00");
+            }
+        }
+
+        /// A faint white wash over `go` while the pointer is on it, so every clickable thing
+        /// answers the mouse. An overlay rather than a colour tint: the buttons' own Image colour
+        /// is their STATE (active brush, selected object, armed tool) and is rewritten by refresh
+        /// code at any moment, and uGUI's tint can only darken it. Added as the first child, so
+        /// it draws over the button's background but under its label.
+        public static void AddHoverGlow(GameObject go)
+        {
+            var glowGO = new GameObject("HoverGlow", typeof(RectTransform), typeof(Image));
+            glowGO.transform.SetParent(go.transform, false);
+            glowGO.transform.SetAsFirstSibling();
+            var rect = glowGO.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.sizeDelta = Vector2.zero;
+            var image = glowGO.GetComponent<Image>();
+            image.color = new Color(1f, 1f, 1f, 0f);
+            image.raycastTarget = false;
+            var glow = go.AddComponent<HoverGlow>();
+            glow.Glow = image;
+            glow.Owner = go.GetComponent<Selectable>();
+        }
+
+        private sealed class HoverGlow : MonoBehaviour, IPointerEnterHandler, IPointerExitHandler
+        {
+            private static readonly Color On = new Color(1f, 1f, 1f, 0.08f);
+            private static readonly Color Off = new Color(1f, 1f, 1f, 0f);
+
+            public Image Glow;
+            public Selectable Owner;
+
+            public void OnPointerEnter(PointerEventData eventData)
+            {
+                if (Glow != null && (Owner == null || Owner.IsInteractable())) Glow.color = On;
+            }
+
+            public void OnPointerExit(PointerEventData eventData)
+            {
+                if (Glow != null) Glow.color = Off;
+            }
+
+            private void OnDisable()
+            {
+                if (Glow != null) Glow.color = Off;
+            }
         }
 
         /// A dropdown made from CreateDropdown. The option list opens INLINE under the button,
@@ -848,24 +928,41 @@ namespace Sculpting
             headerGO.AddComponent<LayoutElement>().preferredHeight = 24;
             var btn = headerGO.AddComponent<Button>();
             btn.targetGraphic = headerGO.GetComponent<Image>();
+            AddHoverGlow(headerGO);
+
+            // Same drawn chevron as the UICategory headers these sit inside, smaller.
+            var chevronGO = new GameObject("Chevron", typeof(RectTransform), typeof(Image));
+            chevronGO.transform.SetParent(headerGO.transform, false);
+            var chevronRect = chevronGO.GetComponent<RectTransform>();
+            chevronRect.anchorMin = chevronRect.anchorMax = new Vector2(0, 0.5f);
+            chevronRect.pivot = new Vector2(0.5f, 0.5f);
+            chevronRect.anchoredPosition = new Vector2(11, 0);
+            chevronRect.sizeDelta = new Vector2(8, 8);
+            var chevron = chevronGO.GetComponent<Image>();
+            chevron.sprite = UICategory.ChevronSprite;
+            chevron.color = new Color(1f, 1f, 1f, 0.6f);
+            chevron.raycastTarget = false;
 
             var textGO = new GameObject("Text", typeof(RectTransform));
             textGO.transform.SetParent(headerGO.transform, false);
             var textRect = textGO.GetComponent<RectTransform>();
             textRect.anchorMin = Vector2.zero;
             textRect.anchorMax = Vector2.one;
-            textRect.offsetMin = new Vector2(8, 0);
+            textRect.offsetMin = new Vector2(21, 0);
             textRect.offsetMax = Vector2.zero;
             var text = textGO.AddComponent<Text>();
             text.font = Font;
-            text.fontSize = 13;
+            text.fontSize = 12;
             text.fontStyle = FontStyle.Bold;
             text.alignment = TextAnchor.MiddleLeft;
-            text.color = Color.white;
+            text.color = new Color(0.9f, 0.9f, 0.93f);
+            text.raycastTarget = false;
 
             var contentGO = new GameObject("FoldoutContent_" + title, typeof(RectTransform));
             contentGO.transform.SetParent(parent, false);
             var vlg = contentGO.AddComponent<VerticalLayoutGroup>();
+            // Indented, so a sub-section's controls read as belonging to its header.
+            vlg.padding = new RectOffset(8, 0, 2, 4);
             vlg.spacing = 6;
             vlg.childAlignment = TextAnchor.UpperLeft;
             vlg.childControlHeight = true;
@@ -878,10 +975,11 @@ namespace Sculpting
             void SetOpen(bool open)
             {
                 contentGO.SetActive(open);
-                // Plain ASCII rather than Unicode triangle glyphs (e.g. U+25BE) - the
-                // built-in LegacyRuntime.ttf font isn't guaranteed to include those, and a
-                // missing glyph fails silently (blank box) rather than erroring.
-                text.text = (open ? "v " : "> ") + title;
+                // A drawn chevron rather than a Unicode triangle glyph - the built-in
+                // LegacyRuntime.ttf font isn't guaranteed to include those, and a missing glyph
+                // fails silently (blank box) rather than erroring.
+                chevronRect.localEulerAngles = new Vector3(0, 0, open ? -90f : 0f);
+                text.text = title;
             }
 
             btn.onClick.AddListener(() => SetOpen(!contentGO.activeSelf));

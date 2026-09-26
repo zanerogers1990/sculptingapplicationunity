@@ -419,7 +419,7 @@ namespace Sculpting
                 outTris.Add(a2);
                 // Reflection flips handedness, so the mirrored copy needs its winding reversed or
                 // the whole new half renders inside-out - the same fix, for the same reason, as
-                // MeshMirror.MirrorAcross's odd-axis-count swap.
+                // MeshMirror.ReflectGeometry's odd-axis-count swap.
                 outTris.Add(mirrorIndex[i0]);
                 outTris.Add(mirrorIndex[i2]);
                 outTris.Add(mirrorIndex[i1]);

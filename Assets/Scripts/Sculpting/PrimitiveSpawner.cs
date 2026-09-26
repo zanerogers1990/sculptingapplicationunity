@@ -3,10 +3,11 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// Spawns a new, independently-sculptable primitive object into the scene, positioned at
-    /// the scene's main object (see MainObject) so it's ready to be moved into place via
-    /// TransformGizmo. Found via FindFirstObjectByType by SceneGraphUIBuilder's "Add Primitive"
-    /// buttons.
+    /// Spawns a new, independently-sculptable primitive object into the scene at the world
+    /// origin - Nomad's scene centre - ready to be moved into place via TransformGizmo. The world
+    /// origin is also where a live mirror's planes pass (see MirrorRepeater), so a part spawned,
+    /// dragged to one side and mirrored lands its copy symmetrically about the scene. Found via
+    /// FindFirstObjectByType by SceneGraphUIBuilder's "Add Primitive" buttons.
     public class PrimitiveSpawner : MonoBehaviour
     {
         // Spawned primitives default to this fraction of the main object's average bounds
@@ -21,9 +22,8 @@ namespace Sculpting
         private SelectionManager _selection;
         private SelectionManager Selection => _selection != null ? _selection : (_selection = FindFirstObjectByType<SelectionManager>());
 
-        /// The scene's anchor object - the first-registered SculptableMesh (today's
-        /// SculptSphere) - used as the spawn point for new primitives and as the reflection
-        /// center for Mirror (see MeshMirror).
+        /// The scene's reference object - the first-registered SculptableMesh (today's
+        /// SculptSphere) - whose size new primitives, lathes and SSphere rigs are scaled to.
         public SculptableMesh MainObject => Selection != null && Selection.AllObjects.Count > 0 ? Selection.AllObjects[0] : null;
 
         private readonly Dictionary<PrimitiveShapeType, int> _spawnCounts = new Dictionary<PrimitiveShapeType, int>();
@@ -47,7 +47,7 @@ namespace Sculpting
             if (col != null) Destroy(col);
 
             SculptableMesh main = MainObject;
-            Vector3 spawnPos = main != null ? main.transform.position : Vector3.zero;
+            Vector3 spawnPos = Vector3.zero;
             float size = FallbackSize;
             if (main != null && main.Mesh != null)
             {

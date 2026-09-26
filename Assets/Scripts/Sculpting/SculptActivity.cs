@@ -36,7 +36,7 @@ namespace Sculpting
 
         /// The object most recently sculpted, so the camera can follow whatever is being worked
         /// on rather than whatever happens to be selected. Null for a change that isn't about one
-        /// object's vertices (a ZSphere convert, a gizmo drag on a light).
+        /// object's vertices (an SSphere convert, a gizmo drag on a light).
         public static SculptableMesh LastEdited { get; private set; }
 
         public static float SecondsSinceLastEdit => Time.unscaledTime - LastEditUnscaledTime;

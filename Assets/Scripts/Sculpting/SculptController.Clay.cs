@@ -103,7 +103,7 @@ namespace Sculpting
             FrameSample current = _strokeSamples[_strokeSamples.Count - 1];
 
             Ray ray = cam.ScreenPointToRay(current.Screen);
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(ray, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
             if (!_isHovering) { EndClayStroke(); return; }
@@ -138,7 +138,7 @@ namespace Sculpting
 
                 Vector3 point = currentHit, normal = currentNormal;
                 if (i < _strokeSamples.Count - 1 &&
-                    !sculptableMesh.RaycastMesh(cam.ScreenPointToRay(sample.Screen), 1000f, out point, out normal))
+                    !RaycastTarget(cam.ScreenPointToRay(sample.Screen), out point, out normal))
                     continue;
 
                 _clayKnotScratch.Add(ToLocalClayKnot(point, normal, sample.Pressure));
@@ -154,10 +154,10 @@ namespace Sculpting
         private StrokePath.Knot ToLocalClayKnot(Vector3 worldPoint, Vector3 worldNormal, float pressure) =>
             new StrokePath.Knot
             {
-                Point = sculptableMesh.transform.InverseTransformPoint(worldPoint),
+                Point = Frame.InverseTransformPoint(worldPoint),
                 // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
                 // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-                Normal = sculptableMesh.WorldToLocalNormal(worldNormal),
+                Normal = WorldToLocalNormal(worldNormal),
                 Pressure = pressure,
             };
 
@@ -323,7 +323,7 @@ namespace Sculpting
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, clayTipRoundness < 1f ? brushRadius * Sqrt2 : brushRadius);
             while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
-                Vector3 mirroredPoint = op.Apply(localPoint);
+                Vector3 mirroredPoint = op.ApplyPoint(localPoint);
                 Vector3 mirroredNormal = op.Apply(localNormal).normalized;
                 // Map the frozen stroke tangent frame the same way the point/normal are mapped,
                 // instead of rebuilding it from the mapped normal - keeps a mirrored or radial

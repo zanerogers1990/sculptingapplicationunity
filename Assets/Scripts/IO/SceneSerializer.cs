@@ -103,20 +103,14 @@ namespace Sculpting.IO
                         entry.radialCount = mirror.RadialCount;
                         entry.radialAxis = (int)mirror.RadialAxisChoice;
                         entry.radialCustomAxis = mirror.RadialCustomAxis;
+                        entry.symmetrySpace = (int)mirror.Space;
                     }
 
-                    // Recorded on the original half only - see ObjectEntry.mirrorLinked.
-                    MirrorLink link = m.LinkedMirror;
-                    if (link != null && link.Source == m)
+                    MirrorRepeater repeater = m.Repeater;
+                    if (repeater != null)
                     {
-                        int twinIndex = meshes.IndexOf(link.Twin);
-                        if (twinIndex >= 0)
-                        {
-                            entry.mirrorLinked = true;
-                            entry.mirrorLinkTwin = twinIndex;
-                            entry.mirrorLinkCenter = link.Center;
-                            entry.mirrorLinkSigns = link.Signs;
-                        }
+                        entry.mirrorRepeaterAxes = repeater.AxisMask;
+                        entry.mirrorRepeaterCenter = repeater.Center;
                     }
 
                     // The CPU-side working arrays are authoritative; the Mesh's own getters do
@@ -230,9 +224,9 @@ namespace Sculpting.IO
             var selection = UnityEngine.Object.FindFirstObjectByType<SelectionManager>();
 
             // Before DestroyExistingObjects, not after: history can be holding objects that are
-            // NOT in SelectionManager's list and so would survive that sweep - an undone ZSphere
+            // NOT in SelectionManager's list and so would survive that sweep - an undone SSphere
             // convert parks the object it made, deactivated and unregistered, for a possible redo
-            // (see ZSphereController.RecordConvertUndo). Clearing first runs each step's discard
+            // (see SSphereController.RecordConvertUndo). Clearing first runs each step's discard
             // while those objects are still reachable, so the load starts from a genuinely empty
             // scene instead of leaving orphans behind. Import deliberately does NOT do this -
             // adding objects invalidates nothing that is already in history.
@@ -242,7 +236,6 @@ namespace Sculpting.IO
             var created = new List<SculptableMesh>(file.Meshes.Count);
             for (int i = 0; i < file.Data.objects.Count; i++)
                 created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Hidden[i], file.Data.objects[i].name));
-            RestoreMirrorLinks(file.Data.objects, created);
 
             ApplySettings(file.Data);
 
@@ -290,13 +283,11 @@ namespace Sculpting.IO
                 takenNames.Add(name);
                 created.Add(CreateObject(file.Data.objects[i], file.Meshes[i], file.Masks[i], file.Hidden[i], name));
             }
-            RestoreMirrorLinks(file.Data.objects, created);
 
             // Select the first import so the gizmo is immediately pointed at what just arrived -
             // same courtesy PrimitiveSpawner does for a newly spawned primitive. Note this does
-            // NOT disturb SelectionManager.AllObjects[0], the scene's "main object" anchor used
-            // by PrimitiveSpawner's spawn position and MeshMirror's reflection center: imports
-            // are appended, so that anchor stays whatever it already was.
+            // NOT disturb SelectionManager.AllObjects[0], the scene's "main object" that new
+            // primitives are sized against: imports are appended, so it stays whatever it was.
             if (selection != null && created.Count > 0) selection.Select(created[0], false);
 
             importedCount = created.Count;
@@ -417,8 +408,8 @@ namespace Sculpting.IO
                 return new List<SculptableMesh>(selection.AllObjects);
 
             // Fallback for a scene with no SelectionManager. FindObjectsByType's order is not
-            // guaranteed, and index 0 is meaningful (PrimitiveSpawner.MainObject / MeshMirror's
-            // reflection center both use it), so sort by name for at least a stable result.
+            // guaranteed, and index 0 is meaningful (PrimitiveSpawner.MainObject sizes new objects
+            // against it), so sort by name for at least a stable result.
             var all = new List<SculptableMesh>(
                 UnityEngine.Object.FindObjectsByType<SculptableMesh>(FindObjectsInactive.Include, FindObjectsSortMode.None));
             all.Sort((a, b) => string.CompareOrdinal(a.name, b.name));
@@ -469,28 +460,19 @@ namespace Sculpting.IO
                     mirror.RadialAxisChoice = (RadialAxis)entry.radialAxis;
                 mirror.RadialCustomAxis = entry.radialCustomAxis;
             }
+            if (System.Enum.IsDefined(typeof(SymmetrySpace), entry.symmetrySpace))
+                mirror.Space = (SymmetrySpace)entry.symmetrySpace;
 
             if (mask != null) sculptable.SetMask(mask);
             if (hidden != null) sculptable.RestoreHiddenTriangles(hidden);
             if (!entry.visible) sculptable.SetVisible(false);
 
-            return sculptable;
-        }
+            // After visibility, so the copies start out matching it. Not an undo step: loading
+            // is not an edit.
+            if ((entry.mirrorRepeaterAxes & 7) != 0)
+                MirrorRepeater.Set(sculptable, entry.mirrorRepeaterAxes, entry.mirrorRepeaterCenter, recordUndo: false);
 
-        /// Re-forms the live mirror pairs a file recorded (see ObjectEntry.mirrorLinked). Runs once
-        /// every object exists, since an entry names its twin by index and the twin can come later
-        /// in the file. MirrorLink.Create turns away the rest of what a damaged file could hold - a
-        /// pair with itself, no mirrored axis, an object claimed twice.
-        private static void RestoreMirrorLinks(List<SculptSaveData.ObjectEntry> entries, List<SculptableMesh> created)
-        {
-            for (int i = 0; i < entries.Count && i < created.Count; i++)
-            {
-                SculptSaveData.ObjectEntry entry = entries[i];
-                if (!entry.mirrorLinked) continue;
-                int twin = entry.mirrorLinkTwin;
-                if (twin < 0 || twin >= created.Count) continue;
-                MirrorLink.Create(created[i], created[twin], entry.mirrorLinkCenter, entry.mirrorLinkSigns);
-            }
+            return sculptable;
         }
 
         /// Turns a bare Mesh into a fully live, sculptable scene object - see
@@ -559,10 +541,8 @@ namespace Sculpting.IO
             // TRANSFORM scale rather than baked into vertices, so it's non-destructive and the
             // user can undo the guess with the Scale gizmo.
             float scale = 1f;
-            Vector3 anchorPos = Vector3.zero;
             if (anchor != null && anchor.Mesh != null)
             {
-                anchorPos = anchor.transform.position;
                 Vector3 ae = anchor.Mesh.bounds.extents;
                 float targetExtent = (ae.x + ae.y + ae.z) / 3f * 2f;
                 Vector3 me = mesh.bounds.extents;
@@ -570,10 +550,11 @@ namespace Sculpting.IO
                 if (modelExtent > 1e-5f && targetExtent > 1e-5f) scale = targetExtent / modelExtent;
             }
 
-            // Offset so the model's BOUNDS CENTRE lands on the anchor, not its local origin - a
-            // model authored with its origin at the feet (or far off in space) would otherwise
-            // arrive out of view even though its transform is nominally in the right place.
-            Vector3 position = anchorPos - mesh.bounds.center * scale;
+            // Offset so the model's BOUNDS CENTRE lands on the world origin - the scene centre every
+            // new object arrives at - not its local origin: a model authored with its origin at
+            // the feet (or far off in space) would otherwise arrive out of view even though its
+            // transform is nominally in the right place.
+            Vector3 position = -mesh.bounds.center * scale;
 
             var taken = new HashSet<string>();
             if (selection != null)

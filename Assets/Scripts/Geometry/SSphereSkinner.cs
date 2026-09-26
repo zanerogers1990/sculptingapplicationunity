@@ -3,7 +3,7 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// Turns a ZSphereRig into a mesh - the "skinning" step, and the part of the feature that
+    /// Turns an SSphereRig into a mesh - the "skinning" step, and the part of the feature that
     /// earns the workflow its reputation.
     ///
     /// Approach: build an analytic signed distance field out of the rig, then extract its
@@ -39,7 +39,7 @@ namespace Sculpting
     ///
     /// Main thread only, synchronously: it shares MeshRemesher's static scratch buffers, and a
     /// finished mesh on return is what lets the caller treat this as "redraw the skin".
-    public static class ZSphereSkinner
+    public static class SSphereSkinner
     {
         public struct SkinSettings
         {
@@ -152,8 +152,8 @@ namespace Sculpting
         // scratch is: every entry point runs synchronously to completion on the main thread.
         private static float[] _sdf = new float[0];
         private static readonly List<Primitive> _primitives = new List<Primitive>();
-        private static readonly List<ZSphereRig.SphereInstance> _spheres = new List<ZSphereRig.SphereInstance>();
-        private static readonly List<ZSphereRig.LinkInstance> _links = new List<ZSphereRig.LinkInstance>();
+        private static readonly List<SSphereRig.SphereInstance> _spheres = new List<SSphereRig.SphereInstance>();
+        private static readonly List<SSphereRig.LinkInstance> _links = new List<SSphereRig.LinkInstance>();
         private static Vector3Int[] _primLo = new Vector3Int[0];
         private static Vector3Int[] _primHi = new Vector3Int[0];
 
@@ -167,10 +167,10 @@ namespace Sculpting
 
         /// Skins into a brand new Mesh, for callers that want to own one (Convert). Returns null
         /// with `error` set when there is nothing to skin.
-        public static Mesh Skin(ZSphereRig rig, bool symmetry, SkinSettings settings,
+        public static Mesh Skin(SSphereRig rig, bool symmetry, SkinSettings settings,
                                 SkinQuality quality, out SkinStats stats, out string error)
         {
-            var mesh = new Mesh { name = "ZSphere Skin", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
+            var mesh = new Mesh { name = "SSphere Skin", indexFormat = UnityEngine.Rendering.IndexFormat.UInt32 };
             if (SkinInto(rig, symmetry, settings, quality, mesh, out stats, out error)) return mesh;
             Object.Destroy(mesh);
             return null;
@@ -179,7 +179,7 @@ namespace Sculpting
         /// Refills `target` with the rig's skin. False (with `error` set) when there is nothing to
         /// skin or the field produced no surface; `target` is left untouched then, so a live
         /// preview keeps its last good skin rather than flickering to empty.
-        public static bool SkinInto(ZSphereRig rig, bool symmetry, SkinSettings settings,
+        public static bool SkinInto(SSphereRig rig, bool symmetry, SkinSettings settings,
                                     SkinQuality quality, Mesh target, out SkinStats stats, out string error)
         {
             stats = default;
@@ -188,7 +188,7 @@ namespace Sculpting
 
             if (rig == null || rig.IsEmpty)
             {
-                error = "No ZSpheres placed.";
+                error = "No SSpheres placed.";
                 return false;
             }
             if (target == null)
@@ -203,7 +203,7 @@ namespace Sculpting
             BuildPrimitives(rig, symmetry, blend);
             if (_primitives.Count == 0)
             {
-                error = "No ZSpheres placed.";
+                error = "No SSpheres placed.";
                 return false;
             }
 
@@ -279,7 +279,7 @@ namespace Sculpting
 
         /// The resolution a Convert will run at, for the UI. An estimate: it does not model the
         /// sample-budget walk-down, so a very lopsided rig can come out a step or two coarser.
-        public static int PreviewResolution(ZSphereRig rig, bool symmetry, SkinSettings settings)
+        public static int PreviewResolution(SSphereRig rig, bool symmetry, SkinSettings settings)
         {
             if (rig == null || rig.IsEmpty) return MinResolution;
             Bounds bounds = rig.ComputeBounds(symmetry);
@@ -296,7 +296,7 @@ namespace Sculpting
         private static long SampleCount(Vector3Int dims) =>
             (long)(dims.x + 1) * (dims.y + 1) * (dims.z + 1);
 
-        private static int ResolveResolution(ZSphereRig rig, SkinSettings settings, SkinQuality quality, float maxExtent)
+        private static int ResolveResolution(SSphereRig rig, SkinSettings settings, SkinQuality quality, float maxExtent)
         {
             TierLimits(quality, out float scale, out int maxResolution, out _);
             float minRadius = rig.MinRadius();
@@ -341,14 +341,14 @@ namespace Sculpting
 
         // --------------------------------------------------------------------- field building
 
-        private static void BuildPrimitives(ZSphereRig rig, bool symmetry, float blend)
+        private static void BuildPrimitives(SSphereRig rig, bool symmetry, float blend)
         {
             _primitives.Clear();
             rig.CollectGeometry(symmetry, _spheres, _links);
 
             for (int i = 0; i < _spheres.Count; i++)
             {
-                ZSphereRig.SphereInstance s = _spheres[i];
+                SSphereRig.SphereInstance s = _spheres[i];
                 // Every sphere contributes even though a link's round cone includes both endcaps:
                 // it is cheap, and it is what makes a lone root skin into something.
                 _primitives.Add(new Primitive(s.Centre, s.Centre, s.Radius, s.Radius,
@@ -357,7 +357,7 @@ namespace Sculpting
 
             for (int i = 0; i < _links.Count; i++)
             {
-                ZSphereRig.LinkInstance l = _links[i];
+                SSphereRig.LinkInstance l = _links[i];
                 _primitives.Add(new Primitive(l.A, l.B, l.RadiusA, l.RadiusB,
                                               blend * Mathf.Max(l.RadiusA, l.RadiusB), isSphere: false));
             }

@@ -42,6 +42,35 @@ namespace Sculpting
             }
         }
 
+        private int _primaryView = -1;
+        // The object _primaryView was chosen for - any path that changes the primary leaves it
+        // behind, so the view index never carries over to a different object.
+        private SculptableMesh _primaryViewOwner;
+
+        /// Which side of a live-mirrored primary is selected: -1 for the object itself, or the
+        /// index of one of its mirror copies (see MirrorRepeater) - the one the transform gizmo
+        /// then sits on and drags. Brushes don't care: they sculpt whichever side is under the
+        /// cursor. Falls back to -1 once that copy no longer exists.
+        public int PrimaryView
+        {
+            get
+            {
+                SculptableMesh primary = PrimarySelection;
+                if (_primaryView < 0 || primary == null || primary != _primaryViewOwner) return -1;
+                MirrorRepeater repeater = primary.Repeater;
+                return repeater != null && repeater.View(_primaryView) != null ? _primaryView : -1;
+            }
+        }
+
+        /// Select(obj, false) with a particular side of it - see PrimaryView.
+        public void SelectView(SculptableMesh obj, int view)
+        {
+            if (obj == null) return;
+            Select(obj, false);
+            _primaryView = view;
+            _primaryViewOwner = obj;
+        }
+
         public void Register(SculptableMesh obj)
         {
             if (!_allObjects.Contains(obj)) _allObjects.Add(obj);
@@ -66,6 +95,7 @@ namespace Sculpting
                 _selectedSet.Clear();
                 _selectedSet.Add(obj);
                 _primary = obj;
+                _primaryView = -1;
             }
             else
             {
@@ -137,21 +167,29 @@ namespace Sculpting
         /// Raycast, also reporting how far along the ray the hit is (world units, assuming a
         /// normalized ray direction) - what CameraOrbitController needs to keep the camera and
         /// its near plane out of the surface it is looking at.
-        public SculptableMesh Raycast(Ray ray, out float distance, float maxDistance = 1000f)
+        public SculptableMesh Raycast(Ray ray, out float distance, float maxDistance = 1000f) =>
+            Raycast(ray, out distance, out _, maxDistance);
+
+        /// Raycast, also reporting which side of the hit object was hit: -1 for the object itself,
+        /// or the index of the live mirror copy (see MirrorRepeater) - a copy is that object's
+        /// geometry on screen, so it is picked like the object.
+        public SculptableMesh Raycast(Ray ray, out float distance, out int view, float maxDistance = 1000f)
         {
             distance = 0f;
+            view = -1;
             SculptableMesh closest = null;
             float closestSqr = float.MaxValue;
             for (int i = 0; i < _allObjects.Count; i++)
             {
                 SculptableMesh obj = _allObjects[i];
                 if (obj == null || !obj.Visible) continue;
-                if (!obj.RaycastMesh(ray, maxDistance, out Vector3 hitPoint, out _)) continue;
+                if (!obj.RaycastAnyCopy(ray, maxDistance, out Vector3 hitPoint, out _, out Transform frame)) continue;
 
                 float sqr = (hitPoint - ray.origin).sqrMagnitude;
                 if (sqr >= closestSqr) continue;
                 closestSqr = sqr;
                 closest = obj;
+                view = obj.Repeater != null ? obj.Repeater.IndexOfView(frame) : -1;
             }
             if (closest != null) distance = Mathf.Sqrt(closestSqr);
             return closest;
@@ -188,7 +226,7 @@ namespace Sculpting
 
         /// Unregisters and deactivates obj's GameObject - NOT an immediate Destroy - and records
         /// one EditHistory scene action so Z undoes it, reselecting a remaining object if obj was
-        /// primary. Mirrors ZSphereController.Skin's Convert-undo: parked (unregistered, inactive) rather than destroyed, so undo just reactivates
+        /// primary. Mirrors SSphereController.Skin's Convert-undo: parked (unregistered, inactive) rather than destroyed, so undo just reactivates
         /// and reselects the same object - any strokes on it are untouched. The GameObject is only
         /// actually freed once the step falls off history (or the scene is cleared), via the
         /// discard closure below - SceneSerializer's save path walks SelectionManager.AllObjects,

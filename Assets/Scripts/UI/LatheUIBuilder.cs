@@ -162,7 +162,11 @@ namespace Sculpting
         /// header's open/closed arrow stays right. The header is the sibling just above the content.
         private void RevealSection()
         {
-            if (_section == null || _section.gameObject.activeSelf) return;
+            if (_section == null) return;
+            // The foldout sits inside a panel category, which has to be open too for it to show.
+            UICategory category = _section.GetComponentInParent<UICategory>(true);
+            if (category != null && !category.IsOpen) category.SetOpen(true);
+            if (_section.gameObject.activeSelf) return;
             int index = _section.GetSiblingIndex();
             if (index == 0) return;
             Button header = _section.parent.GetChild(index - 1).GetComponent<Button>();

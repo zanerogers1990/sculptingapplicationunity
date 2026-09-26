@@ -183,10 +183,6 @@ namespace Sculpting
             BindGpuScatter();
 
             ReseatCollider();
-
-            // Remesh, Trim, Boolean, Join and Cut & Mirror all end up here - see
-            // MirrorLink.OnTopologyChanged for why that finalizes a linked mirror pair.
-            if (LinkedMirror != null) LinkedMirror.OnTopologyChanged(this);
         }
     }
 }

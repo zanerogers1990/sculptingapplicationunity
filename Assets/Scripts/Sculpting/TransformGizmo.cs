@@ -7,7 +7,7 @@ namespace Sculpting
 {
     /// Which handles a gizmo shows. A flag set rather than a mode enum because the two existing
     /// modes are already combinations (Transpose is Move+Rotate, Scale is Scale+UniformScale) and
-    /// the tools now pointing the gizmo at their own targets want their own mixes - a ZSphere node
+    /// the tools now pointing the gizmo at their own targets want their own mixes - an SSphere node
     /// has no meaningful scale, a light has no meaningful size.
     [System.Flags]
     public enum GizmoHandleSet
@@ -22,20 +22,28 @@ namespace Sculpting
         Scaling = Scale | UniformScale,
     }
 
+    /// Which axes the Move/Rotate handles run along for the scene selection:
+    /// - Auto: the object's own axes for one object, world axes for a multi-selection.
+    /// - Local: the (primary) object's own axes, always.
+    /// - Global: the world axes, always.
+    /// Scale handles always use each object's own axes - scale is stored per local axis, and a
+    /// world-axis stretch of a rotated object is a shear no Transform can hold.
+    public enum GizmoOrientation { Auto, Local, Global }
+
     /// A tool that points the gizmo at targets of its own rather than at the scene-graph
     /// selection - see TransformGizmo.SetExternalTargets.
     public interface IGizmoTargetSource
     {
         /// True when this source pushes its OWN undo entry for a gizmo drag, so the gizmo must not
         /// also record a scene-level transform step - one gesture would otherwise take two undo
-        /// presses to reverse. A ZSphere rig says true (it keeps rig-local history); a source whose
+        /// presses to reverse. An SSphere rig says true (it keeps rig-local history); a source whose
         /// targets are plain Transforms says false and lets the gizmo record it, which is the right
         /// answer for anything that has no history of its own.
         bool RecordsOwnUndoStep { get; }
 
         /// A drag on this source's targets is about to start, before anything has moved. The
-        /// source opens its own undo step here - a ZSphere rig keeps rig-local history separate
-        /// from the scene's (see ZSphereController.BeginRigEdit), and it has to snapshot BEFORE
+        /// source opens its own undo step here - an SSphere rig keeps rig-local history separate
+        /// from the scene's (see SSphereController.BeginRigEdit), and it has to snapshot BEFORE
         /// the first frame of movement or the step records the already-moved state.
         void OnGizmoDragStarted();
 
@@ -147,8 +155,12 @@ namespace Sculpting
         public GizmoMode Mode { get; private set; } = GizmoMode.Sculpt;
         public void SetMode(GizmoMode mode) => Mode = mode;
 
+        /// See GizmoOrientation. Applies to the scene selection only - a tool pushing its own
+        /// targets (SSphere nodes, mold features) defines their axes itself.
+        public GizmoOrientation Orientation { get; set; } = GizmoOrientation.Auto;
+
         /// True while a handle drag is running. Any other tool sharing the mouse has to stand down
-        /// for the duration - see ZSphereController.HandleInput.
+        /// for the duration - see SSphereController.HandleInput.
         public bool IsDragging => _dragging;
 
         /// True while the running drag is a ROTATE. A rotate drag also writes every target's
@@ -226,6 +238,9 @@ namespace Sculpting
         // Transform (see SculptableMesh.BeginMaskedTransform). Captured at mouse-press for the
         // same reason _dragTarget is: a selection change mid-drag must not redirect it.
         private SculptableMesh _maskedTarget;
+        // The transform the masked drag's world-space motion is mapped through: the object's own,
+        // or a mirror copy's (see MirrorRepeater) when the copy is what is being dragged.
+        private Transform _maskedFrame;
         // Uniform scale is the one handle with no absolute drag reference (see
         // DragUniformScale) - masked mode needs a total-since-drag-start factor, not a
         // per-frame one, so it accumulates here rather than compounding into the Transform.
@@ -272,7 +287,7 @@ namespace Sculpting
 
             RefreshTargets();
 
-            // An external source (ZSphere move, a selected light) owns the gizmo whenever it has
+            // An external source (SSphere move, a selected light) owns the gizmo whenever it has
             // pushed targets, whatever Mode says - those tools run under their own GizmoMode and
             // would otherwise never see handles at all. Failing that, this is tested against this
             // gizmo's OWN two modes rather than `!= Sculpt`: GizmoMode also carries modes
@@ -303,7 +318,7 @@ namespace Sculpting
             // derived from how far each target sits from the pivot (see ComputeArmLength), and the
             // pivot every non-Move drag measures against is the one it started at - so dragging a
             // target away from that point grew the arms by exactly the distance dragged. On a
-            // ZSphere node, whose own radius is small next to the drag, that read as the arrows
+            // SSphere node, whose own radius is small next to the drag, that read as the arrows
             // ballooning off the sphere mid-drag and snapping back on release.
             _root.transform.localScale =
                 Vector3.one * (_dragging ? _dragArmLength : ComputeArmLength(_targets, pivot));
@@ -334,7 +349,7 @@ namespace Sculpting
             bool scale = (handles & GizmoHandleSet.Scale) != 0;
 
             // A set that cannot scale must not show scale handles even if the caller asked for
-            // them - a ZSphere node has no localScale to write, and a handle that visibly does
+            // them - an SSphere node has no localScale to write, and a handle that visibly does
             // nothing is worse than an absent one.
             if (scale && !AnyTargetSupportsScale()) scale = false;
             if (rotate && !AnyTargetSupportsRotation() && _targets.Count == 1) rotate = false;
@@ -362,7 +377,7 @@ namespace Sculpting
             return false;
         }
 
-        // A single point-like target (a ZSphere node) has nothing to rotate. A SET of them does:
+        // A single point-like target (an SSphere node) has nothing to rotate. A SET of them does:
         // rotating swings them around the shared pivot, which is a real and useful edit even
         // though no individual target's own orientation changes.
         private bool AnyTargetSupportsRotation()
@@ -401,20 +416,23 @@ namespace Sculpting
 
             // The whole multi-selection, not just the primary - shift-clicking two objects and
             // dragging them together is the point. Falls back to the primary alone so a scene that
-            // never touched the multi-select path behaves exactly as it always did.
-            IReadOnlyList<SculptableMesh> selected = selection.SelectedSet;
-            if (selected.Count > 0)
-            {
-                for (int i = 0; i < selected.Count; i++)
-                    if (selected[i] != null && selected[i].Visible)
-                        _targets.Add(new TransformGizmoTarget(selected[i].transform));
-            }
+            // never touched the multi-select path behaves exactly as it always did. The primary
+            // goes first: Local orientation takes its axes from targets[0].
+            SculptableMesh primary = selection.PrimarySelection;
+            if (primary != null && primary.Visible) _targets.Add(TargetFor(primary, selection.PrimaryView));
 
-            if (_targets.Count == 0)
-            {
-                SculptableMesh primary = selection.PrimarySelection;
-                if (primary != null && primary.Visible) _targets.Add(new TransformGizmoTarget(primary.transform));
-            }
+            IReadOnlyList<SculptableMesh> selected = selection.SelectedSet;
+            for (int i = 0; i < selected.Count; i++)
+                if (selected[i] != null && selected[i] != primary && selected[i].Visible)
+                    _targets.Add(new TransformGizmoTarget(selected[i].transform));
+        }
+
+        // A selected mirror copy is dragged through the original - see MirrorViewGizmoTarget.
+        private static GizmoTarget TargetFor(SculptableMesh obj, int view)
+        {
+            MirrorRepeater repeater = obj.Repeater;
+            if (view >= 0 && repeater != null && repeater.View(view) != null) return new MirrorViewGizmoTarget(repeater, view);
+            return new TransformGizmoTarget(obj.transform);
         }
 
         private bool HasDeadTarget()
@@ -433,11 +451,23 @@ namespace Sculpting
             return sum / Mathf.Max(1, targets.Count);
         }
 
-        // A single target's handles align to its OWN axes, which is what makes "move along the
-        // object's X" mean anything on a rotated object. A multi-selection has no single local
-        // frame to borrow, so it falls back to world axes - the same choice every DCC makes.
-        private static Quaternion ComputePivotRotation(List<GizmoTarget> targets) =>
-            targets.Count == 1 ? targets[0].Rotation : Quaternion.identity;
+        // Auto: a single target's handles align to its OWN axes, which is what makes "move along
+        // the object's X" mean anything on a rotated object; a multi-selection has no single local
+        // frame to borrow, so it falls back to world axes - the same choice every DCC makes. Local
+        // and Global force one or the other (Local borrows the primary's, which RefreshTargets puts
+        // first). Scale and external tools always get Auto - see GizmoOrientation.
+        private Quaternion ComputePivotRotation(List<GizmoTarget> targets)
+        {
+            if (targets.Count == 0) return Quaternion.identity;
+            GizmoOrientation orientation = _externalTargets.Count > 0 || Mode == GizmoMode.Scale
+                ? GizmoOrientation.Auto : Orientation;
+            switch (orientation)
+            {
+                case GizmoOrientation.Local: return targets[0].Rotation;
+                case GizmoOrientation.Global: return Quaternion.identity;
+                default: return targets.Count == 1 ? targets[0].Rotation : Quaternion.identity;
+            }
+        }
 
         private float ComputeArmLength(List<GizmoTarget> targets, Vector3 pivot)
         {
@@ -501,7 +531,7 @@ namespace Sculpting
         /// missed handle grab than a deliberate deselect.
         private void TryPickObject(Mouse mouse)
         {
-            // A ZSphere rig owns its own selection and drives the gizmo from it - picking a mesh
+            // An SSphere rig owns its own selection and drives the gizmo from it - picking a mesh
             // out from under it would swap the gizmo onto something that tool has no say over.
             if (_externalTargets.Count > 0) return;
 
@@ -511,20 +541,25 @@ namespace Sculpting
                                            kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed);
 
             SelectionManager selection = Selection;
-            SculptableMesh meshHit = selection != null ? selection.Raycast(ray) : null;
+            if (selection == null) return;
+            SculptableMesh meshHit = selection.Raycast(ray, out _, out int view);
             if (meshHit == null) return;
+
+            // The side clicked is what flashes: the object itself, or its mirror copy.
+            GameObject flashed = view >= 0 && meshHit.Repeater != null && meshHit.Repeater.View(view) != null
+                ? meshHit.Repeater.View(view).gameObject : meshHit.gameObject;
 
             if (additive)
             {
                 selection.ToggleSelected(meshHit);
-                SelectionFlashEffect.Play(meshHit.gameObject);
+                SelectionFlashEffect.Play(flashed);
                 return;
             }
 
             // Re-clicking the only selected object is a no-op rather than a flash: nothing changed.
-            if (selection.SelectedSet.Count == 1 && selection.PrimarySelection == meshHit) return;
-            selection.Select(meshHit, false);
-            SelectionFlashEffect.Play(meshHit.gameObject);
+            if (selection.SelectedSet.Count == 1 && selection.PrimarySelection == meshHit && selection.PrimaryView == view) return;
+            selection.SelectView(meshHit, view);
+            SelectionFlashEffect.Play(flashed);
         }
 
         private bool TryBeginDrag(Mouse mouse)
@@ -535,7 +570,7 @@ namespace Sculpting
             // with what is on screen.
             if (!TryPickHandle(ray, out GizmoHandleTag tag, out _)) return false;
 
-            // The tool owning the gizmo may keep the press even over a handle. A ZSphere rig does
+            // The tool owning the gizmo may keep the press even over a handle. An SSphere rig does
             // wherever the cursor is on a sphere's body: the arrow shafts start at the selected
             // sphere's centre, so otherwise every grab of that sphere became a one-axis drag.
             if (_externalTargets.Count > 0 && _externalSource is IGizmoPointerClaim claim && claim.ClaimsPointer(ray))
@@ -568,11 +603,18 @@ namespace Sculpting
             // straight back to the plain Transform drag when nothing is masked (see
             // SculptableMesh.BeginMaskedTransform).
             SculptableMesh candidateTarget = Target;
-            _maskedTarget = _dragTargets.Count == 1 && _dragSource == null &&
-                            candidateTarget != null &&
-                            _dragTargets[0] is TransformGizmoTarget only &&
-                            only.Transform == candidateTarget.transform &&
-                            candidateTarget.BeginMaskedTransform() ? candidateTarget : null;
+            Transform maskedFrame = null;
+            if (_dragTargets.Count == 1 && _dragSource == null && candidateTarget != null)
+            {
+                if (_dragTargets[0] is TransformGizmoTarget only && only.Transform == candidateTarget.transform)
+                    maskedFrame = candidateTarget.transform;
+                // Dragging a masked object's mirror copy deforms the same vertices, seen through
+                // the copy's reflected transform.
+                else if (_dragTargets[0] is MirrorViewGizmoTarget copy && copy.Repeater == candidateTarget.Repeater)
+                    maskedFrame = copy.Repeater.View(copy.Index).transform;
+            }
+            _maskedTarget = maskedFrame != null && candidateTarget.BeginMaskedTransform() ? candidateTarget : null;
+            _maskedFrame = _maskedTarget != null ? maskedFrame : null;
 
             // The handle's own axis, in the frame the gizmo is currently drawn in - which is the
             // single target's local axes, or world axes for a set (see ComputePivotRotation). The
@@ -634,6 +676,7 @@ namespace Sculpting
                 // vertex-delta undo entry BeginMaskedTransform opened - nothing to record here.
                 _maskedTarget.EndMaskedTransform();
                 _maskedTarget = null;
+                _maskedFrame = null;
                 _dragTargets.Clear();
                 _dragStartStates.Clear();
                 return;
@@ -727,7 +770,7 @@ namespace Sculpting
             if (_maskedTarget != null)
             {
                 _maskedTarget.ApplyMaskedTransform(
-                    Matrix4x4.Translate(_maskedTarget.transform.InverseTransformVector(worldDelta)));
+                    Matrix4x4.Translate(_maskedFrame.InverseTransformVector(worldDelta)));
                 return;
             }
 
@@ -747,11 +790,24 @@ namespace Sculpting
 
             if (_maskedTarget != null)
             {
-                // _dragAxisWorld is this same local axis pushed through the object's rotation
-                // (see TryBeginDrag), so rotating by the local axis is the same rotation
-                // expressed in the frame the vertices actually live in.
-                _maskedTarget.ApplyMaskedTransform(
-                    Matrix4x4.Rotate(Quaternion.AngleAxis(deltaAngle, AxisDirections[_dragAxis])));
+                if (_maskedFrame == _maskedTarget.transform && _dragPivotRotation.Equals(_maskedFrame.rotation))
+                {
+                    // _dragAxisWorld is this same local axis pushed through the object's rotation
+                    // (see TryBeginDrag), so rotating by the local axis is the same rotation
+                    // expressed in the frame the vertices actually live in.
+                    _maskedTarget.ApplyMaskedTransform(
+                        Matrix4x4.Rotate(Quaternion.AngleAxis(deltaAngle, AxisDirections[_dragAxis])));
+                }
+                else
+                {
+                    // World axes (Global orientation), or a mirror copy's reflected frame, where a
+                    // turn about a local axis is not the turn on screen: the world rotation about
+                    // the pivot, carried into the vertices' own space.
+                    Matrix4x4 world = Matrix4x4.Translate(_dragPivot) *
+                                      Matrix4x4.Rotate(Quaternion.AngleAxis(deltaAngle, _dragAxisWorld)) *
+                                      Matrix4x4.Translate(-_dragPivot);
+                    _maskedTarget.ApplyMaskedTransform(_maskedFrame.worldToLocalMatrix * world * _maskedFrame.localToWorldMatrix);
+                }
                 return;
             }
 

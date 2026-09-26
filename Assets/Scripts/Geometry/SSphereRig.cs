@@ -4,7 +4,7 @@ using UnityEngine;
 namespace Sculpting
 {
     /// The armature itself: a tree of spheres (position + radius + parent/child links) that
-    /// ZSphereSkinner turns into a mesh and ZSphereController edits. Pure data - no GameObjects,
+    /// SSphereSkinner turns into a mesh and SSphereController edits. Pure data - no GameObjects,
     /// no input, no rendering.
     ///
     /// Positions are in RIG-LOCAL space, so moving the rig root moves the whole blockout without
@@ -24,7 +24,7 @@ namespace Sculpting
     /// Deleted nodes are TOMBSTONED (Alive = false) rather than removed. Every link here is an
     /// index into _nodes, and so is the controller's selection and drag target; compacting would
     /// invalidate all of them at once on an operation (pruning a limb) that happens constantly.
-    public class ZSphereRig
+    public class SSphereRig
     {
         public const int NoNode = -1;
 

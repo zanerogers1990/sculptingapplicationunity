@@ -206,7 +206,7 @@ namespace Sculpting.Molding
         /// a feature is anchored ON the parting sheet, so mirroring along the pull axis would
         /// just move it off the sheet. Copies are DERIVED at build and preview time rather than
         /// stored, so dragging or resizing the original carries its mirror with it and there is
-        /// no second object to keep in step - see the ZSphere symmetry work for why stored twins
+        /// no second object to keep in step - see the SSphere symmetry work for why stored twins
         /// are the wrong shape for this.
         ///
         /// Not applied to the sprue: there is one pour hole, and two would feed the cavity from

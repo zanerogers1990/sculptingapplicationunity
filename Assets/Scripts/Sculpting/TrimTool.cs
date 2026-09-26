@@ -38,9 +38,11 @@ namespace Sculpting
                 return false;
             }
 
-            Transform t = target.transform;
-            Matrix4x4 mvp = cam.projectionMatrix * cam.worldToCameraMatrix * t.localToWorldMatrix;
-            Matrix4x4 modelToView = cam.worldToCameraMatrix * t.localToWorldMatrix;
+            // Every place the mesh is drawn - the object, then its live mirror copies (see
+            // MirrorRepeater). A cut drawn over a copy cuts the vertices the copy shows, which is
+            // the original's own mesh. Copied out: the shared list is reused by the next caller.
+            var modelToViews = new List<Matrix4x4>(
+                RegionSelectTool.MeshFrameMatrices(target, cam.worldToCameraMatrix));
             Rect viewport = cam.pixelRect;
 
             int openLoops = 0;
@@ -50,25 +52,34 @@ namespace Sculpting
             long trianglesBefore = tris.Length / 3;
 
             SymmetryGroup symmetry = Symmetry(target, removeCovered);
-            for (int k = 0; k < symmetry.Count; k++)
+            for (int f = 0; f < modelToViews.Count; f++)
             {
-                MeshTrimmer.Result result = MeshTrimmer.Trim(
-                    verts, tris, mvp, modelToView, viewport, symmetry[k], region, removeCovered);
+                // A crop keeps what one shape covers; running it again through another copy would
+                // keep only the overlap, so a crop stops at the first copy it actually lands on.
+                if (!removeCovered && cuts > 0) break;
 
-                if (!result.Success)
+                Matrix4x4 modelToView = modelToViews[f];
+                Matrix4x4 mvp = cam.projectionMatrix * modelToView;
+                for (int k = 0; k < symmetry.Count; k++)
                 {
-                    // A mirrored pass that lands on empty space is ordinary (a shape drawn over
-                    // one arm has no counterpart when the other arm is turned away), so this only
-                    // becomes a failure if EVERY pass misses.
-                    lastError = result.Error;
-                    continue;
-                }
+                    MeshTrimmer.Result result = MeshTrimmer.Trim(
+                        verts, tris, mvp, modelToView, viewport, symmetry[k], region, removeCovered);
 
-                verts = result.Vertices;
-                tris = result.Triangles;
-                openLoops += result.OpenLoops;
-                capTriangles += result.CapTriangles;
-                cuts++;
+                    if (!result.Success)
+                    {
+                        // A mirrored pass that lands on empty space is ordinary (a shape drawn
+                        // over one arm has no counterpart when the other arm is turned away), so
+                        // this only becomes a failure if EVERY pass misses.
+                        lastError = result.Error;
+                        continue;
+                    }
+
+                    verts = result.Vertices;
+                    tris = result.Triangles;
+                    openLoops += result.OpenLoops;
+                    capTriangles += result.CapTriangles;
+                    cuts++;
+                }
             }
 
             if (cuts == 0)

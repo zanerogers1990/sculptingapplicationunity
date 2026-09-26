@@ -87,6 +87,17 @@ namespace Sculpting
             return new SymmetryGroup(ops, n);
         }
 
+        /// This group - built about the WORLD origin and axes - as the same symmetry of an
+        /// object's local space (see SymmetryOp.InObjectFrame). Conjugation keeps the product
+        /// table, so the result walks exactly like this one.
+        public SymmetryGroup InObjectFrame(Quaternion rotation, Vector3 position, Matrix4x4 worldToLocal)
+        {
+            var ops = new List<SymmetryOp>(_ops.Length);
+            for (int i = 0; i < _ops.Length; i++)
+                ops.Add(SymmetryOp.InObjectFrame(_ops[i], rotation, position, worldToLocal));
+            return new SymmetryGroup(ops, RadialCount);
+        }
+
         public static Vector3 SignOfFlipMask(int mask) =>
             new Vector3((mask & 1) != 0 ? -1f : 1f, (mask & 2) != 0 ? -1f : 1f, (mask & 4) != 0 ? -1f : 1f);
 
@@ -129,7 +140,7 @@ namespace Sculpting
             int generators = 0;
             for (int g = 1; g < _ops.Length; g++)
             {
-                if ((point - _ops[g].Apply(point)).sqrMagnitude >= limitSqr) continue;
+                if ((point - _ops[g].ApplyPoint(point)).sqrMagnitude >= limitSqr) continue;
                 _member[g] = true;
                 subgroup.Add(g);
                 generators++;

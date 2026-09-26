@@ -5,7 +5,7 @@ namespace Sculpting
     /// The one construction sequence for a live, sculptable scene object: a GameObject with a
     /// MeshFilter + MeshRenderer, a SculptableMesh, a MirrorController, and the shared sculpt
     /// material. Every path that makes one - load, import, primitives, clones, mask extract,
-    /// ZSphere convert, Lathe create - goes through here, so none of them can forget a piece (a
+    /// SSphere convert, Lathe create - goes through here, so none of them can forget a piece (a
     /// SculptableMesh without a MirrorController, or a renderer left on the default material).
     ///
     /// Selection and undo recording stay with the callers: each needs them at a different point

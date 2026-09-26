@@ -33,7 +33,7 @@ namespace Sculpting
             if (overUI) { ResetDabStroke(); return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(ray, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
             if (!_isHovering) { ResetDabStroke(); return; }
@@ -56,9 +56,9 @@ namespace Sculpting
         /// smoothing (DabHoldMode.AlwaysWorks).
         private void ApplySmoothStroke(Vector3 worldPoint, Vector3 worldNormal, float dt)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             BeginDirtyVertices();
-            StepDabStroke(t.InverseTransformPoint(worldPoint), sculptableMesh.WorldToLocalNormal(worldNormal), dt,
+            StepDabStroke(t.InverseTransformPoint(worldPoint), WorldToLocalNormal(worldNormal), dt,
                 DabHoldMode.AlwaysWorks, _placeSmoothDab ??= PlaceSmoothDab);
             FlushDirtyVertices();
         }
@@ -70,7 +70,7 @@ namespace Sculpting
         /// One dab, applied once (the world-space entry point the tests drive directly).
         private void ApplySmoothBrush(Vector3 worldPoint, float dt)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             BeginDirtyVertices();
             ApplySmoothDabLocal(t.InverseTransformPoint(worldPoint), dt);
             FlushDirtyVertices();
@@ -82,7 +82,7 @@ namespace Sculpting
             // reads one ring past its footprint, which MirrorInteractionMargin covers.
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
             while (NextMirroredDab(ref dabs, out SymmetryOp op))
-                ApplySmoothBrushLocal(op.Apply(localPoint), dt);
+                ApplySmoothBrushLocal(op.ApplyPoint(localPoint), dt);
         }
 
         private void ApplySmoothBrushLocal(Vector3 localPoint, float dt)

@@ -142,7 +142,7 @@ namespace Sculpting
                     Vector3 worldDelta = current - _lastDragPoint;
                     if (worldDelta.sqrMagnitude > 1e-12f)
                     {
-                        Vector3 localDelta = sculptableMesh.transform.InverseTransformVector(worldDelta);
+                        Vector3 localDelta = Frame.InverseTransformVector(worldDelta);
                         int versionBefore = sculptableMesh.GeometryVersion;
                         BeginDirtyVertices();
                         foreach (var (selection, op) in _grabSelections)
@@ -169,7 +169,7 @@ namespace Sculpting
             if (overUI || altHeld) return;
 
             Ray hoverRay = cam.ScreenPointToRay(mouse.position.ReadValue());
-            bool hasHit = sculptableMesh.RaycastMesh(hoverRay, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(hoverRay, out Vector3 hitPoint, out Vector3 hitNormal);
             _isHovering = hasHit;
             if (_isHovering)
             {
@@ -180,7 +180,7 @@ namespace Sculpting
 
             if (!_isHovering || !mouse.leftButton.wasPressedThisFrame) return;
 
-            Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
+            Vector3 localHit = Frame.InverseTransformPoint(hitPoint);
 
             var selections = new List<(SculptableMesh.GrabSelection, SymmetryOp)>();
             SymmetryGroup symmetry = Symmetry();
@@ -192,7 +192,7 @@ namespace Sculpting
                 // entire drag rather than merely weakening one frame of it.
                 BeginMirroredDab(symmetry, k);
                 SymmetryOp op = symmetry[k];
-                var selection = sculptableMesh.SelectGrab(op.Apply(localHit), brushRadius, frontFacingOnly, _dabCameraLocal,
+                var selection = sculptableMesh.SelectGrab(op.ApplyPoint(localHit), brushRadius, frontFacingOnly, _dabCameraLocal,
                     moveConnectedOnly);
                 if (selection.IsValid) selections.Add((selection, op));
             }
@@ -239,12 +239,12 @@ namespace Sculpting
                     // its stroke-start position each frame, so there's nothing to accumulate
                     // onto (see its remarks for why that's the more robust choice for a
                     // rotation-based deform).
-                    Vector3 localCurrent = sculptableMesh.transform.InverseTransformPoint(current);
+                    Vector3 localCurrent = Frame.InverseTransformPoint(current);
                     int versionBefore = sculptableMesh.GeometryVersion;
                     BeginDirtyVertices();
                     foreach (var (selection, op) in _poseSelections)
                     {
-                        sculptableMesh.ApplyPoseDelta(selection, op.Apply(localCurrent));
+                        sculptableMesh.ApplyPoseDelta(selection, op.ApplyPoint(localCurrent));
                         int[] indices = selection.Indices;
                         for (int k = 0; k < indices.Length; k++) _dirtyVertexScratch.Add(indices[k]);
                     }
@@ -268,7 +268,7 @@ namespace Sculpting
             if (overUI || altHeld) { _poseSelections = null; return; }
 
             Ray hoverRay = cam.ScreenPointToRay(mouse.position.ReadValue());
-            bool hasHit = sculptableMesh.RaycastMesh(hoverRay, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(hoverRay, out Vector3 hitPoint, out Vector3 hitNormal);
             _isHovering = hasHit;
             if (!_isHovering) { _poseSelections = null; return; }
 
@@ -276,13 +276,13 @@ namespace Sculpting
             _hoverNormal = hitNormal;
             _previewPositive = true;
 
-            Vector3 localHit = sculptableMesh.transform.InverseTransformPoint(hitPoint);
+            Vector3 localHit = Frame.InverseTransformPoint(hitPoint);
             var selections = new List<(SculptableMesh.PoseSelection, SymmetryOp)>();
             SymmetryGroup symmetry = Symmetry();
             for (int k = 0; k < symmetry.Count; k++)
             {
                 SymmetryOp op = symmetry[k];
-                var selection = sculptableMesh.SelectPose(op.Apply(localHit), brushRadius, poseRigidity, poseSegments);
+                var selection = sculptableMesh.SelectPose(op.ApplyPoint(localHit), brushRadius, poseRigidity, poseSegments);
                 if (selection.IsValid) selections.Add((selection, op));
             }
             _poseSelections = selections.Count > 0 ? selections : null;
@@ -350,7 +350,7 @@ namespace Sculpting
                 // points are that copy's own mesh positions. (Mapping them again used to draw every
                 // mirrored chain back on top of the primary one.)
                 for (int p = 0; p < points.Length; p++)
-                    lr.SetPosition(p, sculptableMesh.transform.TransformPoint(points[p]));
+                    lr.SetPosition(p, Frame.TransformPoint(points[p]));
             }
             for (int s = _poseSelections.Count; s < _poseChainLines.Count; s++)
                 _poseChainLines[s].gameObject.SetActive(false);

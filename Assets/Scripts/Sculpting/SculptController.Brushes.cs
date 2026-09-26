@@ -376,7 +376,7 @@ namespace Sculpting
             if (overUI) { ResetDabStroke(); return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(ray, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
             if (!_isHovering) { ResetDabStroke(); return; }
@@ -406,9 +406,9 @@ namespace Sculpting
         private void ApplyStandardStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive, float dt,
             Action<Vector3, Vector3, bool, float> applyBrushLocal, float dabDt, DabHoldMode hold, bool footprintNormal)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+            Vector3 localNormal = WorldToLocalNormal(worldNormal);
             if (footprintNormal) localNormal = AverageFootprintNormal(localPoint, localNormal);
 
             _standardDabApply = applyBrushLocal;
@@ -433,11 +433,11 @@ namespace Sculpting
         private void ApplyMirroredBrush(Vector3 worldPoint, Vector3 worldNormal, bool positive, float dt,
             Action<Vector3, Vector3, bool, float> applyBrushLocal)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
             // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+            Vector3 localNormal = WorldToLocalNormal(worldNormal);
 
             BeginDirtyVertices();
             ApplyMirroredDabLocal(localPoint, localNormal, positive, dt, applyBrushLocal);
@@ -452,7 +452,7 @@ namespace Sculpting
             while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
                 Vector3 mirroredNormal = op.Apply(localNormal).normalized;
-                applyBrushLocal(op.Apply(localPoint), mirroredNormal, positive, dt);
+                applyBrushLocal(op.ApplyPoint(localPoint), mirroredNormal, positive, dt);
             }
         }
 

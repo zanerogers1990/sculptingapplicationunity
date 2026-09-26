@@ -130,9 +130,10 @@ namespace Sculpting
             return copy;
         }
 
-        /// The live mirror pair this object is one half of, or null - set only by MirrorLink. The
-        /// vertex apply paths below report to it, which is how the other half follows an edit.
-        public MirrorLink LinkedMirror { get; internal set; }
+        /// This object's live mirror copies (Nomad's Mirror), or null - set only by MirrorRepeater.
+        /// The copies draw this very mesh through reflected transforms, so they need nothing from
+        /// the edit paths: every change here is already a change there.
+        public MirrorRepeater Repeater { get; internal set; }
 
         public bool Visible => _visible;
 
@@ -188,7 +189,7 @@ namespace Sculpting
         /// triangles, and Unity warns on every such cook ("Source mesh has over 2,097,152 triangles
         /// in it, and is using the Fast Midphase option. This might cause certain collisions to not
         /// be detected correctly..."). A high-resolution remesh passes that easily, and this
-        /// collider is not just decoration - ZSphere attach raycasts it - so past the limit it
+        /// collider is not just decoration - SSphere attach raycasts it - so past the limit it
         /// cooks the way that warning recommends, without fast midphase.
         private const long FastMidphaseTriangleLimit = 1L << 21;
 
@@ -239,7 +240,7 @@ namespace Sculpting
         /// filter at that copy, which leaves the original referenced by nothing. Unity never
         /// frees a Mesh on its own (see ReleaseReplacedMesh), so an object spawned from a mesh
         /// built at runtime used to strand that mesh for the rest of the session - one full
-        /// vertex+index buffer per clone, mirror, extract, import and ZSphere convert.
+        /// vertex+index buffer per clone, mirror, extract, import and SSphere convert.
         ///
         /// ONLY for a source built specifically to seed this object - every caller here
         /// constructs one a few lines earlier and drops it. PrimitiveSpawner deliberately does
@@ -334,7 +335,41 @@ namespace Sculpting
         /// instead of Physics.Raycast against a MeshCollider - see class remarks for why.
         /// worldRay/maxDistance/worldPoint/worldNormal are all in world space, matching what
         /// callers previously got from a RaycastHit.
-        public bool RaycastMesh(Ray worldRay, float maxDistance, out Vector3 worldPoint, out Vector3 worldNormal)
+        public bool RaycastMesh(Ray worldRay, float maxDistance, out Vector3 worldPoint, out Vector3 worldNormal) =>
+            RaycastMesh(transform, worldRay, maxDistance, out worldPoint, out worldNormal);
+
+        /// The nearest hit on this object OR any of its live mirror copies (see MirrorRepeater),
+        /// with `frame` the transform of whichever was hit - this object's own, or a copy's. A
+        /// copy draws this same mesh through its own transform, so mapping a world point through
+        /// `frame` lands on the very vertices the copy shows there.
+        public bool RaycastAnyCopy(Ray worldRay, float maxDistance, out Vector3 worldPoint, out Vector3 worldNormal,
+                                   out Transform frame)
+        {
+            frame = transform;
+            bool hit = RaycastMesh(transform, worldRay, maxDistance, out worldPoint, out worldNormal);
+            MirrorRepeater repeater = Repeater;
+            if (repeater == null) return hit;
+
+            float best = hit ? (worldPoint - worldRay.origin).sqrMagnitude : float.PositiveInfinity;
+            for (int i = 0; i < repeater.ViewCount; i++)
+            {
+                Transform view = repeater.ShownViewTransform(i);
+                if (view == null) continue;
+                if (!RaycastMesh(view, worldRay, maxDistance, out Vector3 p, out Vector3 n)) continue;
+                float sqr = (p - worldRay.origin).sqrMagnitude;
+                if (sqr >= best) continue;
+                best = sqr;
+                worldPoint = p;
+                worldNormal = n;
+                frame = view;
+                hit = true;
+            }
+            return hit;
+        }
+
+        /// RaycastMesh through `frame` instead of this object's own transform - see
+        /// RaycastAnyCopy.
+        public bool RaycastMesh(Transform frame, Ray worldRay, float maxDistance, out Vector3 worldPoint, out Vector3 worldNormal)
         {
             worldPoint = default;
             worldNormal = default;
@@ -345,7 +380,7 @@ namespace Sculpting
             // raycasts silently returning false until the next topology change.
             SyncTriangleGrid();
 
-            Transform t = transform;
+            Transform t = frame;
             Vector3 localOrigin = t.InverseTransformPoint(worldRay.origin);
             // InverseTransformVector, NOT InverseTransformDirection: Direction applies only the
             // inverse ROTATION and deliberately ignores scale, so on a non-uniformly scaled
@@ -361,7 +396,7 @@ namespace Sculpting
             // length 1 covers at least minScale of world distance, so this is the longest the
             // local ray could need to be to cover maxDistance in world space. The average could
             // under-estimate it on a stretched object and clip the ray short.
-            float localMaxDistance = maxDistance / Mathf.Max(0.0001f, MinScale());
+            float localMaxDistance = maxDistance / Mathf.Max(0.0001f, MinScale(t));
 
             if (!_triangleGrid.Raycast(localOrigin, localDir, localMaxDistance, _workingVertices, _workingTriangles,
                     out float hitT, out Vector3 localNormal, _hiddenTriangles))
@@ -369,7 +404,7 @@ namespace Sculpting
 
             Vector3 localPoint = localOrigin + localDir * hitT;
             worldPoint = t.TransformPoint(localPoint);
-            worldNormal = LocalToWorldNormal(localNormal);
+            worldNormal = LocalToWorldNormal(t, localNormal);
             return true;
         }
 
@@ -377,18 +412,24 @@ namespace Sculpting
         /// inverse transpose, or a stretched surface reports a normal that is no longer
         /// perpendicular to it (which the normal-driven brushes then push along). Transform's
         /// own TransformDirection/InverseTransformDirection are rotation-only and so are wrong
-        /// for this on any non-uniformly scaled object - see RaycastMesh.
-        public Vector3 LocalToWorldNormal(Vector3 localNormal) =>
-            transform.worldToLocalMatrix.transpose.MultiplyVector(localNormal).normalized;
+        /// for this on any non-uniformly scaled object - see RaycastMesh. The inverse transpose
+        /// is right through a mirror copy's reflected transform too: an outward normal stays
+        /// outward.
+        public Vector3 LocalToWorldNormal(Vector3 localNormal) => LocalToWorldNormal(transform, localNormal);
+
+        public static Vector3 LocalToWorldNormal(Transform frame, Vector3 localNormal) =>
+            frame.worldToLocalMatrix.transpose.MultiplyVector(localNormal).normalized;
 
         /// Inverse of LocalToWorldNormal - what the brushes use to bring a world-space hit
         /// normal back into the local space they deform vertices in.
-        public Vector3 WorldToLocalNormal(Vector3 worldNormal) =>
-            transform.localToWorldMatrix.transpose.MultiplyVector(worldNormal).normalized;
+        public Vector3 WorldToLocalNormal(Vector3 worldNormal) => WorldToLocalNormal(transform, worldNormal);
 
-        private float MinScale()
+        public static Vector3 WorldToLocalNormal(Transform frame, Vector3 worldNormal) =>
+            frame.localToWorldMatrix.transpose.MultiplyVector(worldNormal).normalized;
+
+        private static float MinScale(Transform t)
         {
-            Vector3 s = transform.lossyScale;
+            Vector3 s = t.lossyScale;
             return Mathf.Min(Mathf.Abs(s.x), Mathf.Min(Mathf.Abs(s.y), Mathf.Abs(s.z)));
         }
 

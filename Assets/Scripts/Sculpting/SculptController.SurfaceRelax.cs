@@ -399,7 +399,7 @@ namespace Sculpting
                 CurvatureStart = RelaxCurvatureStart,
                 CurvatureFull = RelaxCurvatureFull,
                 FrontFacingOnly = frontFacingOnly,
-                CameraLocalPos = sculptableMesh.transform.InverseTransformPoint(cam.transform.position),
+                CameraLocalPos = Frame.InverseTransformPoint(cam.transform.position),
             };
 
             int fullPasses = Mathf.FloorToInt(passAmount);

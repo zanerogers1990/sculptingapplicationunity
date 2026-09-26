@@ -42,42 +42,70 @@ namespace Sculpting
 
             var sb = new StringBuilder();
             sb.Append("# Exported from Sculpting Application\n");
-            sb.Append("o SculptMesh\n");
+            AppendObject(sb, "SculptMesh", t, reflected: false, verts, normals, faceStart, faceIndices, 0);
 
-            for (int i = 0; i < verts.Length; i++)
+            // Live mirror copies (see MirrorRepeater) are part of the model on screen, so each is
+            // written as an object of its own - the same geometry through its reflected transform.
+            MirrorRepeater repeater = sculptableMesh.Repeater;
+            if (repeater != null)
             {
-                Vector3 world = t.TransformPoint(verts[i]);
-                AppendVector(sb, "v", -world.x, world.y, world.z);
-            }
-
-            for (int i = 0; i < normals.Length; i++)
-            {
-                // Not t.TransformDirection: that is rotation-only, so on a non-uniformly
-                // scaled object it exports normals that are no longer perpendicular to the
-                // exported (baked, and therefore stretched) faces - see
-                // SculptableMesh.LocalToWorldNormal for the inverse-transpose this needs.
-                Vector3 n = sculptableMesh.LocalToWorldNormal(normals[i]);
-                AppendVector(sb, "vn", -n.x, n.y, n.z);
-            }
-
-            // 1-based indices, reversed winding order (c, b, a instead of a, b, c) to match
-            // the X flip above - flipping one axis inverts face orientation, so the winding
-            // has to flip back too or every face reads backwards/inside-out.
-            for (int f = 0; f + 1 < faceStart.Length; f++)
-            {
-                sb.Append('f');
-                for (int c = faceStart[f + 1] - 1; c >= faceStart[f]; c--)
+                int written = verts.Length;
+                for (int i = 0; i < repeater.ViewCount; i++)
                 {
-                    int v = faceIndices[c] + 1;
-                    sb.Append(' ').Append(v).Append("//").Append(v);
+                    Transform view = repeater.ShownViewTransform(i);
+                    if (view == null) continue;
+                    Vector3 s = repeater.View(i).Signs;
+                    AppendObject(sb, "SculptMesh_Mirror" + repeater.View(i).AxisName, view, s.x * s.y * s.z < 0f,
+                                 verts, normals, faceStart, faceIndices, written);
+                    written += verts.Length;
                 }
-                sb.Append('\n');
             }
 
             string folderPath = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(folderPath)) Directory.CreateDirectory(folderPath);
             File.WriteAllText(fullPath, sb.ToString());
             return fullPath;
+        }
+
+        /// One `o` block: the geometry through `frame`, indices shifted by `indexBase` (the
+        /// vertices every earlier block wrote). `reflected` for a frame that is itself a mirror,
+        /// whose faces then need their winding turned back once more.
+        private static void AppendObject(StringBuilder sb, string name, Transform frame, bool reflected,
+                                         Vector3[] verts, Vector3[] normals, int[] faceStart, int[] faceIndices, int indexBase)
+        {
+            sb.Append("o ").Append(name).Append('\n');
+
+            for (int i = 0; i < verts.Length; i++)
+            {
+                Vector3 world = frame.TransformPoint(verts[i]);
+                AppendVector(sb, "v", -world.x, world.y, world.z);
+            }
+
+            for (int i = 0; i < normals.Length; i++)
+            {
+                // Not frame.TransformDirection: that is rotation-only, so on a non-uniformly
+                // scaled object it exports normals that are no longer perpendicular to the
+                // exported (baked, and therefore stretched) faces - see
+                // SculptableMesh.LocalToWorldNormal for the inverse-transpose this needs.
+                Vector3 n = SculptableMesh.LocalToWorldNormal(frame, normals[i]);
+                AppendVector(sb, "vn", -n.x, n.y, n.z);
+            }
+
+            // 1-based indices, reversed winding order (c, b, a instead of a, b, c) to match
+            // the X flip above - flipping one axis inverts face orientation, so the winding
+            // has to flip back too or every face reads backwards/inside-out. A reflected frame
+            // flips it once more, back to the original order.
+            for (int f = 0; f + 1 < faceStart.Length; f++)
+            {
+                sb.Append('f');
+                int first = faceStart[f], last = faceStart[f + 1] - 1;
+                for (int k = 0; k <= last - first; k++)
+                {
+                    int v = faceIndices[reflected ? first + k : last - k] + 1 + indexBase;
+                    sb.Append(' ').Append(v).Append("//").Append(v);
+                }
+                sb.Append('\n');
+            }
         }
 
         private static void AppendVector(StringBuilder sb, string prefix, float x, float y, float z)

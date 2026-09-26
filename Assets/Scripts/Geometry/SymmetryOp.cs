@@ -20,20 +20,36 @@ namespace Sculpting
     /// same reason, and a half turn about one is itself diagonal.
     ///
     /// Plain fields, so it is blittable and usable from Burst jobs (see SculptController.DabOp).
+    ///
+    /// A World-space symmetry (see MirrorController.Space) is a plane or axis fixed in the scene
+    /// rather than through the object's origin, so in local space it also carries a translation:
+    /// Offset, added to POINTS only (ApplyPoint) - directions and normals take the linear part
+    /// alone (Apply). A Local-space op has a zero Offset, and ApplyPoint then returns exactly
+    /// what Apply does, so local symmetry stays bit for bit what it was.
     public struct SymmetryOp : IEquatable<SymmetryOp>
     {
+        // Field order matters: this struct is embedded in SculptController.DabOp, which Burst
+        // jobs read. A bool between two Vector3s laid the struct out differently for Mono and for
+        // Burst, and every job then read DabOp.Side out of the neighbouring float. Floats first,
+        // bools last, keeps both at the same offsets.
         public Vector3 Row0, Row1, Row2;
 
-        /// True when the map is a pure per-axis sign flip (identity included) - see the type's
-        /// remarks.
+        /// Translation applied after the linear part, for points only. Zero for Local space.
+        public Vector3 Offset;
+
+        /// True when the linear part is a pure per-axis sign flip (identity included) - see the
+        /// type's remarks.
         public bool Diagonal;
+
+        /// Offset is non-zero - the map does not fix the local origin.
+        public bool HasOffset;
 
         public static readonly SymmetryOp Identity = FromSign(Vector3.one);
 
         /// The per-axis signs of a Diagonal op (the mirror sign it stands for).
         public Vector3 Sign => new Vector3(Row0.x, Row1.y, Row2.z);
 
-        public bool IsIdentity => Diagonal && Row0.x > 0f && Row1.y > 0f && Row2.z > 0f;
+        public bool IsIdentity => Diagonal && !HasOffset && Row0.x > 0f && Row1.y > 0f && Row2.z > 0f;
 
         /// True for a map that reverses handedness (an odd number of reflections).
         public bool Reflects => Determinant < 0f;
@@ -96,7 +112,14 @@ namespace Sculpting
             op.Row2.x == 0f && op.Row2.y == 0f &&
             Mathf.Abs(op.Row0.x) == 1f && Mathf.Abs(op.Row1.y) == 1f && Mathf.Abs(op.Row2.z) == 1f;
 
-        /// Maps a local point, direction or normal.
+        /// Maps a local POINT - the linear part, then Offset.
+        public Vector3 ApplyPoint(Vector3 p) => HasOffset ? Apply(p) + Offset : Apply(p);
+
+        /// The inverse of ApplyPoint.
+        public Vector3 ApplyInversePoint(Vector3 p) => HasOffset ? ApplyInverse(p - Offset) : ApplyInverse(p);
+
+        /// Maps a local direction or normal (the linear part only - see Offset). For a point use
+        /// ApplyPoint; the two agree whenever the op has no offset.
         public Vector3 Apply(Vector3 v)
         {
             if (Diagonal) return new Vector3(v.x * Row0.x, v.y * Row1.y, v.z * Row2.z); // == Vector3.Scale
@@ -119,20 +142,72 @@ namespace Sculpting
         /// a * b: the map that applies b first and then a.
         public static SymmetryOp Compose(SymmetryOp a, SymmetryOp b)
         {
-            if (a.Diagonal && b.Diagonal) return FromSign(Vector3.Scale(a.Sign, b.Sign));
+            SymmetryOp op;
+            if (a.Diagonal && b.Diagonal)
+            {
+                op = FromSign(Vector3.Scale(a.Sign, b.Sign));
+            }
+            else
+            {
+                // Columns of b, each mapped through a.
+                Vector3 c0 = a.Apply(new Vector3(b.Row0.x, b.Row1.x, b.Row2.x));
+                Vector3 c1 = a.Apply(new Vector3(b.Row0.y, b.Row1.y, b.Row2.y));
+                Vector3 c2 = a.Apply(new Vector3(b.Row0.z, b.Row1.z, b.Row2.z));
+                op = new SymmetryOp
+                {
+                    Row0 = new Vector3(c0.x, c1.x, c2.x),
+                    Row1 = new Vector3(c0.y, c1.y, c2.y),
+                    Row2 = new Vector3(c0.z, c1.z, c2.z),
+                };
+                op.Diagonal = IsSignMatrix(op);
+            }
 
-            // Columns of b, each mapped through a.
-            Vector3 c0 = a.Apply(new Vector3(b.Row0.x, b.Row1.x, b.Row2.x));
-            Vector3 c1 = a.Apply(new Vector3(b.Row0.y, b.Row1.y, b.Row2.y));
-            Vector3 c2 = a.Apply(new Vector3(b.Row0.z, b.Row1.z, b.Row2.z));
+            // (a*b)(p) = A(B p + tb) + ta.
+            if (a.HasOffset || b.HasOffset) op.SetOffset(a.Apply(b.Offset) + a.Offset);
+            return op;
+        }
+
+        /// Sets Offset, keeping HasOffset in step with it.
+        public void SetOffset(Vector3 offset)
+        {
+            Offset = offset;
+            HasOffset = offset.x != 0f || offset.y != 0f || offset.z != 0f;
+        }
+
+        /// `worldOp` - a map of world space fixing the world origin - as the equivalent map of an
+        /// object's LOCAL space, for the object whose rotation and position are given:
+        /// p -> L^-1 worldOp L p. The linear part is taken through the rotation alone (orthogonal,
+        /// as the type requires); `worldToLocal` supplies the exact offset, so the plane or axis
+        /// passes through the right local point even on a non-uniformly scaled object, where only
+        /// its tilt is approximate. Entries within 1e-6 of 0 or +-1 are snapped, so an object
+        /// turned by a quarter turn still gets exact sign-flip ops.
+        public static SymmetryOp InObjectFrame(SymmetryOp worldOp, Quaternion rotation, Vector3 position,
+                                               Matrix4x4 worldToLocal)
+        {
+            if (worldOp.IsIdentity) return Identity;
+
+            Quaternion inverse = Quaternion.Inverse(rotation);
+            // Column j of R^-1 G R is R^-1 G (R e_j).
+            Vector3 c0 = inverse * worldOp.Apply(rotation * Vector3.right);
+            Vector3 c1 = inverse * worldOp.Apply(rotation * Vector3.up);
+            Vector3 c2 = inverse * worldOp.Apply(rotation * Vector3.forward);
             var op = new SymmetryOp
             {
-                Row0 = new Vector3(c0.x, c1.x, c2.x),
-                Row1 = new Vector3(c0.y, c1.y, c2.y),
-                Row2 = new Vector3(c0.z, c1.z, c2.z),
+                Row0 = new Vector3(SnapF(c0.x), SnapF(c1.x), SnapF(c2.x)),
+                Row1 = new Vector3(SnapF(c0.y), SnapF(c1.y), SnapF(c2.y)),
+                Row2 = new Vector3(SnapF(c0.z), SnapF(c1.z), SnapF(c2.z)),
             };
             op.Diagonal = IsSignMatrix(op);
+            op.SetOffset(worldToLocal.MultiplyVector(worldOp.Apply(position) - position));
             return op;
+        }
+
+        private static float SnapF(float v)
+        {
+            if (Mathf.Abs(v) < 1e-6f) return 0f;
+            if (Mathf.Abs(v - 1f) < 1e-6f) return 1f;
+            if (Mathf.Abs(v + 1f) < 1e-6f) return -1f;
+            return v;
         }
 
         /// Largest entry-wise difference - how two ops that should be the same element (say a
@@ -140,19 +215,23 @@ namespace Sculpting
         public static float MaxDifference(SymmetryOp a, SymmetryOp b)
         {
             Vector3 d0 = a.Row0 - b.Row0, d1 = a.Row1 - b.Row1, d2 = a.Row2 - b.Row2;
-            return Mathf.Max(MaxAbs(d0), Mathf.Max(MaxAbs(d1), MaxAbs(d2)));
+            float linear = Mathf.Max(MaxAbs(d0), Mathf.Max(MaxAbs(d1), MaxAbs(d2)));
+            return Mathf.Max(linear, MaxAbs(a.Offset - b.Offset));
         }
 
         private static float MaxAbs(Vector3 v) => Mathf.Max(Mathf.Abs(v.x), Mathf.Max(Mathf.Abs(v.y), Mathf.Abs(v.z)));
 
         // Exact, component by component - Vector3's == is a 1e-5 approximate comparison.
         public bool Equals(SymmetryOp other) =>
-            Row0.Equals(other.Row0) && Row1.Equals(other.Row1) && Row2.Equals(other.Row2) && Diagonal == other.Diagonal;
+            Row0.Equals(other.Row0) && Row1.Equals(other.Row1) && Row2.Equals(other.Row2) && Diagonal == other.Diagonal &&
+            Offset.Equals(other.Offset);
 
         public override bool Equals(object obj) => obj is SymmetryOp other && Equals(other);
 
-        public override int GetHashCode() => Row0.GetHashCode() ^ (Row1.GetHashCode() * 397) ^ (Row2.GetHashCode() * 7919);
+        public override int GetHashCode() =>
+            Row0.GetHashCode() ^ (Row1.GetHashCode() * 397) ^ (Row2.GetHashCode() * 7919) ^ (Offset.GetHashCode() * 31);
 
-        public override string ToString() => Diagonal ? $"Sign{Sign}" : $"[{Row0} {Row1} {Row2}]";
+        public override string ToString() =>
+            (Diagonal ? $"Sign{Sign}" : $"[{Row0} {Row1} {Row2}]") + (HasOffset ? $" + {Offset}" : string.Empty);
     }
 }

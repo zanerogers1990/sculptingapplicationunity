@@ -887,7 +887,7 @@ MonoBehaviour:
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: f036cd005b3a4efaa4b2f4f4dde76d26, type: 3}
   m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.ZSphereController
+  m_EditorClassIdentifier: Assembly-CSharp::Sculpting.SSphereController
 --- !u!114 &803899622
 MonoBehaviour:
   m_ObjectHideFlags: 0

@@ -5,7 +5,7 @@ namespace Sculpting.EditorTools
 {
     /// Clears sculpting objects leaked by EditMode tests before Play mode starts.
     ///
-    /// The EditMode fixtures (SymmetryDriftTests, MirrorLinkTests, the brush parity tests...)
+    /// The EditMode fixtures (SymmetryDriftTests, MirrorRepeaterTests, the brush parity tests...)
     /// build their SculptableMesh / SculptController objects with HideAndDontSave and destroy
     /// them in [OneTimeTearDown]. A run cut short - a script recompile mid-run is enough - never
     /// reaches the teardown, and HideAndDontSave objects outlive everything short of quitting the
@@ -36,13 +36,16 @@ namespace Sculpting.EditorTools
                 // Assets and prefabs are persistent; anything in a scene is the user's.
                 if (EditorUtility.IsPersistent(go) || go.scene.IsValid()) continue;
                 if ((go.hideFlags & HideFlags.DontSave) == 0) continue;
-                if (go.GetComponentInChildren<SculptableMesh>(true) == null &&
+                bool mirrorCopy = go.GetComponent<MirrorRepeaterView>() != null;
+                if (!mirrorCopy && go.GetComponentInChildren<SculptableMesh>(true) == null &&
                     go.GetComponentInChildren<SculptController>(true) == null) continue;
 
-                // The fixtures hand their meshes over as sharedMesh, so they leaked too.
-                foreach (MeshFilter filter in go.GetComponentsInChildren<MeshFilter>(true))
-                    if (filter.sharedMesh != null && !EditorUtility.IsPersistent(filter.sharedMesh))
-                        Object.DestroyImmediate(filter.sharedMesh);
+                // The fixtures hand their meshes over as sharedMesh, so they leaked too. Not for a
+                // live mirror copy: its mesh is its object's, freed with that object.
+                if (!mirrorCopy)
+                    foreach (MeshFilter filter in go.GetComponentsInChildren<MeshFilter>(true))
+                        if (filter.sharedMesh != null && !EditorUtility.IsPersistent(filter.sharedMesh))
+                            Object.DestroyImmediate(filter.sharedMesh);
 
                 Object.DestroyImmediate(go);
                 removed++;

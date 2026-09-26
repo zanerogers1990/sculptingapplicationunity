@@ -17,9 +17,9 @@ namespace Sculpting
     ///     the mirror - you drag the right arm and the right arm follows your hand;
     ///   - clicks mean the same thing in every mode (select, right-click delete, wheel resize);
     ///     the mode only changes what a DRAG does.
-    public partial class ZSphereController
+    public partial class SSphereController
     {
-        private const int NoNode = ZSphereRig.NoNode;
+        private const int NoNode = SSphereRig.NoNode;
 
         private const float DragThresholdPixels = 3f;
 
@@ -27,7 +27,7 @@ namespace Sculpting
         /// on a zoomed-out view is still grabbable. Only consulted when nothing is hit exactly.
         private const float PickSlopPixels = 7f;
 
-        /// Must match ZSphereArmatureView.LinkVisualScale, so a link is pickable exactly where it is
+        /// Must match SSphereArmatureView.LinkVisualScale, so a link is pickable exactly where it is
         /// drawn.
         private const float LinkPickScale = 0.6f;
 
@@ -55,8 +55,8 @@ namespace Sculpting
         private Vector3 _cursorLocal;
         private float _cursorRadius;
 
-        private readonly List<ZSphereRig.SphereInstance> _pickSpheres = new List<ZSphereRig.SphereInstance>();
-        private readonly List<ZSphereRig.LinkInstance> _pickLinks = new List<ZSphereRig.LinkInstance>();
+        private readonly List<SSphereRig.SphereInstance> _pickSpheres = new List<SSphereRig.SphereInstance>();
+        private readonly List<SSphereRig.LinkInstance> _pickLinks = new List<SSphereRig.LinkInstance>();
         private int _pickVersion = -1;
         private bool _pickSymmetry;
 
@@ -129,7 +129,7 @@ namespace Sculpting
             bool gizmoHasPointer = !blocked && !pick.IsNode && gizmo != null && gizmo.IsPointerOverHandle(ray);
 
             HoveredNode = pick.Node;
-            _hoveredLink = !pick.IsNode && !gizmoHasPointer && EditMode == ZSphereEditMode.Draw ? pick.LinkChild : NoNode;
+            _hoveredLink = !pick.IsNode && !gizmoHasPointer && EditMode == SSphereEditMode.Draw ? pick.LinkChild : NoNode;
             IsHoveringNode = pick.IsNode;
 
             UpdatePlacementCursor(blocked || gizmoHasPointer, pick, ray);
@@ -195,7 +195,7 @@ namespace Sculpting
             float scroll = mouse.scroll.ReadValue().y;
             if (Mathf.Abs(scroll) < 0.01f) return;
 
-            ZSphereRig.Node node = _rig.Get(pick.Node);
+            SSphereRig.Node node = _rig.Get(pick.Node);
             if (node == null) return;
             // Coalesced: a resize is a run of notches, and one undo step per notch would take a
             // dozen presses to walk back.
@@ -211,7 +211,7 @@ namespace Sculpting
             if (_drag == DragKind.Scale || _drag == DragKind.PendingDraw) return;
             float scroll = mouse.scroll.ReadValue().y;
             if (Mathf.Abs(scroll) < 0.01f) return;
-            ZSphereRig.Node node = _rig.Get(_dragNode);
+            SSphereRig.Node node = _rig.Get(_dragNode);
             if (node == null) return;
             _rig.SetRadius(_dragNode, Mathf.Clamp(node.Radius * (1f + Mathf.Sign(scroll) * WheelResizePerNotch),
                                                   MinNodeRadius, MaxNodeRadius));
@@ -225,7 +225,7 @@ namespace Sculpting
             _dragMirrored = pick.Mirrored;
             _dragPlaneAnchor = RigToWorld(pick.DrawnPoint);
 
-            if (pick.IsNode || (pick.IsLink && EditMode != ZSphereEditMode.Draw))
+            if (pick.IsNode || (pick.IsLink && EditMode != SSphereEditMode.Draw))
             {
                 // A link grabbed outside Draw mode is a handle on the bone's END - the child it runs
                 // into - which is what "move/scale/rotate this limb" means.
@@ -234,7 +234,7 @@ namespace Sculpting
 
                 switch (EditMode)
                 {
-                    case ZSphereEditMode.Draw:
+                    case SSphereEditMode.Draw:
                         // Opened now so the snapshot predates the child; the commit throws it away
                         // again if the press turns out to be a plain selection click.
                         BeginRigEdit("Draw Sphere");
@@ -243,18 +243,18 @@ namespace Sculpting
                         _drag = DragKind.PendingDraw;
                         break;
 
-                    case ZSphereEditMode.Move:
+                    case SSphereEditMode.Move:
                         BeginMove(node, singleNode: shift, ray, "Move Sphere");
                         break;
 
-                    case ZSphereEditMode.Scale:
+                    case SSphereEditMode.Scale:
                         BeginRigEdit("Scale Sphere");
                         CaptureDragNodes(node, subtree: shift);
                         _dragNode = node;
                         _drag = DragKind.Scale;
                         break;
 
-                    case ZSphereEditMode.Rotate:
+                    case SSphereEditMode.Rotate:
                         BeginRotate(node, ray);
                         break;
                 }
@@ -271,7 +271,7 @@ namespace Sculpting
             // limb root wherever the body is clicked. Anything else is a click in the void, which
             // deselects - and never spawns a stray disconnected sphere.
             bool onSurface = TrySurfacePoint(ray, out _);
-            if (_rig.IsEmpty || (EditMode == ZSphereEditMode.Draw && onSurface))
+            if (_rig.IsEmpty || (EditMode == SSphereEditMode.Draw && onSurface))
             {
                 PlaceRoot(ray);
                 return;
@@ -288,7 +288,7 @@ namespace Sculpting
                 case DragKind.PendingDraw:
                 {
                     if (!pastThreshold || !TryCanonicalDragPoint(ray, out Vector3 point)) return;
-                    ZSphereRig.Node parent = _rig.Get(_dragParent);
+                    SSphereRig.Node parent = _rig.Get(_dragParent);
                     if (parent == null) { EndDrag(); return; }
 
                     float radius = Mathf.Clamp(parent.Radius * _childTaper, MinNodeRadius, MaxNodeRadius);
@@ -300,7 +300,7 @@ namespace Sculpting
 
                 case DragKind.Draw:
                 {
-                    ZSphereRig.Node node = _rig.Get(_dragNode);
+                    SSphereRig.Node node = _rig.Get(_dragNode);
                     if (node == null) { EndDrag(); return; }
                     if (TryCanonicalDragPoint(ray, out Vector3 point))
                         _rig.SetPosition(_dragNode, SnapIfSymmetric(point, node.Radius));
@@ -384,7 +384,7 @@ namespace Sculpting
 
         private void UpdateMove(Ray ray)
         {
-            ZSphereRig.Node node = _rig.Get(_dragNode);
+            SSphereRig.Node node = _rig.Get(_dragNode);
             if (node == null || _dragNodes.Count == 0) { EndDrag(); return; }
 
             Vector3 target;
@@ -405,7 +405,7 @@ namespace Sculpting
 
         private void BeginRotate(int node, Ray ray)
         {
-            ZSphereRig.Node n = _rig.Get(node);
+            SSphereRig.Node n = _rig.Get(node);
             // A root has no joint to swing about, so rotating it moves the whole rig instead - the
             // only useful meaning, and it saves a trip to Move mode.
             if (n == null || !_rig.IsAlive(n.Parent))
@@ -450,7 +450,7 @@ namespace Sculpting
             return false;
         }
 
-        private Vector3 Canonical(Vector3 rigPoint) => _dragMirrored ? ZSphereRig.Mirror(rigPoint) : rigPoint;
+        private Vector3 Canonical(Vector3 rigPoint) => _dragMirrored ? SSphereRig.Mirror(rigPoint) : rigPoint;
 
         // ---------------------------------------------------------------------- creation
 
@@ -476,8 +476,8 @@ namespace Sculpting
         /// at it, in one motion.
         private void InsertOnLink(Pick pick, Ray ray)
         {
-            ZSphereRig.Node child = _rig.Get(pick.LinkChild);
-            ZSphereRig.Node parent = child != null ? _rig.Get(child.Parent) : null;
+            SSphereRig.Node child = _rig.Get(pick.LinkChild);
+            SSphereRig.Node parent = child != null ? _rig.Get(child.Parent) : null;
             if (parent == null) return;
 
             // Interpolated between the CANONICAL ends, which is the canonical point whether the
@@ -520,7 +520,7 @@ namespace Sculpting
             if (blocked || pick.IsNode || pick.IsLink || PreviewMode) return;
 
             bool onSurface = TrySurfacePoint(ray, out Vector3 surface);
-            if (!_rig.IsEmpty && !(EditMode == ZSphereEditMode.Draw && onSurface)) return;
+            if (!_rig.IsEmpty && !(EditMode == SSphereEditMode.Draw && onSurface)) return;
 
             _cursorLocal = WorldToRig(onSurface ? surface : ViewPlanePoint(ray));
             _cursorRadius = DefaultRootRadius();
@@ -557,7 +557,7 @@ namespace Sculpting
 
             for (int i = 0; i < _pickSpheres.Count; i++)
             {
-                ZSphereRig.SphereInstance s = _pickSpheres[i];
+                SSphereRig.SphereInstance s = _pickSpheres[i];
                 float slop = PickSlopPixels * PixelSizeAt(s.Centre, camPos, camForward);
 
                 if (RaySphere(origin, dir, s.Centre, s.Radius, out float t))
@@ -574,7 +574,7 @@ namespace Sculpting
 
             for (int i = 0; i < _pickLinks.Count; i++)
             {
-                ZSphereRig.LinkInstance l = _pickLinks[i];
+                SSphereRig.LinkInstance l = _pickLinks[i];
                 RaySegment(origin, dir, l.A, l.B, out float t, out float u, out Vector3 onAxis, out float distance);
                 float radius = Mathf.Lerp(l.RadiusA, l.RadiusB, u) * LinkPickScale;
                 var pick = new Pick
@@ -598,7 +598,7 @@ namespace Sculpting
             return softLink;
         }
 
-        private static Pick NodePick(ZSphereRig.SphereInstance s) =>
+        private static Pick NodePick(SSphereRig.SphereInstance s) =>
             new Pick { Node = s.Node, LinkChild = NoNode, Mirrored = s.Mirrored, DrawnPoint = s.Centre };
 
         /// Rig-local size of one screen pixel at `point`.

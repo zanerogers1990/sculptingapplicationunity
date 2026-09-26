@@ -18,7 +18,7 @@ namespace Sculpting
     ///   LatheController.cs         state, lifecycle, preview mesh, overlay, operations, undo, Create
     ///   LatheController.Input.cs   picking and every mouse/keyboard gesture
     ///
-    /// Like the ZSphere rig, the profile is a scaffold rather than a scene object: it is not in
+    /// Like the SSphere rig, the profile is a scaffold rather than a scene object: it is not in
     /// SelectionManager or save files, and it keeps its own undo history. Create is where the work
     /// becomes real geometry, and Create is one step on the scene's EditHistory.
     public partial class LatheController : MonoBehaviour
@@ -261,7 +261,7 @@ namespace Sculpting
 
         private void OnDisable()
         {
-            // Committed rather than dropped - see ZSphereController.OnDisable.
+            // Committed rather than dropped - see SSphereController.OnDisable.
             CommitEdit();
             SetOverlayVisible(false);
         }
@@ -322,7 +322,7 @@ namespace Sculpting
             if (_previewRenderer.sharedMaterial != null) return;
 
             if (_fallbackMaterial == null)
-                _fallbackMaterial = ZSphereArmatureView.CreateLit("Lathe Preview", new Color(0.72f, 0.72f, 0.74f), 0.35f);
+                _fallbackMaterial = SSphereArmatureView.CreateLit("Lathe Preview", new Color(0.72f, 0.72f, 0.74f), 0.35f);
             _previewRenderer.sharedMaterial = _fallbackMaterial;
         }
 
@@ -510,7 +510,7 @@ namespace Sculpting
         // ------------------------------------------------------------------------- create
 
         /// Bakes the current shape into a real, independent SculptableMesh at full detail - the same
-        /// "brand new object" contract ZSphere Convert, Clone and Mirror use, so the result is
+        /// "brand new object" contract SSphere Convert, Clone and Mirror use, so the result is
         /// immediately sculptable, maskable, joinable, savable and exportable. The profile is kept,
         /// so the next Create can be a variation. Null (with Status set) when there is nothing to
         /// build.
@@ -570,7 +570,7 @@ namespace Sculpting
         }
 
         /// One undo press takes the created object away and puts you back on the lathe - the same
-        /// park-don't-destroy contract as ZSphereController.RecordConvertUndo, so a redo finds the
+        /// park-don't-destroy contract as SSphereController.RecordConvertUndo, so a redo finds the
         /// object, and anything sculpted on it since, intact.
         private void RecordCreateUndo(SculptableMesh created)
         {
@@ -607,7 +607,7 @@ namespace Sculpting
 
         // ---------------------------------------------------------------- profile undo
 
-        /// The profile keeps its own undo stack, like the ZSphere rig and for the same reason: forty
+        /// The profile keeps its own undo stack, like the SSphere rig and for the same reason: forty
         /// handle drags on the scene's history would bury the mesh edits either side of them. Z
         /// answers here while the tool is up and has something to undo, and falls through to the
         /// scene's history otherwise (see HandlesUndoKey), which is how Z right after Create

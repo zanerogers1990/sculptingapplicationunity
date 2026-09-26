@@ -385,7 +385,7 @@ namespace Sculpting
         private bool _isOverUI;
 
         // Short-lived text popup independent of the brush cursor above, since it needs to be
-        // readable even when nothing is selected (undoing a ZSphere convert, say - see the
+        // readable even when nothing is selected (undoing an SSphere convert, say - see the
         // remarks on Undo/Redo below) and shouldn't disappear the instant the mouse moves off
         // the model. Originally Undo/Redo-only (see TriggerUndoRedoFeedback); now shared with
         // Save/Save As (see TriggerActionToast) since both are the same "confirm a one-shot
@@ -699,9 +699,9 @@ namespace Sculpting
         // The old form undid whatever the SELECTION had last done, so undoing after clicking a
         // different object in the scene panel reversed something you did minutes ago on that
         // object instead of the thing you just did - and it could not reach edits that are not
-        // about one object's vertices at all, like skinning a ZSphere rig into a new mesh. Note
+        // about one object's vertices at all, like skinning an SSphere rig into a new mesh. Note
         // these no longer require a selection: there is plenty worth undoing when nothing is
-        // selected (that ZSphere convert, for one).
+        // selected (that SSphere convert, for one).
         public bool CanUndo => EditHistory.CanUndo;
         public bool CanRedo => EditHistory.CanRedo;
 
@@ -722,7 +722,7 @@ namespace Sculpting
         }
 
         // Very brief white flash across the sculpted surface (skipped if nothing is selected -
-        // undoing a ZSphere convert, say, has no single mesh to flash) plus the toast text,
+        // undoing an SSphere convert, say, has no single mesh to flash) plus the toast text,
         // which shows regardless of selection since it's confirming the action happened at all,
         // not that a particular mesh changed.
         private void TriggerUndoRedoFeedback(string label)
@@ -937,12 +937,14 @@ namespace Sculpting
             _lastCarveStrokeLocal = null;
             ResetClayStroke();
             ResetDabStroke();
+            ResetBrushFrame();
         }
 
         private void HandleSculptInput()
         {
             var mouse = Mouse.current;
             if (mouse == null || cam == null || sculptableMesh == null) return;
+            ReleaseBrushFrameIfIdle();
 
             // Anything OUTSIDE this component can have moved geometry since the last frame - an
             // undo (HandleUndoRedoKeys, a few lines earlier in Update), a gizmo drag, a Remesh, a

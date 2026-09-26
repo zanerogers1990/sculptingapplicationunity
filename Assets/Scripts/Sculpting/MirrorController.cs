@@ -16,8 +16,15 @@ namespace Sculpting
     /// Stored by value in save files, so new members go on the end.
     public enum RadialAxis { X, Y, Z, Custom }
 
-    /// The sculpting symmetry of one object: up to three axes of local-space mirroring, plus
-    /// N-fold radial symmetry around an axis, all through the sculptable mesh's local origin.
+    /// Where an object's symmetry lives (Nomad's Local/World): through the object's own origin and
+    /// along its own axes, moving with it - or fixed at the world origin along the world axes,
+    /// with the object free to move through it. Stored by value in save files.
+    public enum SymmetrySpace { Local, World }
+
+    /// The sculpting symmetry of one object: up to three axes of mirroring, plus N-fold radial
+    /// symmetry around an axis - through the sculptable mesh's local origin along its own axes
+    /// (Local space), or through the world origin along the world axes (World space, see
+    /// SymmetrySpace).
     /// Each enabled mirror axis reflects every brush stroke, any combination can be active at
     /// once (e.g. X+Y mirrors a stroke into all four quadrants), and radial symmetry repeats it
     /// at N evenly spaced angles - combined with the mirrors when both are on (see
@@ -45,6 +52,8 @@ namespace Sculpting
         [SerializeField] private RadialAxis radialAxis = RadialAxis.Y;
         [SerializeField] private Vector3 radialCustomAxis = Vector3.up;
 
+        [SerializeField] private SymmetrySpace space = SymmetrySpace.Local;
+
         // Unity's axis-handle/gizmo convention: X red, Y green, Z blue.
         private static readonly Color XColor = new Color(1f, 0.25f, 0.25f);
         private static readonly Color YColor = new Color(0.35f, 1f, 0.35f);
@@ -61,6 +70,14 @@ namespace Sculpting
 
         private SculptableMesh _sculptableMesh;
         private Transform _planeX, _planeY, _planeZ;
+
+        // Unity's built-in Quad lies in the local XY plane (normal +Z) by default - that's already
+        // the Z=0 plane. Rotating it 90 deg about Y swings its face into the YZ plane (X=0); 90 deg
+        // about X swings it into the XZ plane (Y=0). Local rotations under this object in Local
+        // space, world rotations at the world origin in World space.
+        private static readonly Quaternion PlaneXRotation = Quaternion.Euler(0f, 90f, 0f);
+        private static readonly Quaternion PlaneYRotation = Quaternion.Euler(90f, 0f, 0f);
+        private static readonly Quaternion PlaneZRotation = Quaternion.identity;
         private Transform _radialGuide;
         private Mesh _radialGuideMesh;
         private Material _radialGuideMaterial;
@@ -80,6 +97,8 @@ namespace Sculpting
         }
 
         public RadialAxis RadialAxisChoice { get => radialAxis; set => radialAxis = value; }
+
+        public SymmetrySpace Space { get => space; set => space = value; }
 
         /// The direction used when RadialAxisChoice is Custom. Stored as given; a zero vector
         /// falls back to Y when used (see RadialAxisVector).
@@ -115,6 +134,7 @@ namespace Sculpting
             radialCount = source.radialCount;
             radialAxis = source.radialAxis;
             radialCustomAxis = Vector3.Scale(source.radialCustomAxis, localSigns);
+            space = source.space;
         }
 
         /// Applies a plane-visibility choice to EVERY object in the scene, not just the
@@ -137,12 +157,9 @@ namespace Sculpting
         {
             _sculptableMesh = GetComponent<SculptableMesh>();
 
-            // Unity's built-in Quad lies in the local XY plane (normal +Z) by default -
-            // that's already the Z=0 plane. Rotating it 90 deg about Y swings its face into
-            // the YZ plane (X=0); 90 deg about X swings it into the XZ plane (Y=0).
-            _planeX = CreatePlane("MirrorPlane_X", XColor, Quaternion.Euler(0f, 90f, 0f));
-            _planeY = CreatePlane("MirrorPlane_Y", YColor, Quaternion.Euler(90f, 0f, 0f));
-            _planeZ = CreatePlane("MirrorPlane_Z", ZColor, Quaternion.identity);
+            _planeX = CreatePlane("MirrorPlane_X", XColor, PlaneXRotation);
+            _planeY = CreatePlane("MirrorPlane_Y", YColor, PlaneYRotation);
+            _planeZ = CreatePlane("MirrorPlane_Z", ZColor, PlaneZRotation);
             _radialGuide = CreateRadialGuide();
         }
 
@@ -156,13 +173,13 @@ namespace Sculpting
 
         private void Update()
         {
-            UpdatePlane(_planeX, mirrorX);
-            UpdatePlane(_planeY, mirrorY);
-            UpdatePlane(_planeZ, mirrorZ);
+            UpdatePlane(_planeX, mirrorX, PlaneXRotation);
+            UpdatePlane(_planeY, mirrorY, PlaneYRotation);
+            UpdatePlane(_planeZ, mirrorZ, PlaneZRotation);
             UpdateRadialGuide();
         }
 
-        private void UpdatePlane(Transform plane, bool axisActive)
+        private void UpdatePlane(Transform plane, bool axisActive, Quaternion rotation)
         {
             // The clean-view check is here rather than a flip of showPlanes, which is saved into
             // scene files - a save made mid-presentation would otherwise lose the planes.
@@ -170,8 +187,37 @@ namespace Sculpting
             if (plane.gameObject.activeSelf != visible) plane.gameObject.SetActive(visible);
             if (!visible) return;
 
-            float size = PlaneSize();
-            plane.localScale = new Vector3(size, size, 1f);
+            if (space == SymmetrySpace.World)
+            {
+                plane.SetPositionAndRotation(Vector3.zero, rotation);
+                float size = WorldGuideSize() / ParentScale();
+                plane.localScale = new Vector3(size, size, 1f);
+            }
+            else
+            {
+                plane.localPosition = Vector3.zero;
+                plane.localRotation = rotation;
+                float size = PlaneSize();
+                plane.localScale = new Vector3(size, size, 1f);
+            }
+        }
+
+        /// Full width of a World-space guide: it sits at the world origin and has to reach past the
+        /// object wherever the object has been moved to.
+        private float WorldGuideSize()
+        {
+            var r = _sculptableMesh.GetComponent<Renderer>();
+            if (r == null) return 2f;
+            Bounds b = r.bounds;
+            float extent = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
+            return Mathf.Max(0.01f, b.center.magnitude + extent) * 2f * PlanePadding;
+        }
+
+        // Guides are children of this object, so a world size is divided by its scale.
+        private float ParentScale()
+        {
+            Vector3 s = transform.lossyScale;
+            return Mathf.Max(1e-6f, Mathf.Max(Mathf.Abs(s.x), Mathf.Max(Mathf.Abs(s.y), Mathf.Abs(s.z))));
         }
 
         /// The radial guide: the axis line through the object, and a ring around it with one spoke
@@ -191,6 +237,15 @@ namespace Sculpting
             color.a = RadialGuideAlpha;
             if (_radialGuideMaterial.color != color) _radialGuideMaterial.color = color;
 
+            if (space == SymmetrySpace.World)
+            {
+                _radialGuide.SetPositionAndRotation(Vector3.zero, Quaternion.FromToRotation(Vector3.up, RadialAxisVector));
+                float worldSize = WorldGuideSize() * 0.5f / ParentScale();
+                _radialGuide.localScale = new Vector3(worldSize, worldSize, worldSize);
+                return;
+            }
+
+            _radialGuide.localPosition = Vector3.zero;
             _radialGuide.localRotation = Quaternion.FromToRotation(Vector3.up, RadialAxisVector);
             float size = PlaneSize() * 0.5f;
             _radialGuide.localScale = new Vector3(size, size, size);
@@ -265,8 +320,8 @@ namespace Sculpting
                 meshExtent = Mathf.Max(e.x, Mathf.Max(e.y, e.z));
             }
 
-            // A ZSphere rig mirroring about THIS object's origin is sharing this exact plane (the
-            // rig suppresses its own quad when this one is up - see ZSphereController.
+            // An SSphere rig mirroring about THIS object's origin is sharing this exact plane (the
+            // rig suppresses its own quad when this one is up - see SSphereController.
             // UpdateSymmetryPlane), and a blockout is routinely grown well past the sphere it was
             // started from. Sizing to the mesh alone left the plane as a small card floating
             // inside a much larger rig, which is no more use than not drawing it. The rig reaches
@@ -352,22 +407,39 @@ namespace Sculpting
         /// enabled mirror reflections times the radial rotations (see SymmetryGroup). Mapping a
         /// local point, delta or normal through op k gives its k-th symmetric copy.
         ///
-        /// Shared and immutable; cached until a setting changes.
+        /// Shared and immutable; cached until a setting changes - and, in World space, until the
+        /// object moves.
         public SymmetryGroup GetSymmetry()
         {
             int count = radial ? radialCount : 1;
             Vector3 axis = RadialAxisVector;
-            if (_symmetry != null && _builtX == mirrorX && _builtY == mirrorY && _builtZ == mirrorZ &&
-                _builtRadialCount == count && (count == 1 || _builtRadialAxis.Equals(axis)))
-                return _symmetry;
+            if (_symmetry == null || _builtX != mirrorX || _builtY != mirrorY || _builtZ != mirrorZ ||
+                _builtRadialCount != count || (count != 1 && !_builtRadialAxis.Equals(axis)))
+            {
+                _symmetry = !mirrorX && !mirrorY && !mirrorZ && count == 1
+                    ? SymmetryGroup.Trivial
+                    : SymmetryGroup.Build(mirrorX, mirrorY, mirrorZ, count, axis);
+                _builtX = mirrorX; _builtY = mirrorY; _builtZ = mirrorZ;
+                _builtRadialCount = count;
+                _builtRadialAxis = axis;
+                _worldSymmetry = null;
+            }
 
-            _symmetry = !mirrorX && !mirrorY && !mirrorZ && count == 1
-                ? SymmetryGroup.Trivial
-                : SymmetryGroup.Build(mirrorX, mirrorY, mirrorZ, count, axis);
-            _builtX = mirrorX; _builtY = mirrorY; _builtZ = mirrorZ;
-            _builtRadialCount = count;
-            _builtRadialAxis = axis;
-            return _symmetry;
+            if (space == SymmetrySpace.Local || _symmetry.Count == 1) return _symmetry;
+
+            // World space: the same group built about the world origin, carried into this
+            // object's local frame. Rebuilt only when the object has moved - exactly compared, so
+            // a gizmo drag rebuilds it once per frame and a stroke never does.
+            Matrix4x4 localToWorld = transform.localToWorldMatrix;
+            if (_worldSymmetry == null || !_worldSymmetryMatrix.Equals(localToWorld))
+            {
+                _worldSymmetry = _symmetry.InObjectFrame(transform.rotation, transform.position, transform.worldToLocalMatrix);
+                _worldSymmetryMatrix = localToWorld;
+            }
+            return _worldSymmetry;
         }
+
+        private SymmetryGroup _worldSymmetry;
+        private Matrix4x4 _worldSymmetryMatrix;
     }
 }

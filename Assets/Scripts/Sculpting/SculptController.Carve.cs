@@ -29,7 +29,7 @@ namespace Sculpting
             if (overUI) { _lastCarveStrokeLocal = null; return; }
 
             Ray ray = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            bool hasHit = sculptableMesh.RaycastMesh(ray, 1000f, out Vector3 hitPoint, out Vector3 hitNormal);
+            bool hasHit = RaycastTarget(ray, out Vector3 hitPoint, out Vector3 hitNormal);
 
             _isHovering = hasHit;
             if (!_isHovering) { _lastCarveStrokeLocal = null; return; }
@@ -81,11 +81,11 @@ namespace Sculpting
 
         private void ApplyCarveStroke(Vector3 worldPoint, Vector3 worldNormal, bool positive)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             Vector3 localPoint = t.InverseTransformPoint(worldPoint);
             // Not InverseTransformDirection: that is rotation-only and mis-tilts the normal
             // on a non-uniformly scaled object - see SculptableMesh.WorldToLocalNormal.
-            Vector3 localNormal = sculptableMesh.WorldToLocalNormal(worldNormal);
+            Vector3 localNormal = WorldToLocalNormal(worldNormal);
             Vector3 sampledNormal = AverageFootprintNormal(localPoint, localNormal);
             float spacing = Mathf.Max(brushRadius * CreaseDabSpacingFraction, 0.0005f);
 
@@ -210,7 +210,7 @@ namespace Sculpting
             MirroredDabWalk dabs = BeginMirroredDabs(localPoint, brushRadius);
             while (NextMirroredDab(ref dabs, out SymmetryOp op))
             {
-                Vector3 mirroredPoint = op.Apply(localPoint);
+                Vector3 mirroredPoint = op.ApplyPoint(localPoint);
                 Vector3 mirroredNormal = op.Apply(_carveStrokeNormal).normalized;
                 // Map the stroke frame the same way Clay maps its frozen tip axes, rather than
                 // rebuilding it from the mapped normal - keeps a mirrored or radial groove exactly

@@ -11,7 +11,7 @@ namespace Sculpting
     /// background, and records exactly one revolution as a seamless loop.
     ///
     /// THE CAMERA ORBITS; THE MODEL NEVER MOVES. Spinning the objects themselves would write
-    /// their transforms (undo history, mirror links, ZSphere rigs and saved files would all see
+    /// their transforms (undo history, mirror links, SSphere rigs and saved files would all see
     /// it), where orbiting is pure view state. It also looks right with the default lighting:
     /// the lighting presets are locked to the camera, so the lights ride along with the orbit
     /// and the model reads as turning under fixed studio lights. Matcaps are view-space and
@@ -434,11 +434,11 @@ namespace Sculpting
         //
         // Handled elsewhere, by a CleanViewActive check at the source, because their owners
         // re-assert visibility every frame: the transform gizmo, mirror planes, pose guide lines,
-        // selection flashes. The ZSphere skin preview is deliberately NOT here - in Preview mode
+        // selection flashes. The SSphere skin preview is deliberately NOT here - in Preview mode
         // it is the model, as far as anyone looking at it is concerned.
         private static readonly HashSet<string> HelperObjectNames = new HashSet<string>
         {
-            "ZSphereArmature", "ZSpherePlacementCursor", "ZSphereSymmetryPlane",
+            "SSphereArmature", "SSpherePlacementCursor", "SSphereSymmetryPlane",
             "MoldPartingSurface", "MoldUndercutTint", "MoldBlockOutline", "MoldFeaturePreview",
             "ExtractPreview"
         };
@@ -449,7 +449,7 @@ namespace Sculpting
 
             // FindObjectsOfTypeAll rather than FindObjectsByType: most of these are DontSave,
             // which FindObjectsByType does not return. Walked from the named roots so their
-            // children (the ZSphere armature's link meshes) go too. Once, on entry: every tool
+            // children (the SSphere armature's link meshes) go too. Once, on entry: every tool
             // that creates them is locked out of input while the clean view is up.
             foreach (Transform t in Resources.FindObjectsOfTypeAll<Transform>())
             {

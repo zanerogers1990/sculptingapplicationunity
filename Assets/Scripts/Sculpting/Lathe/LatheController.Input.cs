@@ -5,7 +5,7 @@ using UnityEngine.InputSystem;
 
 namespace Sculpting
 {
-    /// Picking and gestures. The same ground rules as the ZSphere tool, for the same reasons:
+    /// Picking and gestures. The same ground rules as the SSphere tool, for the same reasons:
     ///   - a drag is computed ABSOLUTELY from the press (the point's start position and where on it
     ///     you grabbed), never by accumulating per-frame deltas, so nothing creeps and Esc can put
     ///     it back exactly;

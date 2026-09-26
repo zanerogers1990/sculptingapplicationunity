@@ -61,7 +61,7 @@ namespace Sculpting
         // its ring Image, same delegation pattern as IsAdjustingStrength below.
         // The OS cursor is hidden directly here (see UpdateBrushCursor) whenever this
         // ring is shown, and restored whenever it isn't - over a UI panel, over no sculptable
-        // target, or while another tool (Transpose/Scale/ZSphere) owns the viewport.
+        // target, or while another tool (Transpose/Scale/SSphere) owns the viewport.
         private bool _showBrushCursor;
         private Vector2 _brushCursorScreenPos;
         private float _brushCursorScreenDiameter;
@@ -312,15 +312,15 @@ namespace Sculpting
 
             bool redo = kb.leftShiftKey.isPressed || kb.rightShiftKey.isPressed;
 
-            // This is the ONLY place Z is read. The ZSphere tool keeps its own history for the rig
-            // (a scaffold, not a scene object - see ZSphereController's rig-undo remarks) and the
+            // This is the ONLY place Z is read. The SSphere tool keeps its own history for the rig
+            // (a scaffold, not a scene object - see SSphereController's rig-undo remarks) and the
             // Lathe tool one for its profile; each takes the press - and performs the step itself -
             // while it is the active tool and has something left to step through. Asking them in
             // turn rather than letting each read the key is what guarantees exactly one history
             // answers a given press, whatever order the components' Updates run in, and that Z
             // falls back to scene history the moment a tool's own runs out.
-            if (_zsphereForUndo == null) _zsphereForUndo = FindFirstObjectByType<ZSphereController>();
-            if (_zsphereForUndo != null && _zsphereForUndo.HandlesUndoKey(redo)) return;
+            if (_ssphereForUndo == null) _ssphereForUndo = FindFirstObjectByType<SSphereController>();
+            if (_ssphereForUndo != null && _ssphereForUndo.HandlesUndoKey(redo)) return;
             if (_latheForUndo == null) _latheForUndo = FindFirstObjectByType<LatheController>();
             if (_latheForUndo != null && _latheForUndo.HandlesUndoKey(redo)) return;
 
@@ -328,8 +328,8 @@ namespace Sculpting
         }
 
         // Only ever looked up on a frame Z is actually pressed, so the find costs nothing in a
-        // scene that has no ZSphereController at all.
-        private ZSphereController _zsphereForUndo;
+        // scene that has no SSphereController at all.
+        private SSphereController _ssphereForUndo;
         private LatheController _latheForUndo;
 
         // Ctrl+S / Ctrl+Shift+S, matching the quick-save/save-as split most creative software
@@ -352,9 +352,9 @@ namespace Sculpting
 
         // Delete on the selected scene object - prompts before deleting (see
         // SceneGraphUIBuilder.ShowDeleteSelectedConfirm; the prompt is the panel's, so this asks
-        // the panel). Skipped while the ZSphere tool is active: there,
+        // the panel). Skipped while the SSphere tool is active: there,
         // Delete/Backspace already means "delete the selected RIG NODE" (see
-        // ZSphereController.Input.HandleKeys), and letting both fire off one press would delete
+        // SSphereController.Input.HandleKeys), and letting both fire off one press would delete
         // a node AND the object it belongs to. Also skipped while a uGUI text field has focus
         // (typing in the rename box, editing a scene-graph row) so Delete edits text instead of
         // reaching for the object underneath it.
@@ -367,7 +367,7 @@ namespace Sculpting
             // selected pin/sprue/vent" (see MoldController.HandleKeys), and letting both fire
             // would take the model with it.
             // And in Lathe mode, where Delete removes the selected profile point.
-            if (Gizmo != null && (Gizmo.Mode == GizmoMode.ZSphere || Gizmo.Mode == GizmoMode.Mold ||
+            if (Gizmo != null && (Gizmo.Mode == GizmoMode.SSphere || Gizmo.Mode == GizmoMode.Mold ||
                                   Gizmo.Mode == GizmoMode.Lathe)) return;
 
             if (_sceneGraphPanel == null) _sceneGraphPanel = FindFirstObjectByType<SceneGraphUIBuilder>();
@@ -377,7 +377,7 @@ namespace Sculpting
         }
 
         // Only ever looked up on a frame Ctrl+S or Delete is actually pressed, so the find costs
-        // nothing otherwise - same reasoning as _zsphereForUndo above.
+        // nothing otherwise - same reasoning as _ssphereForUndo above.
         private SceneDocumentController _document;
         private SceneGraphUIBuilder _sceneGraphPanel;
 
@@ -385,7 +385,7 @@ namespace Sculpting
         // hotkey block (RefreshShortcutGate). Two things take a key away from them: a focused
         // text field - the key is text for it (typing a name used to remesh on R, swap brushes on
         // the digits and Shift, and pop the radial menu on Space) - and a tool that owns the
-        // viewport and its own keys (ZSphere, Lathe, Mold), where R would remesh the mesh under
+        // viewport and its own keys (SSphere, Lathe, Mold), where R would remesh the mesh under
         // the rig and X toggle its mirror. Only a gesture's START is gated: a hold already under
         // way still sees its release, so the S/F gauges and the Shift-smooth override can never
         // be left stuck on.
@@ -399,7 +399,7 @@ namespace Sculpting
         private void RefreshShortcutGate()
         {
             GizmoMode mode = Gizmo != null ? Gizmo.Mode : GizmoMode.Sculpt;
-            bool toolOwnsKeys = mode == GizmoMode.ZSphere || mode == GizmoMode.Lathe || mode == GizmoMode.Mold;
+            bool toolOwnsKeys = mode == GizmoMode.SSphere || mode == GizmoMode.Lathe || mode == GizmoMode.Mold;
             _typingInText = InputFocus.IsTypingInText();
             _shortcutKeysBlocked = toolOwnsKeys || _typingInText;
             _radialMenusBlocked = _shortcutKeysBlocked || mode != GizmoMode.Sculpt;
@@ -824,8 +824,13 @@ namespace Sculpting
             if (!_strokeAnchorTracking || !_isHovering) return;
 
             _strokeAnchorOwner = sculptableMesh;
-            _strokeAnchorLocal = sculptableMesh.transform.InverseTransformPoint(_hoverPoint);
+            _strokeAnchorFrame = Frame;
+            _strokeAnchorLocal = _strokeAnchorFrame.InverseTransformPoint(_hoverPoint);
         }
+
+        // The side of the anchor's object it was sculpted on - the object itself, or one of its
+        // live mirror copies (see SculptController.Frame).
+        private Transform _strokeAnchorFrame;
 
         /// World position of the last spot sculpted - see _strokeAnchorOwner. False before the
         /// first stroke, and while the object it was on is deleted, disabled or hidden.
@@ -836,7 +841,8 @@ namespace Sculpting
                 worldPoint = default;
                 return false;
             }
-            worldPoint = _strokeAnchorOwner.transform.TransformPoint(_strokeAnchorLocal);
+            Transform frame = _strokeAnchorFrame != null ? _strokeAnchorFrame : _strokeAnchorOwner.transform;
+            worldPoint = frame.TransformPoint(_strokeAnchorLocal);
             return true;
         }
 
@@ -1010,7 +1016,7 @@ namespace Sculpting
             Color color = PositiveColor;
 
             // Same "another tool owns the cursor" carve-out the old preview had - Transpose/
-            // Scale drag the transform, ZSpheres place and grow rig spheres, and each shows its
+            // Scale drag the transform, SSpheres place and grow rig spheres, and each shows its
             // own affordance instead - the R-hold density gauge joins them here, its grid/label
             // being its own affordance the same way (see DensityGrid).
             bool sculptToolActive = sculptableMesh != null && cam != null && !RegionSelectActive

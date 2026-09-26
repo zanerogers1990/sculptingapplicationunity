@@ -56,7 +56,7 @@ namespace Sculpting
         {
             _dabOpIndex = index;
             _dabOp = group[index];
-            _dabCameraLocal = _dabOp.Apply(sculptableMesh.transform.InverseTransformPoint(cam.transform.position));
+            _dabCameraLocal = _dabOp.ApplyPoint(Frame.InverseTransformPoint(cam.transform.position));
         }
 
         /// The symmetry op the dab being applied is mapped through, and its index in the group.
@@ -302,7 +302,7 @@ namespace Sculpting
             int representative = _walkCosets[walk.Coset];
             for (int h = 0; h < walk.Orderings; h++)
             {
-                Vector3 centre = group[group.Product(representative, _walkSubgroup[h])].Apply(walk.Point);
+                Vector3 centre = group[group.Product(representative, _walkSubgroup[h])].ApplyPoint(walk.Point);
                 // The spatial grid's shared buffer - consumed fully before the next query.
                 List<int> found = sculptableMesh.QueryNear(centre, walk.Reach);
                 for (int k = 0; k < found.Count; k++)
@@ -367,7 +367,7 @@ namespace Sculpting
             double multiplicity = 0.0;
             for (int h = 0; h < walk.Orderings; h++)
             {
-                float separation = (walk.Point - walk.Group[_walkSubgroup[h]].Apply(walk.Point)).magnitude;
+                float separation = (walk.Point - walk.Group[_walkSubgroup[h]].ApplyPoint(walk.Point)).magnitude;
                 multiplicity += DiscOverlapFraction(separation / (2f * walk.Reach));
             }
             return (float)System.Math.Max(1.0, multiplicity);

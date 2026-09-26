@@ -235,7 +235,7 @@ namespace Sculpting
             if (overUI || altHeld) return;
 
             Ray hoverRay = cam.ScreenPointToRay(GetStrokeScreenPosition(mouse));
-            if (!sculptableMesh.RaycastMesh(hoverRay, 1000f, out Vector3 hitPoint, out Vector3 hitNormal)) return;
+            if (!RaycastTarget(hoverRay, out Vector3 hitPoint, out Vector3 hitNormal)) return;
             _isHovering = true;
             _hoverPoint = hitPoint;
             _hoverNormal = hitNormal;
@@ -253,7 +253,7 @@ namespace Sculpting
 
         private void ApplySnakeHook(Vector3 worldDelta)
         {
-            Transform t = sculptableMesh.transform;
+            Transform t = Frame;
             Vector3 localTip = t.InverseTransformPoint(_snakeTipWorld);
             Vector3 localDelta = t.InverseTransformVector(worldDelta);
 
@@ -271,7 +271,7 @@ namespace Sculpting
                 float pad = travelled;
                 MirroredDabWalk dabs = BeginMirroredDabs(localTip, brushRadius + pad);
                 while (NextMirroredDab(ref dabs, out SymmetryOp op))
-                    SnakeHookStep(op.Apply(localTip), op.Apply(step), pad);
+                    SnakeHookStep(op.ApplyPoint(localTip), op.Apply(step), pad);
                 localTip += step;
                 travelled += step.magnitude;
             }

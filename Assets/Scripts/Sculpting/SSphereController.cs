@@ -3,37 +3,37 @@ using UnityEngine;
 
 namespace Sculpting
 {
-    /// Drives the ZSphere blockout: owns the armature, draws it, owns the mouse while
-    /// GizmoMode.ZSphere is active, keeps a live skin on it, and bakes that skin into an ordinary
+    /// Drives the SSphere blockout: owns the armature, draws it, owns the mouse while
+    /// GizmoMode.SSphere is active, keeps a live skin on it, and bakes that skin into an ordinary
     /// SculptableMesh on Convert.
     ///
     /// Split across partial files by concern:
-    ///   ZSphereController.cs          state, lifecycle, drawing, rig-level operations, gizmo
-    ///   ZSphereController.Input.cs    analytic picking and every mouse/keyboard gesture
-    ///   ZSphereController.Skin.cs     the live skin and Convert
-    ///   ZSphereController.History.cs  rig-local undo, and attaching the rig to an object
+    ///   SSphereController.cs          state, lifecycle, drawing, rig-level operations, gizmo
+    ///   SSphereController.Input.cs    analytic picking and every mouse/keyboard gesture
+    ///   SSphereController.Skin.cs     the live skin and Convert
+    ///   SSphereController.History.cs  rig-local undo, and attaching the rig to an object
     ///
     /// The rig is a scaffold, not a scene object: it is not in SelectionManager or save files,
     /// and it keeps its own undo history. Convert is where the work becomes real geometry.
     // Before the default order for the same reason as SculptController: CameraOrbitController
     // (order 0) reads IsHoveringNode to leave the wheel to the rig's resize.
     [DefaultExecutionOrder(-10)]
-    public partial class ZSphereController : MonoBehaviour, IGizmoTargetSource, IGizmoPointerClaim, IMirrorPlaneExtentProvider
+    public partial class SSphereController : MonoBehaviour, IGizmoTargetSource, IGizmoPointerClaim, IMirrorPlaneExtentProvider
     {
         public const float MinNodeRadius = 0.005f;
         public const float MaxNodeRadius = 5f;
 
-        private readonly ZSphereRig _rig = new ZSphereRig();
-        public ZSphereRig Rig => _rig;
+        private readonly SSphereRig _rig = new SSphereRig();
+        public SSphereRig Rig => _rig;
 
-        public int SelectedNode { get; private set; } = ZSphereRig.NoNode;
-        public int HoveredNode { get; private set; } = ZSphereRig.NoNode;
+        public int SelectedNode { get; private set; } = SSphereRig.NoNode;
+        public int HoveredNode { get; private set; } = SSphereRig.NoNode;
 
         /// Whether the cursor is over a rig sphere. Read by CameraOrbitController so the wheel
         /// resizes the sphere under the cursor instead of zooming.
         public static bool IsHoveringNode { get; private set; }
 
-        public ZSphereEditMode EditMode
+        public SSphereEditMode EditMode
         {
             get => _editMode;
             set
@@ -43,7 +43,7 @@ namespace Sculpting
                 _editMode = value;
             }
         }
-        private ZSphereEditMode _editMode = ZSphereEditMode.Draw;
+        private SSphereEditMode _editMode = SSphereEditMode.Draw;
 
         /// Mirror across the rig's x = 0 plane. On by default: creatures and characters are
         /// overwhelmingly bilateral, and building one side twice is the tedium this tool removes.
@@ -89,7 +89,7 @@ namespace Sculpting
             _orbit != null ? _orbit : (_orbit = FindFirstObjectByType<CameraOrbitController>());
 
         private Transform _rigRoot;
-        private ZSphereArmatureView _view;
+        private SSphereArmatureView _view;
         private bool _wasActive;
 
         // What the armature mesh was last built from - see RefreshView.
@@ -120,7 +120,7 @@ namespace Sculpting
             TickPendingRigEdit();
             FollowAttachTarget();
 
-            bool active = Gizmo != null && Gizmo.Mode == GizmoMode.ZSphere && _cam != null;
+            bool active = Gizmo != null && Gizmo.Mode == GizmoMode.SSphere && _cam != null;
             if (active != _wasActive)
             {
                 _wasActive = active;
@@ -131,8 +131,8 @@ namespace Sculpting
             if (!active)
             {
                 IsHoveringNode = false;
-                HoveredNode = ZSphereRig.NoNode;
-                _hoveredLink = ZSphereRig.NoNode;
+                HoveredNode = SSphereRig.NoNode;
+                _hoveredLink = SSphereRig.NoNode;
                 _cursorVisible = false;
                 SyncGizmoTargets();
                 return;
@@ -169,9 +169,9 @@ namespace Sculpting
         private void EnsureRigRoot()
         {
             if (_rigRoot != null) return;
-            var root = new GameObject("ZSphere Rig") { hideFlags = HideFlags.DontSave };
+            var root = new GameObject("SSphere Rig") { hideFlags = HideFlags.DontSave };
             _rigRoot = root.transform;
-            _view = new ZSphereArmatureView(_rigRoot);
+            _view = new SSphereArmatureView(_rigRoot);
         }
 
         private void SetRigVisible(bool visible)
@@ -182,14 +182,14 @@ namespace Sculpting
         }
 
         /// Rebuilds the armature mesh when anything it shows has changed. Picking is analytic
-        /// (see ZSphereController.Input), so unlike the old collider-per-sphere rig there is no
+        /// (see SSphereController.Input), so unlike the old collider-per-sphere rig there is no
         /// physics copy to resync afterwards - what was just drawn is what the next click tests.
         private void RefreshView()
         {
             bool armature = !PreviewMode;
             bool plane = SymmetryX && !_rig.IsEmpty && !PreviewMode && !AnchorShowsOwnPlane();
-            int hover = _drag == DragKind.None ? HoveredNode : ZSphereRig.NoNode;
-            int hoverLink = _drag == DragKind.None ? _hoveredLink : ZSphereRig.NoNode;
+            int hover = _drag == DragKind.None ? HoveredNode : SSphereRig.NoNode;
+            int hoverLink = _drag == DragKind.None ? _hoveredLink : SSphereRig.NoNode;
 
             if (_rig.Version != _drawnVersion || SelectedNode != _drawnSelection || hover != _drawnHover ||
                 hoverLink != _drawnHoverLink || SymmetryX != _drawnSymmetry || armature != _drawnArmature ||
@@ -269,20 +269,20 @@ namespace Sculpting
                     : "Symmetry off.";
             }
 
-            if (!_rig.IsAlive(SelectedNode)) SelectedNode = ZSphereRig.NoNode;
+            if (!_rig.IsAlive(SelectedNode)) SelectedNode = SSphereRig.NoNode;
             CommitRigEdit();
             return report;
         }
 
-        /// Starts a blockout from nothing - the ZSphere entry in Add Primitive. Never clears an
+        /// Starts a blockout from nothing - the SSphere entry in Add Primitive. Never clears an
         /// existing rig: a button among Cube/Sphere/Cylinder reads as "add one", and silently
         /// destroying a blockout would be the worst thing in the tool. Returns false (having just
         /// armed the tool) when a rig is already up.
         public bool StartNewRig()
         {
             EnsureRigRoot();
-            EditMode = ZSphereEditMode.Draw;
-            Gizmo?.SetMode(GizmoMode.ZSphere);
+            EditMode = SSphereEditMode.Draw;
+            Gizmo?.SetMode(GizmoMode.SSphere);
             if (!_rig.IsEmpty) return false;
 
             Vector3 world = Vector3.zero;
@@ -291,7 +291,7 @@ namespace Sculpting
 
             AnchorRigRoot(world);
 
-            BeginRigEdit("New ZSphere Rig");
+            BeginRigEdit("New SSphere Rig");
             float radius = DefaultRootRadius();
             SelectedNode = _rig.AddRoot(SnapIfSymmetric(WorldToRig(world), radius), radius);
             CommitRigEdit();
@@ -305,8 +305,8 @@ namespace Sculpting
             if (!_rig.IsAlive(index)) return;
             BeginRigEdit("Delete Sphere");
             _rig.Remove(index);
-            if (!_rig.IsAlive(SelectedNode)) SelectedNode = ZSphereRig.NoNode;
-            if (!_rig.IsAlive(HoveredNode)) HoveredNode = ZSphereRig.NoNode;
+            if (!_rig.IsAlive(SelectedNode)) SelectedNode = SSphereRig.NoNode;
+            if (!_rig.IsAlive(HoveredNode)) HoveredNode = SSphereRig.NoNode;
             CommitRigEdit();
         }
 
@@ -316,7 +316,7 @@ namespace Sculpting
         {
             if (_rig.IsEmpty) return;
             EndDrag();
-            BeginRigEdit("Clear ZSpheres");
+            BeginRigEdit("Clear SSpheres");
             ClearRigInternal();
             CommitRigEdit();
         }
@@ -327,8 +327,8 @@ namespace Sculpting
         {
             _drag = DragKind.None;
             _rig.Clear();
-            SelectedNode = ZSphereRig.NoNode;
-            HoveredNode = ZSphereRig.NoNode;
+            SelectedNode = SSphereRig.NoNode;
+            HoveredNode = SSphereRig.NoNode;
         }
 
         /// Radius of the selected sphere, for the panel's slider. 0 with nothing selected.
@@ -336,7 +336,7 @@ namespace Sculpting
         {
             get
             {
-                ZSphereRig.Node node = _rig.Get(SelectedNode);
+                SSphereRig.Node node = _rig.Get(SelectedNode);
                 return node != null ? node.Radius : 0f;
             }
             set
@@ -349,7 +349,7 @@ namespace Sculpting
         }
 
         private Vector3 SnapIfSymmetric(Vector3 position, float radius) =>
-            _symmetryX ? ZSphereRig.SnapToAxis(position, radius) : position;
+            _symmetryX ? SSphereRig.SnapToAxis(position, radius) : position;
 
         // ------------------------------------------------------------------- anchoring
 
@@ -445,14 +445,14 @@ namespace Sculpting
         /// does, so the two ways of moving a sphere never disagree about what moves with it.
         public void MoveNodeFromGizmo(int nodeIndex, Vector3 worldPosition)
         {
-            ZSphereRig.Node node = _rig.Get(nodeIndex);
+            SSphereRig.Node node = _rig.Get(nodeIndex);
             if (_rigRoot == null || node == null) return;
             Vector3 target = SnapIfSymmetric(WorldToRig(worldPosition), node.Radius);
             _rig.TranslateSubtree(nodeIndex, target - node.Position);
         }
 
         private readonly List<GizmoTarget> _gizmoTargets = new List<GizmoTarget>();
-        private int _gizmoTargetNode = ZSphereRig.NoNode;
+        private int _gizmoTargetNode = SSphereRig.NoNode;
 
         /// Points the axis gizmo at the selected sphere in Move mode, for the moment a limb needs
         /// moving straight down one axis. Grabbing the sphere itself still free-drags it.
@@ -461,15 +461,15 @@ namespace Sculpting
             TransformGizmo gizmo = Gizmo;
             if (gizmo == null) return;
 
-            bool wants = _wasActive && EditMode == ZSphereEditMode.Move && !PreviewMode &&
+            bool wants = _wasActive && EditMode == SSphereEditMode.Move && !PreviewMode &&
                          _rig.IsAlive(SelectedNode) && _drag == DragKind.None;
 
             if (!wants)
             {
-                if (_gizmoTargetNode != ZSphereRig.NoNode)
+                if (_gizmoTargetNode != SSphereRig.NoNode)
                 {
                     gizmo.ClearExternalTargets(this);
-                    _gizmoTargetNode = ZSphereRig.NoNode;
+                    _gizmoTargetNode = SSphereRig.NoNode;
                     _gizmoTargets.Clear();
                 }
                 return;
@@ -479,7 +479,7 @@ namespace Sculpting
 
             _gizmoTargetNode = SelectedNode;
             _gizmoTargets.Clear();
-            _gizmoTargets.Add(new ZSphereNodeTarget(this, SelectedNode));
+            _gizmoTargets.Add(new SSphereNodeTarget(this, SelectedNode));
             gizmo.SetExternalTargets(this, _gizmoTargets, GizmoHandleSet.Move);
         }
 
