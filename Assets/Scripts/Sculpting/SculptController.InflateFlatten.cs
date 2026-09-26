@@ -42,7 +42,7 @@ namespace Sculpting
         // vertex further from the plane it is measured against, so the next push is larger), so
         // it gets a cap on how far one stroke may drive any vertex off its starting height,
         // as a fraction of brushRadius. Measured from SculptableMesh.StrokeStartPosition and
-        // applied symmetrically - unlike Clay's one-sided ClampStrokeDepth, contrast moves the
+        // applied symmetrically - unlike Clay's one-sided LimitStrokeDepth, contrast moves the
         // two sides of the plane in OPPOSITE directions, so both need bounding.
         private const float FlattenContrastLimit = 0.5f;
 

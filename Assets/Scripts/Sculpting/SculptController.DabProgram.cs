@@ -447,6 +447,7 @@ namespace Sculpting
                     Accumulate = accumulate,
                     Rate = sign * clayHeightFactor * EffectiveClayStrengthAccumulate * ClaySpeed * dt * RadiusScale,
                     MaxAlong = height * (accumulate ? ClayStrokeDepthLimitAccumulate : ClayStrokeDepthLimit),
+                    SoftBand = Mathf.Abs(height) * StrokeDepthSoftBand,
                 },
             };
             job.Schedule().Complete();

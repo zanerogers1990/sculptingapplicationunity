@@ -247,19 +247,69 @@ namespace Sculpting
         // default clayTipRoundness=1, so this changes nothing for the plain round tip.
         private const float Sqrt2 = 1.4142136f;
 
-        /// Caps how far THIS stroke has displaced one vertex, measured from where the stroke
+        // The soft stroke-depth cap - see LimitStrokeDepth. Once a vertex is within
+        // StrokeDepthSoftBand clay heights (brushRadius * clayHeightFactor) of its cap, the part
+        // of each step that heads for the cap is scaled by (remaining / band)^StrokeDepthSoftExponent.
+        // That reaches exactly 0 AT the cap, so the settled height is a smooth function of how
+        // much work a spot received and a plateau's shoulder rounds off instead of truncating.
+        //
+        // Why a band of fixed width rather than the plain (1 - along/maxAlong)^k from the start
+        // of the stroke: that slows EVERY step, including an ordinary single pass. Measured at
+        // 327k triangles, one Accumulate pass already reaches ~93% of its 3-height cap, and even
+        // easing only over the upper half of the cap cut it from 2.79 to 2.32 heights. A band
+        // measured in clay heights also gives the same shoulder in both modes, although their caps
+        // (ClayStrokeDepthLimit, ClayStrokeDepthLimitAccumulate) differ by 2x. At 0.75 a single
+        // pass gives up 0.97 -> 0.93 heights (Accumulate off) and 2.79 -> 2.58 (on); eight
+        // back-and-forth passes that used to pin 227 vertices flat on the cap pin none.
+        //
+        // Exponent 2: the rate falls to zero with zero slope, so a heavily worked spot creeps
+        // the last part of the way instead of arriving at a fixed speed and stopping, which is
+        // what makes the shoulder round rather than merely less sharp.
+        private const float StrokeDepthSoftBand = 0.75f;
+        private const float StrokeDepthSoftExponent = 2f;
+
+        /// Limits how far THIS stroke has displaced one vertex, measured from where the stroke
         /// found it rather than from any absolute height - so it bounds only the growth this
         /// stroke is itself responsible for, and a stroke crossing a ridge an earlier stroke
-        /// built neither chisels it nor is blocked by it. Only the normal component is capped;
-        /// tangential motion is left alone. Shared by the managed path and (as an inlined copy)
-        /// ClayDisplacementJob - see ClayStrokeDepthLimit for the whole rationale, including why
-        /// maxAlong must NOT be scaled by the dab's falloff weight.
-        private static Vector3 ClampStrokeDepth(Vector3 position, Vector3 strokeStart,
-                                                Vector3 planeNormal, float maxAlong, float height)
+        /// built neither chisels it nor is blocked by it. Only the normal component is limited;
+        /// tangential motion, and any step AWAY from the cap, are left alone.
+        ///
+        /// Two stages. The soft one eases the step from `from` to `moved` as the vertex nears the
+        /// cap (see StrokeDepthSoftBand): a hard clamp alone let a vertex run at full speed and
+        /// stop dead, so where part of a footprint had reached the cap and part had not, the
+        /// surface changed slope abruptly - a faint shelf round every held or scrubbed stroke.
+        /// The hard clamp stays after it as a safety net for a single step large enough to jump
+        /// what is left of the band. Both are flat per vertex - see ClayStrokeDepthLimit for why
+        /// maxAlong must NOT be scaled by the dab's falloff weight. maxAlong carries the stroke's
+        /// sign (height * limit); softBand is a positive distance.
+        ///
+        /// Shared by the managed path and ClayDisplace (both Clay jobs), so they cannot diverge.
+        private static Vector3 LimitStrokeDepth(Vector3 from, Vector3 moved, Vector3 strokeStart,
+                                                Vector3 planeNormal, float maxAlong, float softBand)
         {
-            float along = Vector3.Dot(position - strokeStart, planeNormal);
-            bool within = height >= 0f ? along <= maxAlong : along >= maxAlong;
-            return within ? position : position - planeNormal * (along - maxAlong);
+            // The cap is "up" for a positive stroke and "down" for an inverted one.
+            bool up = maxAlong >= 0f;
+
+            float step = Vector3.Dot(moved - from, planeNormal);
+            if (up ? step > 0f : step < 0f)
+            {
+                float remaining = maxAlong - Vector3.Dot(from - strokeStart, planeNormal);
+                if (!up) remaining = -remaining;
+                moved -= planeNormal * (step * (1f - StrokeDepthEase(remaining, softBand)));
+            }
+
+            float along = Vector3.Dot(moved - strokeStart, planeNormal);
+            bool within = up ? along <= maxAlong : along >= maxAlong;
+            return within ? moved : moved - planeNormal * (along - maxAlong);
+        }
+
+        /// The soft cap's rate factor for a vertex `remaining` short of its cap (sign already
+        /// folded in): 1 outside the band, falling to 0 at the cap and beyond it.
+        private static float StrokeDepthEase(float remaining, float softBand)
+        {
+            if (remaining >= softBand) return 1f;
+            float x = Mathf.Clamp01(remaining / softBand);
+            return Mathf.Pow(x, StrokeDepthSoftExponent);
         }
 
 

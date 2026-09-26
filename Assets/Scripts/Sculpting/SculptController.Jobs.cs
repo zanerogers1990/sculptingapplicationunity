@@ -39,7 +39,7 @@ namespace Sculpting
         private NativeArray<Vector3> _nativeClayWeightedPos;
         private NativeArray<Vector3> _nativeClayWeightedNormal;
         // Each candidate's position as of THIS stroke's start (see
-        // SculptableMesh.StrokeStartPosition) - the reference ClampStrokeDepth measures Clay's
+        // SculptableMesh.StrokeStartPosition) - the reference LimitStrokeDepth measures Clay's
         // per-stroke buildup cap against (and Flatten's contrast cap - see
         // FlattenContrastLimit, and Crease's whole carve target - see CreaseJob).
         // Gathered in the Clay/Flatten/Crease job paths only, alongside
@@ -621,7 +621,7 @@ namespace Sculpting
         private struct ClayDisplacementJob : IJobParallelFor
         {
             [ReadOnly] public NativeArray<Vector3> PositionsIn;
-            // See ClampStrokeDepth - the cap is per-vertex, relative to where this stroke found
+            // See LimitStrokeDepth - the cap is per-vertex, relative to where this stroke found
             // each one, so it bounds only what this stroke added.
             [ReadOnly] public NativeArray<Vector3> StrokeStartIn;
             [ReadOnly] public NativeArray<float> WeightsIn;
@@ -643,9 +643,11 @@ namespace Sculpting
             public int AlphaSize;
             public bool Accumulate;
             public float Rate; // sign * brushStrength * ClaySpeed * dt, only used when Accumulate
-            // Signed per-stroke displacement cap along PlaneNormal - see ClampStrokeDepth.
+            // Signed per-stroke displacement cap along PlaneNormal - see LimitStrokeDepth.
             // Deliberately NOT multiplied by this dab's weight; see ClayStrokeDepthLimit.
             public float MaxAlong;
+            // Positive width of the soft band below MaxAlong - see StrokeDepthSoftBand.
+            public float SoftBand;
 
             public void Execute(int index)
             {
@@ -654,7 +656,7 @@ namespace Sculpting
                 {
                     Height = Height, LerpFactorScale = LerpFactorScale, UseAlpha = UseAlpha, InvertAlpha = InvertAlpha,
                     CosR = CosR, SinR = SinR, InvStampRadius = InvStampRadius, AlphaSize = AlphaSize,
-                    Accumulate = Accumulate, Rate = Rate, MaxAlong = MaxAlong,
+                    Accumulate = Accumulate, Rate = Rate, MaxAlong = MaxAlong, SoftBand = SoftBand,
                 };
                 if (!ClayDisplace(ref pos, WeightsIn[index], StrokeStartIn[index], LocalPoint, PlaneOrigin, PlaneNormal,
                         Tangent, Bitangent, settings, AlphaSamples))
@@ -704,6 +706,7 @@ namespace Sculpting
             public bool Accumulate;
             public float Rate;
             public float MaxAlong;
+            public float SoftBand;
         }
 
         /// ClayDisplacementJob's per-vertex body, shared with ClayProgramJob so the per-dab and
@@ -754,15 +757,10 @@ namespace Sculpting
                 ? pos + planeNormal * (s.Rate * weight) + toTarget * lerp
                 : pos + toTarget * lerp;
 
-            // Inlined ClampStrokeDepth - a Burst job can't call the shared static without
-            // dragging Vector3 method-call overhead into the inner loop, and the two must
-            // stay identical or the Burst and managed paths would diverge (see
-                // MinJobVertexCount: which one runs depends only on footprint size).
-            float along = Vector3.Dot(moved - strokeStart, planeNormal);
-            bool overshot = s.Height >= 0f ? along > s.MaxAlong : along < s.MaxAlong;
-            if (overshot) moved -= planeNormal * (along - s.MaxAlong);
-
-            pos = moved;
+            // The same LimitStrokeDepth the managed path calls - it was an inlined copy, and the
+            // two must stay identical or the Burst and managed paths diverge (see
+            // MinJobVertexCount: which one runs depends only on footprint size).
+            pos = LimitStrokeDepth(pos, moved, strokeStart, planeNormal, s.MaxAlong, s.SoftBand);
             return true;
         }
 

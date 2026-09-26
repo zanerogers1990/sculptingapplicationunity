@@ -265,6 +265,96 @@ namespace Sculpting.Tests
             }
         }
 
+        private delegate Vector3 StrokeDepthLimit(Vector3 from, Vector3 moved, Vector3 strokeStart,
+            Vector3 planeNormal, float maxAlong, float softBand);
+
+        /// Clay's per-stroke depth cap eases a vertex in rather than stopping it dead: full steps
+        /// outside the soft band, shrinking steps inside it, never past the cap, and nothing
+        /// changed for a step away from the cap or sideways - for both stroke signs.
+        [Test]
+        public void StrokeDepthLimitEasesIntoTheCap()
+        {
+            var method = typeof(SculptController).GetMethod("LimitStrokeDepth",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            Assert.That(method, Is.Not.Null, "SculptController.LimitStrokeDepth not found - renamed? Update this test.");
+            var limit = (StrokeDepthLimit)Delegate.CreateDelegate(typeof(StrokeDepthLimit), method);
+
+            const float cap = 0.3f, band = 0.15f, step = 0.01f;
+            foreach (float sign in new[] { 1f, -1f })
+            {
+                Vector3 n = Vector3.up * sign;
+                Vector3 start = new Vector3(0.2f, -0.1f, 0.4f);
+                float Along(Vector3 p) => Vector3.Dot(p - start, n);
+
+                // Outside the band a step is untouched.
+                Vector3 low = start + n * 0.05f;
+                Assert.That(Along(limit(low, low + n * step, start, Vector3.up, sign * cap, band)) - Along(low),
+                    Is.EqualTo(step).Within(1e-6f), $"sign {sign}: a step below the band was eased.");
+
+                // Inside it, each step is smaller than the last and the vertex never passes the cap.
+                Vector3 p = start + n * (cap - band);
+                float last = float.MaxValue;
+                for (int k = 0; k < 400; k++)
+                {
+                    Vector3 next = limit(p, p + n * step + Vector3.right * 0.002f, start, Vector3.up, sign * cap, band);
+                    float moved = Along(next) - Along(p);
+                    Assert.That(moved, Is.GreaterThanOrEqualTo(0f).And.LessThanOrEqualTo(last + 1e-7f),
+                        $"sign {sign}: step {k} grew inside the band.");
+                    Assert.That(Along(next), Is.LessThanOrEqualTo(cap + 1e-6f), $"sign {sign}: passed the cap.");
+                    Assert.That(next.x - p.x, Is.EqualTo(0.002f).Within(1e-6f), $"sign {sign}: tangential motion was limited.");
+                    last = moved;
+                    p = next;
+                }
+                Assert.That(Along(p), Is.GreaterThan(cap - band * 0.1f), $"sign {sign}: never got close to the cap.");
+
+                // A step back away from the cap is untouched, even right at it.
+                Vector3 atCap = start + n * cap;
+                Assert.That(Along(limit(atCap, atCap - n * step, start, Vector3.up, sign * cap, band)),
+                    Is.EqualTo(cap - step).Within(1e-6f), $"sign {sign}: a step away from the cap was limited.");
+
+                // One step big enough to jump the whole band still stops at the cap (the hard safety net).
+                Assert.That(Along(limit(low, low + n * 1f, start, Vector3.up, sign * cap, band)),
+                    Is.LessThanOrEqualTo(cap + 1e-6f), $"sign {sign}: a large step jumped the cap.");
+            }
+        }
+
+        /// Scrubbing back and forth drives the middle of a Clay stroke up to its per-stroke cap. With a
+        /// hard clamp that flattened ~230 vertices onto the cap at this density, with a slope break
+        /// (a faint shelf) where the plateau met the part still rising; eased in, none sit on it.
+        [Test]
+        public void ScrubbedClayStrokeRoundsOffInsteadOfPinningAtTheCap()
+        {
+            _controller.CurrentBrush = BrushType.Clay;
+            _controller.BrushStrength = 0.5f;
+            _controller.Accumulate = false;
+            _controller.SurfaceRelax = 0f; // relax is not capped, and would blur what is measured
+            _controller.UseAlpha = false;
+            TestReflection.SetField(_controller, "_lastClayStrokeLocal", null);
+            TestReflection.SetField(_controller, "_lastClayStrokeNormalLocal", null);
+            var stroke = TestReflection.Bind<Action<Vector3, Vector3, bool>>(_controller, "ApplyClayStroke");
+            const int framesPerPass = 30, passes = 8;
+            for (int f = 0; f <= framesPerPass * passes; f++)
+            {
+                float x = Mathf.Lerp(-0.15f, 0.15f, Mathf.PingPong(f / (float)framesPerPass, 1f));
+                Vector3 dir = new Vector3(x, 0f, -0.5f).normalized;
+                TestReflection.Invoke(_controller, "MarkPositionMirrorStale");
+                stroke(dir * SymmetricTestMesh.SurfaceRadius(dir), dir, true);
+            }
+
+            float cap = BrushRadius * _controller.ClayHeightFactor * 1.5f; // ClayStrokeDepthLimit
+            Vector3[] v = _sculptable.Vertices;
+            int pinned = 0;
+            float peak = 0f;
+            for (int i = 0; i < v.Length; i++)
+            {
+                float rise = Vector3.Dot(v[i] - _startVertices[i], _startVertices[i].normalized);
+                peak = Mathf.Max(peak, rise);
+                if (Mathf.Abs(rise - cap) < cap * 0.002f) pinned++;
+            }
+            Assert.That(peak, Is.GreaterThan(cap * 0.9f), "The stroke never got near its cap - the test proves nothing.");
+            Assert.That(pinned, Is.LessThan(10), $"{pinned} vertices sit flat on the cap.");
+        }
+
         [Test]
         public void FalloffCurvePassesThroughItsPointsWithoutOvershoot()
         {

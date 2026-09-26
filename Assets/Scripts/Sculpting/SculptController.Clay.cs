@@ -42,8 +42,10 @@ namespace Sculpting
         // profile gives each competing stamp a hard rim. The plane is deliberately LIVE again;
         // only this per-stroke displacement cap holds the buildup down, and because it is a
         // flat per-vertex limit (NOT scaled by the dab's falloff weight) it is identical for
-        // every dab that reaches it - so it truncates into one clean plateau instead of
-        // re-imposing each dab's profile the way a weight-scaled ceiling did.
+        // every dab that reaches it - so it settles into one clean plateau instead of
+        // re-imposing each dab's profile the way a weight-scaled ceiling did. Vertices EASE into
+        // it rather than stopping dead (see LimitStrokeDepth): a hard stop left a slope break -
+        // a faint shelf - where a footprint was part capped and part not.
         //
         // Releasing and stroking again re-bases the cap, so buildup ACROSS strokes - which is
         // what clay buildup actually means - is untouched.
@@ -385,6 +387,7 @@ namespace Sculpting
                 Accumulate = accumulate,
                 Rate = sign * clayHeightFactor * effectiveStrengthAccumulate * ClaySpeed * dt * RadiusScale,
                 MaxAlong = height * (accumulate ? ClayStrokeDepthLimitAccumulate : ClayStrokeDepthLimit),
+                SoftBand = Mathf.Abs(height) * StrokeDepthSoftBand,
             };
             dispJob.Schedule(candidates.Count, 32).Complete();
 
@@ -490,9 +493,9 @@ namespace Sculpting
                     Vector3 flattenTarget = planeOrigin + tangentialOffsetAcc + planeNormal * (height * weight);
                     Vector3 flattenDelta = (flattenTarget - verts[i]) * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt);
 
-                    verts[i] = ClampStrokeDepth(verts[i] + buildDelta + flattenDelta,
+                    verts[i] = LimitStrokeDepth(verts[i], verts[i] + buildDelta + flattenDelta,
                         mesh.StrokeStartPosition(i), planeNormal,
-                        height * ClayStrokeDepthLimitAccumulate, height);
+                        height * ClayStrokeDepthLimitAccumulate, Mathf.Abs(height) * StrokeDepthSoftBand);
                 }
                 else
                 {
@@ -512,9 +515,9 @@ namespace Sculpting
                     // reproduced this empirically while testing this brush (a synthetic
                     // large-dt stroke sent a vertex from radius 0.5 to over 3.0 in 90 frames
                     // before this clamp existed).
-                    verts[i] = ClampStrokeDepth(verts[i] + toTarget * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt),
+                    verts[i] = LimitStrokeDepth(verts[i], verts[i] + toTarget * Mathf.Clamp01(weight * effectiveStrength * ClaySpeed * dt),
                         mesh.StrokeStartPosition(i), planeNormal,
-                        height * ClayStrokeDepthLimit, height);
+                        height * ClayStrokeDepthLimit, Mathf.Abs(height) * StrokeDepthSoftBand);
                 }
 
                 _dirtyVertexScratch.Add(i);
